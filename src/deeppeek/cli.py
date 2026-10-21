@@ -6,7 +6,6 @@ from . import __version__
 from .commands import (
     capture as capture_cmd,
     recover as recover_cmd,
-    dig as dig_cmd,
     extension as extension_cmd,
     diagnose as diagnose_cmd,
     pipe as pipe_cmd,
@@ -24,7 +23,6 @@ def _build_root_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
     capture_cmd.register(sub)
     recover_cmd.register(sub)
-    dig_cmd.register(sub)
     pipe_cmd.register(sub)
     extension_cmd.register(sub)
     diagnose_cmd.register(sub)
@@ -34,7 +32,6 @@ def _build_root_parser() -> argparse.ArgumentParser:
 _DISPATCH = {
     "capture": capture_cmd.run,
     "recover": recover_cmd.run,
-    "dig": dig_cmd.run,
     "pipe": pipe_cmd.run,
     "extension": extension_cmd.run,
     "diagnose": diagnose_cmd.run,

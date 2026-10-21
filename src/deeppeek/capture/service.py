@@ -1,6 +1,18 @@
 """High-level capture: run the local HTTP server, block on a payload,
 slice, render, and either return the text in memory or write it to
 disk.
+
+Two entry points for callers:
+
+  capture_conversation(cfg)   — capture + slice + render, return a
+                                CaptureResult without touching disk.
+  capture_to_markdown(cfg)    — capture + slice + render + write to
+                                cfg.output (auto-naming if None),
+                                return the written Path.
+
+Also exports `default_output_path(title, as_json)` — the timestamped
+filename generator — so the CLI can produce the same name for
+`capture -o auto`.
 """
 import json
 import re
@@ -50,6 +62,21 @@ def _safe_title(title: Optional[str], maxlen: int = 30) -> str:
     s = re.sub(r"[^a-zA-Z0-9-_\s]", "", title)
     s = re.sub(r"\s+", "_", s)
     return s[:maxlen].rstrip("_").strip()
+
+
+def default_output_path(title: Optional[str], as_json: bool) -> Path:
+    """Produce a timestamped default output filename.
+
+    Used by `capture -o auto` and by `capture_to_markdown` when
+    `cfg.output is None`.  Example: `DeepSeek_2026-10-21_15-42-03.md`
+    or `DeepSeek_<sanitized-title>_2026-10-21_15-42-03.md` if the
+    conversation had a title.
+    """
+    stamp = datetime.now().strftime("%Y-%m-%d_%H_%M_%S")
+    safe = _safe_title(title)
+    ext = ".json" if as_json else ".md"
+    suffix = f"_{safe}" if safe else ""
+    return Path(f"DeepSeek{suffix}_{stamp}{ext}")
 
 
 def _print_prompt_index(messages, label: str) -> None:
@@ -146,11 +173,7 @@ def capture_to_markdown(cfg: CaptureConfig) -> Path:
     result = capture_conversation(cfg)
     output_path = cfg.output
     if output_path is None:
-        stamp = datetime.now().strftime("%Y-%m-%d_%H_%M_%S")
-        safe = _safe_title(result.title)
-        ext = ".json" if cfg.as_json else ".md"
-        suffix = f"_{safe}" if safe else ""
-        output_path = Path(f"DeepSeek{suffix}_{stamp}{ext}")
+        output_path = default_output_path(result.title, cfg.as_json)
     output_path.write_text(result.text, encoding="utf-8")
     print(f"Wrote {output_path} ({result.message_count} message(s))",
           file=sys.stderr)

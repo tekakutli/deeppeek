@@ -3,20 +3,29 @@
 Modes:
 
   capture                    recover in memory → ./recovered/
-  capture --apply-to DIR     recover in memory → applied directly to DIR
-  capture -o chat.md         write chat.md only (old behavior)
+  capture -o chat.md         write chat.md only
   capture -o chat.md \
-      --recover              write chat.md AND recover
+      --recover              write chat.md AND recover from it
+  capture -o auto \
+      --recover              auto-named chat file + recover
+  capture --apply-to DIR     recover in memory → applied directly to DIR
   capture --json -o chat.md  write JSON, no recovery
 
-The extension watchdog is controlled by `deeppeek extension watchdog
-on/off`, not by capture flags.
+When a file is written (via -o), recovery reads it back from disk so
+that manifest.dump.path records the real path rather than
+"<in-memory>".  When -o is absent, recovery runs on the in-memory
+text and the manifest records "<in-memory>".
 """
 import argparse
 import sys
 from pathlib import Path
+from typing import Optional
 
-from ..capture.service import CaptureConfig, capture_conversation
+from ..capture.service import (
+    CaptureConfig,
+    capture_conversation,
+    default_output_path,
+)
 from ..recover.pipeline import RecoverConfig, run as recover_run
 
 
@@ -27,9 +36,11 @@ def register(sub: argparse._SubParsersAction) -> None:
              "(default: recover its files in memory)",
     )
     p.add_argument(
-        "-o", "--output", type=Path, default=None,
-        help="write the markdown to this path "
-             "(skips recovery unless --recover or --apply-to is given)",
+        "-o", "--output", type=str, default=None,
+        metavar="PATH|auto",
+        help="write the markdown to PATH (or 'auto' for a timestamped "
+             "default like DeepSeek_2026-10-21_15-42-03.md).  Skips "
+             "recovery unless --recover or --apply-to is given.",
     )
     p.add_argument(
         "--recover", action="store_true",
@@ -61,7 +72,8 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--no-thinking", action="store_true")
     p.add_argument("--no-hints", action="store_true")
     p.add_argument("--latex", action="store_true")
-    p.add_argument("--json", action="store_true")
+    p.add_argument("--json", action="store_true",
+                   help="emit JSON instead of Markdown (disables recovery)")
     p.add_argument("--timeout", type=float, default=None)
 
     # ---- recovery-side flags ----
@@ -96,6 +108,7 @@ def _parse_remap(items):
 
 
 def run(args: argparse.Namespace) -> int:
+    # ---- decide recovery intent ----
     if args.apply_to is not None and args.recover_to is not None:
         print("error: --apply-to and --recover-to are mutually exclusive",
               file=sys.stderr)
@@ -117,22 +130,26 @@ def run(args: argparse.Namespace) -> int:
         do_recover = True
 
     if not do_recover and not args.output:
-        print("error: --no-recover requires -o/--output",
+        print("error: --no-recover requires -o/--output "
+              "(there would be nowhere to put the capture)",
               file=sys.stderr)
         return 3
     if args.json and do_recover:
-        print("note: --json disables recovery", file=sys.stderr)
+        print("note: --json disables recovery "
+              "(JSON is not a valid recovery input)",
+              file=sys.stderr)
         do_recover = False
         if not args.output:
             print("error: --json alone would discard the capture — "
                   "add -o to write it somewhere", file=sys.stderr)
             return 3
 
+    # ---- capture (in memory) ----
     try:
         result = capture_conversation(CaptureConfig(
             port=args.port,
             watch=args.watch,
-            output=None,
+            output=None,   # never written by capture_conversation
             start_prompt=args.start_prompt,
             end_prompt=args.end_prompt,
             start_index=args.start_index,
@@ -150,18 +167,33 @@ def run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         return 1
 
-    if args.output:
-        args.output.write_text(result.text, encoding="utf-8")
-        print(f"Wrote {args.output} ({result.message_count} message(s))",
+    # ---- resolve output path, write if requested ----
+    resolved_output: Optional[Path] = None
+    if args.output is not None:
+        if args.output == "auto":
+            resolved_output = default_output_path(result.title, args.json)
+        else:
+            resolved_output = Path(args.output)
+        resolved_output.write_text(result.text, encoding="utf-8")
+        print(f"Wrote {resolved_output} ({result.message_count} message(s))",
               file=sys.stderr)
 
     if not do_recover:
         return 0
 
+    # ---- recovery: from file when we wrote one, from memory otherwise ----
     out_dir = args.recover_to if args.recover_to is not None else Path("./recovered")
 
+    if resolved_output is not None:
+        dump_path: Optional[Path] = resolved_output
+        dump_text: Optional[str] = None
+    else:
+        dump_path = None
+        dump_text = result.text
+
     return recover_run(RecoverConfig(
-        dump_text=result.text,
+        dump_path=dump_path,
+        dump_text=dump_text,
         out_dir=out_dir,
         apply_to=args.apply_to,
         layout=args.layout,
