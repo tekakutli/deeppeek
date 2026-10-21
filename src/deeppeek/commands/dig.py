@@ -1,9 +1,4 @@
-"""`deeppeek dig` — capture + recover in one step.
-
-Writes the intermediate markdown to disk (--capture-to) and then runs
-recovery.  With --apply-to, the recovery is applied directly to an
-existing directory tree instead of the standard ./recovered/ layout.
-"""
+"""`deeppeek dig` — capture + recover in one step."""
 import argparse
 import sys
 from datetime import datetime
@@ -38,6 +33,14 @@ def register(sub: argparse._SubParsersAction) -> None:
         help="keep only the last N user turns (each turn = 1 user "
              "message + its reply).  Overrides --start-prompt, "
              "--end-prompt, --start-index, --end-index.",
+    )
+    p.add_argument(
+        "--last-regex", default=None, metavar="PATTERN",
+        help="anchor at the LAST user prompt whose content matches "
+             "PATTERN (Python regex; case-sensitive unless '(?i)' "
+             "prefix), then slice to end.  Overrides --last, "
+             "--start-prompt, --end-prompt, --start-index, "
+             "--end-index.",
     )
     p.add_argument("--no-thinking", action="store_true")
     p.add_argument("--no-hints", action="store_true")
@@ -80,6 +83,7 @@ def run(args: argparse.Namespace) -> int:
             latex=args.latex,
             timeout=args.timeout,
             last_user_turns=args.last,
+            last_regex=args.last_regex,
         ))
     except KeyboardInterrupt:
         return 1

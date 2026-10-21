@@ -6,12 +6,8 @@ Modes:
   capture --apply-to DIR     recover in memory → applied directly to DIR
   capture -o chat.md         write chat.md only (old behavior)
   capture -o chat.md \
-      --recover              write chat.md AND recover (./recovered/)
-  capture -o chat.md \
-      --recover \
-      --apply-to DIR         write chat.md AND apply to DIR
+      --recover              write chat.md AND recover
   capture --json -o chat.md  write JSON, no recovery
-  capture --no-recover       ERROR (nothing to save)
 """
 import argparse
 import sys
@@ -55,6 +51,14 @@ def register(sub: argparse._SubParsersAction) -> None:
         help="keep only the last N user turns (each turn = 1 user "
              "message + its reply).  Overrides --start-prompt, "
              "--end-prompt, --start-index, --end-index.",
+    )
+    p.add_argument(
+        "--last-regex", default=None, metavar="PATTERN",
+        help="anchor at the LAST user prompt whose content matches "
+             "PATTERN (Python regex; case-sensitive unless '(?i)' "
+             "prefix), then slice to end.  Overrides --last, "
+             "--start-prompt, --end-prompt, --start-index, "
+             "--end-index.  Example: --last-regex 'write\\.py'",
     )
     p.add_argument("--no-thinking", action="store_true")
     p.add_argument("--no-hints", action="store_true")
@@ -102,8 +106,6 @@ def _parse_remap(items):
 
 
 def run(args: argparse.Namespace) -> int:
-    # ---- decide recovery intent ----
-    # apply_to implies recovery.  -o alone means file-only.
     if args.apply_to is not None and args.recover_to is not None:
         print("error: --apply-to and --recover-to are mutually exclusive",
               file=sys.stderr)
@@ -139,7 +141,6 @@ def run(args: argparse.Namespace) -> int:
                   "add -o to write it somewhere", file=sys.stderr)
             return 3
 
-    # ---- capture (in memory) ----
     try:
         result = capture_conversation(CaptureConfig(
             port=args.port,
@@ -157,11 +158,11 @@ def run(args: argparse.Namespace) -> int:
             as_json=args.json,
             timeout=args.timeout,
             last_user_turns=args.last,
+            last_regex=args.last_regex,
         ))
     except KeyboardInterrupt:
         return 1
 
-    # ---- optional file output ----
     if args.output:
         args.output.write_text(result.text, encoding="utf-8")
         print(f"Wrote {args.output} ({result.message_count} message(s))",
@@ -170,7 +171,6 @@ def run(args: argparse.Namespace) -> int:
     if not do_recover:
         return 0
 
-    # ---- recovery from the in-memory text ----
     out_dir = args.recover_to if args.recover_to is not None else Path("./recovered")
 
     return recover_run(RecoverConfig(

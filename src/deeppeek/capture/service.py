@@ -5,17 +5,10 @@ disk.
 Two entry points for callers:
 
   capture_conversation(cfg)   — capture + slice + render, return a
-                                CaptureResult (text + title + count)
-                                without touching disk.
+                                CaptureResult without touching disk.
   capture_to_markdown(cfg)    — capture + slice + render + write to
                                 cfg.output (auto-naming if None),
                                 return the written Path.
-
-The default `deeppeek capture` flow uses capture_conversation() and
-passes .text straight into recover.pipeline.run(); the markdown never
-hits the filesystem.  `deeppeek capture -o file.md` calls
-capture_to_markdown() for the artifact, then runs recovery on the
-same in-memory text.
 """
 import json
 import re
@@ -36,7 +29,7 @@ from .latex import convert_latex_delimiters
 class CaptureConfig:
     port: int = 8765
     watch: bool = False
-    output: Optional[Path] = None           # ignored by capture_conversation
+    output: Optional[Path] = None
     start_prompt: Optional[str] = None
     end_prompt: Optional[str] = None
     start_index: Optional[int] = None
@@ -49,6 +42,7 @@ class CaptureConfig:
     as_json: bool = False
     timeout: Optional[float] = None
     last_user_turns: Optional[int] = None
+    last_regex: Optional[str] = None        # NEW
 
 
 @dataclass
@@ -67,11 +61,7 @@ def _safe_title(title: Optional[str], maxlen: int = 30) -> str:
 
 
 def _print_prompt_index(messages, label: str) -> None:
-    """Print every user prompt in `messages` to stderr with an index.
-
-    Called for both the full captured set and the sliced set so the
-    user can see exactly what --last / --start-prompt selected.
-    """
+    """Print every user prompt in `messages` to stderr with an index."""
     prompts = [m for m in messages if m.role == "user"]
     if not prompts:
         print(f"  {label}: (none)", file=sys.stderr)
@@ -86,9 +76,7 @@ def _print_prompt_index(messages, label: str) -> None:
 
 def capture_payload(cfg: CaptureConfig) -> Conversation:
     """Run the local HTTP server, block on the next POST, parse the
-    payload into a Conversation.  No disk I/O, no slicing, no
-    formatting — that's render_conversation's job.
-    """
+    payload into a Conversation."""
     server = ExportServer(port=cfg.port, watch_mode=cfg.watch)
     server.start()
     print(f"Listening on http://127.0.0.1:{cfg.port}", file=sys.stderr)
@@ -104,7 +92,7 @@ def capture_payload(cfg: CaptureConfig) -> Conversation:
 
 def render_conversation(conversation: Conversation,
                         cfg: CaptureConfig) -> CaptureResult:
-    """Slice + format the conversation into a markdown (or JSON) string."""
+    """Slice + format the conversation into markdown (or JSON) text."""
     print(f"  captured {len(conversation.messages)} message(s)",
           file=sys.stderr)
     _print_prompt_index(conversation.messages, "prompts in full capture")
@@ -118,10 +106,12 @@ def render_conversation(conversation: Conversation,
         match_mode=cfg.match_mode,
         context=cfg.context,
         last_user_turns=cfg.last_user_turns,
+        last_regex=cfg.last_regex,
     )
 
     sliced_flag = (
         cfg.last_user_turns is not None
+        or cfg.last_regex is not None
         or cfg.start_prompt is not None
         or cfg.end_prompt is not None
         or cfg.start_index is not None
@@ -160,26 +150,14 @@ def render_conversation(conversation: Conversation,
 
 
 def capture_conversation(cfg: CaptureConfig) -> CaptureResult:
-    """Capture, slice, render — nothing written to disk.
-
-    Returns a CaptureResult whose .text field is the markdown (or JSON
-    if cfg.as_json) and whose .message_count is the number of rendered
-    messages.  Used by `deeppeek capture` for the in-memory path into
-    recovery, and by `deeppeek capture -o …` to write the artifact.
-    """
+    """Capture, slice, render — nothing written to disk."""
     conversation = capture_payload(cfg)
     return render_conversation(conversation, cfg)
 
 
 def capture_to_markdown(cfg: CaptureConfig) -> Path:
     """Capture, slice, render, and write to cfg.output (auto-naming
-    if None).  Returns the written Path.
-
-    Kept for `deeppeek dig` and any callers that want the intermediate
-    artifact on disk.  Uses the exact same pipeline as
-    capture_conversation, so recovery on the resulting file is
-    equivalent to recovery on the in-memory text.
-    """
+    if None).  Returns the written Path."""
     result = capture_conversation(cfg)
     output_path = cfg.output
     if output_path is None:

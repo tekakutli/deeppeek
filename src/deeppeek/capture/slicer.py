@@ -25,15 +25,54 @@ def slice_messages(
     match_mode: str = "substring",
     context: int = 0,
     last_user_turns: Optional[int] = None,
+    last_regex: Optional[str] = None,
 ) -> List[Message]:
     if not messages:
         return []
 
     last = len(messages) - 1
 
-    # --last N — take the last N user turns (each turn = 1 user message
-    # plus its reply, up to the end of the conversation).  Overrides
-    # the other slicing flags when present.
+    # --last-regex PATTERN — anchor at the LAST user message whose
+    # content matches PATTERN, slice to end.  More specific than
+    # --last N (which counts user turns by position).  Use when you
+    # want "everything from the most recent mention of X onward",
+    # regardless of how many turns back that was.
+    #
+    # Priority: --last-regex > --last > start/end anchors.  The
+    # regex form is the most specific selector and short-circuits
+    # everything else.  An invalid pattern is a hard error (exit 3);
+    # a valid pattern with no matches warns and returns the whole
+    # conversation — matching the existing convention for
+    # --start-prompt that fails to match.
+    if last_regex is not None:
+        try:
+            pat = re.compile(last_regex)
+        except re.error as e:
+            print(f"error: --last-regex is not a valid regex: {e}",
+                  file=sys.stderr)
+            raise SystemExit(3)
+
+        match_idx = None
+        for i, m in enumerate(messages):
+            if m.role == "user" and pat.search(m.content or ""):
+                match_idx = i
+
+        if match_idx is None:
+            print(
+                f"warning: --last-regex {last_regex!r} matched no "
+                f"user prompt; returning whole conversation",
+                file=sys.stderr,
+            )
+            start = 0
+        else:
+            start = match_idx
+        end = last
+        start = max(0, start - context)
+        end = min(last, end + context)
+        return messages[start:end + 1]
+
+    # --last N — last N user turns (each turn = 1 user message +
+    # its reply, extending to end of conversation).
     if last_user_turns is not None:
         if last_user_turns <= 0:
             return []
@@ -53,7 +92,7 @@ def slice_messages(
         end = min(last, end + context)
         return messages[start:end + 1]
 
-    # Start
+    # Start (anchor resolution)
     if start_index is not None:
         start = max(0, min(start_index, last))
     elif start_prompt is not None:
@@ -69,7 +108,8 @@ def slice_messages(
     else:
         start = 0
 
-    # End (inclusive, extend to the assistant reply if the match is a user message)
+    # End (inclusive, extend to the assistant reply when the anchor
+    # is a user message)
     if end_index is not None:
         end = max(0, min(end_index, last))
     elif end_prompt is not None:
