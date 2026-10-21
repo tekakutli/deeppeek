@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "DeepSeek Chat Exporter (DSX)",
+  "version": "0.1.0",
+  "description": "Send a DeepSeek conversation to the dsx CLI for Markdown export.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "dsx@local",
+      "strict_min_version": "115.0"
+    }
+  },
+  "permissions": ["scripting", "activeTab"],
+  "host_permissions": [
+    "https://chat.deepseek.com/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "action": {
+    "default_title": "Send chat to dsx"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chat.deepseek.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["injected.js"],
+      "matches": ["https://chat.deepseek.com/*"]
+    }
+  ]
+}

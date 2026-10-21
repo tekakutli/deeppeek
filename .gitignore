@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Recover output
+recovered/
+
+# Migration scratch (originals of files we rewrote)
+.migration/
+
+# OS
+.DS_Store
+
+
+
+
+
+
+*project_dump*
