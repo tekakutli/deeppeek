@@ -1,14 +1,6 @@
 """High-level capture: run the local HTTP server, block on a payload,
 slice, render, and either return the text in memory or write it to
 disk.
-
-Two entry points for callers:
-
-  capture_conversation(cfg)   — capture + slice + render, return a
-                                CaptureResult without touching disk.
-  capture_to_markdown(cfg)    — capture + slice + render + write to
-                                cfg.output (auto-naming if None),
-                                return the written Path.
 """
 import json
 import re
@@ -42,7 +34,7 @@ class CaptureConfig:
     as_json: bool = False
     timeout: Optional[float] = None
     last_user_turns: Optional[int] = None
-    last_regex: Optional[str] = None        # NEW
+    last_regex: Optional[str] = None
 
 
 @dataclass
@@ -61,7 +53,6 @@ def _safe_title(title: Optional[str], maxlen: int = 30) -> str:
 
 
 def _print_prompt_index(messages, label: str) -> None:
-    """Print every user prompt in `messages` to stderr with an index."""
     prompts = [m for m in messages if m.role == "user"]
     if not prompts:
         print(f"  {label}: (none)", file=sys.stderr)
@@ -75,8 +66,6 @@ def _print_prompt_index(messages, label: str) -> None:
 
 
 def capture_payload(cfg: CaptureConfig) -> Conversation:
-    """Run the local HTTP server, block on the next POST, parse the
-    payload into a Conversation."""
     server = ExportServer(port=cfg.port, watch_mode=cfg.watch)
     server.start()
     print(f"Listening on http://127.0.0.1:{cfg.port}", file=sys.stderr)
@@ -92,7 +81,6 @@ def capture_payload(cfg: CaptureConfig) -> Conversation:
 
 def render_conversation(conversation: Conversation,
                         cfg: CaptureConfig) -> CaptureResult:
-    """Slice + format the conversation into markdown (or JSON) text."""
     print(f"  captured {len(conversation.messages)} message(s)",
           file=sys.stderr)
     _print_prompt_index(conversation.messages, "prompts in full capture")
@@ -150,14 +138,11 @@ def render_conversation(conversation: Conversation,
 
 
 def capture_conversation(cfg: CaptureConfig) -> CaptureResult:
-    """Capture, slice, render — nothing written to disk."""
     conversation = capture_payload(cfg)
     return render_conversation(conversation, cfg)
 
 
 def capture_to_markdown(cfg: CaptureConfig) -> Path:
-    """Capture, slice, render, and write to cfg.output (auto-naming
-    if None).  Returns the written Path."""
     result = capture_conversation(cfg)
     output_path = cfg.output
     if output_path is None:

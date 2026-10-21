@@ -1,4 +1,5 @@
-"""`deeppeek extension` — install / update / status / build / dev / uninstall."""
+"""`deeppeek extension` — install / update / status / build / dev /
+uninstall / watchdog."""
 import argparse
 from pathlib import Path
 
@@ -31,6 +32,27 @@ def register(sub: argparse._SubParsersAction) -> None:
     eun = esub.add_parser("uninstall", help="Remove the extension from Zen")
     eun.add_argument("--profile")
     eun.set_defaults(func=_uninstall)
+
+    ew = esub.add_parser(
+        "watchdog",
+        help="Persistently enable/disable the 500ms watchdog "
+             "(browser.storage.local).  Requires the extension to be "
+             "connected.",
+    )
+    ew_sub = ew.add_subparsers(dest="wd_action", required=True)
+
+    ew_on = ew_sub.add_parser("on", help="Enable the watchdog (default)")
+    ew_on.set_defaults(func=_watchdog_on)
+
+    ew_off = ew_sub.add_parser(
+        "off",
+        help="Disable the watchdog — trades ~1s extra CLI-start "
+             "latency for ~0 background CPU while idle",
+    )
+    ew_off.set_defaults(func=_watchdog_off)
+
+    ew_status = ew_sub.add_parser("status", help="Report current watchdog setting")
+    ew_status.set_defaults(func=_watchdog_status)
 
 
 def _install(args) -> int:
@@ -65,6 +87,21 @@ def _dev(args) -> int:
 def _uninstall(args) -> int:
     from ..extension.install import uninstall
     return uninstall(profile=args.profile)
+
+
+def _watchdog_on(args) -> int:
+    from ..extension.watchdog import set_watchdog
+    return set_watchdog(True)
+
+
+def _watchdog_off(args) -> int:
+    from ..extension.watchdog import set_watchdog
+    return set_watchdog(False)
+
+
+def _watchdog_status(args) -> int:
+    from ..extension.watchdog import get_status
+    return get_status()
 
 
 def run(args: argparse.Namespace) -> int:

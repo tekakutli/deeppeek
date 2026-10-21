@@ -11,15 +11,8 @@ from ..recover.pipeline import RecoverConfig, run as recover_run
 def register(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("dig", help="Capture a conversation AND recover its files")
     p.add_argument("--capture-to", type=Path, default=None)
-    p.add_argument("--recover-to", type=Path, default=None,
-                   help="standard layout target (default: ./recovered). "
-                        "Mutually exclusive with --apply-to.")
-    p.add_argument(
-        "--apply-to", type=Path, default=None, metavar="DIR",
-        help="apply the recovery directly to an existing directory tree "
-             "(recovered files go into DIR, [DEL] files are actually deleted, "
-             "reports land beside them).  DIR must exist.",
-    )
+    p.add_argument("--recover-to", type=Path, default=None)
+    p.add_argument("--apply-to", type=Path, default=None, metavar="DIR")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--watch", action="store_true")
     p.add_argument("--start-prompt")
@@ -28,20 +21,8 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--start-index", type=int)
     p.add_argument("--end-index", type=int)
     p.add_argument("--context", type=int, default=0)
-    p.add_argument(
-        "--last", type=int, default=None, metavar="N",
-        help="keep only the last N user turns (each turn = 1 user "
-             "message + its reply).  Overrides --start-prompt, "
-             "--end-prompt, --start-index, --end-index.",
-    )
-    p.add_argument(
-        "--last-regex", default=None, metavar="PATTERN",
-        help="anchor at the LAST user prompt whose content matches "
-             "PATTERN (Python regex; case-sensitive unless '(?i)' "
-             "prefix), then slice to end.  Overrides --last, "
-             "--start-prompt, --end-prompt, --start-index, "
-             "--end-index.",
-    )
+    p.add_argument("--last", type=int, default=None, metavar="N")
+    p.add_argument("--last-regex", default=None, metavar="PATTERN")
     p.add_argument("--no-thinking", action="store_true")
     p.add_argument("--no-hints", action="store_true")
     p.add_argument("--latex", action="store_true")

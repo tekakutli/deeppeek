@@ -8,6 +8,9 @@ Modes:
   capture -o chat.md \
       --recover              write chat.md AND recover
   capture --json -o chat.md  write JSON, no recovery
+
+The extension watchdog is controlled by `deeppeek extension watchdog
+on/off`, not by capture flags.
 """
 import argparse
 import sys
@@ -48,35 +51,22 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--context", type=int, default=0)
     p.add_argument(
         "--last", type=int, default=None, metavar="N",
-        help="keep only the last N user turns (each turn = 1 user "
-             "message + its reply).  Overrides --start-prompt, "
-             "--end-prompt, --start-index, --end-index.",
+        help="keep only the last N user turns.",
     )
     p.add_argument(
         "--last-regex", default=None, metavar="PATTERN",
         help="anchor at the LAST user prompt whose content matches "
-             "PATTERN (Python regex; case-sensitive unless '(?i)' "
-             "prefix), then slice to end.  Overrides --last, "
-             "--start-prompt, --end-prompt, --start-index, "
-             "--end-index.  Example: --last-regex 'write\\.py'",
+             "PATTERN (Python regex), slice to end.  Overrides --last.",
     )
     p.add_argument("--no-thinking", action="store_true")
     p.add_argument("--no-hints", action="store_true")
     p.add_argument("--latex", action="store_true")
-    p.add_argument("--json", action="store_true",
-                   help="emit JSON instead of Markdown (disables recovery)")
+    p.add_argument("--json", action="store_true")
     p.add_argument("--timeout", type=float, default=None)
 
     # ---- recovery-side flags ----
-    p.add_argument("--recover-to", type=Path, default=None,
-                   help="standard layout target (default: ./recovered). "
-                        "Mutually exclusive with --apply-to.")
-    p.add_argument(
-        "--apply-to", type=Path, default=None, metavar="DIR",
-        help="apply the recovery directly to an existing directory tree "
-             "(recovered files go into DIR, [DEL] files are actually deleted, "
-             "reports land beside them).  DIR must exist.",
-    )
+    p.add_argument("--recover-to", type=Path, default=None)
+    p.add_argument("--apply-to", type=Path, default=None, metavar="DIR")
     p.add_argument("--layout", choices=["flat", "header", "passthrough"],
                    default="flat")
     p.add_argument("--remap", action="append", default=[], metavar="OLD=NEW")
@@ -127,14 +117,11 @@ def run(args: argparse.Namespace) -> int:
         do_recover = True
 
     if not do_recover and not args.output:
-        print("error: --no-recover requires -o/--output "
-              "(there would be nowhere to put the capture)",
+        print("error: --no-recover requires -o/--output",
               file=sys.stderr)
         return 3
     if args.json and do_recover:
-        print("note: --json disables recovery "
-              "(JSON is not a valid recovery input)",
-              file=sys.stderr)
+        print("note: --json disables recovery", file=sys.stderr)
         do_recover = False
         if not args.output:
             print("error: --json alone would discard the capture — "
