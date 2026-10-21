@@ -1,5 +1,22 @@
 """High-level capture: run the local HTTP server, block on a payload,
-render it to markdown/JSON, write to disk."""
+slice, render, and either return the text in memory or write it to
+disk.
+
+Two entry points for callers:
+
+  capture_conversation(cfg)   — capture + slice + render, return a
+                                CaptureResult (text + title + count)
+                                without touching disk.
+  capture_to_markdown(cfg)    — capture + slice + render + write to
+                                cfg.output (auto-naming if None),
+                                return the written Path.
+
+The default `deeppeek capture` flow uses capture_conversation() and
+passes .text straight into recover.pipeline.run(); the markdown never
+hits the filesystem.  `deeppeek capture -o file.md` calls
+capture_to_markdown() for the artifact, then runs recovery on the
+same in-memory text.
+"""
 import json
 import re
 import sys
@@ -19,7 +36,7 @@ from .latex import convert_latex_delimiters
 class CaptureConfig:
     port: int = 8765
     watch: bool = False
-    output: Optional[Path] = None
+    output: Optional[Path] = None           # ignored by capture_conversation
     start_prompt: Optional[str] = None
     end_prompt: Optional[str] = None
     start_index: Optional[int] = None
@@ -34,6 +51,13 @@ class CaptureConfig:
     last_user_turns: Optional[int] = None
 
 
+@dataclass
+class CaptureResult:
+    text: str
+    title: Optional[str]
+    message_count: int
+
+
 def _safe_title(title: Optional[str], maxlen: int = 30) -> str:
     if not title:
         return ""
@@ -43,6 +67,11 @@ def _safe_title(title: Optional[str], maxlen: int = 30) -> str:
 
 
 def _print_prompt_index(messages, label: str) -> None:
+    """Print every user prompt in `messages` to stderr with an index.
+
+    Called for both the full captured set and the sliced set so the
+    user can see exactly what --last / --start-prompt selected.
+    """
     prompts = [m for m in messages if m.role == "user"]
     if not prompts:
         print(f"  {label}: (none)", file=sys.stderr)
@@ -55,7 +84,11 @@ def _print_prompt_index(messages, label: str) -> None:
         print(f"    [{i}] {preview}", file=sys.stderr)
 
 
-def capture_to_markdown(cfg: CaptureConfig) -> Path:
+def capture_payload(cfg: CaptureConfig) -> Conversation:
+    """Run the local HTTP server, block on the next POST, parse the
+    payload into a Conversation.  No disk I/O, no slicing, no
+    formatting — that's render_conversation's job.
+    """
     server = ExportServer(port=cfg.port, watch_mode=cfg.watch)
     server.start()
     print(f"Listening on http://127.0.0.1:{cfg.port}", file=sys.stderr)
@@ -66,9 +99,14 @@ def capture_to_markdown(cfg: CaptureConfig) -> Path:
         payload = server.wait_for_result(timeout=cfg.timeout)
     finally:
         server.stop()
+    return Conversation.from_json(payload)
 
-    conversation = Conversation.from_json(payload)
-    print(f"  captured {len(conversation.messages)} message(s)", file=sys.stderr)
+
+def render_conversation(conversation: Conversation,
+                        cfg: CaptureConfig) -> CaptureResult:
+    """Slice + format the conversation into a markdown (or JSON) string."""
+    print(f"  captured {len(conversation.messages)} message(s)",
+          file=sys.stderr)
     _print_prompt_index(conversation.messages, "prompts in full capture")
 
     sliced = slice_messages(
@@ -82,13 +120,19 @@ def capture_to_markdown(cfg: CaptureConfig) -> Path:
         last_user_turns=cfg.last_user_turns,
     )
 
-    if cfg.last_user_turns is not None or cfg.start_prompt or cfg.end_prompt \
-            or cfg.start_index is not None or cfg.end_index is not None:
+    sliced_flag = (
+        cfg.last_user_turns is not None
+        or cfg.start_prompt is not None
+        or cfg.end_prompt is not None
+        or cfg.start_index is not None
+        or cfg.end_index is not None
+    )
+    if sliced_flag:
         print(f"  sliced to {len(sliced)} message(s)", file=sys.stderr)
         _print_prompt_index(sliced, "prompts after slice")
 
     if cfg.as_json:
-        out = json.dumps(
+        text = json.dumps(
             {
                 "title": conversation.title,
                 "url": conversation.url,
@@ -98,7 +142,7 @@ def capture_to_markdown(cfg: CaptureConfig) -> Path:
             ensure_ascii=False,
         )
     else:
-        out = format_conversation(
+        text = format_conversation(
             conversation.title,
             conversation.url,
             sliced,
@@ -106,16 +150,45 @@ def capture_to_markdown(cfg: CaptureConfig) -> Path:
             include_hints=cfg.include_hints,
         )
         if cfg.latex:
-            out = convert_latex_delimiters(out)
+            text = convert_latex_delimiters(text)
 
+    return CaptureResult(
+        text=text,
+        title=conversation.title,
+        message_count=len(sliced),
+    )
+
+
+def capture_conversation(cfg: CaptureConfig) -> CaptureResult:
+    """Capture, slice, render — nothing written to disk.
+
+    Returns a CaptureResult whose .text field is the markdown (or JSON
+    if cfg.as_json) and whose .message_count is the number of rendered
+    messages.  Used by `deeppeek capture` for the in-memory path into
+    recovery, and by `deeppeek capture -o …` to write the artifact.
+    """
+    conversation = capture_payload(cfg)
+    return render_conversation(conversation, cfg)
+
+
+def capture_to_markdown(cfg: CaptureConfig) -> Path:
+    """Capture, slice, render, and write to cfg.output (auto-naming
+    if None).  Returns the written Path.
+
+    Kept for `deeppeek dig` and any callers that want the intermediate
+    artifact on disk.  Uses the exact same pipeline as
+    capture_conversation, so recovery on the resulting file is
+    equivalent to recovery on the in-memory text.
+    """
+    result = capture_conversation(cfg)
     output_path = cfg.output
     if output_path is None:
         stamp = datetime.now().strftime("%Y-%m-%d_%H_%M_%S")
-        safe = _safe_title(conversation.title)
+        safe = _safe_title(result.title)
         ext = ".json" if cfg.as_json else ".md"
         suffix = f"_{safe}" if safe else ""
         output_path = Path(f"DeepSeek{suffix}_{stamp}{ext}")
-
-    output_path.write_text(out, encoding="utf-8")
-    print(f"Wrote {output_path} ({len(sliced)} message(s))", file=sys.stderr)
+    output_path.write_text(result.text, encoding="utf-8")
+    print(f"Wrote {output_path} ({result.message_count} message(s))",
+          file=sys.stderr)
     return output_path

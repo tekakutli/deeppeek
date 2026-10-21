@@ -28,6 +28,7 @@ def _parse_file_header(text: str) -> Optional[tuple[str, Optional[str]]]:
     # to keep because they occur in filenames (`__init__.py`).
     s = re.sub(r"[*`]", "", s)
 
+    # --- 1. `file: path` / `path: path` / `source: path` ---
     m = re.match(
         r"^(?:file|path|source)\s*:\s*"
         r"([A-Za-z0-9_./\-]+\.[a-zA-Z0-9]+)"
@@ -38,14 +39,39 @@ def _parse_file_header(text: str) -> Optional[tuple[str, Optional[str]]]:
         mod = m.group(2) or m.group(3) or m.group(4)
         return m.group(1), (mod.strip() if mod else None)
 
+    # --- 2. `== path ==` ---
     m = re.match(r"^==+\s*(\S+)\s*==+$", s)
     if m:
         return m.group(1), None
 
+    # --- 3. `[path]` ---
     m = re.match(r"^\[([^\]]+)\]$", s)
     if m and "." in m.group(1):
         return m.group(1), None
 
+    # --- 4. NEW: `## N. <path> — <description>` and similar ---
+    #       Matches: "1. path.py — full", "2) path.py — changed",
+    #       "1 - path.py", "path.py — full", "path.py (corrected)", etc.
+    #       Requires the token after the optional numeric prefix to
+    #       look like a source file with a recognized extension.
+    m = re.match(
+        r"^(?:(?:\d+)\s*[.):\-]\s*)?"
+        r"([A-Za-z0-9_./\-]+\.[a-zA-Z0-9]{1,6})"
+        r"\s*(?:(?:—|–|\s-\s|\(|\[)\s*"
+        r"(.+?)\s*(?:\)|\])?)?\s*$",
+        s,
+    )
+    if m:
+        path = m.group(1)
+        ext = "." + path.split(".")[-1].lower()
+        # Reject things that look like prose with a period at the end
+        # (e.g. "Done. — final" would grab "Done." → wrong).
+        # Only accept if the extension is one we actually recognize.
+        if ext in SOURCE_EXTENSIONS:
+            mod = m.group(2)
+            return path, (mod.strip() if mod else None)
+
+    # --- 5. bare path only ---
     m = re.match(r"^([A-Za-z0-9_./\-]+\.[a-zA-Z0-9]{1,5})$", s)
     if m:
         ext = "." + m.group(1).split(".")[-1].lower()

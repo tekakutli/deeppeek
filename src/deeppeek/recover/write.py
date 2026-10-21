@@ -21,64 +21,23 @@ DIFFICULT.  Owns:
     FIX [E]   MISSING_FILES.txt is filtered in two ways before writing:
 
                 1. Extension filter — only extensions the recovered
-                   project actually uses are considered.  A Python
-                   project that wraps JS in `.py` modules has zero
-                   recovered `.js` files; a `pg_state.js` mention is
-                   a reference to the same module, not a missing file.
+                   project actually uses are considered.
 
                 2. Prefix filter — only files whose stem shares a
                    `_`-separated prefix with a recovered file are
-                   listed.  `cable_geometry.py` matches `cable_` and
-                   is reported; `playground_fonts.py` does not match
-                   any recovered prefix and is filtered out.
+                   listed.  If no prefix structure exists at all,
+                   prose-only mentions are dropped entirely.
 
-              If the recovered set has NO `_`-prefix structure at
-              all (e.g. the dsx project with `paths.py`, `cli.py`,
-              `models.py`, …), the prefix filter cannot
-              discriminate.  In that case prose-only mentions are
-              DROPPED entirely — otherwise every unrelated file
-              named in the conversation (setup.py, requirements,
-              README of a dependency, …) would appear as a
-              false-positive "missing" entry.  The import-graph
-              scan (`_aggregate_missing_imports`) is the reliable
-              source in that case; it only names files that some
-              recovered Python module actually needs.
+    NEW (2026-10-21)  Basename-collision detection for the flat layout.
 
-    NEW (2026-10-21)  Basename-collision detection.  With
-              `layout = "flat"` two records whose source paths
-              differ only by directory end up writing to the same
-              `files/<basename>` and silently overwrite each other.
-              The pass now detects the collision, logs the second
-              write as skipped, and returns exit code 2 — no silent
-              data loss.
+    NEW (2026-10-21b)  "missing modules" summary line.
 
-    NEW (2026-10-21)  `_aggregate_missing_imports` now strips the
-              leading dots of relative imports before deriving the
-              missing filename (``.paths`` → ``paths.py``,
-              ``.extension.dev`` → ``dev.py``) and passes
-              ``records`` to ``_is_likely_local`` so non-underscore
-              local modules are recognized.
+    NEW (2026-10-22)  Pre-existing file preservation report.
 
-    NEW (2026-10-21b)  "missing modules" summary line.  The pass-7
-              problem list is per (importer, module) pair, which is
-              what a fixer needs; but a compact "N unique modules"
-              line at the end of the run answers "what do I need to
-              go find?" in one glance.  Derived from the same
-              ``cross_validate["problems"]`` dict that was already
-              passed in — nothing new computed.  Printed just
-              before the "Wrote N files" summary so it reads as a
-              natural footnote to the graph line that follows.
-
-    NEW (2026-10-22)  Pre-existing file preservation report.  The
-              pass has always only written files it has a record
-              for; unrelated files with different names in
-              `files/` (or `files_low_trust/`) were silently left
-              alone.  A new summary line lists how many
-              pre-existing files were preserved, plus how many
-              were overwritten, so a stale artefact from an
-              earlier run cannot masquerade as part of this run's
-              output.  The per-name detail is written to
-              `warnings.txt` for audit.
+    NEW (2026-10-23)  Manifest accepts dump_display/dump_size so the
+              pipeline can be fed by an in-memory string (from
+              `deeppeek capture`'s default mode) — dump_display is
+              recorded as "<in-memory>" in that case.
 """
 
 import hashlib
@@ -111,15 +70,8 @@ def _scan_mentioned_files(dump_text: str) -> set[str]:
 
 
 def _aggregate_missing_imports(records: dict[str, FileRecord]) -> set[str]:
-    """Collect filenames imported by recovered ``.py`` files that are
-    not themselves recovered.
-
-    Relative imports are normalised: ``.paths`` and
-    ``.extension.dev`` both strip to their last dotted segment
-    (``paths``, ``dev``) before the ``.py`` suffix is appended,
-    because ``records`` keys use bare basenames (no directory
-    component), and the missing-files report is flat.
-    """
+    """Collect filenames imported by recovered .py files that are not
+    themselves recovered."""
     expected: set[str] = set()
     for path, rec in records.items():
         if not path.endswith(".py"):
@@ -139,27 +91,7 @@ def _aggregate_missing_imports(records: dict[str, FileRecord]) -> set[str]:
 
 
 def _recovered_name_prefixes(records: dict[str, FileRecord]) -> set[str]:
-    """Filename-stem prefixes shared by the recovered files.
-
-    A recovered file like `cable_html.py` contributes the prefix
-    `cable_`; a recovered file like `pg_core.py` contributes `pg_`.
-    These prefixes are the signal the MISSING_FILES report uses to
-    distinguish a project-local dependency from a shared-library one:
-
-        · `cable_geometry.py` (imported by `cable_playground.py`)
-          matches `cable_` and is reported as missing.
-        · `playground_fonts.py` (imported by `pg_state.py`) does not
-          match any recovered prefix and is filtered out — it is a
-          dependency of the environment, not of the recovered project.
-        · `boxes_playground.py` (mentioned in prose) is not a prefix
-          match and is filtered out — it is a sibling project, not a
-          file of the project being recovered.
-
-    Returns an empty set if no recovered filename has a `_`-separated
-    prefix (single-file or flat-name projects); in that case the
-    caller skips the prefix filter and drops prose-only mentions
-    altogether (see the module docstring's FIX [E] note).
-    """
+    """Filename-stem prefixes shared by the recovered files."""
     prefixes: set[str] = set()
     for path, rec in records.items():
         if rec.content is None:
@@ -177,18 +109,7 @@ def _recovered_name_prefixes(records: dict[str, FileRecord]) -> set[str]:
 
 
 def _recovered_extensions(records: dict[str, FileRecord]) -> set[str]:
-    """Extensions present in the recovered file set.
-
-    Used to filter `_scan_mentioned_files` output: a `.js` mention
-    from inside a `.py` wrapper's raw-string content is a reference
-    to the same module in a different language, not a missing file.
-    If the project has zero recovered `.js` files, then a
-    `pg_state.js` reference is not a candidate for "missing".
-
-    Returns an empty set if the recovered set has no extensions
-    (defensive fallback); the caller then skips the extension
-    filter.
-    """
+    """Extensions present in the recovered file set."""
     exts: set[str] = set()
     for path, rec in records.items():
         if rec.content is None:
@@ -206,7 +127,8 @@ def pass9_write(records: dict[str, FileRecord],
                 layout: str,
                 remap: dict[str, str],
                 min_trust: str,
-                dump_path: Path,
+                dump_display: str,
+                dump_size: int,
                 dump_sha: str,
                 dump_text: str,
                 llm: Optional[LLMClient],
@@ -217,12 +139,6 @@ def pass9_write(records: dict[str, FileRecord],
     files_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "llm_audit").mkdir(parents=True, exist_ok=True)
 
-    # NEW (2026-10-22): snapshot the pre-existing state of the two
-    # output directories the pass writes to.  The write loop below
-    # only ever writes files that appear in `records` -- anything
-    # else with a different name is left alone by construction.
-    # The snapshot exists only so the summary can report what was
-    # preserved and what was overwritten.
     pre_existing_files: set[str] = (
         {p.name for p in files_dir.iterdir() if p.is_file()}
         if files_dir.exists() else set()
@@ -242,8 +158,8 @@ def pass9_write(records: dict[str, FileRecord],
     written_count = 0
     exit_code = 0
     written_out_names: dict[str, str] = {}
-    actually_written: set[str] = set()        # NEW (2026-10-22)
-    actually_written_low: set[str] = set()    # NEW (2026-10-22)
+    actually_written: set[str] = set()
+    actually_written_low: set[str] = set()
 
     for path, rec in sorted(records.items()):
         if layout == "flat":
@@ -257,16 +173,12 @@ def pass9_write(records: dict[str, FileRecord],
                     out_name = new + out_name[len(old):]
                     break
 
-        # Collision detection for the flat layout: two source
-        # paths that differ only by directory would write to the
-        # same `files/<basename>` and silently overwrite each
-        # other.  Surface as an error so the user can pick a
-        # different layout or resolve the conflict manually.
         if out_name in written_out_names:
             prev_src = written_out_names[out_name]
             reason = (
                 f"basename collision with {prev_src!r} "
-                f"(layout={layout})")
+                f"(layout={layout})"
+            )
             warnings_lines.append(
                 f"[{path}] [ERROR] {reason}; not written")
             skipped.append({
@@ -345,7 +257,7 @@ def pass9_write(records: dict[str, FileRecord],
                 if not low_content.endswith("\n"):
                     low_content += "\n"
                 low_target.write_text(low_content)
-                actually_written_low.add(out_name)     # NEW (2026-10-22)
+                actually_written_low.add(out_name)
                 warnings_lines.append(
                     f"[{path}] [{rec.trust}] -> files_low_trust/")
             if verbose:
@@ -368,7 +280,7 @@ def pass9_write(records: dict[str, FileRecord],
         if not content.endswith("\n"):
             content += "\n"
         target.write_text(content)
-        actually_written.add(out_name)                     # NEW (2026-10-22)
+        actually_written.add(out_name)
 
         sha = hashlib.sha256(content.encode()).hexdigest()
         written[path] = {
@@ -421,14 +333,9 @@ def pass9_write(records: dict[str, FileRecord],
             f"could not be attributed to any file "
             f"(lang={b.fence_lang}, {b.body_line_count} lines)")
 
-    # ---- MISSING_FILES.txt ----------------------------------------------
+    # ---- MISSING_FILES.txt ----
     mentioned = _scan_mentioned_files(dump_text)
 
-    # Step 1: extension filter.  A Python project with no recovered
-    # `.js` files has no missing `.js` files — the `.js` mentions
-    # come from inside `.py` wrappers' raw-string content and refer
-    # to the same module in another language, not to a distinct
-    # missing file.
     recovered_exts = _recovered_extensions(records)
     if recovered_exts:
         mentioned = {
@@ -441,15 +348,6 @@ def pass9_write(records: dict[str, FileRecord],
                  if r.content is not None}
     deleted_set = set(deleted_files)
 
-    # Step 2: prefix filter.  When the project has a `_`-prefix
-    # structure (`cable_*`, `pg_*`), only prose mentions sharing
-    # that prefix survive — cable_geometry.py survives, playground_
-    # fonts.py does not.  When the project has NO prefix structure
-    # (dsx: `paths.py`, `cli.py`, `models.py`, …), there is no way
-    # to distinguish project files from arbitrary files the
-    # conversation happens to mention, so prose-only mentions are
-    # dropped entirely.  The import graph is the reliable signal
-    # for that layout.
     project_prefixes = _recovered_name_prefixes(records)
     if project_prefixes:
         mentioned = {
@@ -480,11 +378,6 @@ def pass9_write(records: dict[str, FileRecord],
             f"— see MISSING_FILES.txt")
         exit_code = max(exit_code, 2)
 
-    # NEW (2026-10-22): report pre-existing files we left untouched,
-    # plus pre-existing files we did overwrite.  "Untouched" is the
-    # files the write loop never touched because no record in this
-    # run has that name; "overwritten" is files that pre-existed AND
-    # share a name with a file we wrote this run.
     untouched_files = pre_existing_files - actually_written
     untouched_low = pre_existing_low - actually_written_low
     overwritten_files = pre_existing_files & actually_written
@@ -535,7 +428,6 @@ def pass9_write(records: dict[str, FileRecord],
     orphans_attributed = sum(
         1 for b in blocks if b.is_orphan and b.attributed_to)
 
-    # Per-file decision audit trail
     decisions = {}
     for path, rec in records.items():
         decisions[path] = {
@@ -555,9 +447,9 @@ def pass9_write(records: dict[str, FileRecord],
 
     manifest = {
         "dump": {
-            "path": str(dump_path),
+            "path": dump_display,
             "sha256": dump_sha,
-            "byte_len": dump_path.stat().st_size,
+            "byte_len": dump_size,
         },
         "run": {
             "timestamp": datetime.now(timezone.utc)
@@ -588,7 +480,6 @@ def pass9_write(records: dict[str, FileRecord],
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
-    # Category summary (not per-file)
     if skipped:
         by_reason: dict[str, list[str]] = {
             "no_full":    [],
@@ -621,14 +512,6 @@ def pass9_write(records: dict[str, FileRecord],
         print(f"    Full list: {out_dir / 'warnings.txt'}",
               file=sys.stderr)
 
-    # ---- Pass-7 unique-missing-modules footnote -------------------------
-    # The pass-7 problem list above is per (importer, module) pair —
-    # one line per site that needs fixing.  For a quick "what do I
-    # still need to find" glance, collapse to the set of distinct
-    # module names.  `paths` imported from four files shows as one
-    # name here and four lines above; both readings are useful and
-    # they compose without further work because `cross_validate` was
-    # already in scope.
     xv = cross_validate.get("problems", [])
     if xv:
         missing_mods = sorted({
@@ -640,13 +523,8 @@ def pass9_write(records: dict[str, FileRecord],
 
     print(f"\nWrote {written_count} files to {files_dir}/")
     print(f"  skipped:  {len(skipped)}"
-          + (f"  (see warnings.txt)" if skipped else ""))
+          + ("  (see warnings.txt)" if skipped else ""))
 
-    # NEW (2026-10-22): the write loop has always only overwritten
-    # files whose name matches a recovered record, leaving every
-    # other pre-existing file alone.  Surface that so a stale file
-    # from a previous run is visible rather than silently mixed
-    # into the current output.
     total_preserved = len(untouched_files) + len(untouched_low)
     if total_preserved:
         print(f"  preserved: {total_preserved} pre-existing file(s) "

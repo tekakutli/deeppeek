@@ -1,9 +1,10 @@
 """recover.pipeline — orchestration of passes 1-9.
 
-This is the old `main()` body, decoupled from argparse.  A caller
-builds a RecoverConfig and calls run(); the CLI adapter in
-commands/recover.py is the only expected caller, but tests may
-call this directly.
+Input is either a dump file on disk (dump_path) or a string already
+in memory (dump_text) — the recover pipeline accepts both so callers
+can choose whether the intermediate markdown lives on disk at all.
+The manifest's `dump.path` field records "<in-memory>" when the
+source was dump_text.
 """
 import hashlib
 import sys
@@ -27,8 +28,11 @@ from .write import pass9_write
 
 @dataclass
 class RecoverConfig:
-    dump_path: Path
-    out_dir: Path
+    # Exactly one of these must be set:
+    dump_path: Optional[Path] = None        # read the markdown from this file
+    dump_text: Optional[str] = None         # use this string directly
+
+    out_dir: Path = field(default_factory=lambda: Path("./recovered"))
     layout: str = "flat"
     remap: dict = field(default_factory=dict)
     min_trust: str = "MEDIUM"
@@ -45,12 +49,32 @@ class RecoverConfig:
     llm_verbose: bool = False
 
 
-def run(cfg: RecoverConfig) -> int:
+def _resolve_dump(cfg: RecoverConfig) -> tuple[str, str, int]:
+    """Return (dump_text, dump_display, dump_size_bytes).
+
+    dump_display is what gets recorded in manifest.dump.path — either
+    the real filesystem path or "<in-memory>".
+    """
+    if cfg.dump_text is not None:
+        text = cfg.dump_text
+        return text, "<in-memory>", len(text.encode("utf-8"))
+    if cfg.dump_path is None:
+        raise SystemExit(
+            "error: RecoverConfig needs either dump_path or dump_text"
+        )
     if not cfg.dump_path.exists():
-        print(f"error: dump not found: {cfg.dump_path}", file=sys.stderr)
+        raise SystemExit(f"error: dump not found: {cfg.dump_path}")
+    text = cfg.dump_path.read_text()
+    return text, str(cfg.dump_path), cfg.dump_path.stat().st_size
+
+
+def run(cfg: RecoverConfig) -> int:
+    try:
+        dump_text, dump_display, dump_size = _resolve_dump(cfg)
+    except SystemExit as e:
+        print(str(e), file=sys.stderr)
         return 3
 
-    dump_text = cfg.dump_path.read_text()
     dump_sha = hashlib.sha256(dump_text.encode()).hexdigest()
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -140,10 +164,23 @@ def run(cfg: RecoverConfig) -> int:
     pass8_verify(records)
 
     print("[pass 9] writing files...")
-    rc = pass9_write(records, blocks, deleted_files, cfg.out_dir,
-                     cfg.layout, cfg.remap, cfg.min_trust, cfg.dump_path,
-                     dump_sha, dump_text, llm, cfg.llm_mode,
-                     cross_validate, cfg.trace)
+    rc = pass9_write(
+        records=records,
+        blocks=blocks,
+        deleted_files=deleted_files,
+        out_dir=cfg.out_dir,
+        layout=cfg.layout,
+        remap=cfg.remap,
+        min_trust=cfg.min_trust,
+        dump_display=dump_display,
+        dump_size=dump_size,
+        dump_sha=dump_sha,
+        dump_text=dump_text,
+        llm=llm,
+        llm_mode=cfg.llm_mode,
+        cross_validate=cross_validate,
+        verbose=cfg.trace,
+    )
 
     print(f"  total time: {time.monotonic() - t_start:.1f}s")
     return rc
