@@ -8,7 +8,18 @@ from ..recover.pipeline import RecoverConfig, run as recover_run
 def register(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("recover", help="Recover source files from a markdown dump")
     p.add_argument("dump", type=Path)
-    p.add_argument("--out", type=Path, default=Path("./recovered"))
+    p.add_argument(
+        "--out", type=Path, default=None,
+        help="output directory for the standard layout "
+             "(default: ./recovered).  Mutually exclusive with --apply-to.",
+    )
+    p.add_argument(
+        "--apply-to", type=Path, default=None, metavar="DIR",
+        help="apply the recovery directly to an existing directory tree: "
+             "recovered files go into DIR (no files/ subdir), files marked "
+             "[DEL] in the conversation are actually deleted from DIR, and "
+             "reports land beside them.  DIR must exist.",
+    )
     p.add_argument("--layout", choices=["flat", "header", "passthrough"], default="flat")
     p.add_argument("--remap", action="append", default=[], metavar="OLD=NEW")
     p.add_argument("--min-trust", choices=["HIGH", "MEDIUM", "LOW"], default="MEDIUM")
@@ -35,9 +46,17 @@ def _parse_remap(items):
 
 
 def run(args: argparse.Namespace) -> int:
+    if args.apply_to is not None and args.out is not None:
+        print("error: --out and --apply-to are mutually exclusive",
+              file=sys.stderr)
+        return 3
+
+    out_dir = args.out if args.out is not None else Path("./recovered")
+
     cfg = RecoverConfig(
         dump_path=args.dump,
-        out_dir=args.out,
+        out_dir=out_dir,
+        apply_to=args.apply_to,
         layout=args.layout,
         remap=_parse_remap(args.remap),
         min_trust=args.min_trust,

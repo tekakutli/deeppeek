@@ -5,39 +5,33 @@ DIFFICULT.  Owns:
 
     FIX [D]   --min-trust-filtered files are written to a shadow
               `files_low_trust/` directory instead of being silently
-              dropped.  Content is preserved for inspection even when
-              the primary write path excludes it.
+              dropped.
 
     FIX [6]   Per-file skip detail is gated behind --trace (verbose).
-              Default output is a category summary.
 
-    FIX [7]   Category summary at end: "Skipped N files: X no_full,
-              Y low_trust, Z no_content".
+    FIX [7]   Category summary at end of skips.
 
-    FIX [8]   New manifest.decisions section: `jq '.decisions["foo.py"]'`
-              answers "why is this file missing" without grepping
-              warnings.txt.
+    FIX [8]   manifest.decisions section for auditing missing files.
 
-    FIX [E]   MISSING_FILES.txt is filtered in two ways before writing:
+    FIX [E]   MISSING_FILES.txt double-filtered (extension + prefix).
 
-                1. Extension filter — only extensions the recovered
-                   project actually uses are considered.
+    NEW (2026-10-21)   Basename-collision detection (flat layout).
 
-                2. Prefix filter — only files whose stem shares a
-                   `_`-separated prefix with a recovered file are
-                   listed.  If no prefix structure exists at all,
-                   prose-only mentions are dropped entirely.
+    NEW (2026-10-21b)  Unique-missing-modules summary line.
 
-    NEW (2026-10-21)  Basename-collision detection for the flat layout.
+    NEW (2026-10-22)   Pre-existing file preservation report.
 
-    NEW (2026-10-21b)  "missing modules" summary line.
+    NEW (2026-10-23)   Manifest accepts dump_display/dump_size so the
+                       pipeline can be fed by an in-memory string.
 
-    NEW (2026-10-22)  Pre-existing file preservation report.
-
-    NEW (2026-10-23)  Manifest accepts dump_display/dump_size so the
-              pipeline can be fed by an in-memory string (from
-              `deeppeek capture`'s default mode) — dump_display is
-              recorded as "<in-memory>" in that case.
+    NEW (2026-10-24)   --apply-to mode: recovered files go directly
+                       into an existing directory; files marked [DEL]
+                       are actually deleted there; low-trust files go
+                       to <apply_to>/.deeppeek/low_trust/; reports go
+                       to <apply_to>/ (preserved-files listing is
+                       suppressed because the target tree has its own
+                       unrelated files, and the deleted.txt report is
+                       annotated with which deletions were applied).
 """
 
 import hashlib
@@ -70,8 +64,6 @@ def _scan_mentioned_files(dump_text: str) -> set[str]:
 
 
 def _aggregate_missing_imports(records: dict[str, FileRecord]) -> set[str]:
-    """Collect filenames imported by recovered .py files that are not
-    themselves recovered."""
     expected: set[str] = set()
     for path, rec in records.items():
         if not path.endswith(".py"):
@@ -91,7 +83,6 @@ def _aggregate_missing_imports(records: dict[str, FileRecord]) -> set[str]:
 
 
 def _recovered_name_prefixes(records: dict[str, FileRecord]) -> set[str]:
-    """Filename-stem prefixes shared by the recovered files."""
     prefixes: set[str] = set()
     for path, rec in records.items():
         if rec.content is None:
@@ -109,7 +100,6 @@ def _recovered_name_prefixes(records: dict[str, FileRecord]) -> set[str]:
 
 
 def _recovered_extensions(records: dict[str, FileRecord]) -> set[str]:
-    """Extensions present in the recovered file set."""
     exts: set[str] = set()
     for path, rec in records.items():
         if rec.content is None:
@@ -118,6 +108,49 @@ def _recovered_extensions(records: dict[str, FileRecord]) -> set[str]:
         if ext:
             exts.add(ext)
     return exts
+
+
+def _apply_deletions(apply_to: Path,
+                     all_deleted: list[str],
+                     warnings_lines: list[str]) -> tuple[list[str], list[str]]:
+    """Remove files marked [DEL] from `apply_to`.
+
+    Returns (applied, missing) — applied lists names that were actually
+    deleted, missing lists names that were marked deleted but weren't
+    present (either already gone from a prior run, or never existed).
+
+    Tries the basename first (flat layout compat) and then the literal
+    path (header layout compat).
+    """
+    applied: list[str] = []
+    missing: list[str] = []
+    for name in all_deleted:
+        base = os.path.basename(name)
+        candidates = []
+        if base and base != name:
+            candidates.append(apply_to / base)     # flat: foo.py
+        candidates.append(apply_to / name)         # header: sub/foo.py
+
+        target = None
+        for c in candidates:
+            if c.exists() and c.is_file():
+                target = c
+                break
+
+        if target is None:
+            missing.append(name)
+            continue
+
+        try:
+            target.unlink()
+            applied.append(name)
+            warnings_lines.append(
+                f"[{name}] [DELETED] removed from target tree")
+        except Exception as e:
+            warnings_lines.append(
+                f"[{name}] [ERROR] could not delete: {e}")
+            missing.append(name)
+    return applied, missing
 
 
 def pass9_write(records: dict[str, FileRecord],
@@ -134,19 +167,30 @@ def pass9_write(records: dict[str, FileRecord],
                 llm: Optional[LLMClient],
                 llm_mode: str,
                 cross_validate: dict,
+                apply_to: Optional[Path] = None,
                 verbose: bool = False) -> int:
-    files_dir = out_dir / "files"
+    # ---- resolve output layout ------------------------------------
+    if apply_to is not None:
+        files_dir = apply_to
+        low_dir = apply_to / ".deeppeek" / "low_trust"
+        aux_dir = apply_to / ".deeppeek"
+        reports_dir = apply_to
+    else:
+        files_dir = out_dir / "files"
+        low_dir = out_dir / "files_low_trust"
+        aux_dir = out_dir / "llm_audit"
+        reports_dir = out_dir
+
     files_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "llm_audit").mkdir(parents=True, exist_ok=True)
+    aux_dir.mkdir(parents=True, exist_ok=True)
 
     pre_existing_files: set[str] = (
         {p.name for p in files_dir.iterdir() if p.is_file()}
         if files_dir.exists() else set()
     )
-    _low_dir = out_dir / "files_low_trust"
     pre_existing_low: set[str] = (
-        {p.name for p in _low_dir.iterdir() if p.is_file()}
-        if _low_dir.exists() else set()
+        {p.name for p in low_dir.iterdir() if p.is_file()}
+        if low_dir.exists() else set()
     )
 
     trust_rank = {"SKIP": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
@@ -249,7 +293,6 @@ def pass9_write(records: dict[str, FileRecord],
                 "verification": rec.verification,
             })
             if rec.content is not None:
-                low_dir = out_dir / "files_low_trust"
                 low_dir.mkdir(parents=True, exist_ok=True)
                 low_target = low_dir / out_name
                 low_target.parent.mkdir(parents=True, exist_ok=True)
@@ -258,11 +301,17 @@ def pass9_write(records: dict[str, FileRecord],
                     low_content += "\n"
                 low_target.write_text(low_content)
                 actually_written_low.add(out_name)
-                warnings_lines.append(
-                    f"[{path}] [{rec.trust}] -> files_low_trust/")
+                if apply_to is not None:
+                    warnings_lines.append(
+                        f"[{path}] [{rec.trust}] -> .deeppeek/low_trust/")
+                else:
+                    warnings_lines.append(
+                        f"[{path}] [{rec.trust}] -> files_low_trust/")
             if verbose:
+                dest = (".deeppeek/low_trust/" if apply_to is not None
+                        else "files_low_trust/")
                 print(f"  SKIPPED {path} ({rec.trust}): {reason} "
-                      f"-> files_low_trust/", file=sys.stderr)
+                      f"-> {dest}", file=sys.stderr)
                 for w in rec.warnings[:3]:
                     print(f"    warning: {w}", file=sys.stderr)
             exit_code = max(exit_code, 1)
@@ -283,6 +332,14 @@ def pass9_write(records: dict[str, FileRecord],
         actually_written.add(out_name)
 
         sha = hashlib.sha256(content.encode()).hexdigest()
+        # Relative path in manifest — always relative to the directory
+        # that actually holds the recovered tree (out_dir in standard
+        # mode, apply_to in apply mode).
+        manifest_base = apply_to if apply_to is not None else out_dir
+        try:
+            rel_path = str(target.relative_to(manifest_base))
+        except ValueError:
+            rel_path = str(target)
         written[path] = {
             "state": rec.state,
             "source_blocks": rec.source_blocks,
@@ -297,20 +354,47 @@ def pass9_write(records: dict[str, FileRecord],
             "is_new": rec.is_new,
             "is_deleted": False,
             "trust": rec.trust,
-            "output_path": str(target.relative_to(out_dir)),
+            "output_path": rel_path,
             "line_count": content.count("\n"),
             "sha256": sha,
             "verification": rec.verification,
         }
         written_count += 1
 
+    # ---- deletions ------------------------------------------------
     deleted_from_records = {p for p, r in records.items() if r.is_deleted}
     all_deleted = sorted(set(deleted_files) | deleted_from_records)
-    deleted_text = "\n".join(all_deleted)
-    if deleted_text:
-        deleted_text += "\n"
-    (out_dir / "deleted.txt").write_text(deleted_text)
 
+    deleted_applied: list[str] = []
+    deleted_missing: list[str] = []
+    if apply_to is not None:
+        deleted_applied, deleted_missing = _apply_deletions(
+            apply_to, all_deleted, warnings_lines)
+
+    deleted_lines = [
+        "# Files marked [DEL]/[DELETED]/[REMOVED] or `rm` in the conversation.",
+        "# In standard mode this is informational only.",
+        "# In --apply-to mode, the deleted-applied section was actually",
+        "# removed from the target tree.",
+        "",
+        "[marked-deleted]",
+    ]
+    for name in all_deleted:
+        deleted_lines.append(name)
+    if apply_to is not None:
+        deleted_lines.append("")
+        deleted_lines.append("[deleted-applied]")
+        for name in deleted_applied:
+            deleted_lines.append(name)
+        if deleted_missing:
+            deleted_lines.append("")
+            deleted_lines.append("[deleted-not-found]")
+            for name in deleted_missing:
+                deleted_lines.append(name)
+    (reports_dir / "deleted.txt").write_text(
+        "\n".join(deleted_lines) + "\n")
+
+    # ---- graph warnings -------------------------------------------
     for gp in cross_validate.get("problems", []):
         if gp["type"] == "missing_module":
             warnings_lines.append(
@@ -333,7 +417,7 @@ def pass9_write(records: dict[str, FileRecord],
             f"could not be attributed to any file "
             f"(lang={b.fence_lang}, {b.body_line_count} lines)")
 
-    # ---- MISSING_FILES.txt ----
+    # ---- MISSING_FILES.txt ---------------------------------------
     mentioned = _scan_mentioned_files(dump_text)
 
     recovered_exts = _recovered_extensions(records)
@@ -372,39 +456,52 @@ def pass9_write(records: dict[str, FileRecord],
         for name in sorted(missing):
             lines.append(f"## {name}")
             lines.append("")
-        (out_dir / "MISSING_FILES.txt").write_text("\n".join(lines) + "\n")
+        (reports_dir / "MISSING_FILES.txt").write_text(
+            "\n".join(lines) + "\n")
         warnings_lines.append(
             f"[missing] {len(missing)} file(s) referenced but not recovered "
             f"— see MISSING_FILES.txt")
         exit_code = max(exit_code, 2)
 
+    # ---- preservation / overwrite report -------------------------
     untouched_files = pre_existing_files - actually_written
     untouched_low = pre_existing_low - actually_written_low
     overwritten_files = pre_existing_files & actually_written
     overwritten_low = pre_existing_low & actually_written_low
 
+    # In apply mode, the target tree may have hundreds of unrelated
+    # files.  Listing them all in warnings.txt is noise; the count is
+    # enough.  In standard mode, listing them is useful (they're
+    # residue from previous runs that should probably be cleaned up).
     if untouched_files or untouched_low:
+        total = len(untouched_files) + len(untouched_low)
         warnings_lines.append(
-            "[preserved] pre-existing files in output directory left "
-            "untouched (not produced by this run):")
-        for name in sorted(untouched_files):
-            warnings_lines.append(f"  files/{name}")
-        for name in sorted(untouched_low):
-            warnings_lines.append(f"  files_low_trust/{name}")
+            f"[preserved] {total} pre-existing file(s) in the output "
+            f"directory left untouched (not part of this run)")
+        if apply_to is None:
+            for name in sorted(untouched_files):
+                warnings_lines.append(f"  files/{name}")
+            for name in sorted(untouched_low):
+                warnings_lines.append(f"  files_low_trust/{name}")
+        else:
+            warnings_lines.append(
+                "  (per-file listing suppressed in --apply-to mode; "
+                "the target tree owns its own files)")
 
     if overwritten_files or overwritten_low:
         warnings_lines.append(
             "[overwritten] pre-existing files overwritten by this run:")
         for name in sorted(overwritten_files):
-            warnings_lines.append(f"  files/{name}")
+            warnings_lines.append(f"  {name}")
         for name in sorted(overwritten_low):
-            warnings_lines.append(f"  files_low_trust/{name}")
+            warnings_lines.append(f"  .deeppeek/low_trust/{name}")
 
     warnings_text = "\n".join(warnings_lines)
     if warnings_text:
         warnings_text += "\n"
-    (out_dir / "warnings.txt").write_text(warnings_text)
+    (reports_dir / "warnings.txt").write_text(warnings_text)
 
+    # ---- manifest ------------------------------------------------
     escalations = []
     for b in blocks:
         if b.escalation_reason is None:
@@ -454,6 +551,8 @@ def pass9_write(records: dict[str, FileRecord],
         "run": {
             "timestamp": datetime.now(timezone.utc)
                           .isoformat(timespec="seconds"),
+            "mode": "apply" if apply_to is not None else "recover",
+            "apply_to": str(apply_to) if apply_to is not None else None,
             "llm_mode": llm_mode,
             "llm_model": llm.model if llm else None,
             "llm_calls": {
@@ -472,14 +571,17 @@ def pass9_write(records: dict[str, FileRecord],
             "escalations": escalations,
             "cross_validate": cross_validate,
             "missing_files": sorted(missing) if missing else [],
+            "deleted_applied": deleted_applied,
+            "deleted_not_found": deleted_missing,
         },
         "files": written,
         "skipped": skipped,
         "decisions": decisions,
         "deleted": all_deleted,
     }
-    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    (reports_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
+    # ---- summary --------------------------------------------------
     if skipped:
         by_reason: dict[str, list[str]] = {
             "no_full":    [],
@@ -509,7 +611,7 @@ def pass9_write(records: dict[str, FileRecord],
             tail = f" … (+{len(paths)-5} more)" if len(paths) > 5 else ""
             print(f"    {label}: {len(paths)}  ({head}{tail})",
                   file=sys.stderr)
-        print(f"    Full list: {out_dir / 'warnings.txt'}",
+        print(f"    Full list: {reports_dir / 'warnings.txt'}",
               file=sys.stderr)
 
     xv = cross_validate.get("problems", [])
@@ -521,24 +623,39 @@ def pass9_write(records: dict[str, FileRecord],
             print(f"  missing modules ({len(missing_mods)}): "
                   f"{', '.join(missing_mods)}", file=sys.stderr)
 
-    print(f"\nWrote {written_count} files to {files_dir}/")
+    if apply_to is not None:
+        print(f"\nApplied {written_count} file(s) to {files_dir}/")
+    else:
+        print(f"\nWrote {written_count} files to {files_dir}/")
     print(f"  skipped:  {len(skipped)}"
           + ("  (see warnings.txt)" if skipped else ""))
+
+    if deleted_applied:
+        print(f"  deleted:  {len(deleted_applied)} file(s) removed "
+              f"from target tree")
+        for name in deleted_applied[:5]:
+            print(f"    {name}")
+        if len(deleted_applied) > 5:
+            print(f"    ... +{len(deleted_applied) - 5} more")
+    if deleted_missing and apply_to is not None:
+        print(f"  del-miss: {len(deleted_missing)} file(s) marked "
+              f"[DEL] but not present in target tree")
 
     total_preserved = len(untouched_files) + len(untouched_low)
     if total_preserved:
         print(f"  preserved: {total_preserved} pre-existing file(s) "
               f"left untouched (not part of this run)")
-        shown = 0
-        for name in sorted(untouched_files)[:5]:
-            print(f"    files/{name}")
-            shown += 1
-        for name in sorted(untouched_low)[:5]:
-            print(f"    files_low_trust/{name}")
-            shown += 1
-        if total_preserved > shown:
-            print(f"    ... +{total_preserved - shown} more "
-                  f"(see warnings.txt)")
+        if apply_to is None:
+            shown = 0
+            for name in sorted(untouched_files)[:5]:
+                print(f"    files/{name}")
+                shown += 1
+            for name in sorted(untouched_low)[:5]:
+                print(f"    files_low_trust/{name}")
+                shown += 1
+            if total_preserved > shown:
+                print(f"    ... +{total_preserved - shown} more "
+                      f"(see warnings.txt)")
     total_overwritten = len(overwritten_files) + len(overwritten_low)
     if total_overwritten:
         print(f"  overwrote: {total_overwritten} pre-existing file(s) "
@@ -552,15 +669,17 @@ def pass9_write(records: dict[str, FileRecord],
              if unattributed else ""))
     print(f"  graph:    {len(xv)} import problem(s)"
           if xv else "  graph:    clean")
-    print(f"  deleted:  {out_dir / 'deleted.txt'} "
-          f"({len(all_deleted)} entries)")
+    print(f"  deleted:  {reports_dir / 'deleted.txt'} "
+          f"({len(all_deleted)} marked"
+          + (f", {len(deleted_applied)} applied)" if apply_to is not None
+             else f")"))
     if missing:
-        print(f"  missing:  {out_dir / 'MISSING_FILES.txt'} "
+        print(f"  missing:  {reports_dir / 'MISSING_FILES.txt'} "
               f"({len(missing)} files referenced but never recovered)")
     if llm is not None:
         print(f"  LLM:      {llm.calls_made} live, "
               f"{llm.calls_cached} cached, "
               f"{llm.calls_refused} refused")
-    print(f"  warnings: {out_dir / 'warnings.txt'}")
-    print(f"  manifest: {out_dir / 'manifest.json'}")
+    print(f"  warnings: {reports_dir / 'warnings.txt'}")
+    print(f"  manifest: {reports_dir / 'manifest.json'}")
     return exit_code

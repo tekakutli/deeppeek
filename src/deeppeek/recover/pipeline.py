@@ -5,6 +5,12 @@ in memory (dump_text) — the recover pipeline accepts both so callers
 can choose whether the intermediate markdown lives on disk at all.
 The manifest's `dump.path` field records "<in-memory>" when the
 source was dump_text.
+
+Output is either the standard `out_dir` layout (files/, files_low_trust/,
+reports beside them) or — when `apply_to` is set — an in-place apply
+against an existing directory: recovered files go directly into
+apply_to, files marked [DEL] are deleted from it, and all reports are
+written beside them.
 """
 import hashlib
 import sys
@@ -29,10 +35,18 @@ from .write import pass9_write
 @dataclass
 class RecoverConfig:
     # Exactly one of these must be set:
-    dump_path: Optional[Path] = None        # read the markdown from this file
-    dump_text: Optional[str] = None         # use this string directly
+    dump_path: Optional[Path] = None
+    dump_text: Optional[str] = None
 
+    # Standard output directory (files/, files_low_trust/, reports).
+    # Ignored when apply_to is set.
     out_dir: Path = field(default_factory=lambda: Path("./recovered"))
+
+    # Apply mode: recovered files go directly into this existing
+    # directory; deleted-marked files are removed from it; reports go
+    # alongside.  Must exist and be a directory.
+    apply_to: Optional[Path] = None
+
     layout: str = "flat"
     remap: dict = field(default_factory=dict)
     min_trust: str = "MEDIUM"
@@ -50,11 +64,7 @@ class RecoverConfig:
 
 
 def _resolve_dump(cfg: RecoverConfig) -> tuple[str, str, int]:
-    """Return (dump_text, dump_display, dump_size_bytes).
-
-    dump_display is what gets recorded in manifest.dump.path — either
-    the real filesystem path or "<in-memory>".
-    """
+    """Return (dump_text, dump_display, dump_size_bytes)."""
     if cfg.dump_text is not None:
         text = cfg.dump_text
         return text, "<in-memory>", len(text.encode("utf-8"))
@@ -68,6 +78,23 @@ def _resolve_dump(cfg: RecoverConfig) -> tuple[str, str, int]:
     return text, str(cfg.dump_path), cfg.dump_path.stat().st_size
 
 
+def _validate_apply_to(cfg: RecoverConfig) -> Optional[int]:
+    """Return exit code on error, None on success."""
+    if cfg.apply_to is None:
+        return None
+    if not cfg.apply_to.exists():
+        print(f"error: --apply-to directory does not exist: {cfg.apply_to}",
+              file=sys.stderr)
+        print("  (create it first, or omit --apply-to to use ./recovered/)",
+              file=sys.stderr)
+        return 3
+    if not cfg.apply_to.is_dir():
+        print(f"error: --apply-to path is not a directory: {cfg.apply_to}",
+              file=sys.stderr)
+        return 3
+    return None
+
+
 def run(cfg: RecoverConfig) -> int:
     try:
         dump_text, dump_display, dump_size = _resolve_dump(cfg)
@@ -75,12 +102,24 @@ def run(cfg: RecoverConfig) -> int:
         print(str(e), file=sys.stderr)
         return 3
 
+    err = _validate_apply_to(cfg)
+    if err is not None:
+        return err
+
     dump_sha = hashlib.sha256(dump_text.encode()).hexdigest()
-    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+
+    if cfg.apply_to is None:
+        cfg.out_dir.mkdir(parents=True, exist_ok=True)
+        aux_base = cfg.out_dir
+    else:
+        # In apply mode we don't touch out_dir at all; ancillary data
+        # (cache, llm_audit) goes under the target tree's hidden dir.
+        aux_base = cfg.apply_to / ".deeppeek"
+        aux_base.mkdir(parents=True, exist_ok=True)
 
     llm: Optional[LLMClient] = None
     if cfg.llm_mode != "off":
-        cache = cfg.cache_dir or (cfg.out_dir / "cache" / "llm")
+        cache = cfg.cache_dir or (aux_base / "cache" / "llm")
         llm = LLMClient(cfg.llm_url, cfg.llm_model, cache,
                         max_calls=cfg.llm_max_calls,
                         timeout=cfg.llm_timeout)
@@ -101,6 +140,9 @@ def run(cfg: RecoverConfig) -> int:
     else:
         print(f"[startup] LLM mode: {cfg.llm_mode} (model={cfg.llm_model})",
               file=sys.stderr)
+
+    if cfg.apply_to is not None:
+        print(f"[startup] apply mode: {cfg.apply_to}", file=sys.stderr)
 
     t_start = time.monotonic()
 
@@ -169,6 +211,7 @@ def run(cfg: RecoverConfig) -> int:
         blocks=blocks,
         deleted_files=deleted_files,
         out_dir=cfg.out_dir,
+        apply_to=cfg.apply_to,
         layout=cfg.layout,
         remap=cfg.remap,
         min_trust=cfg.min_trust,

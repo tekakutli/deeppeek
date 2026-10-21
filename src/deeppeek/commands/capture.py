@@ -2,14 +2,16 @@
 
 Modes:
 
-  capture                    recover in memory → ./recovered/  (default)
+  capture                    recover in memory → ./recovered/
+  capture --apply-to DIR     recover in memory → applied directly to DIR
   capture -o chat.md         write chat.md only (old behavior)
   capture -o chat.md \
-      --recover              write chat.md AND recover in memory
-  capture --no-recover \
-      -o chat.md             same as `-o chat.md` (explicit form)
+      --recover              write chat.md AND recover (./recovered/)
+  capture -o chat.md \
+      --recover \
+      --apply-to DIR         write chat.md AND apply to DIR
+  capture --json -o chat.md  write JSON, no recovery
   capture --no-recover       ERROR (nothing to save)
-  capture --json             print JSON, no recovery
 """
 import argparse
 import sys
@@ -27,12 +29,12 @@ def register(sub: argparse._SubParsersAction) -> None:
     )
     p.add_argument(
         "-o", "--output", type=Path, default=None,
-        help="write the markdown to this path and skip recovery "
-             "(use --recover to also run recovery)",
+        help="write the markdown to this path "
+             "(skips recovery unless --recover or --apply-to is given)",
     )
     p.add_argument(
         "--recover", action="store_true",
-        help="run recovery even when -o is given (write file AND recover)",
+        help="force recovery even when -o is given",
     )
     p.add_argument(
         "--no-recover", action="store_true",
@@ -62,7 +64,15 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--timeout", type=float, default=None)
 
     # ---- recovery-side flags ----
-    p.add_argument("--recover-to", type=Path, default=Path("./recovered"))
+    p.add_argument("--recover-to", type=Path, default=None,
+                   help="standard layout target (default: ./recovered). "
+                        "Mutually exclusive with --apply-to.")
+    p.add_argument(
+        "--apply-to", type=Path, default=None, metavar="DIR",
+        help="apply the recovery directly to an existing directory tree "
+             "(recovered files go into DIR, [DEL] files are actually deleted, "
+             "reports land beside them).  DIR must exist.",
+    )
     p.add_argument("--layout", choices=["flat", "header", "passthrough"],
                    default="flat")
     p.add_argument("--remap", action="append", default=[], metavar="OLD=NEW")
@@ -92,19 +102,28 @@ def _parse_remap(items):
 
 
 def run(args: argparse.Namespace) -> int:
-    # ---- decide recovery intent --------------------------------
-    #  --no-recover                  → never recover
-    #  -o file  (no --recover)       → file only, no recover
-    #  -o file  --recover            → both
-    #  no -o                         → recover (default)
+    # ---- decide recovery intent ----
+    # apply_to implies recovery.  -o alone means file-only.
+    if args.apply_to is not None and args.recover_to is not None:
+        print("error: --apply-to and --recover-to are mutually exclusive",
+              file=sys.stderr)
+        return 3
+    if args.no_recover and args.apply_to is not None:
+        print("error: --no-recover and --apply-to are mutually exclusive "
+              "(--apply-to implies recovery)", file=sys.stderr)
+        return 3
+
     if args.no_recover:
         do_recover = False
-    elif args.output and not args.recover:
+    elif args.apply_to is not None:
+        do_recover = True
+    elif args.recover:
+        do_recover = True
+    elif args.output:
         do_recover = False
     else:
         do_recover = True
 
-    # ---- validate the flag combination -------------------------
     if not do_recover and not args.output:
         print("error: --no-recover requires -o/--output "
               "(there would be nowhere to put the capture)",
@@ -120,7 +139,7 @@ def run(args: argparse.Namespace) -> int:
                   "add -o to write it somewhere", file=sys.stderr)
             return 3
 
-    # ---- capture (in memory) -----------------------------------
+    # ---- capture (in memory) ----
     try:
         result = capture_conversation(CaptureConfig(
             port=args.port,
@@ -142,7 +161,7 @@ def run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         return 1
 
-    # ---- optional file output ----------------------------------
+    # ---- optional file output ----
     if args.output:
         args.output.write_text(result.text, encoding="utf-8")
         print(f"Wrote {args.output} ({result.message_count} message(s))",
@@ -151,10 +170,13 @@ def run(args: argparse.Namespace) -> int:
     if not do_recover:
         return 0
 
-    # ---- recovery from the in-memory text ----------------------
+    # ---- recovery from the in-memory text ----
+    out_dir = args.recover_to if args.recover_to is not None else Path("./recovered")
+
     return recover_run(RecoverConfig(
         dump_text=result.text,
-        out_dir=args.recover_to,
+        out_dir=out_dir,
+        apply_to=args.apply_to,
         layout=args.layout,
         remap=_parse_remap(args.remap),
         min_trust=args.min_trust,

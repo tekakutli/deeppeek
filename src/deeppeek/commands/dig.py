@@ -1,4 +1,9 @@
-"""`deeppeek dig` — capture + recover in one step."""
+"""`deeppeek dig` — capture + recover in one step.
+
+Writes the intermediate markdown to disk (--capture-to) and then runs
+recovery.  With --apply-to, the recovery is applied directly to an
+existing directory tree instead of the standard ./recovered/ layout.
+"""
 import argparse
 import sys
 from datetime import datetime
@@ -11,7 +16,15 @@ from ..recover.pipeline import RecoverConfig, run as recover_run
 def register(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("dig", help="Capture a conversation AND recover its files")
     p.add_argument("--capture-to", type=Path, default=None)
-    p.add_argument("--recover-to", type=Path, default=Path("./recovered"))
+    p.add_argument("--recover-to", type=Path, default=None,
+                   help="standard layout target (default: ./recovered). "
+                        "Mutually exclusive with --apply-to.")
+    p.add_argument(
+        "--apply-to", type=Path, default=None, metavar="DIR",
+        help="apply the recovery directly to an existing directory tree "
+             "(recovered files go into DIR, [DEL] files are actually deleted, "
+             "reports land beside them).  DIR must exist.",
+    )
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--watch", action="store_true")
     p.add_argument("--start-prompt")
@@ -42,6 +55,11 @@ def register(sub: argparse._SubParsersAction) -> None:
 
 
 def run(args: argparse.Namespace) -> int:
+    if args.apply_to is not None and args.recover_to is not None:
+        print("error: --apply-to and --recover-to are mutually exclusive",
+              file=sys.stderr)
+        return 3
+
     stamp = datetime.now().strftime("%Y-%m-%d_%H_%M_%S")
     capture_path = args.capture_to or Path(f"DeepSeek_{stamp}.md")
 
@@ -67,9 +85,13 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     print(f"[dig 2/2] recovering files from {capture_path}...", file=sys.stderr)
+
+    out_dir = args.recover_to if args.recover_to is not None else Path("./recovered")
+
     return recover_run(RecoverConfig(
         dump_path=capture_path,
-        out_dir=args.recover_to,
+        out_dir=out_dir,
+        apply_to=args.apply_to,
         layout=args.layout,
         min_trust=args.min_trust,
         llm_mode=args.llm_mode,
