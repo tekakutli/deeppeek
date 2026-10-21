@@ -7,13 +7,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 class ExportServer:
     """
     Tiny HTTP server. The extension POSTs the extracted conversation to /export.
-    /poll returns {"action": "extract"} only in --watch mode; otherwise {"action": "idle"}.
+    /poll returns {"action": "extract"} only in --watch mode AND only until the
+    first /export arrives; after that it returns {"action": "idle"} so the
+    extension stops re-triggering.  Without this one-shot latch, --watch mode
+    tells the extension to sweep the page every 3 seconds forever, which
+    produces a visible bottom→top→bottom bounce on the DeepSeek tab and blocks
+    the CLI on wait_for_result() if the first sweep never completes.
     """
 
     def __init__(self, port: int = 8765, watch_mode: bool = False):
         self.port = port
         self.watch_mode = watch_mode
         self.result_queue: "queue.Queue[dict]" = queue.Queue()
+        self._watch_fired = False          # NEW: one-shot latch
         self._httpd = None
         self._thread = None
 
@@ -42,7 +48,13 @@ class ExportServer:
 
             def do_GET(self):
                 if self.path == "/poll":
-                    action = "extract" if parent.watch_mode else "idle"
+                    # One-shot: only the first poll while unwatched gets
+                    # "extract".  After /export has been received, all
+                    # polls return idle, so the extension stops sweeping.
+                    if parent.watch_mode and not parent._watch_fired:
+                        action = "extract"
+                    else:
+                        action = "idle"
                     self._send_json(200, {"action": action})
                 elif self.path == "/status":
                     self._send_json(200, {"ok": True})
@@ -58,6 +70,7 @@ class ExportServer:
                     except Exception as e:
                         self._send_json(400, {"error": f"bad json: {e}"})
                         return
+                    parent._watch_fired = True   # NEW: latch on
                     parent.result_queue.put(data)
                     self._send_json(200, {"ok": True})
                 else:

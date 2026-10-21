@@ -24,11 +24,34 @@ def slice_messages(
     end_index: Optional[int] = None,
     match_mode: str = "substring",
     context: int = 0,
+    last_user_turns: Optional[int] = None,
 ) -> List[Message]:
     if not messages:
         return []
 
     last = len(messages) - 1
+
+    # --last N — take the last N user turns (each turn = 1 user message
+    # plus its reply, up to the end of the conversation).  Overrides
+    # the other slicing flags when present.
+    if last_user_turns is not None:
+        if last_user_turns <= 0:
+            return []
+        user_indices = [i for i, m in enumerate(messages) if m.role == "user"]
+        if not user_indices:
+            print(
+                "warning: --last given but no user messages in conversation",
+                file=sys.stderr,
+            )
+            return []
+        if len(user_indices) <= last_user_turns:
+            start = 0
+        else:
+            start = user_indices[-last_user_turns]
+        end = last
+        start = max(0, start - context)
+        end = min(last, end + context)
+        return messages[start:end + 1]
 
     # Start
     if start_index is not None:
@@ -40,15 +63,13 @@ def slice_messages(
                 start = i
                 break
         if start is None:
-            print(
-                f"warning: start prompt not found; starting at first message",
-                file=sys.stderr,
-            )
+            print("warning: start prompt not found; starting at first message",
+                  file=sys.stderr)
             start = 0
     else:
         start = 0
 
-    # End (inclusive)
+    # End (inclusive, extend to the assistant reply if the match is a user message)
     if end_index is not None:
         end = max(0, min(end_index, last))
     elif end_prompt is not None:
@@ -57,13 +78,10 @@ def slice_messages(
             if m.role == "user" and _matches(m.content, end_prompt, match_mode):
                 last_match = i
         if last_match is None:
-            print(
-                "warning: end prompt not found; ending at last message",
-                file=sys.stderr,
-            )
+            print("warning: end prompt not found; ending at last message",
+                  file=sys.stderr)
             end = last
         else:
-            # Include the assistant reply immediately following that user turn
             if last_match + 1 <= last and messages[last_match + 1].role == "assistant":
                 end = last_match + 1
             else:
@@ -76,4 +94,4 @@ def slice_messages(
 
     start = max(0, start - context)
     end = min(last, end + context)
-    return messages[start : end + 1]
+    return messages[start:end + 1]

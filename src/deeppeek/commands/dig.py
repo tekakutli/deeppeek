@@ -20,6 +20,12 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--start-index", type=int)
     p.add_argument("--end-index", type=int)
     p.add_argument("--context", type=int, default=0)
+    p.add_argument(
+        "--last", type=int, default=None, metavar="N",
+        help="keep only the last N user turns (each turn = 1 user "
+             "message + its reply).  Overrides --start-prompt, "
+             "--end-prompt, --start-index, --end-index.",
+    )
     p.add_argument("--no-thinking", action="store_true")
     p.add_argument("--no-hints", action="store_true")
     p.add_argument("--latex", action="store_true")
@@ -55,6 +61,7 @@ def run(args: argparse.Namespace) -> int:
             include_hints=not args.no_hints,
             latex=args.latex,
             timeout=args.timeout,
+            last_user_turns=args.last,
         ))
     except KeyboardInterrupt:
         return 1

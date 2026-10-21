@@ -19,7 +19,7 @@ from .latex import convert_latex_delimiters
 class CaptureConfig:
     port: int = 8765
     watch: bool = False
-    output: Optional[Path] = None           # None -> auto-name
+    output: Optional[Path] = None
     start_prompt: Optional[str] = None
     end_prompt: Optional[str] = None
     start_index: Optional[int] = None
@@ -31,6 +31,7 @@ class CaptureConfig:
     latex: bool = False
     as_json: bool = False
     timeout: Optional[float] = None
+    last_user_turns: Optional[int] = None
 
 
 def _safe_title(title: Optional[str], maxlen: int = 30) -> str:
@@ -39,6 +40,19 @@ def _safe_title(title: Optional[str], maxlen: int = 30) -> str:
     s = re.sub(r"[^a-zA-Z0-9-_\s]", "", title)
     s = re.sub(r"\s+", "_", s)
     return s[:maxlen].rstrip("_").strip()
+
+
+def _print_prompt_index(messages, label: str) -> None:
+    prompts = [m for m in messages if m.role == "user"]
+    if not prompts:
+        print(f"  {label}: (none)", file=sys.stderr)
+        return
+    print(f"  {label} ({len(prompts)}):", file=sys.stderr)
+    for i, p in enumerate(prompts):
+        preview = (p.content or "").replace("\n", " ").strip()[:80]
+        if len(p.content or "") > 80:
+            preview += "…"
+        print(f"    [{i}] {preview}", file=sys.stderr)
 
 
 def capture_to_markdown(cfg: CaptureConfig) -> Path:
@@ -54,6 +68,9 @@ def capture_to_markdown(cfg: CaptureConfig) -> Path:
         server.stop()
 
     conversation = Conversation.from_json(payload)
+    print(f"  captured {len(conversation.messages)} message(s)", file=sys.stderr)
+    _print_prompt_index(conversation.messages, "prompts in full capture")
+
     sliced = slice_messages(
         conversation.messages,
         start_prompt=cfg.start_prompt,
@@ -62,7 +79,13 @@ def capture_to_markdown(cfg: CaptureConfig) -> Path:
         end_index=cfg.end_index,
         match_mode=cfg.match_mode,
         context=cfg.context,
+        last_user_turns=cfg.last_user_turns,
     )
+
+    if cfg.last_user_turns is not None or cfg.start_prompt or cfg.end_prompt \
+            or cfg.start_index is not None or cfg.end_index is not None:
+        print(f"  sliced to {len(sliced)} message(s)", file=sys.stderr)
+        _print_prompt_index(sliced, "prompts after slice")
 
     if cfg.as_json:
         out = json.dumps(
