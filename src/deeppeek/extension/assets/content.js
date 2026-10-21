@@ -1,7 +1,7 @@
-// Runs in the Firefox content-script world. Injects the page-world extractor and
-// bridges messages between it and the background script. Also holds an open
-// port to the background, which keeps the MV3 event page alive (Firefox docs:
-// a content-script port keeps the background from being suspended).
+// Runs in the Firefox content-script world. Injects the page-world
+// extractor and bridges messages between it and the background
+// script. Also holds an open port to the background, which keeps the
+// MV3 event page alive.
 
 (async function () {
   function injectPageWorldScript() {
@@ -27,51 +27,65 @@
     return false;
   }
 
-  browser.runtime.onMessage.addListener(async (msg) => {
-    if (!msg || msg.type !== "DSX_EXTRACT") {
-      return null;
-    }
-
+  async function ensurePageWorldFn(name, timeoutMs = 5000) {
     const ready = await waitFor(
-      () =>
-        window.wrappedJSObject &&
-        typeof window.wrappedJSObject.__dsx_extract === "function"
+      () => window.wrappedJSObject && typeof window.wrappedJSObject[name] === "function",
+      timeoutMs,
     );
     if (!ready) {
       injectPageWorldScript();
-      const retried = await waitFor(
-        () =>
-          window.wrappedJSObject &&
-          typeof window.wrappedJSObject.__dsx_extract === "function",
-        3000
+      return await waitFor(
+        () => window.wrappedJSObject && typeof window.wrappedJSObject[name] === "function",
+        3000,
       );
-      if (!retried) {
+    }
+    return true;
+  }
+
+  browser.runtime.onMessage.addListener(async (msg) => {
+    if (!msg) return null;
+
+    if (msg.type === "DSX_EXTRACT") {
+      if (!(await ensurePageWorldFn("__dsx_extract"))) {
         console.error("DSX: page-world extractor unavailable.");
+        return null;
+      }
+      try {
+        const jsonString = await window.wrappedJSObject.__dsx_extract();
+        return JSON.parse(jsonString);
+      } catch (e) {
+        console.error("DSX: extraction threw:", e);
         return null;
       }
     }
 
-    try {
-      const jsonString = await window.wrappedJSObject.__dsx_extract();
-      return JSON.parse(jsonString);
-    } catch (e) {
-      console.error("DSX: extraction threw:", e);
-      return null;
+    if (msg.type === "DSX_ATTACH") {
+      if (!(await ensurePageWorldFn("__dsx_attach_json"))) {
+        console.error("DSX: page-world attach unavailable.");
+        return { success: false, reason: "page-world attach unavailable" };
+      }
+      try {
+        // Firefox Xray: content-script-owned objects cannot be read by
+        // page-world code (accessing opts.delay_ms triggers "Permission
+        // denied to access property").  Strings cross transparently.
+        // So stringify here, page-world JSON.parses on its side.
+        // Same pattern as __dsx_extract, which already works.
+        const argsJson = JSON.stringify({
+          files: msg.files || [],
+          opts: msg.opts || {},
+        });
+        const resultJson = await window.wrappedJSObject.__dsx_attach_json(argsJson);
+        return JSON.parse(resultJson);
+      } catch (e) {
+        console.error("DSX: attach threw:", e);
+        return { success: false, reason: `attach threw: ${e.message}` };
+      }
     }
+
+    return null;
   });
 
-  // ---- keepalive port to background ----------------------------------
-  //
-  // Opening a runtime.connect() port from the content script keeps the
-  // background event page alive indefinitely in Firefox MV3.  Without
-  // this, the background is suspended after ~30s idle and the SSE
-  // watchdog never fires — which is why `deeppeek capture --watch` was
-  // slow whenever the user was already on the deepseek tab.
-  //
-  // The port also carries a "hello" on connect (new page load) and a
-  // periodic "heartbeat" while the page is visible.  The background
-  // treats either as a signal to force-reconnect SSE and re-check the
-  // armed state.
+  // ---- keepalive port to background ------------------------------
 
   function connectKeepalive() {
     let port;
@@ -81,53 +95,35 @@
       console.warn("DSX: keepalive connect failed:", e);
       return null;
     }
-
-    // Attach a message listener so Firefox does not GC-close the port.
     port.onMessage.addListener(() => {});
-
     port.onDisconnect.addListener(() => {
-      // Background reloaded — reconnect after a short delay.
       window.__dsx_port__ = null;
       setTimeout(connectKeepalive, 1000);
     });
-
     try {
       port.postMessage({ type: "hello", url: location.href });
     } catch (_) {}
-
     window.__dsx_port__ = port;
     return port;
   }
 
   const port = connectKeepalive();
 
-  // Heartbeat while the tab is visible.  3s cadence matches the
-  // background's watchdog interval; combined they give a steady
-  // "user is on this page, check SSE" signal without any new polling
-  // protocol — the port messages are just wake signals.
   let heartbeat = null;
   function startHeartbeat() {
     if (heartbeat || !port) return;
     heartbeat = setInterval(() => {
-      try {
-        port.postMessage({ type: "heartbeat" });
-      } catch (_) {
-        clearInterval(heartbeat);
-        heartbeat = null;
-      }
+      try { port.postMessage({ type: "heartbeat" }); }
+      catch (_) { clearInterval(heartbeat); heartbeat = null; }
     }, 3000);
   }
   function stopHeartbeat() {
-    if (heartbeat) {
-      clearInterval(heartbeat);
-      heartbeat = null;
-    }
+    if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
   }
   if (document.visibilityState === "visible") startHeartbeat();
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
       startHeartbeat();
-      // Immediate ping on becoming visible (tab switched back to)
       if (port) {
         try { port.postMessage({ type: "hello", url: location.href }); }
         catch (_) {}

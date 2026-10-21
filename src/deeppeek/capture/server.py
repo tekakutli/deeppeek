@@ -9,26 +9,19 @@ class ExportServer:
     """
     Local HTTP server.  Roles:
 
-      /events   SSE stream — arms/disarms the extension, and can
-                carry one-shot `config` / `request-status` events
-                used by `deeppeek extension watchdog`.
+      /events   SSE stream — arms/disarms the extension, carries
+                one-shot `config` / `request-status` events (watchdog
+                subcommand), and `attach` events (pipe subcommand).
       /export   POST endpoint — extension pushes payloads or acks.
       /status   plain JSON for debugging.
-
-    The server has no notion of the extension's watchdog setting —
-    that lives in the extension's browser.storage.local, and only
-    `deeppeek extension watchdog` writes to it.  Regular captures
-    never touch that value.
     """
 
     def __init__(self, port: int = 8765, watch_mode: bool = False):
         self.port = port
         self.watch_mode = watch_mode
         self.result_queue: "queue.Queue[dict]" = queue.Queue()
-
         self.armed = watch_mode
         self.sse_clients: list["queue.Queue[dict]"] = []
-
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._httpd = None
@@ -63,6 +56,32 @@ class ExportServer:
                 q.put_nowait(msg)
             except queue.Full:
                 pass
+
+    def has_extension(self) -> bool:
+        with self._lock:
+            return bool(self.sse_clients)
+
+    def wait_for_extension(self, timeout: float) -> bool:
+        """Block up to `timeout` seconds waiting for any SSE client."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.has_extension():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def broadcast_attach(self, files: list[dict], batch_id: str,
+                        delay_ms: int = 0) -> None:
+        """Push an attach event to all connected extension clients.
+
+        `files` is a list of {"name", "mime", "base64"} dicts.
+        `delay_ms == 0` → batch; `> 0` → serial with the given delay.
+        """
+        self._broadcast("attach", {
+            "batch_id": batch_id,
+            "files": files,
+            "opts": {"delay_ms": delay_ms},
+        })
 
     # ---- lifecycle ------------------------------------------------
 
