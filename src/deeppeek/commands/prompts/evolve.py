@@ -1,42 +1,35 @@
-"""`deeppeek prompt evolve` — craft a task prompt + attachments, send
-to DeepSeek.
+"""`deeppeek prompt evolve` — craft the task prompt, type it, pipe inputs.
 
 Pipeline:
 
-    assemble   validate paths
-    generate   run the real commands to produce the four artefacts:
+    assemble   validate paths, infer deeppeek-source
+    generate   run the real commands to produce the four inputs:
                  deeppeek capture -o <ws>/conversation.md --last N --watch
                  deeppeek recover <conversation> --apply-to <target>
-                 copy <target>/deeppeek/      -> <ws>/meta/
-                 scan <target>                 -> <ws>/playground_dump.md
-                 dump_py -r in <source>        -> <ws>/project_dump_deeppeek.md
-               then build the task prompt with those paths interpolated
-    compose    fold prompt + four artefacts -> <ws>/bundle.md
-    dispatch   deeppeek type <bundle>
-               deeppeek enter
+                 dump.py -r -o <ws>/project_dump_<target>.md
+                 dump.py -r -o <ws>/project_dump_<source>.md
+    build      format TASK_PROMPT_TEMPLATE with the real paths
+    type       `deeppeek type <tempfile>`      ← the prompt text
+    pipe       `deeppeek pipe conv dump meta/* dump`  ← the four inputs
 
-That's it.  This command produces one bundle on disk and one message
-in the chat.  It does not capture the reply, does not store it, does
-not apply it.  Review and iterate in the browser; if you want to
-re-run, run it again.
+The prompt text and the attachments are separate: the text names the
+files, the pipe stage attaches them as file chips.  No inline content
+in the prompt.  No Enter.  No reply capture.  No apply.
 
-Self-invocation: every network-bound step shells out to a `deeppeek`
-subprocess.  Each subprocess opens its own ExportServer on port 8765
-— no state leaks between stages, every stage can be re-run standalone.
-
-The task prompt is NOT a fixed string: it is built by `_build_prompt`
-after `generate`, with every path interpolated.
+The deeppeek source tree is inferred automatically — from the package
+location for editable installs, or from the current directory if it's
+a deeppeek checkout.  No flag, no configuration.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
-import uuid
+import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -48,7 +41,7 @@ from typing import Optional
 _EXCLUDE_DIR_NAMES = {
     ".git", "__pycache__", "node_modules", ".venv", "venv",
     "dist", "build", "target", ".tox", ".nox", ".mypy_cache",
-    ".pytest_cache", ".deeppeek",
+    ".pytest_cache", ".deeppeek", "cache", "deeppeek",
 }
 _EXCLUDE_SUFFIXES = {
     ".pyc", ".pyo", ".so", ".dll", ".dylib", ".o", ".a",
@@ -58,10 +51,9 @@ _EXCLUDE_SUFFIXES = {
 }
 _MAX_ATTACHMENT_BYTES = 2_000_000
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_DUMP_PY_SCRIPT = _PROJECT_ROOT / "scripts" / "dumps" / "dump.py"
 
-# ---------------------------------------------------------------------------
-# Task prompt template (filled in by _build_prompt)
-# ---------------------------------------------------------------------------
 
 TASK_PROMPT_TEMPLATE = """\
 I maintain a CLI utility called deeppeek. Its purpose is to take an
@@ -80,16 +72,15 @@ apart from metadata artifacts. Those metadata files are under
 {meta} and contain errors, warnings, and other side effects from
 the attempted apply.
 
-I am providing the following inputs:
+I am providing the following inputs, attached to this message as
+files:
 
-1. The extracted conversation Markdown containing the patches:
-   {conversation}
-2. A dump/state of the target code playground after the attempted
-   apply: {playground_dump}
-3. The deeppeek metadata artifacts:
-   {meta}
-4. A dump of the deeppeek project itself:
-   {project_dump}
+1. `{conversation_name}` — the extracted conversation Markdown
+   containing the patches.
+2. `{playground_dump_name}` — a dump/state of the target code
+   playground after the attempted apply.
+3. `{meta_name}/` — the deeppeek metadata artifacts (directory).
+4. `{project_dump_name}` — a dump of the deeppeek project itself.
    This is the codebase I want you to edit.
 
 Please fix the deeppeek CLI so that it can robustly turn a
@@ -111,12 +102,13 @@ this single conversation.
 # ---------------------------------------------------------------------------
 
 @dataclass
-class _Artefacts:
-    conversation: Path
-    playground_dump: Path
-    meta_dir: Path
-    project_dump: Path
-    prompt: str
+class _Inputs:
+    conversation_path: Path
+    target_path: Path
+    meta_path: Path
+    meta_paths: list[Path]
+    playground_path: Path
+    project_path: Path
     gen_conversation: str
     gen_playground: str
     gen_meta: str
@@ -124,7 +116,7 @@ class _Artefacts:
 
 
 # ---------------------------------------------------------------------------
-# Subprocess + filesystem helpers
+# Subprocess helpers
 # ---------------------------------------------------------------------------
 
 def _deeppeek_cmd() -> list[str]:
@@ -135,13 +127,11 @@ def _deeppeek_cmd() -> list[str]:
 
 def _run_cmd(cmd: list[str], *,
              timeout: Optional[float] = None,
-             allow_failure: bool = False,
-             cwd: Optional[Path] = None) -> tuple[int, str, str]:
+             allow_failure: bool = False) -> tuple[int, str, str]:
     print(f"    $ {' '.join(cmd)}", file=sys.stderr)
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True,
-            timeout=timeout, cwd=(str(cwd) if cwd else None),
+            cmd, capture_output=True, text=True, timeout=timeout,
         )
     except FileNotFoundError:
         msg = f"`{cmd[0]}` not on PATH"
@@ -161,7 +151,33 @@ def _run_cmd(cmd: list[str], *,
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def _walk_text_files(root: Path):
+def _infer_deeppeek_source() -> Optional[Path]:
+    """Infer the deeppeek source tree.
+
+    Preference order:
+      1. _PROJECT_ROOT derived from __file__ — correct for editable
+         installs (pipx --editable, pip install -e .)
+      2. Current working directory, if it's a deeppeek checkout
+
+    A "source tree" is defined as: has a pyproject.toml AND has a
+    src/deeppeek/ directory.  A frozen-wheel install points at
+    site-packages instead and won't have either, so inference safely
+    fails there and the caller is told to run from the source tree.
+    """
+    for c in (_PROJECT_ROOT, Path.cwd()):
+        if not c.is_dir():
+            continue
+        if (c / "pyproject.toml").is_file() and \
+           (c / "src" / "deeppeek").is_dir():
+            return c
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Filesystem helpers
+# ---------------------------------------------------------------------------
+
+def _iter_text_files(root: Path):
     if root.is_file():
         yield root, root.name
         return
@@ -183,180 +199,61 @@ def _walk_text_files(root: Path):
         yield p, rel.as_posix()
 
 
-def _fence_for(content: str) -> str:
-    longest = 0
-    cur = 0
-    for ch in content:
-        if ch == "`":
-            cur += 1
-            longest = max(longest, cur)
-        else:
-            cur = 0
-    return "`" * max(3, longest + 1)
+def _dump_to_path(directory: Path, out: Path, timeout: float,
+                  dump_py: Optional[Path] = None) -> None:
+    """Run `dump.py -r -o <out>` in `directory`.
 
-
-def _emit_fenced(lines: list[str], content: str) -> None:
-    fence = _fence_for(content)
-    lines.append(fence)
-    lines.append(content.rstrip("\n"))
-    lines.append(fence)
-    lines.append("")
-
-
-def _render_tree_lines(root: Path, excludes: set[str]) -> list[str]:
-    def _visible(p: Path) -> bool:
-        return (not p.name.startswith(".")) and (p.name not in excludes)
-
-    lines = ["./"]
-
-    def _recurse(d: Path, prefix: str) -> None:
-        entries = sorted(
-            (e for e in d.iterdir() if _visible(e)),
-            key=lambda e: (not e.is_dir(), e.name.lower()),
-        )
-        for i, entry in enumerate(entries):
-            last = (i == len(entries) - 1)
-            conn = "└── " if last else "├── "
-            lines.append(
-                f"{prefix}{conn}{entry.name}{'/' if entry.is_dir() else ''}"
-            )
-            if entry.is_dir():
-                _recurse(entry, prefix + ("    " if last else "│   "))
-
-    _recurse(root, "")
-    return lines
-
-
-def _generate_directory_dump(root: Path, out: Path) -> None:
-    if not root.exists():
-        raise SystemExit(f"error: cannot dump nonexistent path: {root}")
-    out.parent.mkdir(parents=True, exist_ok=True)
-
-    if root.is_file():
-        content = root.read_text(encoding="utf-8", errors="replace")
-        lines = [
-            "=" * 70,
-            f"SCANNED FILE: {root.resolve()}",
-            "=" * 70,
-            "",
-            "=" * 70,
-            "FILE CONTENTS",
-            "=" * 70,
-            "```python",
-            content.rstrip("\n"),
-            "```",
-        ]
-        out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return
-
-    lines: list[str] = []
-    lines += ["=" * 70, f"SCANNED DIRECTORY: {root.resolve()}",
-              "=" * 70, ""]
-    lines += ["=" * 70, "DIRECTORY TREE", "=" * 70, "```"]
-    lines += _render_tree_lines(root, _EXCLUDE_DIR_NAMES)
-    lines += ["```", ""]
-
-    files = list(_walk_text_files(root))
-    total = len(files)
-    for i, (fp, rel) in enumerate(files, 1):
-        lines += ["=" * 70, f"FILE {i}/{total}: {rel}", "=" * 70,
-                  "```python"]
-        try:
-            content = fp.read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            content = f"<unreadable: {e}>"
-        lines.append(content.rstrip("\n"))
-        lines += ["```", ""]
-
-    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"    wrote {out} ({out.stat().st_size:,} bytes, "
-          f"{total} files)", file=sys.stderr)
-
-
-def _generate_project_dump_with_dump_py(source: Path, out: Path,
-                                         timeout: float) -> None:
-    if not source.exists() or not source.is_dir():
+    The output path is chosen by us and passed via `-o`, so we never
+    need to guess what filename dump.py picks — it writes exactly
+    where we told it.  Uses the running interpreter (sys.executable)
+    so `dump.py` sees the same env as deeppeek itself.
+    """
+    script = dump_py or _DUMP_PY_SCRIPT
+    if not directory.is_dir():
+        raise SystemExit(f"error: dump target is not a directory: {directory}")
+    if not script.exists():
         raise SystemExit(
-            f"error: --deeppeek-source must be a directory: {source}"
+            f"error: dump script not found at {script}\n"
+            f"  (pass --playground-dump / --project-dump to skip the "
+            f"dump step, or --dump-py to point at a different script)"
         )
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    run_id = uuid.uuid4().hex[:8]
-    begin = f"__DPEVOLVE_BEGIN_{run_id}__"
-    end = f"__DPEVOLVE_END_{run_id}__"
-    script = (
-        f"printf '%s\\n' {begin}; "
-        f"dump_py -r; "
-        f"printf '%s\\n' {end}"
-    )
-
-    print(f"    $ (cd {source} && bash -ic 'dump_py -r')",
-          file=sys.stderr)
+    python_bin = sys.executable
+    cmd = [python_bin, str(script), "-r", "-o", str(out)]
+    print(f"    $ (cd {directory} && "
+          f"{python_bin} {script} -r -o {out})", file=sys.stderr)
     try:
         proc = subprocess.run(
-            ["bash", "-ic", script], cwd=str(source),
+            cmd, cwd=str(directory),
             capture_output=True, text=True, timeout=timeout,
         )
-    except FileNotFoundError:
-        raise SystemExit("error: `bash` not on PATH")
     except subprocess.TimeoutExpired:
-        raise SystemExit(
-            f"error: `dump_py -r` timed out after {timeout:.0f}s"
-        )
+        raise SystemExit(f"error: dump timed out after {timeout:.0f}s")
 
     if proc.returncode != 0:
-        print(f"    warning: dump_py exited {proc.returncode}",
-              file=sys.stderr)
+        print(f"    warning: exit {proc.returncode}", file=sys.stderr)
         for line in (proc.stderr or "").splitlines()[:5]:
             print(f"      {line}", file=sys.stderr)
+    for line in (proc.stdout or "").splitlines()[:2]:
+        if line.strip():
+            print(f"    {line.strip()}", file=sys.stderr)
 
-    stdout = proc.stdout
-    if begin in stdout and end in stdout:
-        body = stdout.split(begin, 1)[1].split(end, 1)[0].lstrip("\n")
-    else:
-        print("    warning: markers not found in dump_py stdout; "
-              "using raw output", file=sys.stderr)
-        body = stdout
-
-    out.write_text(body, encoding="utf-8")
+    if not out.exists() or not out.read_text(encoding="utf-8").strip():
+        raise SystemExit(
+            f"error: dump.py did not produce {out}\n"
+            f"  stdout: {proc.stdout[:200]!r}\n"
+            f"  stderr: {proc.stderr[:200]!r}"
+        )
     print(f"    wrote {out} ({out.stat().st_size:,} bytes)",
           file=sys.stderr)
 
 
-def _collect_meta(target: Path, dest: Path) -> str:
-    if not target.is_dir():
-        return ""
-    sources: list[str] = []
-    for sub in ("deeppeek", ".deeppeek"):
-        cand = target / sub
-        if cand.is_dir():
-            shutil.copytree(
-                cand, dest, dirs_exist_ok=True,
-                ignore=shutil.ignore_patterns("cache"),
-            )
-            sources.append(str(cand))
-    for name in ("manifest.json", "warnings.txt", "deleted.txt",
-                 "MISSING_FILES.txt"):
-        f = target / name
-        if f.is_file():
-            shutil.copy2(f, dest / name)
-            sources.append(str(f))
-    return ", ".join(sources) if sources else ""
-
-
 # ---------------------------------------------------------------------------
-# Prompt builder
+# Prompt assembly — TEMPLATE ONLY, no attachment content
 # ---------------------------------------------------------------------------
 
-def _build_prompt(
-    *,
-    conversation: Path,
-    target: Path,
-    meta: Path,
-    playground_dump: Path,
-    project_dump: Path,
-    capture_cmd: Optional[str],
-) -> str:
+def _build_prompt(inputs: _Inputs, capture_cmd: Optional[str]) -> str:
     if capture_cmd:
         extraction = (
             "The conversation was extracted with:\n"
@@ -365,31 +262,33 @@ def _build_prompt(
         )
     else:
         extraction = (
-            "The conversation is a pre-existing Markdown export "
-            "(not captured this run).\n"
+            "The conversation is a pre-existing Markdown export.\n"
         )
+
     return TASK_PROMPT_TEMPLATE.format(
-        conversation=conversation.resolve(),
-        target=target.resolve(),
-        meta=meta.resolve(),
-        playground_dump=playground_dump.resolve(),
-        project_dump=project_dump.resolve(),
+        conversation=inputs.conversation_path.resolve(),
+        conversation_name=inputs.conversation_path.name or "conversation.md",
+        target=inputs.target_path.resolve(),
+        meta=inputs.meta_path.resolve(),
+        meta_name=inputs.meta_path.name or "deeppeek",
+        playground_dump_name=inputs.playground_path.name,
+        project_dump_name=inputs.project_path.name,
         extraction=extraction,
     )
 
 
 # ---------------------------------------------------------------------------
-# Stage 1 — assemble
+# Stages
 # ---------------------------------------------------------------------------
 
 def _stage_assemble(args: argparse.Namespace) -> None:
     print("[assemble] checking inputs", file=sys.stderr)
-    if not args.deeppeek_source.exists() or not args.deeppeek_source.is_dir():
+    if not args.deeppeek_source.is_dir():
         raise SystemExit(
-            f"error: --deeppeek-source must be an existing directory: "
+            f"error: deeppeek-source resolved to a non-directory: "
             f"{args.deeppeek_source}"
         )
-    if not args.target.exists() or not args.target.is_dir():
+    if not args.target.is_dir():
         raise SystemExit(
             f"error: --target must be an existing directory: {args.target}"
         )
@@ -400,30 +299,49 @@ def _stage_assemble(args: argparse.Namespace) -> None:
     for name in ("playground_dump", "meta_dir", "project_dump"):
         p = getattr(args, name)
         if p is not None and not p.exists():
-            raise SystemExit(f"error: --{name.replace('_', '-')} not found: {p}")
+            raise SystemExit(
+                f"error: --{name.replace('_', '-')} not found: {p}"
+            )
     print(f"  deeppeek-source: {args.deeppeek_source}", file=sys.stderr)
     print(f"  target:          {args.target}", file=sys.stderr)
 
 
-# ---------------------------------------------------------------------------
-# Stage 2 — generate
-# ---------------------------------------------------------------------------
+def _stage_generate(args: argparse.Namespace
+                     ) -> tuple[_Inputs, Optional[str]]:
+    if args.workspace is None:
+        ws = Path(tempfile.mkdtemp(prefix="deeppeek_evolve_"))
+    else:
+        ws = args.workspace.resolve()
+        ws.mkdir(parents=True, exist_ok=True)
 
-def _stage_generate(args: argparse.Namespace) -> _Artefacts:
-    ws = args.workspace
-    ws.mkdir(parents=True, exist_ok=True)
+    try:
+        ws_in_source = ws.is_relative_to(args.deeppeek_source.resolve())
+    except (ValueError, OSError):
+        ws_in_source = False
+    if ws_in_source:
+        print(
+            f"    warning: workspace {ws} is INSIDE --deeppeek-source.  "
+            f"dump.py -r will include the workspace's own files in the "
+            f"project dump.  Use a path outside the source tree, or "
+            f"omit --workspace to get a /tmp default.",
+            file=sys.stderr,
+        )
+
     print(f"[generate] workspace: {ws}", file=sys.stderr)
+    print(f"  (kept after run for inspection; rm -rf {ws} when done)",
+          file=sys.stderr)
     prefix = _deeppeek_cmd()
 
+    # ---- 1. conversation ----
     capture_cmd: Optional[str] = None
     if args.conversation is not None:
-        conversation = args.conversation
-        gen_conv = f"provided by user via --conversation ({conversation})"
-        print(f"  conversation: using {conversation}", file=sys.stderr)
+        conversation_path = args.conversation.resolve()
+        gen_conv = f"provided via --conversation ({conversation_path})"
+        print(f"  conversation: using {conversation_path}", file=sys.stderr)
     else:
-        conversation = ws / "conversation.md"
+        conversation_path = ws / "conversation.md"
         cmd = prefix + [
-            "capture", "-o", str(conversation),
+            "capture", "-o", str(conversation_path),
             "--last", str(args.last),
             "--watch",
             "--timeout", str(args.capture_timeout),
@@ -433,230 +351,148 @@ def _stage_generate(args: argparse.Namespace) -> _Artefacts:
                  allow_failure=False)
         gen_conv = f"`{' '.join(cmd)}`"
         capture_cmd = " ".join(cmd)
-    if not conversation.exists():
+    if not conversation_path.exists():
         raise SystemExit(
-            f"error: conversation file not produced: {conversation}"
+            f"error: conversation file not produced: {conversation_path}"
         )
 
+    # ---- 2. initial recover ----
     recover_rc: Optional[int] = None
-    recover_cmd_str = (
-        f"deeppeek recover {conversation} --apply-to {args.target}"
-    )
     if args.skip_recover:
         print("  recover: SKIPPED via --skip-recover", file=sys.stderr)
     else:
         print("  recover: attempting (this is expected to fail)",
               file=sys.stderr)
         cmd = prefix + [
-            "recover", str(conversation),
+            "recover", str(conversation_path),
             "--apply-to", str(args.target),
         ]
         recover_rc, _, _ = _run_cmd(
             cmd, timeout=args.recover_timeout, allow_failure=True,
         )
 
+    # ---- 3. meta ----
     if args.meta_dir is not None:
-        meta_dir = args.meta_dir
-        gen_meta = "provided by user via --meta-dir"
-        print(f"  meta: using {meta_dir}", file=sys.stderr)
+        meta_path = args.meta_dir.resolve()
+        gen_meta = f"provided via --meta-dir ({meta_path})"
     else:
-        meta_dir = ws / "meta"
-        meta_dir.mkdir(parents=True, exist_ok=True)
-        copied_from = _collect_meta(args.target, meta_dir)
+        meta_path = args.target / "deeppeek"
+        if not meta_path.is_dir():
+            meta_path = args.target / ".deeppeek"
         if recover_rc is not None:
             gen_meta = (
-                f"side-effect of `{recover_cmd_str}` "
-                f"(exit code {recover_rc})"
+                f"side-effect of `deeppeek recover {conversation_path} "
+                f"--apply-to {args.target}` (exit code {recover_rc})"
             )
-            if copied_from:
-                gen_meta += f", collected from {copied_from}"
         else:
             gen_meta = f"pre-existing state of {args.target}"
-        print(f"  meta: {meta_dir} ({copied_from or 'empty'})",
-              file=sys.stderr)
+    meta_paths = [p for p, _ in _iter_text_files(meta_path)]
+    print(f"  meta: {len(meta_paths)} file(s) from {meta_path}",
+          file=sys.stderr)
+    if not meta_paths and args.meta_dir is None:
+        print(
+            f"    warning: no metadata files under {meta_path}.  Did "
+            f"recover write its reports elsewhere?  Continuing without "
+            f"attachment 3.",
+            file=sys.stderr,
+        )
 
+    # ---- 4. playground dump (post-recover state of target) ----
     if args.playground_dump is not None:
-        playground_dump = args.playground_dump
-        gen_playground = "provided by user via --playground-dump"
-        print(f"  playground: using {playground_dump}", file=sys.stderr)
+        playground_path = args.playground_dump.resolve()
+        gen_playground = (
+            f"provided via --playground-dump ({playground_path})"
+        )
+        print(f"  playground: using {playground_path}", file=sys.stderr)
     else:
-        playground_dump = ws / "playground_dump.md"
-        print(f"  playground: scanning {args.target}", file=sys.stderr)
-        _generate_directory_dump(args.target, playground_dump)
-        gen_playground = f"directory scan of {args.target}"
+        playground_path = ws / f"project_dump_{args.target.name}.md"
+        print(f"  playground: dump.py -r in {args.target}", file=sys.stderr)
+        _dump_to_path(
+            args.target, playground_path,
+            args.dump_py_timeout, dump_py=args.dump_py,
+        )
+        gen_playground = (
+            f"`dump.py -r` in {args.target} "
+            f"(output: {playground_path.name})"
+        )
 
+    # ---- 5. project dump (deeppeek source) ----
     if args.project_dump is not None:
-        project_dump = args.project_dump
-        gen_project_dump = "provided by user via --project-dump"
-        print(f"  project-dump: using {project_dump}", file=sys.stderr)
+        project_path = args.project_dump.resolve()
+        gen_project_dump = (
+            f"provided via --project-dump ({project_path})"
+        )
+        print(f"  project-dump: using {project_path}", file=sys.stderr)
     else:
-        project_dump = ws / "project_dump_deeppeek.md"
-        print(f"  project-dump: running `dump_py -r` in "
-              f"{args.deeppeek_source}", file=sys.stderr)
-        _generate_project_dump_with_dump_py(
-            args.deeppeek_source, project_dump, args.dump_py_timeout,
+        project_path = ws / f"project_dump_{args.deeppeek_source.name}.md"
+        print(f"  project-dump: dump.py -r in {args.deeppeek_source}",
+              file=sys.stderr)
+        _dump_to_path(
+            args.deeppeek_source, project_path,
+            args.dump_py_timeout, dump_py=args.dump_py,
         )
         gen_project_dump = (
-            f"`bash -ic 'dump_py -r'` run with cwd={args.deeppeek_source}"
+            f"`dump.py -r` in {args.deeppeek_source} "
+            f"(output: {project_path.name})"
         )
 
-    prompt = _build_prompt(
-        conversation=conversation,
-        target=args.target,
-        meta=meta_dir,
-        playground_dump=playground_dump,
-        project_dump=project_dump,
-        capture_cmd=capture_cmd,
-    )
-    print(f"  prompt: built ({len(prompt):,} chars)", file=sys.stderr)
-
-    return _Artefacts(
-        conversation=conversation,
-        playground_dump=playground_dump,
-        meta_dir=meta_dir,
-        project_dump=project_dump,
-        prompt=prompt,
+    inputs = _Inputs(
+        conversation_path=conversation_path,
+        target_path=args.target,
+        meta_path=meta_path,
+        meta_paths=meta_paths,
+        playground_path=playground_path,
+        project_path=project_path,
         gen_conversation=gen_conv,
         gen_playground=gen_playground,
         gen_meta=gen_meta,
         gen_project_dump=gen_project_dump,
     )
+    return inputs, capture_cmd
 
 
-# ---------------------------------------------------------------------------
-# Stage 3 — compose
-# ---------------------------------------------------------------------------
-
-def _emit_prompt_section(lines: list[str], title: str,
-                         gen_method: str, prompt: str) -> None:
-    lines += [
-        f"## {title}", "",
-        f"**Generation method:** {gen_method}", "",
-        prompt.rstrip(), "",
-    ]
-
-
-def _emit_file_section(lines: list[str], title: str,
-                       gen_method: str, path: Path,
-                       is_dir: bool = False) -> None:
-    lines += [
-        f"## {title}", "",
-        f"**Generation method:** {gen_method}", "",
-        f"**Path:** `{path}`", "",
-    ]
-    if is_dir and path.is_dir():
-        lines += ["Directory. Contents below, one subsection per file.", ""]
-        count = 0
-        for file_path, rel in _walk_text_files(path):
-            try:
-                content = file_path.read_text(encoding="utf-8")
-            except (UnicodeDecodeError, OSError) as e:
-                lines += [f"### `{rel}`", "", f"<unreadable: {e}>", ""]
-                continue
-            count += 1
-            lines += [f"### `{rel}`", ""]
-            _emit_fenced(lines, content)
-        if count == 0:
-            lines += ["<no readable text files>", ""]
-        return
+def _stage_type(prompt: str, args: argparse.Namespace) -> int:
+    fd, path = tempfile.mkstemp(
+        prefix="deeppeek_evolve_", suffix=".md",
+    )
     try:
-        content = path.read_text(encoding="utf-8")
-    except (UnicodeDecodeError, OSError) as e:
-        lines += [f"<unreadable: {e}>", ""]
-        return
-    _emit_fenced(lines, content)
-
-
-def _stage_compose(arts: _Artefacts, out: Path) -> Path:
-    print(f"[compose] writing bundle -> {out}", file=sys.stderr)
-
-    index = [
-        ("[0] Task prompt",
-         "dynamically built by `_build_prompt` in `prompts/evolve.py` "
-         "from the resolved paths of this run"),
-        ("[1] 1. Extracted conversation Markdown",
-         arts.gen_conversation),
-        ("[2] 2. Target code-playground dump",
-         arts.gen_playground),
-        ("[3] 3. deeppeek meta artifacts",
-         arts.gen_meta),
-        ("[4] 4. project_dump_deeppeek.md",
-         arts.gen_project_dump),
-    ]
-
-    lines: list[str] = [
-        "# deeppeek prompt evolve — payload bundle", "",
-        (f"_Generated "
-         f"{datetime.now(timezone.utc).isoformat(timespec='seconds')}_"),
-        "",
-        ("Each entry below is prefixed with the command or tool that "
-         "produced it, so the recipient can reason about provenance "
-         "as well as content.  Entry 0 is the task prompt; entries "
-         "1+ are the inputs it references."),
-        "",
-        "## Payload index", "",
-    ]
-    for header, method in index:
-        lines.append(f"- **{header}**")
-        lines.append(f"  — {method}")
-    lines += ["", "---", ""]
-
-    _emit_prompt_section(
-        lines, "[0] Task prompt",
-        index[0][1], arts.prompt,
-    )
-    _emit_file_section(
-        lines, "[1] 1. Extracted conversation Markdown",
-        arts.gen_conversation, arts.conversation,
-    )
-    _emit_file_section(
-        lines, "[2] 2. Target code-playground dump",
-        arts.gen_playground, arts.playground_dump,
-    )
-    _emit_file_section(
-        lines, "[3] 3. deeppeek meta artifacts",
-        arts.gen_meta, arts.meta_dir, is_dir=True,
-    )
-    _emit_file_section(
-        lines, "[4] 4. project_dump_deeppeek.md",
-        arts.gen_project_dump, arts.project_dump,
-    )
-
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text("\n".join(lines), encoding="utf-8")
-    size = out.stat().st_size
-    print(f"  {size:,} bytes, {len(index)} entries", file=sys.stderr)
-    if size > 400_000:
-        print(
-            "  warning: bundle is >400 KiB.  DeepSeek may truncate it. "
-            "Consider limiting --target or --deeppeek-source.",
-            file=sys.stderr,
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(prompt)
+        print(f"[type] {len(prompt):,} chars via `deeppeek type`",
+              file=sys.stderr)
+        prefix = _deeppeek_cmd()
+        rc, _, _ = _run_cmd(
+            prefix + ["type", path],
+            timeout=args.type_timeout,
+            allow_failure=False,
         )
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Stage 4 — dispatch (via `deeppeek type` + `deeppeek enter`)
-# ---------------------------------------------------------------------------
-
-def _stage_dispatch(bundle_path: Path, args: argparse.Namespace) -> int:
-    prefix = _deeppeek_cmd()
-
-    print(f"[dispatch] typing {bundle_path.name} "
-          f"({bundle_path.stat().st_size:,} bytes)", file=sys.stderr)
-    rc, _, _ = _run_cmd(
-        prefix + ["type", str(bundle_path)],
-        timeout=args.dispatch_timeout,
-        allow_failure=False,
-    )
-    if rc != 0:
-        print(f"[dispatch] type failed (exit {rc})", file=sys.stderr)
         return rc
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
-    print("[dispatch] pressing Enter", file=sys.stderr)
+
+def _stage_pipe(inputs: _Inputs, args: argparse.Namespace) -> int:
+    files = [
+        inputs.conversation_path,
+        inputs.playground_path,
+        *inputs.meta_paths,
+        inputs.project_path,
+    ]
+    files = [f for f in files if f.exists()]
+    if not files:
+        print("[pipe] no files to attach", file=sys.stderr)
+        return 0
+
+    prefix = _deeppeek_cmd()
+    print(f"[pipe] attaching {len(files)} file(s):", file=sys.stderr)
+    for f in files:
+        print(f"  {f}  ({f.stat().st_size:,} bytes)", file=sys.stderr)
     rc, _, _ = _run_cmd(
-        prefix + ["enter"],
-        timeout=args.dispatch_timeout,
+        prefix + ["pipe"] + [str(f) for f in files],
+        timeout=args.pipe_timeout,
         allow_failure=False,
     )
     return rc
@@ -667,18 +503,53 @@ def _stage_dispatch(bundle_path: Path, args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def run(args: argparse.Namespace) -> int:
+    # Infer deeppeek-source; no flag, no configuration needed.
+    inferred = _infer_deeppeek_source()
+    if inferred is None:
+        raise SystemExit(
+            "error: could not infer the deeppeek source tree "
+            "(no pyproject.toml + src/deeppeek/ near the package or "
+            "in the current directory).\n"
+            "  Run from a deeppeek checkout, or install deeppeek "
+            "editable:\n"
+            "    pipx install --editable /path/to/deeppeek --force"
+        )
+    args.deeppeek_source = inferred
+    print(f"[inferred] deeppeek-source: {args.deeppeek_source}",
+          file=sys.stderr)
+
     _stage_assemble(args)
-    arts = _stage_generate(args)
-    bundle = _stage_compose(
-        arts, args.bundle_out or (args.workspace / "bundle.md"),
-    )
+    inputs, capture_cmd = _stage_generate(args)
+    prompt = _build_prompt(inputs, capture_cmd)
+    print(f"[build] prompt: {len(prompt):,} chars", file=sys.stderr)
 
     if args.dry_run:
-        print("\n[dry-run] stopping after compose.", file=sys.stderr)
-        print(f"  bundle: {bundle}", file=sys.stderr)
+        print("\n[dry-run] prompt below; not typed.", file=sys.stderr)
+        print(prompt)
+        if not args.no_pipe:
+            pipe_files = [
+                inputs.conversation_path,
+                inputs.playground_path,
+                *inputs.meta_paths,
+                inputs.project_path,
+            ]
+            pipe_files = [f for f in pipe_files if f.exists()]
+            print(f"\n[dry-run] would attach {len(pipe_files)} "
+                  f"file(s):", file=sys.stderr)
+            for f in pipe_files:
+                print(f"  {f}  ({f.stat().st_size:,} bytes)",
+                      file=sys.stderr)
         return 0
 
-    return _stage_dispatch(bundle, args)
+    rc = _stage_type(prompt, args)
+    if rc != 0:
+        return rc
+
+    if args.no_pipe:
+        print("\n[--no-pipe] skipping attachments", file=sys.stderr)
+        return 0
+
+    return _stage_pipe(inputs, args)
 
 
 # ---------------------------------------------------------------------------
@@ -688,23 +559,19 @@ def run(args: argparse.Namespace) -> int:
 def register(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "evolve",
-        help="Craft a task prompt + attachments and send them to DeepSeek",
+        help="Craft a task prompt, type it, pipe the four inputs",
     )
 
     p.add_argument(
-        "--deeppeek-source", type=Path, required=True,
-        help="the deeppeek source tree — dumped via dump_py -r",
-    )
-    p.add_argument(
         "--target", type=Path, required=True,
-        help="the target project tree the initial `--apply-to` is "
-             "attempted against; use a scratch copy — the tree is mutated",
+        help="target project tree the initial `--apply-to` is attempted "
+             "against; use a scratch copy — the tree is mutated",
     )
 
     p.add_argument(
         "--conversation", type=Path, default=None,
         help="pre-captured conversation Markdown.  Omit to run "
-             "`deeppeek capture --last N --watch` yourself.",
+             "`deeppeek capture --last N --watch`.",
     )
     p.add_argument(
         "--last", type=int, default=3, metavar="N",
@@ -712,56 +579,62 @@ def register(sub: argparse._SubParsersAction) -> None:
     )
 
     p.add_argument(
-        "--workspace", type=Path,
-        default=Path("./deeppeek_evolve_workspace"),
-        help="where generated artefacts go "
-             "(default: ./deeppeek_evolve_workspace)",
-    )
-    p.add_argument(
-        "--bundle-out", type=Path, default=None,
-        help="where to write the composed bundle "
-             "(default: <workspace>/bundle.md)",
+        "--workspace", type=Path, default=None,
+        help="directory for generated artefacts (conversation capture, "
+             "both dumps).  Default: a fresh temp dir in /tmp.  Do NOT "
+             "point this inside the deeppeek source tree.",
     )
     p.add_argument(
         "--playground-dump", type=Path, default=None,
-        help="skip the target scan; use this file",
+        help="skip the target dump; use this file",
     )
     p.add_argument(
         "--meta-dir", type=Path, default=None,
-        help="skip the meta collection; use this directory",
+        help="skip reading <target>/deeppeek; use this directory",
     )
     p.add_argument(
         "--project-dump", type=Path, default=None,
-        help="skip the deeppeek-source scan; use this file",
+        help="skip the deeppeek-source dump; use this file",
     )
     p.add_argument(
         "--skip-recover", action="store_true",
-        help="don't run the initial `recover --apply-to`; assume "
-             "--target is already in post-recover state",
+        help="don't run the initial `recover --apply-to`",
+    )
+    p.add_argument(
+        "--no-pipe", action="store_true",
+        help="type the prompt but don't attach the input files",
     )
 
+    p.add_argument(
+        "--dump-py", type=Path, default=None,
+        help=f"override the dump.py script path "
+             f"(default: {_DUMP_PY_SCRIPT}).  Must support `-r -o PATH`.",
+    )
+    p.add_argument(
+        "--dump-py-timeout", type=float, default=300.0,
+        help="seconds for each `dump.py -r` call (default: 300)",
+    )
     p.add_argument(
         "--capture-timeout", type=float, default=300.0,
         help="seconds for `deeppeek capture --watch` (default: 300)",
     )
     p.add_argument(
         "--recover-timeout", type=float, default=1800.0,
-        help="seconds for the initial `recover --apply-to` "
-             "(default: 1800)",
+        help="seconds for the initial `recover --apply-to` (default: 1800)",
     )
     p.add_argument(
-        "--dispatch-timeout", type=float, default=600.0,
-        help="seconds for `deeppeek type` and `deeppeek enter` "
-             "(default: 600)",
+        "--type-timeout", type=float, default=600.0,
+        help="seconds for `deeppeek type` (default: 600)",
     )
     p.add_argument(
-        "--dump-py-timeout", type=float, default=300.0,
-        help="seconds for `dump_py -r` (default: 300)",
+        "--pipe-timeout", type=float, default=180.0,
+        help="seconds for `deeppeek pipe` (default: 180)",
     )
 
     p.add_argument(
         "--dry-run", action="store_true",
-        help="stop after composing the bundle",
+        help="print the prompt and would-attach list to stdout and stop "
+             "(no type, no pipe)",
     )
 
     p.set_defaults(func=run)
