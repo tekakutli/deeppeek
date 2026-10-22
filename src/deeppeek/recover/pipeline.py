@@ -8,7 +8,29 @@ Output is either the standard `out_dir` layout (files/,
 files_low_trust/, reports beside them) or — when `apply_to` is set —
 an in-place apply against an existing directory: recovered files go
 directly into apply_to, files marked [DEL] are deleted from it, and
-all reports are written beside them.
+all reports are written into `apply_to/deeppeek/`.
+
+REPORTS DIRECTORY (--apply-to only)
+===================================
+`apply_to/deeppeek/` is a VISIBLE directory created on every run:
+
+    deeppeek/
+    ├── warnings.txt
+    ├── manifest.json
+    ├── deleted.txt
+    ├── MISSING_FILES.txt
+    ├── low_trust/          (--min-trust filtered files)
+    └── cache/llm/          (LLM prompt cache — preserved across runs)
+
+The directory is wiped at the start of every `--apply-to` run so
+reports from a previous invocation never linger.  The one exception
+is `cache/` — the LLM cache is expensive to rebuild and useless to
+drop.  The wipe is in `_wipe_deeppeek_dir` below.
+
+(An older version of this tool used `.deeppeek/`, a hidden dir.  Any
+leftover `.deeppeek/` from a previous install is excluded from the
+pre-existing scan and the DEL-marker scan, but is not auto-deleted;
+clean it up manually if you care.)
 
 LAYOUT (derived, not user-set)
 ==============================
@@ -17,7 +39,7 @@ The effective output layout is derived:
     --apply-to set   → "header"   (preserve the target tree)
     neither          → "flat"     (basenames only)
 
-PREE-XISTING BASELINES + PATH RESOLUTION (--apply-to only)
+PRE-EXISTING BASELINES + PATH RESOLUTION (--apply-to only)
 ==========================================================
 When `--apply-to DIR` is set:
 
@@ -27,17 +49,9 @@ When `--apply-to DIR` is set:
 
   2. `resolve_paths` (in `recover.resolve`) then walks the
      conversation blocks and tries to match each `header_path`
-     against the pre-existing file index.  It handles the case the
-     user actually sees: the conversation uses "recover/pipeline.py"
-     in one message, "pipeline.py" in another, and
-     "tests/recover/test_recover.py" in a third — the resolver
-     recognises all three as pointing to specific real files.  When
-     two pre-existing files share a basename (multiple `__init__.py`,
-     multiple `pipeline.py` in different subpackages), the resolver
-     scores candidates by content similarity and context hints, and
-     commits only when a clear winner exists.
+     against the pre-existing file index.
 
-  3. `pass3_group` then groups records by `output_path`, so a
+  3. `pass3_group` groups records by `output_path`, so a
      conversation block and its matching pre-existing baseline end
      up in the same FileRecord.
 
@@ -46,6 +60,7 @@ When `--apply-to DIR` is set:
      the conversation didn't touch are left alone.
 """
 import hashlib
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
@@ -118,6 +133,42 @@ def _validate_apply_to(cfg: RecoverConfig) -> Optional[int]:
     return None
 
 
+def _wipe_deeppeek_dir(aux_base: Path) -> None:
+    """Empty the reports directory, preserving `cache/`.
+
+    Called at the start of every `--apply-to` run.  The intent is
+    that `deeppeek/` always reflects the MOST RECENT run — no stale
+    manifest, no yesterday's warnings.txt, no low_trust file for a
+    record that no longer applies.
+
+    The `cache/` subdirectory is deliberately preserved: the LLM
+    prompt cache is meant to be reused across runs (identical prompts
+    produce identical responses, and re-requesting them costs real
+    time).  Deleting it every run would defeat its purpose.
+
+    If the user wants a full wipe including cache, they can pass
+    `--cache-dir` to move the cache elsewhere, or delete
+    `deeppeek/cache/` manually.  Making that the default would be
+    surprising for the (larger) audience that expects the cache to
+    persist.
+
+    Failures to unlink individual files are best-effort: a stale
+    file we can't remove does not block the current run.
+    """
+    if not aux_base.exists():
+        return
+    for child in aux_base.iterdir():
+        if child.name == "cache":
+            continue
+        try:
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Pre-existing baseline loader
 # ---------------------------------------------------------------------------
@@ -125,6 +176,13 @@ def _validate_apply_to(cfg: RecoverConfig) -> Optional[int]:
 _PREEXISTING_EXCLUDE_DIRS = {
     "node_modules", "__pycache__", "dist", "build", "target",
     "venv", ".venv", ".tox", ".nox", ".git",
+    # NEW (2026-10-31): our own reports directory is never a
+    # source of pre-existing baselines.  Its JSON files (manifest,
+    # LLM cache) would otherwise be treated as user source files.
+    # ".deeppeek" is kept in the set for backward compatibility with
+    # previous installs that used the hidden dir.
+    "deeppeek",
+    ".deeppeek",
 }
 _PREEXISTING_MAX_FILE_SIZE = 1_048_576  # 1 MiB
 
@@ -137,6 +195,9 @@ def _load_preexisting_blocks(apply_to: Path) -> list[Block]:
     Each block carries its real relative path in both canonical_path
     and output_path — this is the identity used for grouping and the
     target used for writing.
+
+    Directories named in `_PREEXISTING_EXCLUDE_DIRS` (including our
+    own `deeppeek/` reports dir) are skipped at every depth.
     """
     blocks: list[Block] = []
     if not apply_to.is_dir():
@@ -213,7 +274,8 @@ def run(cfg: RecoverConfig) -> int:
         cfg.out_dir.mkdir(parents=True, exist_ok=True)
         aux_base = cfg.out_dir
     else:
-        aux_base = cfg.apply_to / ".deeppeek"
+        aux_base = cfg.apply_to / "deeppeek"
+        _wipe_deeppeek_dir(aux_base)
         aux_base.mkdir(parents=True, exist_ok=True)
 
     llm: Optional[LLMClient] = None
@@ -242,7 +304,9 @@ def run(cfg: RecoverConfig) -> int:
 
     if cfg.apply_to is not None:
         print(f"[startup] apply mode: {cfg.apply_to} "
-              f"(layout={layout})", file=sys.stderr)
+              f"(layout={layout}, reports in "
+              f"{cfg.apply_to / 'deeppeek'})",
+              file=sys.stderr)
     else:
         print(f"[startup] layout: {layout}", file=sys.stderr)
 
@@ -277,7 +341,6 @@ def run(cfg: RecoverConfig) -> int:
           f"other: {n_other}  recovered-meta: {n_meta}"
           + (f"  preexisting: {n_pre_full}" if n_pre_full else ""))
 
-    # ---- NEW: resolve each block's output path ----
     print("[pass 2.5] resolving output paths...")
     resolutions = resolve_paths(blocks, cfg.apply_to, cfg.trace)
     n_resolved = sum(1 for r in resolutions

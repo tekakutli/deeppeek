@@ -4,8 +4,7 @@ recover.write — Pass 9 (write files, manifest, warnings).
 DIFFICULT.  Owns:
 
     FIX [D]   --min-trust-filtered files are written to a shadow
-              `files_low_trust/` directory instead of being silently
-              dropped.
+              directory instead of being silently dropped.
 
     FIX [6]   Per-file skip detail is gated behind --trace (verbose).
 
@@ -33,19 +32,25 @@ DIFFICULT.  Owns:
     NEW (2026-10-27)   Path resolution reporting + recursive
                        deletion.
 
-                       `pass9_write` accepts a `resolutions` list from
-                       `resolve.resolve_paths` and stores it under
-                       `manifest.run.resolutions` — the audit trail of
-                       which conversation header resolved to which
-                       real file, and which could not be resolved.
+    NEW (2026-10-31)   Reports directory move.  In `--apply-to` mode
+                       the four report files (warnings.txt,
+                       manifest.json, deleted.txt, MISSING_FILES.txt)
+                       and the low_trust/ directory now live inside
+                       `apply_to/deeppeek/` (visible) rather than at
+                       the top of `apply_to/`.  The directory is
+                       wiped by `pipeline.run` on each invocation
+                       (preserving `cache/`), so reports never
+                       accumulate across runs.  A leftover
+                       `.deeppeek/` from an older install is
+                       ignored by the pre-existing-baseline scan
+                       and by the DEL-marker recursive search, but
+                       is not auto-deleted.
 
-                       `_apply_deletions` now searches recursively by
-                       basename when `[DEL] name.py` doesn't match a
-                       literal path: if `apply_to.rglob("name.py")`
-                       finds exactly one non-`.deeppeek` file, that's
-                       the deletion target.  Multiple matches are
-                       reported as ambiguous and skipped (safer than
-                       guessing — the user can `git rm` themselves).
+                       In standard mode (`--out`), the layout is
+                       unchanged: reports go directly into out_dir.
+
+    NEW (2026-10-27)   Path resolution reporting + recursive
+                       deletion.
 """
 
 import hashlib
@@ -142,13 +147,17 @@ def _apply_deletions(apply_to: Path,
                 target = c
                 break
 
-        # NEW: recursive basename fallback.  `[DEL] foo.py` should
-        # delete `apply_to/src/foo.py` if that's the only `foo.py`
-        # in the tree.
+        # NEW (2026-10-31): skip our own reports directory when
+        # recursively searching for a basename match.  A `[DEL]
+        # foo.py` marker should never delete a `foo.py` that only
+        # exists inside `deeppeek/low_trust/`; that file is a
+        # produced artefact, not the user's source.  ".deeppeek"
+        # is kept for backward compatibility with older installs.
         if target is None and base:
             matches = [
                 p for p in apply_to.rglob(base)
                 if p.is_file() and p.name == base
+                and "deeppeek" not in p.parts
                 and ".deeppeek" not in p.parts
             ]
             if len(matches) == 1:
@@ -197,9 +206,9 @@ def pass9_write(records: dict[str, FileRecord],
                 verbose: bool = False) -> int:
     if apply_to is not None:
         files_dir = apply_to
-        low_dir = apply_to / ".deeppeek" / "low_trust"
-        aux_dir = apply_to / ".deeppeek"
-        reports_dir = apply_to
+        aux_dir = apply_to / "deeppeek"
+        low_dir = aux_dir / "low_trust"
+        reports_dir = aux_dir
     else:
         files_dir = out_dir / "files"
         low_dir = out_dir / "files_low_trust"
@@ -351,12 +360,12 @@ def pass9_write(records: dict[str, FileRecord],
                 actually_written_low.add(out_name)
                 if apply_to is not None:
                     warnings_lines.append(
-                        f"[{path}] [{rec.trust}] -> .deeppeek/low_trust/")
+                        f"[{path}] [{rec.trust}] -> deeppeek/low_trust/")
                 else:
                     warnings_lines.append(
                         f"[{path}] [{rec.trust}] -> files_low_trust/")
             if verbose:
-                dest = (".deeppeek/low_trust/" if apply_to is not None
+                dest = ("deeppeek/low_trust/" if apply_to is not None
                         else "files_low_trust/")
                 print(f"  SKIPPED {path} ({rec.trust}): {reason} "
                       f"-> {dest}", file=sys.stderr)
@@ -502,6 +511,19 @@ def pass9_write(records: dict[str, FileRecord],
             f"[missing] {len(missing)} file(s) referenced but not recovered "
             f"— see MISSING_FILES.txt")
         exit_code = max(exit_code, 2)
+    else:
+        # The reports directory always contains all four files, so a
+        # consumer can check any of them without first knowing
+        # whether the tool got as far as producing it.  An empty
+        # MISSING_FILES.txt (or one that just says "none") means the
+        # run genuinely had no missing files, not that the file was
+        # skipped.
+        (reports_dir / "MISSING_FILES.txt").write_text(
+            "# No missing files.\n"
+            "# This file is written on every --apply-to run.  An "
+            "empty or all-comment body means the transcript\n"
+            "# did not reference any source file that failed to "
+            "recover.\n")
 
     untouched_files = pre_existing_files - actually_written
     untouched_low = pre_existing_low - actually_written_low
@@ -529,7 +551,7 @@ def pass9_write(records: dict[str, FileRecord],
         for name in sorted(overwritten_files):
             warnings_lines.append(f"  {name}")
         for name in sorted(overwritten_low):
-            warnings_lines.append(f"  .deeppeek/low_trust/{name}")
+            warnings_lines.append(f"  deeppeek/low_trust/{name}")
 
     warnings_text = "\n".join(warnings_lines)
     if warnings_text:
@@ -667,6 +689,7 @@ def pass9_write(records: dict[str, FileRecord],
 
     if apply_to is not None:
         print(f"\nApplied {written_count} file(s) to {files_dir}/")
+        print(f"  reports: {reports_dir}/")
     else:
         print(f"\nWrote {written_count} files to {files_dir}/")
     print(f"  skipped:  {len(skipped)}"

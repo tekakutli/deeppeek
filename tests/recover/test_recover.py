@@ -7,13 +7,7 @@ markdown, no pre-existing tree).
 
 Fixture 07 exercises the `--apply-to` path: the fixture markdown
 carries only patches, and the pre-existing source tree is provided
-by `preexisting/<fixture>/`.  Test 07 additionally uses
-`skip_file_compare=True` so it asserts on SEMANTICS (panelState
-gone, no patch failed, trust HIGH) rather than byte-exact
-whitespace — the deletion path leaves a variable number of
-adjacent blank lines depending on the pre-existing file's exact
-spacing, and over-constraining that would make the test fail on
-correct behaviour.
+by `preexisting/<fixture>/`.
 
 Run:
     python tests/recover/test_recover.py
@@ -74,6 +68,13 @@ def run_recover(fixture: Path, out: Path) -> dict:
 
 
 def run_recover_apply(fixture: Path, apply_to: Path) -> dict:
+    """Run recover in --apply-to mode and load the manifest.
+
+    FIX (2026-10-31): the manifest now lives at
+    `apply_to/deeppeek/manifest.json` rather than at the top of
+    `apply_to/`.  Reports moved into `deeppeek/` so a stale manifest
+    from a previous run can never be mistaken for this run's output.
+    """
     cmd = [
         sys.executable, "-m", "deeppeek", "recover", str(fixture),
         "--apply-to", str(apply_to),
@@ -81,7 +82,7 @@ def run_recover_apply(fixture: Path, apply_to: Path) -> dict:
         "--min-trust", "LOW",
     ]
     result = _run(cmd)
-    manifest_path = apply_to / "manifest.json"
+    manifest_path = apply_to / "deeppeek" / "manifest.json"
     manifest = {}
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
@@ -317,6 +318,17 @@ def test_07():
             f"sample.js: return 99 (alsoKeepMe body) missing.  "
             f"Full content:\n{content}"
         )
+
+        # NEW (2026-10-31): reports live in deeppeek/.
+        reports_dir = target / "deeppeek"
+        assert reports_dir.is_dir(), (
+            f"sample.js: expected {reports_dir} to be created"
+        )
+        for name in ("manifest.json", "warnings.txt",
+                     "deleted.txt", "MISSING_FILES.txt"):
+            assert (reports_dir / name).is_file(), (
+                f"expected deeppeek/{name} to exist"
+            )
 
     check_apply("07_deletion_shapes", extra, skip_file_compare=True)
 
