@@ -15,23 +15,37 @@ DIFFICULT.  Owns:
 
     FIX [E]   MISSING_FILES.txt double-filtered (extension + prefix).
 
-    NEW (2026-10-21)   Basename-collision detection (flat layout).
+    NEW (2026-10-21)   Basename-collision detection.
 
     NEW (2026-10-21b)  Unique-missing-modules summary line.
 
     NEW (2026-10-22)   Pre-existing file preservation report.
 
-    NEW (2026-10-23)   Manifest accepts dump_display/dump_size so the
-                       pipeline can be fed by an in-memory string.
+    NEW (2026-10-23)   Manifest accepts dump_display/dump_size.
 
-    NEW (2026-10-24)   --apply-to mode: recovered files go directly
-                       into an existing directory; files marked [DEL]
-                       are actually deleted there; low-trust files go
-                       to <apply_to>/.deeppeek/low_trust/; reports go
-                       to <apply_to>/ (preserved-files listing is
-                       suppressed because the target tree has its own
-                       unrelated files, and the deleted.txt report is
-                       annotated with which deletions were applied).
+    NEW (2026-10-24)   --apply-to mode.
+
+    NEW (2026-10-25)   Preexisting-baseline skip.
+
+    NEW (2026-10-26)   Layout simplification (--layout / --remap
+                       removed).
+
+    NEW (2026-10-27)   Path resolution reporting + recursive
+                       deletion.
+
+                       `pass9_write` accepts a `resolutions` list from
+                       `resolve.resolve_paths` and stores it under
+                       `manifest.run.resolutions` — the audit trail of
+                       which conversation header resolved to which
+                       real file, and which could not be resolved.
+
+                       `_apply_deletions` now searches recursively by
+                       basename when `[DEL] name.py` doesn't match a
+                       literal path: if `apply_to.rglob("name.py")`
+                       finds exactly one non-`.deeppeek` file, that's
+                       the deletion target.  Multiple matches are
+                       reported as ambiguous and skipped (safer than
+                       guessing — the user can `git rm` themselves).
 """
 
 import hashlib
@@ -113,29 +127,41 @@ def _recovered_extensions(records: dict[str, FileRecord]) -> set[str]:
 def _apply_deletions(apply_to: Path,
                      all_deleted: list[str],
                      warnings_lines: list[str]) -> tuple[list[str], list[str]]:
-    """Remove files marked [DEL] from `apply_to`.
-
-    Returns (applied, missing) — applied lists names that were actually
-    deleted, missing lists names that were marked deleted but weren't
-    present (either already gone from a prior run, or never existed).
-
-    Tries the basename first (flat layout compat) and then the literal
-    path (header layout compat).
-    """
     applied: list[str] = []
     missing: list[str] = []
     for name in all_deleted:
         base = os.path.basename(name)
         candidates = []
         if base and base != name:
-            candidates.append(apply_to / base)     # flat: foo.py
-        candidates.append(apply_to / name)         # header: sub/foo.py
+            candidates.append(apply_to / base)
+        candidates.append(apply_to / name)
 
         target = None
         for c in candidates:
             if c.exists() and c.is_file():
                 target = c
                 break
+
+        # NEW: recursive basename fallback.  `[DEL] foo.py` should
+        # delete `apply_to/src/foo.py` if that's the only `foo.py`
+        # in the tree.
+        if target is None and base:
+            matches = [
+                p for p in apply_to.rglob(base)
+                if p.is_file() and p.name == base
+                and ".deeppeek" not in p.parts
+            ]
+            if len(matches) == 1:
+                target = matches[0]
+            elif len(matches) > 1:
+                rel_matches = [
+                    m.relative_to(apply_to).as_posix() for m in matches
+                ]
+                warnings_lines.append(
+                    f"[{name}] [AMBIGUOUS] {len(matches)} files match "
+                    f"basename ({rel_matches}); not deleted")
+                missing.append(name)
+                continue
 
         if target is None:
             missing.append(name)
@@ -158,7 +184,6 @@ def pass9_write(records: dict[str, FileRecord],
                 deleted_files: list[str],
                 out_dir: Path,
                 layout: str,
-                remap: dict[str, str],
                 min_trust: str,
                 dump_display: str,
                 dump_size: int,
@@ -168,8 +193,8 @@ def pass9_write(records: dict[str, FileRecord],
                 llm_mode: str,
                 cross_validate: dict,
                 apply_to: Optional[Path] = None,
+                resolutions: Optional[list[dict]] = None,
                 verbose: bool = False) -> int:
-    # ---- resolve output layout ------------------------------------
     if apply_to is not None:
         files_dir = apply_to
         low_dir = apply_to / ".deeppeek" / "low_trust"
@@ -204,41 +229,16 @@ def pass9_write(records: dict[str, FileRecord],
     written_out_names: dict[str, str] = {}
     actually_written: set[str] = set()
     actually_written_low: set[str] = set()
+    preexisting_skipped_count = 0
 
     for path, rec in sorted(records.items()):
         if layout == "flat":
             out_name = os.path.basename(path)
-        elif layout == "header":
+        else:  # "header"
             out_name = path
-        else:
-            out_name = path
-            for old, new in remap.items():
-                if out_name.startswith(old):
-                    out_name = new + out_name[len(old):]
-                    break
 
-        if out_name in written_out_names:
-            prev_src = written_out_names[out_name]
-            reason = (
-                f"basename collision with {prev_src!r} "
-                f"(layout={layout})"
-            )
-            warnings_lines.append(
-                f"[{path}] [ERROR] {reason}; not written")
-            skipped.append({
-                "path": path,
-                "state": rec.state,
-                "reason": reason,
-                "source_blocks": rec.source_blocks,
-                "warnings": rec.warnings,
-                "verification": rec.verification,
-            })
-            if verbose:
-                print(f"  SKIPPED {path} (collision): {reason}",
-                      file=sys.stderr)
-            exit_code = max(exit_code, 2)
-            continue
-        written_out_names[out_name] = path
+        for w in rec.warnings:
+            warnings_lines.append(f"[{path}] [WARN] {w}")
 
         if rec.is_deleted:
             warnings_lines.append(
@@ -280,6 +280,54 @@ def pass9_write(records: dict[str, FileRecord],
             exit_code = max(exit_code, 2)
             continue
 
+        preexisting_unmodified = (
+            rec.preexisting_base
+            and not any(
+                p.get("applied_by") in ("deterministic", "llm")
+                for p in rec.patches
+            )
+        )
+        if preexisting_unmodified:
+            reason = ("pre-existing file with no conversation "
+                      "changes; left as-is")
+            warnings_lines.append(f"[{path}] [PREEXISTING] {reason}")
+            skipped.append({
+                "path": path,
+                "state": rec.state,
+                "reason": reason,
+                "source_blocks": rec.source_blocks,
+                "warnings": rec.warnings,
+                "verification": rec.verification,
+            })
+            if verbose:
+                print(f"  SKIPPED {path} (preexisting): {reason}",
+                      file=sys.stderr)
+            preexisting_skipped_count += 1
+            continue
+
+        if out_name in written_out_names:
+            prev_src = written_out_names[out_name]
+            reason = (
+                f"basename collision with {prev_src!r} "
+                f"(layout={layout})"
+            )
+            warnings_lines.append(
+                f"[{path}] [ERROR] {reason}; not written")
+            skipped.append({
+                "path": path,
+                "state": rec.state,
+                "reason": reason,
+                "source_blocks": rec.source_blocks,
+                "warnings": rec.warnings,
+                "verification": rec.verification,
+            })
+            if verbose:
+                print(f"  SKIPPED {path} (collision): {reason}",
+                      file=sys.stderr)
+            exit_code = max(exit_code, 2)
+            continue
+        written_out_names[out_name] = path
+
         if trust_rank.get(rec.trust, 0) < min_rank:
             reason = f"trust={rec.trust} below --min-trust {min_trust}"
             warnings_lines.append(
@@ -320,9 +368,6 @@ def pass9_write(records: dict[str, FileRecord],
         if rec.trust == "LOW":
             exit_code = max(exit_code, 1)
 
-        for w in rec.warnings:
-            warnings_lines.append(f"[{path}] [WARN] {w}")
-
         target = files_dir / out_name
         target.parent.mkdir(parents=True, exist_ok=True)
         content = rec.content
@@ -332,9 +377,6 @@ def pass9_write(records: dict[str, FileRecord],
         actually_written.add(out_name)
 
         sha = hashlib.sha256(content.encode()).hexdigest()
-        # Relative path in manifest — always relative to the directory
-        # that actually holds the recovered tree (out_dir in standard
-        # mode, apply_to in apply mode).
         manifest_base = apply_to if apply_to is not None else out_dir
         try:
             rel_path = str(target.relative_to(manifest_base))
@@ -354,6 +396,7 @@ def pass9_write(records: dict[str, FileRecord],
             "is_new": rec.is_new,
             "is_deleted": False,
             "trust": rec.trust,
+            "preexisting_base": rec.preexisting_base,
             "output_path": rel_path,
             "line_count": content.count("\n"),
             "sha256": sha,
@@ -361,7 +404,6 @@ def pass9_write(records: dict[str, FileRecord],
         }
         written_count += 1
 
-    # ---- deletions ------------------------------------------------
     deleted_from_records = {p for p, r in records.items() if r.is_deleted}
     all_deleted = sorted(set(deleted_files) | deleted_from_records)
 
@@ -394,7 +436,6 @@ def pass9_write(records: dict[str, FileRecord],
     (reports_dir / "deleted.txt").write_text(
         "\n".join(deleted_lines) + "\n")
 
-    # ---- graph warnings -------------------------------------------
     for gp in cross_validate.get("problems", []):
         if gp["type"] == "missing_module":
             warnings_lines.append(
@@ -417,7 +458,6 @@ def pass9_write(records: dict[str, FileRecord],
             f"could not be attributed to any file "
             f"(lang={b.fence_lang}, {b.body_line_count} lines)")
 
-    # ---- MISSING_FILES.txt ---------------------------------------
     mentioned = _scan_mentioned_files(dump_text)
 
     recovered_exts = _recovered_extensions(records)
@@ -463,16 +503,11 @@ def pass9_write(records: dict[str, FileRecord],
             f"— see MISSING_FILES.txt")
         exit_code = max(exit_code, 2)
 
-    # ---- preservation / overwrite report -------------------------
     untouched_files = pre_existing_files - actually_written
     untouched_low = pre_existing_low - actually_written_low
     overwritten_files = pre_existing_files & actually_written
     overwritten_low = pre_existing_low & actually_written_low
 
-    # In apply mode, the target tree may have hundreds of unrelated
-    # files.  Listing them all in warnings.txt is noise; the count is
-    # enough.  In standard mode, listing them is useful (they're
-    # residue from previous runs that should probably be cleaned up).
     if untouched_files or untouched_low:
         total = len(untouched_files) + len(untouched_low)
         warnings_lines.append(
@@ -501,7 +536,6 @@ def pass9_write(records: dict[str, FileRecord],
         warnings_text += "\n"
     (reports_dir / "warnings.txt").write_text(warnings_text)
 
-    # ---- manifest ------------------------------------------------
     escalations = []
     for b in blocks:
         if b.escalation_reason is None:
@@ -520,6 +554,7 @@ def pass9_write(records: dict[str, FileRecord],
 
     by_heuristic = sum(1 for b in blocks if b.classified_by == "heuristic")
     by_llm = sum(1 for b in blocks if b.classified_by == "llm")
+    by_preexisting = sum(1 for b in blocks if b.classified_by == "preexisting")
     escalated = sum(1 for b in blocks if b.escalation_reason is not None)
     overridden = sum(1 for b in blocks if b.override_reason is not None)
     orphans_attributed = sum(
@@ -533,6 +568,7 @@ def pass9_write(records: dict[str, FileRecord],
             "chosen_full_idx": rec.chosen_full_idx,
             "chosen_by": rec.dedup_reason,
             "trust": rec.trust,
+            "preexisting_base": rec.preexisting_base,
             "written": path in written,
             "patch_count": len(rec.patches),
             "patch_failures": [
@@ -553,6 +589,7 @@ def pass9_write(records: dict[str, FileRecord],
                           .isoformat(timespec="seconds"),
             "mode": "apply" if apply_to is not None else "recover",
             "apply_to": str(apply_to) if apply_to is not None else None,
+            "layout": layout,
             "llm_mode": llm_mode,
             "llm_model": llm.model if llm else None,
             "llm_calls": {
@@ -566,13 +603,16 @@ def pass9_write(records: dict[str, FileRecord],
                 "overridden_by_hard_rules": overridden,
                 "classified_by_heuristic": by_heuristic,
                 "classified_by_llm": by_llm,
+                "classified_by_preexisting": by_preexisting,
                 "orphans_attributed": orphans_attributed,
             },
             "escalations": escalations,
+            "resolutions": resolutions or [],
             "cross_validate": cross_validate,
             "missing_files": sorted(missing) if missing else [],
             "deleted_applied": deleted_applied,
             "deleted_not_found": deleted_missing,
+            "preexisting_unchanged": preexisting_skipped_count,
         },
         "files": written,
         "skipped": skipped,
@@ -581,14 +621,14 @@ def pass9_write(records: dict[str, FileRecord],
     }
     (reports_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
-    # ---- summary --------------------------------------------------
     if skipped:
         by_reason: dict[str, list[str]] = {
-            "no_full":    [],
-            "low_trust":  [],
-            "no_content": [],
-            "collision":  [],
-            "other":      [],
+            "no_full":     [],
+            "low_trust":   [],
+            "no_content":  [],
+            "collision":   [],
+            "preexisting": [],
+            "other":       [],
         }
         for s in skipped:
             r = s.get("reason", "")
@@ -600,6 +640,8 @@ def pass9_write(records: dict[str, FileRecord],
                 by_reason["no_content"].append(s["path"])
             elif "basename collision" in r:
                 by_reason["collision"].append(s["path"])
+            elif "pre-existing" in r:
+                by_reason["preexisting"].append(s["path"])
             else:
                 by_reason["other"].append(s["path"])
 
@@ -629,6 +671,10 @@ def pass9_write(records: dict[str, FileRecord],
         print(f"\nWrote {written_count} files to {files_dir}/")
     print(f"  skipped:  {len(skipped)}"
           + ("  (see warnings.txt)" if skipped else ""))
+
+    if preexisting_skipped_count:
+        print(f"  preexisting: {preexisting_skipped_count} file(s) left "
+              f"as-is (unchanged by the conversation)")
 
     if deleted_applied:
         print(f"  deleted:  {len(deleted_applied)} file(s) removed "
@@ -661,8 +707,9 @@ def pass9_write(records: dict[str, FileRecord],
         print(f"  overwrote: {total_overwritten} pre-existing file(s) "
               f"that shared a name with this run's output")
 
-    print(f"  classified: {by_heuristic} heuristic / {by_llm} LLM "
-          f"(escalated {escalated}/{len(blocks)}, "
+    print(f"  classified: {by_heuristic} heuristic / {by_llm} LLM"
+          + (f" / {by_preexisting} preexisting" if by_preexisting else "")
+          + f" (escalated {escalated}/{len(blocks)}, "
           f"{overridden} overridden by hard rules)")
     print(f"  orphans:  {orphans_attributed} attributed to a file"
           + (f", {len(unattributed)} unattributed (see warnings.txt)"

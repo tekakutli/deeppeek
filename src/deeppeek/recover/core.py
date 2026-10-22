@@ -56,15 +56,6 @@ DIFF_CONTEXT_PHRASES = (
     "only the changed",
 )
 
-# FIX [4]: narrow diff-signal detection.
-#
-# The old code checked the whole captured context (up to 6 blocks of
-# prose) against DIFF_CONTEXT_PHRASES.  Any sentence like "the fix in
-# Phase 3 replaced …" would demote a legitimate full print.  The new
-# logic looks only at the last _CONTEXT_WINDOW lines of prose and
-# splits the phrase set into "strong" (unambiguous anywhere) and
-# "weak" (only fires when combined with a locator like "inside" or
-# "below").  This is the primary false-demotion fix.
 _CONTEXT_WINDOW = 2
 
 _STRONG_DIFF_PHRASES = (
@@ -80,11 +71,6 @@ _WEAK_DIFF_PHRASES = ("the fix", "insert ", "replace the", "update the")
 
 
 def _has_diff_signal(ctx: str) -> bool:
-    """True iff `ctx` contains a diff-anchor phrase.
-
-    `ctx` is lowercased and already narrowed by `_narrow_context`.
-    Strong phrases fire alone; weak ones require a locator word
-    ("inside", "below", "in the", "at the")."""
     for phrase in _STRONG_DIFF_PHRASES:
         if phrase in ctx:
             return True
@@ -96,8 +82,6 @@ def _has_diff_signal(ctx: str) -> bool:
 
 
 def _narrow_context(context_before: str) -> str:
-    """Keep only the last `_CONTEXT_WINDOW` lines of captured context.
-    Returns a lowercased string."""
     return "\n".join(
         context_before.splitlines()[-_CONTEXT_WINDOW:]
     ).lower()
@@ -122,14 +106,6 @@ REPRINT_PHRASES = (
 )
 
 
-# FIX [A]: RECOVERED_META_RE matched only "files/" after the colon.
-# Recover's own output uses "recovered/files/foo.py" (header layout) or
-# bare basenames (flat layout) — neither satisfied "\s*files/".  The
-# whole project_dump_recover.md survived Pass 2, its fences were
-# attributed as patches of whatever file was last seen, every patch
-# failed, and 6 good files dropped to LOW-trust.  The relaxed regex
-# matches any "FILE N/M: <path>" — a pattern that appears nowhere in
-# normal prose.
 RECOVERED_META_RE = re.compile(r"FILE\s+\d+/\d+:\s*\S+")
 
 
@@ -156,9 +132,6 @@ SOURCE_EXTENSIONS = (
 
 
 def _del_marker_names(text: str) -> set[str]:
-    """Return every file name explicitly marked as deleted in `text`.
-    Two signals: `[DEL]`/`[DELETED]`/`[REMOVED]` markers, or a
-    shell-style `rm [-flags] <file>` command."""
     names: set[str] = set()
     for m in DEL_MARKER_RE.finditer(text):
         name = m.group("bracket") or m.group("rm")
@@ -190,6 +163,15 @@ class Block:
     is_code_file: Optional[bool] = None
     kind: Optional[str] = None
     canonical_path: Optional[str] = None
+    # NEW: the resolved path this block's content belongs to.  For
+    # pre-existing baselines this equals canonical_path (already a
+    # full relative path).  For conversation blocks it is set by
+    # `resolve_paths()` — the real path in the target tree, resolved
+    # from header_path + content + context.  For orphans it stays
+    # None and is populated later by pass 4's attribution.  For
+    # standard (non --apply-to) recovery it equals canonical_path
+    # (basename).
+    output_path: Optional[str] = None
     confidence: Optional[float] = None
     classified_by: str = "?"
     escalation_reason: Optional[str] = None
@@ -216,3 +198,4 @@ class FileRecord:
     chosen_full_idx: Optional[int] = None
     dedup_reason: Optional[str] = None
     import_problems: list = field(default_factory=list)
+    preexisting_base: bool = False

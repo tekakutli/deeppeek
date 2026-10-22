@@ -20,8 +20,6 @@ def register(sub: argparse._SubParsersAction) -> None:
              "[DEL] in the conversation are actually deleted from DIR, and "
              "reports land beside them.  DIR must exist.",
     )
-    p.add_argument("--layout", choices=["flat", "header", "passthrough"], default="flat")
-    p.add_argument("--remap", action="append", default=[], metavar="OLD=NEW")
     p.add_argument("--min-trust", choices=["HIGH", "MEDIUM", "LOW"], default="MEDIUM")
     p.add_argument("--llm-mode", choices=["off", "smart", "always"], default="off")
     p.add_argument("--llm-url", default=None)
@@ -33,16 +31,6 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--cache-dir", type=Path, default=None)
     p.add_argument("--trace", action="store_true")
     p.set_defaults(func=run)
-
-
-def _parse_remap(items):
-    out = {}
-    for item in items:
-        if "=" not in item:
-            raise SystemExit(f"error: bad --remap {item!r}")
-        k, v = item.split("=", 1)
-        out[k] = v
-    return out
 
 
 def run(args: argparse.Namespace) -> int:
@@ -57,8 +45,6 @@ def run(args: argparse.Namespace) -> int:
         dump_path=args.dump,
         out_dir=out_dir,
         apply_to=args.apply_to,
-        layout=args.layout,
-        remap=_parse_remap(args.remap),
         min_trust=args.min_trust,
         llm_mode=args.llm_mode,
         llm_url=args.llm_url,

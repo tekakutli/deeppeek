@@ -15,6 +15,13 @@ When a file is written (via -o), recovery reads it back from disk so
 that manifest.dump.path records the real path rather than
 "<in-memory>".  When -o is absent, recovery runs on the in-memory
 text and the manifest records "<in-memory>".
+
+Output layout is derived, not user-set:
+
+    --apply-to set   → header (target tree preserved)
+    neither          → flat   (basenames only)
+
+There is no user-facing layout flag and no --remap.
 """
 import argparse
 import sys
@@ -79,9 +86,6 @@ def register(sub: argparse._SubParsersAction) -> None:
     # ---- recovery-side flags ----
     p.add_argument("--recover-to", type=Path, default=None)
     p.add_argument("--apply-to", type=Path, default=None, metavar="DIR")
-    p.add_argument("--layout", choices=["flat", "header", "passthrough"],
-                   default="flat")
-    p.add_argument("--remap", action="append", default=[], metavar="OLD=NEW")
     p.add_argument("--min-trust", choices=["HIGH", "MEDIUM", "LOW"],
                    default="MEDIUM")
     p.add_argument("--llm-mode", choices=["off", "smart", "always"],
@@ -95,16 +99,6 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--cache-dir", type=Path, default=None)
     p.add_argument("--trace", action="store_true")
     p.set_defaults(func=run)
-
-
-def _parse_remap(items):
-    out = {}
-    for item in items:
-        if "=" not in item:
-            raise SystemExit(f"error: bad --remap {item!r}")
-        k, v = item.split("=", 1)
-        out[k] = v
-    return out
 
 
 def run(args: argparse.Namespace) -> int:
@@ -144,12 +138,11 @@ def run(args: argparse.Namespace) -> int:
                   "add -o to write it somewhere", file=sys.stderr)
             return 3
 
-    # ---- capture (in memory) ----
     try:
         result = capture_conversation(CaptureConfig(
             port=args.port,
             watch=args.watch,
-            output=None,   # never written by capture_conversation
+            output=None,
             start_prompt=args.start_prompt,
             end_prompt=args.end_prompt,
             start_index=args.start_index,
@@ -167,7 +160,6 @@ def run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         return 1
 
-    # ---- resolve output path, write if requested ----
     resolved_output: Optional[Path] = None
     if args.output is not None:
         if args.output == "auto":
@@ -181,7 +173,6 @@ def run(args: argparse.Namespace) -> int:
     if not do_recover:
         return 0
 
-    # ---- recovery: from file when we wrote one, from memory otherwise ----
     out_dir = args.recover_to if args.recover_to is not None else Path("./recovered")
 
     if resolved_output is not None:
@@ -196,8 +187,6 @@ def run(args: argparse.Namespace) -> int:
         dump_text=dump_text,
         out_dir=out_dir,
         apply_to=args.apply_to,
-        layout=args.layout,
-        remap=_parse_remap(args.remap),
         min_trust=args.min_trust,
         llm_mode=args.llm_mode,
         llm_url=args.llm_url,

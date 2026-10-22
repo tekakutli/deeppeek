@@ -1,10 +1,13 @@
 """
 recover.extract — Pass 1 (markdown AST extraction) and Pass 3 (group
-by basename).
+by resolved output path).
 
 STABLE.  The markdown-it based extractor has been correct since the
-first revision; the grouping pass is trivial.  Neither contains any
-of the current bugs.
+first revision.  The grouping pass now keys records by the resolved
+`output_path` (set by `resolve.resolve_paths` between classify and
+group), which is what makes `--apply-to` write to the correct
+subdirectories and what makes conversation blocks merge with their
+matching pre-existing baselines.
 """
 
 import re
@@ -24,11 +27,8 @@ def _walk_block_tokens(tokens):
 
 def _parse_file_header(text: str) -> Optional[tuple[str, Optional[str]]]:
     s = text.strip()
-    # Strip backticks/asterisks anywhere; underscores are safe
-    # to keep because they occur in filenames (`__init__.py`).
     s = re.sub(r"[*`]", "", s)
 
-    # --- 1. `file: path` / `path: path` / `source: path` ---
     m = re.match(
         r"^(?:file|path|source)\s*:\s*"
         r"([A-Za-z0-9_./\-]+\.[a-zA-Z0-9]+)"
@@ -39,21 +39,14 @@ def _parse_file_header(text: str) -> Optional[tuple[str, Optional[str]]]:
         mod = m.group(2) or m.group(3) or m.group(4)
         return m.group(1), (mod.strip() if mod else None)
 
-    # --- 2. `== path ==` ---
     m = re.match(r"^==+\s*(\S+)\s*==+$", s)
     if m:
         return m.group(1), None
 
-    # --- 3. `[path]` ---
     m = re.match(r"^\[([^\]]+)\]$", s)
     if m and "." in m.group(1):
         return m.group(1), None
 
-    # --- 4. NEW: `## N. <path> — <description>` and similar ---
-    #       Matches: "1. path.py — full", "2) path.py — changed",
-    #       "1 - path.py", "path.py — full", "path.py (corrected)", etc.
-    #       Requires the token after the optional numeric prefix to
-    #       look like a source file with a recognized extension.
     m = re.match(
         r"^(?:(?:\d+)\s*[.):\-]\s*)?"
         r"([A-Za-z0-9_./\-]+\.[a-zA-Z0-9]{1,6})"
@@ -64,14 +57,10 @@ def _parse_file_header(text: str) -> Optional[tuple[str, Optional[str]]]:
     if m:
         path = m.group(1)
         ext = "." + path.split(".")[-1].lower()
-        # Reject things that look like prose with a period at the end
-        # (e.g. "Done. — final" would grab "Done." → wrong).
-        # Only accept if the extension is one we actually recognize.
         if ext in SOURCE_EXTENSIONS:
             mod = m.group(2)
             return path, (mod.strip() if mod else None)
 
-    # --- 5. bare path only ---
     m = re.match(r"^([A-Za-z0-9_./\-]+\.[a-zA-Z0-9]{1,5})$", s)
     if m:
         ext = "." + m.group(1).split(".")[-1].lower()
@@ -153,6 +142,19 @@ def pass1_extract(dump_text: str) -> tuple[list[Block], list[str]]:
 
 def pass3_group(blocks: list[Block],
                 deleted_files: list[str]) -> dict[str, FileRecord]:
+    """Group blocks into FileRecords keyed by `output_path`.
+
+    `output_path` is set by `resolve.resolve_paths` for every non-
+    orphan block.  Preexisting baselines carry their real path there;
+    conversation blocks carry their resolved path (which either
+    matches a pre-existing file — in which case they merge into that
+    file's record — or falls back to the literal header_path).
+
+    Orphans are skipped here; pass 4 attributes them to a record, and
+    the assignment (`Block.attributed_to`) uses the record's
+    `output_path` as the key, so patch content lands on the right
+    file without a separate path-resolution step.
+    """
     by_path: dict[str, list[Block]] = {}
     for b in blocks:
         if b.is_orphan:
@@ -161,9 +163,10 @@ def pass3_group(blocks: list[Block],
             continue
         if b.kind in ("not_a_file", "recovered_meta"):
             continue
-        if not b.canonical_path:
+        key = b.output_path or b.canonical_path
+        if not key:
             continue
-        by_path.setdefault(b.canonical_path, []).append(b)
+        by_path.setdefault(key, []).append(b)
 
     records: dict[str, FileRecord] = {}
     deleted_set = set(deleted_files)

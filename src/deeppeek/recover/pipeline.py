@@ -1,16 +1,49 @@
 """recover.pipeline — orchestration of passes 1-9.
 
 Input is either a dump file on disk (dump_path) or a string already
-in memory (dump_text) — the recover pipeline accepts both so callers
-can choose whether the intermediate markdown lives on disk at all.
-The manifest's `dump.path` field records "<in-memory>" when the
+in memory (dump_text).  The manifest records `<in-memory>` when the
 source was dump_text.
 
-Output is either the standard `out_dir` layout (files/, files_low_trust/,
-reports beside them) or — when `apply_to` is set — an in-place apply
-against an existing directory: recovered files go directly into
-apply_to, files marked [DEL] are deleted from it, and all reports are
-written beside them.
+Output is either the standard `out_dir` layout (files/,
+files_low_trust/, reports beside them) or — when `apply_to` is set —
+an in-place apply against an existing directory: recovered files go
+directly into apply_to, files marked [DEL] are deleted from it, and
+all reports are written beside them.
+
+LAYOUT (derived, not user-set)
+==============================
+The effective output layout is derived:
+
+    --apply-to set   → "header"   (preserve the target tree)
+    neither          → "flat"     (basenames only)
+
+PREE-XISTING BASELINES + PATH RESOLUTION (--apply-to only)
+==========================================================
+When `--apply-to DIR` is set:
+
+  1. `_load_preexisting_blocks` scans DIR and creates one synthetic
+     full-print block per source file, with canonical_path and
+     output_path both = the real relative path from DIR.
+
+  2. `resolve_paths` (in `recover.resolve`) then walks the
+     conversation blocks and tries to match each `header_path`
+     against the pre-existing file index.  It handles the case the
+     user actually sees: the conversation uses "recover/pipeline.py"
+     in one message, "pipeline.py" in another, and
+     "tests/recover/test_recover.py" in a third — the resolver
+     recognises all three as pointing to specific real files.  When
+     two pre-existing files share a basename (multiple `__init__.py`,
+     multiple `pipeline.py` in different subpackages), the resolver
+     scores candidates by content similarity and context hints, and
+     commits only when a clear winner exists.
+
+  3. `pass3_group` then groups records by `output_path`, so a
+     conversation block and its matching pre-existing baseline end
+     up in the same FileRecord.
+
+  4. Pass 9 writes to `apply_to / output_path`, i.e. to the real
+     subdirectory.  And the pre-existing-baseline skip ensures files
+     the conversation didn't touch are left alone.
 """
 import hashlib
 import sys
@@ -20,11 +53,14 @@ from pathlib import Path
 from typing import Optional
 
 from .core import (
+    Block,
     DEFAULT_ESCALATE, DEFAULT_LLM_MODEL, DEFAULT_LLM_TIMEOUT, DEFAULT_LLM_URL,
+    SOURCE_EXTENSIONS,
 )
 from .llm import LLMClient
 from .extract import pass1_extract, pass3_group
 from .classify import pass2_classify
+from .resolve import resolve_paths
 from .attribute import pass4_attribute_orphans
 from .dedup import pass5_deduplicate
 from .apply_patches import pass6_apply_patches
@@ -34,21 +70,10 @@ from .write import pass9_write
 
 @dataclass
 class RecoverConfig:
-    # Exactly one of these must be set:
     dump_path: Optional[Path] = None
     dump_text: Optional[str] = None
-
-    # Standard output directory (files/, files_low_trust/, reports).
-    # Ignored when apply_to is set.
     out_dir: Path = field(default_factory=lambda: Path("./recovered"))
-
-    # Apply mode: recovered files go directly into this existing
-    # directory; deleted-marked files are removed from it; reports go
-    # alongside.  Must exist and be a directory.
     apply_to: Optional[Path] = None
-
-    layout: str = "flat"
-    remap: dict = field(default_factory=dict)
     min_trust: str = "MEDIUM"
     llm_mode: str = "off"
     llm_url: str = DEFAULT_LLM_URL
@@ -64,7 +89,6 @@ class RecoverConfig:
 
 
 def _resolve_dump(cfg: RecoverConfig) -> tuple[str, str, int]:
-    """Return (dump_text, dump_display, dump_size_bytes)."""
     if cfg.dump_text is not None:
         text = cfg.dump_text
         return text, "<in-memory>", len(text.encode("utf-8"))
@@ -79,7 +103,6 @@ def _resolve_dump(cfg: RecoverConfig) -> tuple[str, str, int]:
 
 
 def _validate_apply_to(cfg: RecoverConfig) -> Optional[int]:
-    """Return exit code on error, None on success."""
     if cfg.apply_to is None:
         return None
     if not cfg.apply_to.exists():
@@ -95,6 +118,82 @@ def _validate_apply_to(cfg: RecoverConfig) -> Optional[int]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Pre-existing baseline loader
+# ---------------------------------------------------------------------------
+
+_PREEXISTING_EXCLUDE_DIRS = {
+    "node_modules", "__pycache__", "dist", "build", "target",
+    "venv", ".venv", ".tox", ".nox", ".git",
+}
+_PREEXISTING_MAX_FILE_SIZE = 1_048_576  # 1 MiB
+
+
+def _load_preexisting_blocks(apply_to: Path) -> list[Block]:
+    """Scan `apply_to` and return one synthetic 'full print' block per
+    source-like file, ready to be prepended to the conversation's
+    blocks.
+
+    Each block carries its real relative path in both canonical_path
+    and output_path — this is the identity used for grouping and the
+    target used for writing.
+    """
+    blocks: list[Block] = []
+    if not apply_to.is_dir():
+        return blocks
+
+    for p in sorted(apply_to.rglob("*")):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(apply_to)
+        rel_parts = rel.parts
+
+        if any(part.startswith(".") for part in rel_parts):
+            continue
+        if any(part in _PREEXISTING_EXCLUDE_DIRS for part in rel_parts):
+            continue
+        if p.suffix.lower() not in SOURCE_EXTENSIONS:
+            continue
+        try:
+            if p.stat().st_size > _PREEXISTING_MAX_FILE_SIZE:
+                continue
+        except OSError:
+            continue
+        try:
+            raw = p.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        body = raw.replace("\r\n", "\n")
+        if body.endswith("\n"):
+            body = body[:-1]
+
+        rel_str = rel.as_posix()
+        blocks.append(Block(
+            idx=0,
+            header_path=rel_str,
+            modifier=None,
+            fence_lang="",
+            body=body,
+            body_line_count=body.count("\n") + 1,
+            context_before="",
+            line_start=-1,
+            line_end=-1,
+            is_orphan=False,
+            is_code_file=True,
+            kind="full",
+            canonical_path=rel_str,
+            output_path=rel_str,
+            confidence=1.0,
+            classified_by="preexisting",
+            heuristic_kind="full",
+        ))
+    return blocks
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
+
 def run(cfg: RecoverConfig) -> int:
     try:
         dump_text, dump_display, dump_size = _resolve_dump(cfg)
@@ -106,14 +205,14 @@ def run(cfg: RecoverConfig) -> int:
     if err is not None:
         return err
 
+    layout = "header" if cfg.apply_to is not None else "flat"
+
     dump_sha = hashlib.sha256(dump_text.encode()).hexdigest()
 
     if cfg.apply_to is None:
         cfg.out_dir.mkdir(parents=True, exist_ok=True)
         aux_base = cfg.out_dir
     else:
-        # In apply mode we don't touch out_dir at all; ancillary data
-        # (cache, llm_audit) goes under the target tree's hidden dir.
         aux_base = cfg.apply_to / ".deeppeek"
         aux_base.mkdir(parents=True, exist_ok=True)
 
@@ -142,7 +241,10 @@ def run(cfg: RecoverConfig) -> int:
               file=sys.stderr)
 
     if cfg.apply_to is not None:
-        print(f"[startup] apply mode: {cfg.apply_to}", file=sys.stderr)
+        print(f"[startup] apply mode: {cfg.apply_to} "
+              f"(layout={layout})", file=sys.stderr)
+    else:
+        print(f"[startup] layout: {layout}", file=sys.stderr)
 
     t_start = time.monotonic()
 
@@ -152,6 +254,15 @@ def run(cfg: RecoverConfig) -> int:
     print(f"  {len(blocks)} fenced blocks ({n_orphans} orphans), "
           f"{len(deleted_files)} [DEL] markers")
 
+    if cfg.apply_to is not None:
+        pre = _load_preexisting_blocks(cfg.apply_to)
+        if pre:
+            print(f"  + {len(pre)} pre-existing baseline file(s) "
+                  f"from --apply-to", file=sys.stderr)
+            blocks = pre + blocks
+            for i, b in enumerate(blocks):
+                b.idx = i
+
     print(f"[pass 2] classifying blocks (mode={cfg.llm_mode}, "
           f"escalate_below={cfg.escalate_below})...")
     pass2_classify(blocks, llm, cfg.llm_mode, cfg.escalate_below,
@@ -160,12 +271,27 @@ def run(cfg: RecoverConfig) -> int:
     n_partial = sum(1 for b in blocks if b.kind == "partial")
     n_other = sum(1 for b in blocks if b.kind == "not_a_file")
     n_meta = sum(1 for b in blocks if b.kind == "recovered_meta")
+    n_pre_full = sum(1 for b in blocks
+                     if b.classified_by == "preexisting")
     print(f"  full: {n_full}  partial: {n_partial}  "
-          f"other: {n_other}  recovered-meta: {n_meta}")
+          f"other: {n_other}  recovered-meta: {n_meta}"
+          + (f"  preexisting: {n_pre_full}" if n_pre_full else ""))
+
+    # ---- NEW: resolve each block's output path ----
+    print("[pass 2.5] resolving output paths...")
+    resolutions = resolve_paths(blocks, cfg.apply_to, cfg.trace)
+    n_resolved = sum(1 for r in resolutions
+                     if not r["reason"].startswith("unresolved"))
+    n_unresolved = sum(1 for r in resolutions
+                       if r["reason"].startswith("unresolved"))
+    print(f"  {n_resolved} resolved, {n_unresolved} unresolved")
 
     print("[pass 3] grouping by file...")
     records = pass3_group(blocks, deleted_files)
-    print(f"  {len(records)} distinct files with headers")
+    n_pre_rec = sum(1 for r in records.values() if r.preexisting_base)
+    print(f"  {len(records)} distinct files with headers"
+          + (f" ({n_pre_rec} preexisting baselines picked up later)"
+             if n_pre_rec else ""))
 
     if n_orphans:
         print(f"[pass 4] attributing {n_orphans} orphan fence(s)...")
@@ -178,10 +304,15 @@ def run(cfg: RecoverConfig) -> int:
     blocks_by_idx = {b.idx: b for b in blocks}
     pass5_deduplicate(records, blocks_by_idx, cfg.trace)
     state_counts = {}
+    pre_base_count = 0
     for r in records.values():
         state_counts[r.state] = state_counts.get(r.state, 0) + 1
+        if r.preexisting_base:
+            pre_base_count += 1
     for st, n in sorted(state_counts.items()):
         print(f"  {st}: {n}")
+    if pre_base_count:
+        print(f"  preexisting_baseline: {pre_base_count}")
 
     print("[pass 6] applying patches...")
     pass6_apply_patches(records, blocks_by_idx, llm)
@@ -212,8 +343,7 @@ def run(cfg: RecoverConfig) -> int:
         deleted_files=deleted_files,
         out_dir=cfg.out_dir,
         apply_to=cfg.apply_to,
-        layout=cfg.layout,
-        remap=cfg.remap,
+        layout=layout,
         min_trust=cfg.min_trust,
         dump_display=dump_display,
         dump_size=dump_size,
@@ -222,6 +352,7 @@ def run(cfg: RecoverConfig) -> int:
         llm=llm,
         llm_mode=cfg.llm_mode,
         cross_validate=cross_validate,
+        resolutions=resolutions,
         verbose=cfg.trace,
     )
 

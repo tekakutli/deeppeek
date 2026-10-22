@@ -28,15 +28,24 @@ DIFFICULT.  Owns:
                 · the body is a unified diff hunk (a `@@ -a,b +c,d @@`
                   header), which the LLM patcher handles.
 
-              Everything else is dropped.  The prior rule ("small
-              body AND shares a 20+ char line with the base") let
-              any prose snippet that quoted a line of the base
-              through; the LLM-off patcher then failed on all of
-              them and every failure appended a warning line, so a
-              single file could accumulate dozens of phantom patch
-              failures that dragged trust to LOW and (under
-              --min-trust HIGH) silently killed files that had a
-              perfectly good full print.
+              Everything else is dropped.
+
+    NEW (2026-10-23)  Preexisting-vs-real split.  In `--apply-to`
+              mode, `pipeline._load_preexisting_blocks` injects a
+              synthetic full-print block for every source file that
+              already exists in the target directory.  This pass
+              partitions `fulls` into:
+
+                  real_fulls  = fulls born from the conversation
+                  pre_fulls   = synthetic blocks from --apply-to
+
+              and prefers real fulls when both exist — the
+              conversation's print is always the authoritative
+              revision of the file.  When only synthetic fulls exist,
+              the record is marked `preexisting_base = True` so pass
+              9 can skip writing it unless a patch actually changed
+              its content.  When both exist, `preexisting_base` stays
+              False; the real print is written normally.
 """
 
 import re
@@ -50,8 +59,25 @@ def pass5_deduplicate(records: dict[str, FileRecord],
                       blocks_by_idx: dict[int, Block],
                       verbose: bool) -> None:
     for path, rec in records.items():
-        fulls = [i for i in rec.source_blocks
-                 if blocks_by_idx[i].kind == "full"]
+        # Partition every "full" block for this path into
+        # conversation-born (real) vs --apply-to-born (synthetic).
+        all_fulls = [i for i in rec.source_blocks
+                     if blocks_by_idx[i].kind == "full"]
+        real_fulls = [i for i in all_fulls
+                      if blocks_by_idx[i].classified_by != "preexisting"]
+        pre_fulls = [i for i in all_fulls
+                     if blocks_by_idx[i].classified_by == "preexisting"]
+
+        if real_fulls:
+            fulls = real_fulls
+            rec.preexisting_base = False
+        elif pre_fulls:
+            fulls = pre_fulls
+            rec.preexisting_base = True
+        else:
+            fulls = []
+            rec.preexisting_base = False
+
         partials = [i for i in rec.source_blocks
                     if blocks_by_idx[i].kind == "partial"]
         orphan_patches = [
@@ -68,7 +94,9 @@ def pass5_deduplicate(records: dict[str, FileRecord],
 
         if len(fulls) == 1:
             rec.chosen_full_idx = fulls[0]
-            rec.dedup_reason = "single_full"
+            rec.dedup_reason = (
+                "preexisting_base" if rec.preexisting_base else "single_full"
+            )
         else:
             chosen, reason = _dedup_pick(path, fulls, blocks_by_idx)
             rec.chosen_full_idx = chosen
@@ -96,14 +124,11 @@ def pass5_deduplicate(records: dict[str, FileRecord],
             if not body:
                 return False
             first_line = body.split("\n", 1)[0].strip()
-            # Object-literal re-declaration — the deterministic
-            # patcher's target shape.
             if re.match(
                 r'^export\s+(?:const|let|var)\s+\w+\s*=\s*\{',
                 first_line,
             ):
                 return True
-            # Unified diff hunk — the LLM patcher's target shape.
             if body.startswith("@@ ") or "\n@@ " in body:
                 return True
             return False
@@ -185,9 +210,7 @@ def _dedup_pick(path: str,
         newest = max(qualifies.keys())
         return newest, f"revision (sim {qualifies[newest]:.2f})"
 
-    # FIX [B]: syntax preference — restrict to ast.parse-valid candidates
-    # before running the modifier signal.  A "corrected" reprint that
-    # fails ast.parse should never beat an older valid print.
+    # FIX [B]: syntax preference
     if path.endswith(".py"):
         import ast
         valid = []

@@ -25,7 +25,6 @@ def run_recover(fixture: Path, out: Path) -> dict:
         sys.executable, "-m", "deeppeek", "recover", str(fixture),
         "--out", str(out),
         "--llm-mode", "off",
-        "--layout", "flat",
         "--min-trust", "LOW",
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)

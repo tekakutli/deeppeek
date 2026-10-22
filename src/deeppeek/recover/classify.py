@@ -19,7 +19,16 @@ DIFFICULT.  This module owns:
     FIX [9]   escalate-batch detail log gated by `verbose` and capped
               at 10 entries.
 
-Everything else is unchanged.
+    NEW (2026-10-23)  Skip preexisting baselines (blocks with
+              classified_by == "preexisting") during classification.
+              These blocks come from `_load_preexisting_blocks` in
+              pipeline.py: they were built from real files on disk,
+              they're already known to be full prints, and they have
+              no meaningful context_before.  Reclassifying them
+              would either leave them unchanged (heuristic path) or
+              accidentally escalate them to the LLM (which would
+              reclassify based on incomplete data).  Both are
+              avoided by the skip.
 """
 
 import json
@@ -79,6 +88,11 @@ def pass2_classify(blocks: list[Block], llm: Optional[LLMClient],
         return
 
     for b in blocks:
+        # NEW: preexisting baselines are already known-good full prints
+        # — never reclassify them.
+        if b.classified_by == "preexisting":
+            b.heuristic_kind = b.kind
+            continue
         _classify_one_heuristic(b)
         b.classified_by = "heuristic"
         b.heuristic_kind = b.kind
@@ -90,19 +104,22 @@ def pass2_classify(blocks: list[Block], llm: Optional[LLMClient],
     if mode == "smart":
         ambiguous = []
         for b in blocks:
+            # NEW: never escalate a preexisting baseline to the LLM.
+            if b.classified_by == "preexisting":
+                continue
             reason = _escalation_reason(b, escalate_below)
             if reason is not None:
                 b.escalation_reason = reason
                 ambiguous.append(b)
     else:  # always
-        ambiguous = list(blocks)
+        ambiguous = [b for b in blocks
+                     if b.classified_by != "preexisting"]
         for b in ambiguous:
             b.escalation_reason = "always"
 
     if ambiguous:
         print(f"  [pass 2] escalating {len(ambiguous)}/{len(blocks)} "
               f"block(s) to LLM:", file=sys.stderr)
-        # FIX [9]: cap the detail at 10; full list is in the manifest
         if verbose:
             for b in ambiguous[:10]:
                 print(f"    idx={b.idx} path={b.canonical_path} "
@@ -135,12 +152,13 @@ def _escalation_reason(b: Block, threshold: float) -> Optional[str]:
 
 
 def _apply_hard_overrides(blocks: list[Block],
-                           verbose: bool = False) -> None:
+                          verbose: bool = False) -> None:
     for b in blocks:
-        # ---- recovered-meta filter (checked FIRST, unconditional) ----
-        # Kills any fence that is itself a reprint of recover's own
-        # output.  FIX [A]: the regex now matches any "FILE N/M: <path>"
-        # regardless of what follows the colon.
+        # NEW: preexisting baselines are untouched by hard overrides.
+        if b.classified_by == "preexisting":
+            continue
+
+        # ---- recovered-meta filter ----
         if (RECOVERED_META_RE.search(b.context_before) is not None
                 or "SCANNED DIRECTORY" in b.context_before):
             if b.kind != "recovered_meta" and verbose:
@@ -151,9 +169,6 @@ def _apply_hard_overrides(blocks: list[Block],
             b.override_reason = "recovered-meta listing"
             continue
 
-        # FIX [4]: narrow the window to the last _CONTEXT_WINDOW lines
-        # and use the split-phrase signal.  Stops a stray "the fix in
-        # Phase 3…" from demoting a legitimate full print.
         ctx_narrow = _narrow_context(b.context_before)
         reason: Optional[str] = None
         if _has_diff_signal(ctx_narrow):
@@ -201,7 +216,6 @@ def _classify_one_heuristic(b: Block) -> None:
             b.confidence = 0.90
             return
 
-    # FIX [4]: narrow-window diff check
     ctx_narrow = _narrow_context(b.context_before)
     if _has_diff_signal(ctx_narrow):
         b.is_code_file = True
@@ -237,12 +251,6 @@ def _classify_one_heuristic(b: Block) -> None:
     b.confidence = 0.85
 
 
-# FIX [1]: structural fallback for `.py` bodies.  Inline JS/CSS inside
-# a raw triple-quoted string can contain `\` at line-end, nested `"""`,
-# or `\u` escapes that break ast.parse without making the source
-# invalid to a human reader.  When ast.parse fails, fall back to a
-# cheap "does the first non-blank line look like a Python module
-# top-level?" check.
 _PY_MODULE_TOPLEVELS = (
     '"""', "'''", "import ", "from ", "def ", "class ",
     "async def ", "@", "#!",
@@ -250,8 +258,6 @@ _PY_MODULE_TOPLEVELS = (
 
 
 def _looks_like_python_module_top_level(body: str) -> bool:
-    """Cheap structural signal: does the first non-blank line look like
-    the start of a Python module?"""
     for line in body.splitlines():
         s = line.strip()
         if not s:
@@ -278,7 +284,6 @@ def _looks_like_full_file(body: str, path: str) -> bool:
             ast.parse(body)
             return True
         except SyntaxError:
-            # FIX [2]: structural fallback
             return _looks_like_python_module_top_level(body)
 
     return True
@@ -291,8 +296,6 @@ def _looks_truncated(body: str, path: str) -> bool:
             ast.parse(body)
             return False
         except SyntaxError:
-            # FIX [3]: only a truncation if the body also lacks
-            # module-shaped top structure
             if _looks_like_python_module_top_level(body):
                 return False
             return True
