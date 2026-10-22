@@ -1,17 +1,14 @@
 """`deeppeek prompt` — AI prompt pipelines.
 
-This is a namespace.  Each prompt gets its own subcommand:
+Each prompt gets its own subcommand:
 
     deeppeek prompt evolve <flags>   — evolve deeppeek via a conversation
-    deeppeek prompt <future> ...     — other prompts, added later
+    deeppeek prompt new [flags]      — seed a prompt about the current dir
 
 Every prompt module under `deeppeek.prompts.*` provides:
 
-    register(subparsers)          — add its subcommand to the `prompt` group
+    register(subparsers)          — add its subcommand
     run(args) -> int              — orchestrate the pipeline
-
-`prompt.run` is only a trampoline: it hands off to whichever
-subcommand argparse dispatched to.
 """
 import argparse
 
@@ -23,8 +20,9 @@ def register(sub: argparse._SubParsersAction) -> None:
     )
     psub = p.add_subparsers(dest="prompt_cmd", required=True)
 
-    from ..prompts import evolve
+    from ..prompts import evolve, new
     evolve.register(psub)
+    new.register(psub)
 
     p.set_defaults(func=run)
 
