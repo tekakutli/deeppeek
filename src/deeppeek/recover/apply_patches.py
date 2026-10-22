@@ -4,39 +4,45 @@ full print).
 
 DIFFICULT.  Owns:
 
-    FIX [5]   Aggregate patch-failure summary: one line at the end
-              instead of one per file.  Per-file detail stays in
-              warnings.txt and the manifest.
-    FIX [11]  A failed orphan patch now demotes the file's confidence
-              to trust_cap (HIGH/MEDIUM) rather than dropping it to
-              LOW.  A file with a valid base print and one missing
-              patch is far more useful than no file; the incomplete
-              state is recorded in verification.patches_incomplete.
+    FIX [5]   Aggregate patch-failure summary.
 
-    NEW (2026-10-20)
-              No-op patch detection.  A patch whose body is a
-              contiguous run of non-blank lines already present in
-              the base is labelled `applied_by = "already-present"`
-              instead of `failed`.  Consequence: the structural-
-              failure gate in `pass8_verify._has_structural_failures`
-              no longer fires for these patches, so a `last_full`
-              pick whose only "failures" are recipe snippets that
-              illustrate the file's own content gets promoted to
-              HIGH instead of being silently demoted to LOW and
-              moved to `files_low_trust/`.
+    FIX [11]  A failed orphan patch demotes trust to trust_cap, not
+              LOW.
 
-              Live symptom that prompted this: the cable playground
-              dump (DeepSeek chat export) prints `pg_dispatch.py`
-              twice — once in Phase 3, once (fully rewritten) in
-              the optimization phase — and the optimization
-              response's own "here's the replacement code" recipe
-              sections were being attributed as patches to the same
-              file.  Those snippets were already in the base; the
-              deterministic and LLM patchers both correctly
-              returned None; `applied_by = "failed"` fired; the
-              `last_full` promotion was blocked; and the fully
-              correct file was written to `files_low_trust/` while
-              `--min-trust HIGH` kept it out of `files/`.
+    NEW (2026-10-20)  No-op patch detection (`already-present`).
+
+    NEW (2026-10-21)  Three new deterministic patch shapes.
+
+    NEW (2026-10-21b) Bug 1 fix — the deterministic patcher does
+              not report byte-identical output as an applied
+              change.
+
+    NEW (2026-10-29)  Three correctness fixes.
+
+    NEW (2026-10-30)  Raw-diff patcher.
+
+    NEW (2026-10-30b) Deletion-instruction routing and idempotency.
+
+    NEW (2026-10-31)  Three fixes for the panel-fade regression:
+
+              1. `_delete_exact_block` only strips diff prefixes when
+                 the body is diff-shaped.  For a raw code body, it
+                 preserves the exact source text.  Prior versions
+                 stripped one leading space from every indented line,
+                 silently corrupting the match and forcing the patch
+                 through the object-literal fallback.
+
+              2. `_try_deterministic_patch` returns None (no-op) when
+                 the object-literal splice produces text identical
+                 to `base`.  The caller then checks
+                 `_patch_already_present` and marks the patch
+                 `already-present`, not `deterministic`.
+
+              3. `_try_raw_diff_patch` treats empty lines as context
+                 blanks.  A markdown processor that strips trailing
+                 whitespace turns a ` ` context blank into ``, which
+                 the walker used to skip and then mismatched the
+                 following `-` line against the wrong base line.
 """
 
 import re
@@ -45,6 +51,10 @@ from typing import Optional
 
 from .core import (
     Block, FileRecord, FENCE, MAX_TOKENS_DIFF,
+    _is_deletion_instruction,
+    _is_pure_deletion_diff_strict,
+    _looks_like_diff_body,
+    _strip_diff_prefixes,
 )
 from .llm import LLMClient
 
@@ -83,14 +93,19 @@ def pass6_apply_patches(records: dict[str, FileRecord],
                 patch["applied_by"] = "deterministic"
                 continue
 
-            # NEW (2026-10-20): a patch whose body is already in the
-            # base has nothing to apply.  Counted as a no-op, not a
-            # failure — so it does not trip the structural-failure
-            # gate in pass 8 that decides whether a `last_full` pick
-            # can be promoted to HIGH.
             if _patch_already_present(patch["body"], content):
                 patch["applied_by"] = "already-present"
                 continue
+
+            if _diff_already_applied(patch["body"], content):
+                patch["applied_by"] = "already-present"
+                continue
+
+            if _is_deletion_instruction(
+                    patch["body"], patch.get("context_before", "")):
+                if _deletion_already_applied(patch["body"], content):
+                    patch["applied_by"] = "already-present"
+                    continue
 
             all_deterministic = False
             if llm is not None:
@@ -109,7 +124,6 @@ def pass6_apply_patches(records: dict[str, FileRecord],
         rec.verification["patches_applied"] = sum(
             1 for p in rec.patches if p.get("applied_by") != "failed")
 
-        # FIX [11]: incomplete patches do not silently kill the file
         rec.trust = trust_cap
         if not all_ok:
             rec.verification["patches_incomplete"] = True
@@ -119,15 +133,6 @@ def pass6_apply_patches(records: dict[str, FileRecord],
         if all_ok and not all_deterministic:
             rec.verification["via_llm"] = True
 
-    # FIX [5]: aggregate summary — one line, no noise.
-    #
-    # NEW (2026-10-20): `total_noop` counts patches that were
-    # already in the base (labelled `already-present`).  Those are
-    # neither "applied" (the tool did not modify the base for them)
-    # nor "failed" (nothing was wrong).  `total_failed` therefore
-    # subtracts both buckets.  A file with 1 det + 3 already-present
-    # patches now reports `0 failed`, not `3 failed`, and its
-    # `last_full` pick can be promoted to HIGH.
     total_patches = sum(len(r.patches) for r in records.values())
     total_applied = sum(
         sum(1 for p in r.patches
@@ -170,51 +175,182 @@ def _looks_like_python_fragment(text: str) -> bool:
     return True
 
 
+def _delete_exact_block(base: str, body: str) -> Optional[str]:
+    """Remove the code block that `body` describes from `base`.
+
+    `body` may be:
+
+      · a raw code block (no diff prefixes) — used verbatim, so
+        indentation inside the block is preserved exactly
+      · a pure-deletion diff (all `-` / unprefixed lines) — diff
+        prefixes are stripped first
+
+    FIX (2026-10-31): the strip is conditional.  A raw code body has
+    no diff prefixes to strip, and stripping one leading space from
+    every indented line corrupts the exact match (base has 2-space
+    indent, stripped body has 1-space indent, no match).
+    """
+    is_diff = _is_pure_deletion_diff_strict(body) or _looks_like_diff_body(body)
+    stripped = _strip_diff_prefixes(body) if is_diff else body
+
+    body_lines = [ln.rstrip() for ln in stripped.splitlines()]
+    while body_lines and not body_lines[0]:
+        body_lines.pop(0)
+    while body_lines and not body_lines[-1]:
+        body_lines.pop()
+    if not body_lines:
+        return None
+
+    base_lines_keepends = base.splitlines(keepends=True)
+    base_lines = [ln.rstrip("\n").rstrip() for ln in base_lines_keepends]
+    n = len(body_lines)
+
+    matches = []
+    for i in range(len(base_lines) - n + 1):
+        if base_lines[i:i+n] == body_lines:
+            matches.append(i)
+
+    if len(matches) != 1:
+        return None
+
+    start = matches[0]
+    end = start + n
+    new_lines = base_lines_keepends[:start] + base_lines_keepends[end:]
+    new_text = "".join(new_lines)
+    if new_text == base:
+        return None
+    return new_text
+
+
+def _deletion_already_applied(body: str, base: str) -> bool:
+    """True if the code block described by `body` is ABSENT from
+    `base`.
+    """
+    stripped = _strip_diff_prefixes(body)
+    body_lines = [ln.rstrip() for ln in stripped.splitlines()
+                  if ln.strip()]
+    if not body_lines:
+        return False
+    base_nonempty = [
+        ln.rstrip() for ln in base.splitlines() if ln.strip()
+    ]
+    n = len(body_lines)
+    for i in range(len(base_nonempty) - n + 1):
+        if base_nonempty[i:i+n] == body_lines:
+            return False
+    return True
+
+
+def _try_raw_diff_patch(base: str, body: str) -> Optional[str]:
+    """Apply a raw `+`/`-` diff block (no `@@` hunk headers) to `base`.
+
+    FIX (2026-10-31): empty lines in the diff body are treated as
+    context blanks.  Some markdown processors strip the trailing
+    space from a ` ` (context blank) line, leaving an empty string.
+    The walker used to `continue` on empty lines — the base cursor
+    did not advance, and the following `-` line mismatched.  A
+    well-formed diff body has no truly empty line in the middle: a
+    blank in the diff always carries one of `+`, `-`, ` `.  An empty
+    line is therefore a whitespace-stripped ` ` context, and treating
+    it as such recovers the intended walk.
+    """
+    diff_lines = body.splitlines()
+    if not any(ln.startswith(("+", "-")) for ln in diff_lines):
+        return None
+    if any(ln.startswith(("+++", "---", "@@")) for ln in diff_lines):
+        return None
+
+    first_anchor = None
+    for ln in diff_lines:
+        if not ln:
+            continue
+        prefix = ln[:1]
+        if prefix in (" ", "-"):
+            first_anchor = ln[1:].rstrip()
+            break
+    if first_anchor is None:
+        return None
+
+    base_lines = base.splitlines(keepends=True)
+    anchors = [
+        idx for idx, ln in enumerate(base_lines)
+        if ln.rstrip() == first_anchor
+    ]
+    if not anchors:
+        return None
+
+    for start in anchors:
+        result: list[str] = base_lines[:start]
+        pos = start
+        i = 0
+        ok = True
+        while i < len(diff_lines):
+            line = diff_lines[i]
+            i += 1
+            if not line:
+                # FIX: whitespace-stripped context blank.
+                line = " "
+            prefix = line[:1]
+            rest = line[1:]
+            if prefix == " ":
+                if pos >= len(base_lines) or (
+                        base_lines[pos].rstrip() != rest.rstrip()):
+                    ok = False
+                    break
+                result.append(base_lines[pos])
+                pos += 1
+            elif prefix == "-":
+                if pos >= len(base_lines) or (
+                        base_lines[pos].rstrip() != rest.rstrip()):
+                    ok = False
+                    break
+                pos += 1
+            elif prefix == "+":
+                result.append(rest + "\n")
+        if ok:
+            result.extend(base_lines[pos:])
+            new_text = "".join(result)
+            if new_text == base:
+                return None
+            return new_text
+    return None
+
+
+def _diff_already_applied(body: str, base: str) -> bool:
+    """True if a diff's net effect is already present in `base`."""
+    if not _looks_like_diff_body(body):
+        return False
+
+    adds: list[str] = []
+    dels: list[str] = []
+    for ln in body.splitlines():
+        if ln.startswith("+") and not ln.startswith("+++"):
+            adds.append(ln[1:].rstrip())
+        elif ln.startswith("-") and not ln.startswith("---"):
+            dels.append(ln[1:].rstrip())
+
+    base_lines_set = {ln.rstrip() for ln in base.splitlines()}
+
+    for a in adds:
+        if a and a not in base_lines_set:
+            return False
+
+    dels_nonempty = [d for d in dels if d.strip()]
+    if dels_nonempty:
+        base_lines_nonempty = [
+            ln.rstrip() for ln in base.splitlines() if ln.strip()
+        ]
+        n = len(dels_nonempty)
+        for i in range(len(base_lines_nonempty) - n + 1):
+            if base_lines_nonempty[i:i + n] == dels_nonempty:
+                return False
+
+    return True
+
+
 def _patch_already_present(body: str, base: str) -> bool:
     """True if `body` appears as a contiguous run of non-blank
-    lines in `base` (whitespace-normalised).
-
-    A recipe section in the conversation often shows a snippet
-    that is *already* in the base file — the "here's the change"
-    fence, in a response that then reprints the whole file.  When
-    we try to apply such a snippet as a patch, it fails not
-    because anything is broken but because the patch was already
-    applied before we saw it.  Labelling it
-    `applied_by = "already-present"` keeps the audit trail clean
-    without contaminating the structural-failure gate in
-    `pass8_verify._has_structural_failures` that decides whether
-    a `last_full` pick can be promoted to HIGH.
-
-    Rationale for the exact test:
-
-      · A patch body that is a *verbatim subsequence* of the base
-        is a redundant illustration, not a change.  This is a
-        sequence-membership test, not an edit-distance test: the
-        only thing a fuzzy distance would buy us is a way to
-        miss the exact-match case where the patch body has been
-        truncated mid-line but the surrounding lines match.  That
-        case is rare in recipe snippets (which are usually whole
-        function bodies, not partial lines) and not worth the
-        false-positive risk that a distance threshold introduces.
-
-      · Both body and base are whitespace-normalised (strip + drop
-        empty lines) before the test.  The recipe text often
-        re-indents the fence body relative to the base file; the
-        bare-token comparison is what we care about.
-
-      · The body's line count being larger than the base's line
-        count short-circuits to False — a "patch" larger than the
-        whole file cannot be a no-op.
-
-      · An empty body returns True — there is nothing to apply,
-        which is trivially the already-present case.  This
-        matches `_try_deterministic_patch`'s early return for
-        empty bodies.
-
-    The helper is deliberately small and pure; it is called once
-    per patch, and the patches are already bounded by the size of
-    the recovered records, so no further optimisation is needed.
-    """
+    lines in `base` (whitespace-normalised)."""
     def norm(s: str) -> list[str]:
         return [ln.strip() for ln in s.splitlines() if ln.strip()]
 
@@ -232,9 +368,33 @@ def _patch_already_present(body: str, base: str) -> bool:
 
 
 def _try_deterministic_patch(base: str, patch: dict) -> Optional[str]:
-    body_stripped = patch["body"].strip()
+    """Try each patch shape in order; return the modified base or None.
+
+    FIX (2026-10-31): the object-literal path returns `None` when
+    its result equals `base` (byte-identical).  Without this, a
+    patch whose object is identical to the base's existing object
+    is marked `deterministic` with content unchanged, and any
+    subsequent diff patch on the same file runs against a content
+    that never had the object removed — passing the diff to the
+    walker with the deletion lines still in place, which then
+    correctly fails and reports `failed`.
+    """
+    raw_body = patch["body"]
+    body_stripped = raw_body.strip()
     if not body_stripped:
         return None
+
+    context_before = patch.get("context_before", "")
+
+    if _is_deletion_instruction(raw_body, context_before):
+        deleted = _delete_exact_block(base, raw_body)
+        if deleted is not None:
+            return deleted
+
+    if _looks_like_diff_body(raw_body):
+        diffed = _try_raw_diff_patch(base, raw_body)
+        if diffed is not None:
+            return diffed
 
     m = re.match(r'^(export\s+(?:const|let)\s+(\w+)\s*=\s*)\{',
                   body_stripped)
@@ -282,7 +442,14 @@ def _try_deterministic_patch(base: str, patch: dict) -> Optional[str]:
         base_had_semi = False
 
     sep = ";" if (body_had_semi or base_had_semi) else ""
-    return base_head + body_trimmed + sep + base_tail
+    result = base_head + body_trimmed + sep + base_tail
+
+    # FIX: no-op check.  If the splice produced byte-identical
+    # content, the object literal in the patch is the same as the
+    # one in base — nothing to change.
+    if result == base:
+        return None
+    return result
 
 
 def _find_matching_brace(text: str, open_idx: int,

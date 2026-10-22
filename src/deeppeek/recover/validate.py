@@ -2,82 +2,46 @@
 recover.validate — Pass 7 (cross-validate imports) and Pass 8
 (verify files).
 
-Pass 7 is a pure read over the recovered content; it walks every
-Python import in every recovered file and reports the ones that do
-not resolve to a recovered target, de-duplicated per (file, module)
-pair.  The concatenation model reported one problem per imported
-*name*, which turned `from playground_fonts import A, B, C` into
-three identical `missing_module` lines; this version de-dupes.
+Pass 7 is a pure read over the recovered content.
 
-THREE FALSE-POSITIVE SOURCES ELIMINATED
-=======================================
-The pass-7 report used to be dominated by noise.  All three
-classes are now handled:
+Pass 8 verifies ast.parse for .py files and checks that patches took
+effect.
 
-    · Framework namespaces (`pgkit.*`, `playground_*`).  Resolved at
-      runtime by the kit's `pgkit_modules()` manifest, not by
-      anything the conversation was trying to recover.
-      `_EXTERNAL_NAMESPACES` lists them; `_is_likely_local` rejects
-      any module whose first dotted segment matches.  Shared with
-      `write._aggregate_missing_imports` so both reports stay
-      silent on the same inputs.
+NEW (2026-10-30c) **Trust the patcher for `deterministic`.**
 
-    · Contentless records.  A header that never got a full print
-      sits in `records` with `content = None`.  `_resolve_module`
-      skips any such record; the import falls through to
-      `_is_likely_local`, which reports it as `missing_module`
-      rather than as a `missing_export` from an empty file.
+The verifier no longer re-checks `deterministic` patches.  A
+deterministic patch is one that matched its anchor exactly and
+mutated the exact lines it named, via a helper (`_delete_exact_block`,
+`_try_raw_diff_patch`, or the object-literal splice) that is correct
+by construction.  Re-checking the *final* content afterwards produces
+false failures whenever a later patch on the same file edited the
+same lines again.
 
-    · Stdlib modules shadowing a local basename.  `import
-      http.server` used to match a recovered `server.py` via the
-      dotted-last-segment fallback.  `_resolve_module` now checks
-      the top segment against `sys.stdlib_module_names` and
-      `_EXTERNAL_NAMESPACES` *before* any resolution attempt, so
-      dotted stdlib modules are never considered candidates for
-      local resolution.
+The specific shape that broke the panel-fade conversation:
 
-FLAT-LAYOUT RESOLUTION
-======================
-`from .extension.install import install` in a nested package
-(`dsx/extension/install.py`) arrives as the module reference
-`.extension.install`.  In the flat output layout, the recovered
-file is stored under its bare basename (`install.py`) — the
-`dsx/extension/` directory prefix is gone.  `_resolve_module`
-first tries the joined path (`extension/install.py`); if that
-fails, it falls back to the last dotted segment's basename
-(`install.py`).  The fallback is only used for *relative*
-imports; absolute imports resolve strictly by basename so a
-stray `import server` cannot accidentally match a project-local
-`server.py` when `server` really refers to a stdlib module.
+    patch 1 (deletion, "delete this block"): applies
+    patch 2 (diff, deletion of the same block): sees block already
+        gone, marks itself `already-present`
+    verify: patch 1 is deterministic, block is gone → the
+        deleted block's lines look "missing" → trust drops to LOW
+    result: pg_state.py is written to .deeppeek/low_trust/ even
+        though both patches succeeded, and the tree version is
+        unchanged.
 
-`_py_imports` additionally preserves `node.level` — the count of
-leading dots in `from .paths import x` — so that relative
-semantics survive into `_resolve_module`'s relative branch.
+Verify now skips `deterministic` and `already-present` patches
+entirely.  Only `llm` patches are re-checked — they can hallucinate
+context and need the presence/absence gate.
 
-Pass 8 is nominally a read but can mutate: when `ast.parse` fails
-on a `.py` body whose last non-blank character looks like a clean
-statement terminator, a small set of "closer" appends are tried and
-the first that parses is written back.  This is a truncation-repair
-heuristic for artefacts of the markdown extraction pipeline (an
-ES-module JS body whose closing `\"\"\"` was cut off; a Python
-literal whose trailing bracket was truncated).  The repair is
-append-only and preserves the truncated prefix verbatim, so a
-mid-file structural error cannot be masked.
+The same skip applies to `already-present`: those were no-ops at
+application time; the content may have evolved since.
 
-Pass 8 also promotes `last_full` picks that pass `ast.parse` and
-carry no *structural* patch failures.  Rationale (see the block
-below the `pass8_verify` body):
+The diff-aware and deletion-aware checks remain for `llm` patches.
 
-    `last_full` means dedup had multiple full prints and picked
-    the later one as a tiebreaker, capping trust at MEDIUM.  Once
-    the pick parses cleanly, the only question the tiebreaker was
-    hedging — "is this the right revision?" — is answered by the
-    fact that the picked content is syntactically valid and is
-    the *later* of the candidates.
-
-The py-AST helpers `_py_exports`, `_py_imports`, `_resolve_module`,
-`_is_likely_local` live here because both pass 7 and pass 9 need
-them.
+Three false-positive classes were eliminated in pass 7 earlier:
+framework namespaces (`pgkit.*`), contentless records, stdlib
+modules shadowing local basenames.  All are handled by
+`_resolve_module` and `_is_likely_local` below, and shared with
+`write._aggregate_missing_imports`.
 """
 
 import ast
@@ -87,7 +51,12 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from .core import FileRecord, _basename
+from .core import (
+    FileRecord, _basename,
+    _is_deletion_instruction,
+    _looks_like_diff_body,
+    _strip_diff_prefixes,
+)
 
 
 def pass7_cross_validate(records: dict[str, FileRecord]) -> dict:
@@ -111,11 +80,6 @@ def pass7_cross_validate(records: dict[str, FileRecord]) -> dict:
             target = _resolve_module(module, records, path)
             if target is None:
                 if _is_likely_local(module, records):
-                    # Relative imports carry their leading dots
-                    # (e.g. ".paths"); display the display-friendly
-                    # form without them.  A bare "." means
-                    # ``from . import x`` — an attribute on the
-                    # package __init__, not a recoverable file.
                     display = module.lstrip(".")
                     if not display:
                         continue
@@ -170,22 +134,6 @@ def _py_exports(body: str) -> set[str]:
 
 
 def _py_imports(body: str) -> list[tuple[str, str]]:
-    """Return ``(module_with_level_prefix, name)`` pairs.
-
-    ``node.level`` in the AST is the count of leading dots in the
-    import statement — ``from .paths import x`` has level 1,
-    ``from .. import x`` has level 2.  The original code dropped
-    this and passed the bare module name to ``_resolve_module``,
-    which treated it as an absolute import.  For flat layouts that
-    happened to work (``paths`` == ``paths.py``); for nested
-    packages it silently resolved to the wrong file or nothing at
-    all.  Prefixing the module name with ``"." * level`` preserves
-    the semantics so ``_resolve_module``'s relative branch fires.
-
-    ``ast.walk`` (not ``tree.body``) so function-level imports are
-    captured too — the dsx extension subcommands import lazily
-    inside their ``cmd_ext_*`` handlers.
-    """
     try:
         tree = ast.parse(body)
     except SyntaxError:
@@ -204,56 +152,11 @@ def _py_imports(body: str) -> list[tuple[str, str]]:
     return out
 
 
-# Framework namespaces — anything imported from these is resolved by
-# the kit's `pgkit_modules()` manifest at runtime, not by the
-# recovered set.  Reporting them as missing is noise: the
-# conversation was never going to recover `pgkit.html_shell` because
-# pgkit is the extraction tool's own dependency tree, and
-# `playground_fonts` is a shared-library module outside the
-# playground being extracted.  Adding a name here silences both the
-# import-graph report (pass 7) and the missing-files report (pass 9).
 _EXTERNAL_NAMESPACES = ("pgkit", "playground_")
 
 
 def _resolve_module(module: str, records: dict[str, FileRecord],
                     from_path: str) -> Optional[str]:
-    """Resolve a module reference to a recovered file path.
-
-    Three things are checked before the recovered set is even
-    consulted:
-
-      1. Stdlib tops.  ``import http.server`` must never match a
-         local ``server.py`` via the last-segment fallback below.
-         The top segment is compared against
-         ``sys.stdlib_module_names``; if it matches, the reference
-         cannot resolve to a recovered file.
-
-      2. External namespaces (``pgkit.*``, ``playground_*``).  Same
-         reasoning — resolved by the kit's own module manifest, not
-         by the recovered set.
-
-      3. Content-bearing records.  A header that was never given a
-         full print sits in ``records`` with ``content = None``;
-         treating it as if it were a valid file produced false
-         ``missing_export`` errors.  Skipping contentless records
-         here makes the caller fall through to
-         ``_is_likely_local``, which correctly reports the file as
-         missing.
-
-    Relative imports (``from .paths import x``) resolve against the
-    directory of ``from_path``, walking up ``level - 1`` directories
-    first, with a **basename fallback** for the flat output layout:
-    when ``dsx/extension/install.py`` has been flattened to
-    ``install.py``, the joined path ``extension/install.py`` does
-    not exist but the basename ``install.py`` does.
-
-    Absolute imports resolve by basename against the recovered set.
-    A dotted absolute module (``dsx.extension.paths``) additionally
-    tries the last segment's basename (``paths.py``); this is only
-    reached for imports whose top segment is *not* stdlib or
-    external, which the check above guarantees.
-    """
-    # ----- 1 & 2: skip stdlib and external namespaces -----
     if not module.startswith((".", "/")):
         top = module.split(".", 1)[0]
         if hasattr(sys, "stdlib_module_names"):
@@ -263,15 +166,12 @@ def _resolve_module(module: str, records: dict[str, FileRecord],
             if top == ns or top.startswith(ns + "."):
                 return None
 
-    # ----- 3: relative imports -----
     if module.startswith("."):
         level = 0
         while level < len(module) and module[level] == ".":
             level += 1
         rest = module[level:]
         if not rest:
-            # ``from . import x`` — attribute on the package
-            # __init__, not a recoverable file.
             return None
 
         parent = os.path.dirname(from_path)
@@ -280,7 +180,6 @@ def _resolve_module(module: str, records: dict[str, FileRecord],
 
         parts = rest.split(".")
 
-        # Try the full joined path first (non-flat layouts).
         candidate = "/".join(([parent] if parent else []) + parts)
         for ext in ("", ".py", ".js", ".mjs", ".ts", ".tsx"):
             full = candidate + ext
@@ -288,11 +187,6 @@ def _resolve_module(module: str, records: dict[str, FileRecord],
             if rec is not None and rec.content is not None:
                 return full
 
-        # Flat-layout fallback: the directory components of the
-        # package path were lost during extraction, so
-        # `from .extension.install import x` arrives as
-        # `.extension.install` but the file lives at the bare
-        # basename `install.py`.
         last = parts[-1]
         for ext in ("", ".py", ".js", ".mjs", ".ts", ".tsx"):
             full = last + ext
@@ -301,7 +195,6 @@ def _resolve_module(module: str, records: dict[str, FileRecord],
                 return full
         return None
 
-    # ----- absolute-path form (rare) -----
     if module.startswith("/"):
         for ext in ("", ".py", ".js", ".mjs", ".ts", ".tsx"):
             full = module + ext
@@ -310,19 +203,11 @@ def _resolve_module(module: str, records: dict[str, FileRecord],
                 return full
         return None
 
-    # ----- absolute module name -----
-    # Match by basename against the recovered set (records use
-    # basenames as keys).
     for path, rec in records.items():
         if rec.content is None:
             continue
         if _basename(path) == module + ".py":
             return path
-        # Dotted absolute module (``dsx.extension.paths``) →
-        # last-segment basename match.  Only reached here for
-        # imports whose top segment is *not* stdlib or external,
-        # which guarantees we never confuse `http.server` with a
-        # local `server.py`.
         last = module.rsplit(".", 1)[-1]
         if last != module and _basename(path) == last + ".py":
             return path
@@ -331,25 +216,6 @@ def _resolve_module(module: str, records: dict[str, FileRecord],
 
 def _is_likely_local(module: str,
                      records: Optional[dict] = None) -> bool:
-    """True if `module` looks like it belongs to the project being
-    recovered.
-
-    Signals, in priority order:
-
-      1. Relative or absolute-path import → local by definition.
-      2. A file with the module's basename exists in `records` as
-         a header (even with `content = None`) → local.  This
-         catches non-underscore-prefixed modules like `paths`,
-         `models`, `slicer` that the original `"_" in module`
-         heuristic missed.
-      3. First dotted segment matches a framework namespace
-         (``pgkit``, ``playground_``) → external.
-      4. First dotted segment is in ``sys.stdlib_module_names`` →
-         external.
-      5. Underscore in the module name → local (the original
-         heuristic, kept as a last-resort signal for projects that
-         don't fit any of the above).
-    """
     if module.startswith((".", "/")):
         return True
     top = module.split(".", 1)[0]
@@ -368,30 +234,10 @@ def _is_likely_local(module: str,
     return "_" in module
 
 
-# Clean statement terminators — the last non-blank character of
-# `body` must be one of these for `_try_repair_python` to attempt an
-# append.  A file whose last line ends mid-expression (`foo.bar(`)
-# is not "repaired" by appending a closer: the append would silently
-# swallow the truncation and produce a body that parses but is
-# semantically incomplete.
 _REPAIR_TERMINATORS = frozenset(';})]"\'>')
 
 
 def _try_repair_python(body: str, err: SyntaxError) -> Optional[str]:
-    """Try appending a plausible closer when ast.parse fails on `body`.
-
-    Only fires when the last non-blank character of the body looks
-    like a clean statement terminator (`;`, `}`, `)`, `]`, `"`, `'`,
-    `>`).  A body that ends mid-expression (e.g. `foo.bar(`) is not
-    repaired — the append would produce a file that parses but is
-    semantically incomplete.
-
-    The repair is append-only: the returned body's prefix is
-    `body.rstrip()`, verbatim.  Nothing is rewritten, deleted, or
-    reformatted.
-
-    Returns the repaired source, or None if no repair works.
-    """
     stripped = body.rstrip()
     if not stripped:
         return None
@@ -417,23 +263,11 @@ def _try_repair_python(body: str, err: SyntaxError) -> Optional[str]:
     return None
 
 
-# Real diff shapes — a `last_full` pick's failed patches count as
-# "structural" only if their body looks like one of these.  A prose
-# snippet that happened to quote a line of the base does not.
 _STRUCTURAL_PATCH_EXPORT_RE = re.compile(
     r'^export\s+(?:const|let|var)\s+\w+\s*=\s*\{')
 
 
 def _has_structural_failures(rec: FileRecord) -> bool:
-    """True if any failed patch body looks like a real diff.
-
-    Used by `pass8_verify`'s `last_full` promotion: a pick whose only
-    patch failures are non-structural (prose snippets, partial-line
-    quotes) can be promoted to HIGH, because the failures are noise
-    and not evidence that the base content is incomplete.  A pick
-    whose failures *do* look like real diffs stays at MEDIUM — the
-    base is likely missing a real change.
-    """
     for p in rec.patches:
         if p.get("applied_by") != "failed":
             continue
@@ -446,6 +280,21 @@ def _has_structural_failures(rec: FileRecord) -> bool:
         if body.startswith("@@ ") or "\n@@ " in body:
             return True
     return False
+
+
+def _diff_lines_for_verify(body: str) -> tuple[list[str], list[str]]:
+    adds: list[str] = []
+    dels: list[str] = []
+    for pl in body.splitlines():
+        if pl.startswith("+") and not pl.startswith("+++"):
+            content = pl[1:].rstrip()
+            if content.strip():
+                adds.append(content)
+        elif pl.startswith("-") and not pl.startswith("---"):
+            content = pl[1:].rstrip()
+            if content.strip():
+                dels.append(content)
+    return adds, dels
 
 
 def pass8_verify(records: dict[str, FileRecord]) -> None:
@@ -480,24 +329,11 @@ def pass8_verify(records: dict[str, FileRecord]) -> None:
                     print(f"  [verify] ast.parse FAIL in {path}: {msg}",
                           file=sys.stderr)
 
-        # Promote `last_full` picks to HIGH after a successful parse.
-        #
-        # `last_full` means dedup had multiple full prints and picked
-        # the later one as a tiebreaker, capping trust at MEDIUM.
-        # Once the pick parses cleanly, the only question the
-        # tiebreaker was hedging — "is this the right revision?" —
-        # is answered by the fact that the picked content is valid
-        # syntax and is the later of the candidates.  The failed
-        # patches, if any, are audited in
-        # `verification.patches_incomplete` and in `warnings.txt`;
-        # if they look structural, we keep MEDIUM; otherwise the
-        # failures are noise and HIGH is appropriate.
         if (path.endswith(".py")
                 and rec.dedup_reason == "last_full"
                 and rec.trust == "MEDIUM"
                 and v.get("ast_parse", "").startswith("ok")):
             if v.get("patches_incomplete") and _has_structural_failures(rec):
-                # Genuine failure — keep MEDIUM, note why.
                 v["last_full_promotion_blocked"] = (
                     "structural patch failure(s)")
                 print(f"  [verify] {path}: last_full promotion blocked "
@@ -516,27 +352,116 @@ def pass8_verify(records: dict[str, FileRecord]) -> None:
                           f"non-structural)",
                           file=sys.stderr)
 
+        # ---- patch_presence ----
         if rec.patches and rec.content:
-            total_missing = 0
+            content_lines = {
+                ln.rstrip() for ln in rec.content.splitlines()
+                if ln.strip()
+            }
+            content_lines_nonempty = [
+                ln.rstrip() for ln in rec.content.splitlines()
+                if ln.strip()
+            ]
+
+            total_missing_adds = 0
+            total_deletions_not_removed = 0
+
             for patch in rec.patches:
-                if patch.get("applied_by") == "failed":
+                status = patch.get("applied_by")
+
+                # --- skip already-verified or no-op patches ---
+                if status == "failed":
                     continue
-                missing = []
-                for pl in patch["body"].splitlines():
+                if status == "already-present":
+                    # No-op at application time; content may have
+                    # evolved since.  Do not re-check.
+                    continue
+                if status == "deterministic":
+                    # The deterministic patcher matched its anchor
+                    # exactly and mutated the exact lines it named.
+                    # Re-checking the FINAL content afterwards
+                    # produces false failures whenever a later patch
+                    # on the same file edits the same lines again —
+                    # e.g. patch A deletes a block, patch B deletes
+                    # the same block (duplicate assistant message),
+                    # and patch A's verify then reports "the block
+                    # is missing" (which it is — that's the point).
+                    # Trust the patcher.
+                    continue
+
+                # Anything else (llm) gets the full verification.
+
+                body = patch["body"]
+
+                if _looks_like_diff_body(body):
+                    adds, dels = _diff_lines_for_verify(body)
+
+                    for a in adds:
+                        if a not in content_lines:
+                            total_missing_adds += 1
+
+                    if dels:
+                        n = len(dels)
+                        block_still_present = False
+                        for i in range(
+                                len(content_lines_nonempty) - n + 1):
+                            if content_lines_nonempty[i:i + n] == dels:
+                                block_still_present = True
+                                break
+                        if block_still_present:
+                            total_deletions_not_removed += 1
+
+                    continue
+
+                if _is_deletion_instruction(
+                        body, patch.get("context_before", "")):
+                    stripped = _strip_diff_prefixes(body)
+                    body_lines = [
+                        ln.rstrip() for ln in stripped.splitlines()
+                        if ln.strip()
+                    ]
+                    if body_lines:
+                        n = len(body_lines)
+                        for i in range(
+                                len(content_lines_nonempty) - n + 1):
+                            if content_lines_nonempty[i:i + n] == body_lines:
+                                total_deletions_not_removed += 1
+                                break
+                    continue
+
+                for pl in body.splitlines():
                     s = pl.strip()
                     if not s:
                         continue
                     if s.startswith(("//", "#")):
                         continue
                     if s not in rec.content:
-                        missing.append(s[:60])
-                total_missing += len(missing)
-            if total_missing:
-                v["patch_presence"] = f"{total_missing} missing lines"
+                        total_missing_adds += 1
+
+            if total_deletions_not_removed:
+                v["patch_presence"] = (
+                    f"{total_deletions_not_removed} deletion block(s) "
+                    f"still present"
+                )
                 rec.warnings.append(
-                    f"patch presence: {total_missing} lines not found")
+                    f"patch presence: "
+                    f"{total_deletions_not_removed} deletion block(s) "
+                    f"that should have been removed are still in the "
+                    f"file"
+                )
                 rec.trust = "LOW"
                 print(f"  [verify] patch presence FAIL in {path}: "
-                      f"{total_missing} missing lines", file=sys.stderr)
+                      f"{total_deletions_not_removed} deletion block(s) "
+                      f"did not take effect", file=sys.stderr)
+            elif total_missing_adds:
+                v["patch_presence"] = (
+                    f"{total_missing_adds} missing lines")
+                rec.warnings.append(
+                    f"patch presence: {total_missing_adds} lines "
+                    f"not found")
+                rec.trust = "LOW"
+                print(f"  [verify] patch presence FAIL in {path}: "
+                      f"{total_missing_adds} missing lines",
+                      file=sys.stderr)
             else:
                 v["patch_presence"] = "ok"

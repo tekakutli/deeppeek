@@ -2,13 +2,31 @@
 '''
 test_recover.py — fixture tests for recover.py.
 
+Fixtures 01–06 exercise the standard `--out` path (self-contained
+markdown, no pre-existing tree).
+
+Fixture 07 exercises the `--apply-to` path: the fixture markdown
+carries only patches, and the pre-existing source tree is provided
+by `preexisting/<fixture>/`.  Test 07 additionally uses
+`skip_file_compare=True` so it asserts on SEMANTICS (panelState
+gone, no patch failed, trust HIGH) rather than byte-exact
+whitespace — the deletion path leaves a variable number of
+adjacent blank lines depending on the pre-existing file's exact
+spacing, and over-constraining that would make the test fail on
+correct behaviour.
+
 Run:
-    python tests/test_recover.py
+    python tests/recover/test_recover.py
+
+Set DEEPPEEK_TEST_KEEP=1 to preserve the temp directory on failure
+for manual inspection.
 
 Exits 0 on success, 1 on any failure.
 '''
 
+import difflib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -17,7 +35,22 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 FIXTURES = HERE / "fixtures"
 EXPECTED = HERE / "expected"
+PREEXISTING = HERE / "preexisting"
 DEEPPEEK = HERE.parents[1]
+
+KEEP_TMP = os.environ.get("DEEPPEEK_TEST_KEEP") == "1"
+
+
+def _run(cmd, cwd=None):
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+    if result.returncode > 4:
+        raise RuntimeError(
+            f"command exited {result.returncode}\n"
+            f"cmd: {' '.join(cmd)}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    return result
 
 
 def run_recover(fixture: Path, out: Path) -> dict:
@@ -27,13 +60,7 @@ def run_recover(fixture: Path, out: Path) -> dict:
         "--llm-mode", "off",
         "--min-trust", "LOW",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode > 4:
-        raise RuntimeError(
-            f"recover exited {result.returncode}\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
-        )
+    result = _run(cmd)
     manifest_path = out / "manifest.json"
     manifest = {}
     if manifest_path.exists():
@@ -46,28 +73,140 @@ def run_recover(fixture: Path, out: Path) -> dict:
     }
 
 
-def check(fixture_name: str, extra=None):
+def run_recover_apply(fixture: Path, apply_to: Path) -> dict:
+    cmd = [
+        sys.executable, "-m", "deeppeek", "recover", str(fixture),
+        "--apply-to", str(apply_to),
+        "--llm-mode", "off",
+        "--min-trust", "LOW",
+    ]
+    result = _run(cmd)
+    manifest_path = apply_to / "manifest.json"
+    manifest = {}
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+    return {
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "manifest": manifest,
+    }
+
+
+def _show_diff(exp_file: Path, act_file: Path) -> str:
+    exp_lines = exp_file.read_text().splitlines(keepends=True)
+    act_lines = act_file.read_text().splitlines(keepends=True)
+    diff = list(difflib.unified_diff(
+        exp_lines, act_lines,
+        fromfile=str(exp_file.name),
+        tofile=str(act_file.name),
+        lineterm="",
+    ))
+    if not diff:
+        return "(no line-level difference; possibly trailing newline only)"
+    out = []
+    for line in diff:
+        out.append(repr(line))
+    return "\n".join(out)
+
+
+def check(fixture_name: str, extra=None, skip_file_compare=False,
+          tmp_holder=None):
+    """Standard-mode test: `--out` with no pre-existing tree."""
     fixture = FIXTURES / f"{fixture_name}.md"
     expected_dir = EXPECTED / fixture_name
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "out"
         run = run_recover(fixture, out)
-        for exp_file in sorted(expected_dir.iterdir()):
-            if not exp_file.is_file():
-                continue
-            actual = out / "files" / exp_file.name
-            assert actual.exists(), (
-                f"{fixture_name}: expected output missing: {exp_file.name}"
-            )
-            exp_lines = exp_file.read_text().splitlines()
-            act_lines = actual.read_text().splitlines()
-            assert exp_lines == act_lines, (
-                f"{fixture_name}: {exp_file.name} mismatch\n"
-                f"EXPECTED:\n{chr(10).join(exp_lines)}\n"
-                f"ACTUAL:\n{chr(10).join(act_lines)}"
-            )
+
+        if not skip_file_compare:
+            for exp_file in sorted(expected_dir.iterdir()):
+                if not exp_file.is_file():
+                    continue
+                actual = out / "files" / exp_file.name
+                assert actual.exists(), (
+                    f"{fixture_name}: expected output missing: "
+                    f"{exp_file.name}"
+                )
+                exp_lines = exp_file.read_text().splitlines()
+                act_lines = actual.read_text().splitlines()
+                if exp_lines != act_lines:
+                    raise AssertionError(
+                        f"{fixture_name}: {exp_file.name} mismatch\n"
+                        + _show_diff(exp_file, actual)
+                    )
+
         if extra:
             extra(out, run)
+
+
+def check_apply(fixture_name: str, extra=None, skip_file_compare=False):
+    """`--apply-to` mode: pre-existing tree provided by
+    `preexisting/<fixture_name>/`.
+
+    When `skip_file_compare=True`, the expected/<fixture>/ contents
+    are not compared byte-for-byte; the caller's `extra` callback is
+    responsible for whatever assertions matter.
+    """
+    fixture = FIXTURES / f"{fixture_name}.md"
+    preexisting_dir = PREEXISTING / fixture_name
+    expected_dir = EXPECTED / fixture_name
+
+    assert preexisting_dir.is_dir(), (
+        f"{fixture_name}: expected preexisting directory at "
+        f"{preexisting_dir}"
+    )
+    if not skip_file_compare:
+        assert expected_dir.is_dir(), (
+            f"{fixture_name}: expected directory at {expected_dir}"
+        )
+
+    if KEEP_TMP:
+        tmp_dir = tempfile.mkdtemp(prefix=f"deeppeek_test_{fixture_name}_")
+        tmp_ctx = None
+    else:
+        tmp_ctx = tempfile.TemporaryDirectory()
+        tmp_dir = tmp_ctx.name
+
+    try:
+        target = Path(tmp_dir) / "target"
+        target.mkdir()
+
+        for src in sorted(preexisting_dir.rglob("*")):
+            if not src.is_file():
+                continue
+            rel = src.relative_to(preexisting_dir)
+            dst = target / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text(src.read_text())
+
+        run = run_recover_apply(fixture, target)
+
+        if not skip_file_compare:
+            for exp_file in sorted(expected_dir.rglob("*")):
+                if not exp_file.is_file():
+                    continue
+                rel = exp_file.relative_to(expected_dir)
+                actual = target / rel
+                assert actual.exists(), (
+                    f"{fixture_name}: expected output missing: {rel}"
+                )
+                exp_lines = exp_file.read_text().splitlines()
+                act_lines = actual.read_text().splitlines()
+                if exp_lines != act_lines:
+                    raise AssertionError(
+                        f"{fixture_name}: {rel} mismatch\n"
+                        + _show_diff(exp_file, actual)
+                    )
+
+        if extra:
+            extra(target, run)
+
+        if KEEP_TMP:
+            print(f"\n[debug] tempdir kept: {tmp_dir}")
+    finally:
+        if tmp_ctx is not None:
+            tmp_ctx.cleanup()
 
 
 def test_01():
@@ -100,10 +239,93 @@ def test_06():
     check("06_superset_wins")
 
 
+def test_07():
+    """Deletion shapes, semantic assertions.
+
+    The exact blank-line count left by `_delete_exact_block` depends
+    on the pre-existing file's spacing around the deleted block —
+    one blank above plus one blank below becomes two adjacent
+    blanks, but a file with only one blank total becomes one.  Both
+    are correct outputs; neither is a bug.  Asserting on the number
+    of blank lines would fail on some valid inputs and pass on
+    others for no good reason.
+
+    So this test asserts on what deeppeek is actually FOR:
+      · the panelState block is gone from the file
+      · the surrounding functions survive
+      · no patch reported `failed`
+      · trust is HIGH (i.e., verify didn't demote)
+    """
+
+    def extra(target, run):
+        manifest = run["manifest"]
+        files = manifest.get("files", {})
+        assert "sample.js" in files, (
+            f"expected sample.js in manifest files, got: {list(files)}"
+        )
+        rec = files["sample.js"]
+
+        assert rec["trust"] == "HIGH", (
+            f"sample.js: expected trust=HIGH, got {rec['trust']}\n"
+            f"warnings: {rec.get('verification', {})}"
+        )
+        assert rec.get("preexisting_base") is True, (
+            f"sample.js: expected preexisting_base=True, got "
+            f"{rec.get('preexisting_base')}"
+        )
+
+        patch_statuses = [p["applied_by"] for p in rec["patches"]]
+        assert "failed" not in patch_statuses, (
+            f"sample.js: expected no failed patches, got "
+            f"{patch_statuses}"
+        )
+        assert any(s in ("deterministic",) for s in patch_statuses), (
+            f"sample.js: expected a deterministic patch, got "
+            f"{patch_statuses}"
+        )
+
+        content = (target / "sample.js").read_text()
+
+        # The block the patches targeted MUST be gone.
+        assert "panelState" not in content, (
+            f"sample.js: panelState block still present after "
+            f"patches applied.  Full content:\n{content}"
+        )
+        assert "hovered: false" not in content, (
+            f"sample.js: 'hovered: false' still present.  "
+            f"Full content:\n{content}"
+        )
+        assert "lastActivity: 0" not in content, (
+            f"sample.js: 'lastActivity: 0' still present.  "
+            f"Full content:\n{content}"
+        )
+
+        # The untouched neighbours MUST survive.
+        assert "keepMe" in content, (
+            f"sample.js: keepMe function removed unexpectedly.  "
+            f"Full content:\n{content}"
+        )
+        assert "return 42" in content, (
+            f"sample.js: return 42 (keepMe body) missing.  "
+            f"Full content:\n{content}"
+        )
+        assert "alsoKeepMe" in content, (
+            f"sample.js: alsoKeepMe function removed unexpectedly.  "
+            f"Full content:\n{content}"
+        )
+        assert "return 99" in content, (
+            f"sample.js: return 99 (alsoKeepMe body) missing.  "
+            f"Full content:\n{content}"
+        )
+
+    check_apply("07_deletion_shapes", extra, skip_file_compare=True)
+
+
 def main():
     tests = [
         ("01", test_01), ("02", test_02), ("03", test_03),
         ("04", test_04), ("05", test_05), ("06", test_06),
+        ("07", test_07),
     ]
     failed = 0
     for name, fn in tests:

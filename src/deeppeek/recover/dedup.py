@@ -4,63 +4,61 @@ recover.dedup — Pass 5 (pick one full-print winner per file).
 DIFFICULT.  Owns:
 
     FIX [B]   Syntax-preference step between "revision" (2.5) and
-              "modifier" (3).  For .py files, restrict the candidate
-              set to ast.parse-valid prints before running the modifier
-              signal.  A "corrected" reprint that fails ast.parse must
-              never beat an older valid print.  This recovers
-              pg_base.py — the fonts-fixed reprint has an unterminated
-              docstring that swallowed the body.
+              "modifier" (3).
 
     FIX [C]   Filter spurious trailing "patches".  A partial block
-              after the chosen full print becomes a real patch ONLY
+              after the chosen full print becomes a real patch only
               if it satisfies one of:
 
                 · override_reason is a diff- or reprint-context anchor
-                  (i.e., the prose immediately before the block says
-                  "change inside …" or "reprint in place …"), or
+
+                · the body is a deletion instruction —
+                  `_is_deletion_instruction(body, context_before)`
+                  — i.e. a pure-deletion diff or a raw code block
+                  preceded by "Delete:" / "Remove:"
 
                 · the body's first line is a structural diff target —
-                  an object-literal re-declaration (`export const X =
-                  {...}` / `export let X = {...}` / `export var X =
-                  {...}`), which the deterministic patcher handles
-                  directly, or
+                  an object-literal re-declaration
 
-                · the body is a unified diff hunk (a `@@ -a,b +c,d @@`
-                  header), which the LLM patcher handles.
+                · the body is a unified diff hunk
+
+                · the body is a raw prefix diff (every line prefixed
+                  with `+`/`-`/` `)
 
               Everything else is dropped.
 
-    NEW (2026-10-23)  Preexisting-vs-real split.  In `--apply-to`
-              mode, `pipeline._load_preexisting_blocks` injects a
-              synthetic full-print block for every source file that
-              already exists in the target directory.  This pass
-              partitions `fulls` into:
+    NEW (2026-10-23)  Preexisting-vs-real split.
 
-                  real_fulls  = fulls born from the conversation
-                  pre_fulls   = synthetic blocks from --apply-to
+    NEW (2026-10-30)  Diff-shaped patches survive the real-patch
+              filter.
 
-              and prefers real fulls when both exist — the
-              conversation's print is always the authoritative
-              revision of the file.  When only synthetic fulls exist,
-              the record is marked `preexisting_base = True` so pass
-              9 can skip writing it unless a patch actually changed
-              its content.  When both exist, `preexisting_base` stays
-              False; the real print is written normally.
+    NEW (2026-10-30b) Deletion instructions survive the real-patch
+              filter.  This is the case that made the panel-fade
+              conversation fail: assistant #1 emitted the `panelState`
+              removal as a ```js body with "Delete:" prose, not as a
+              diff.  Without this change, that block was dropped by
+              pass 5, never landed in `rec.patches`, and the diff
+              fence from assistant #2 that DID survive had no
+              sibling to verify against — but worse, when it did
+              land, `validate` demanded the code be present after
+              it was deliberately removed.
 """
 
 import re
 import sys
 from typing import Optional
 
-from .core import Block, FileRecord, FIX_PROSE_PHRASES, MODIFIER_RANK
+from .core import (
+    Block, FileRecord, FIX_PROSE_PHRASES, MODIFIER_RANK,
+    _is_deletion_instruction,
+    _looks_like_diff_body,
+)
 
 
 def pass5_deduplicate(records: dict[str, FileRecord],
                       blocks_by_idx: dict[int, Block],
                       verbose: bool) -> None:
     for path, rec in records.items():
-        # Partition every "full" block for this path into
-        # conversation-born (real) vs --apply-to-born (synthetic).
         all_fulls = [i for i in rec.source_blocks
                      if blocks_by_idx[i].kind == "full"]
         real_fulls = [i for i in all_fulls
@@ -83,6 +81,7 @@ def pass5_deduplicate(records: dict[str, FileRecord],
         orphan_patches = [
             b.idx for b in blocks_by_idx.values()
             if b.is_orphan and b.attributed_to == path
+            and b.kind != "full"
         ]
         partials = sorted(partials + orphan_patches)
 
@@ -108,7 +107,6 @@ def pass5_deduplicate(records: dict[str, FileRecord],
 
         rec.last_full_idx = rec.chosen_full_idx
 
-        # FIX [C]: real patches only.
         chosen_idx = rec.chosen_full_idx
 
         def _is_real_patch(p_idx: int) -> bool:
@@ -123,6 +121,18 @@ def pass5_deduplicate(records: dict[str, FileRecord],
             body = b.body.strip()
             if not body:
                 return False
+
+            # Deletion instruction: covers both pure-deletion diffs
+            # and raw code blocks with "Delete:" prose.
+            if _is_deletion_instruction(body, b.context_before):
+                return True
+
+            if b.fence_lang.lower() == "diff":
+                return True
+
+            if _looks_like_diff_body(body):
+                return True
+
             first_line = body.split("\n", 1)[0].strip()
             if re.match(
                 r'^export\s+(?:const|let|var)\s+\w+\s*=\s*\{',
@@ -159,12 +169,10 @@ def _dedup_pick(path: str,
     if len(fulls) == 1:
         return fulls[0], "single"
 
-    # 1. All identical
     bodies = [blocks_by_idx[i].body for i in fulls]
     if len(set(bodies)) == 1:
         return fulls[-1], "identical"
 
-    # 2. One strict superset of the rest
     for i in fulls:
         bi = blocks_by_idx[i]
         if all(
@@ -175,7 +183,6 @@ def _dedup_pick(path: str,
         ):
             return i, "superset"
 
-    # 2.5. High-similarity revision
     _SIM_THRESHOLD = 0.75
     _SIM_MIN_LINES = 20
 
@@ -210,7 +217,6 @@ def _dedup_pick(path: str,
         newest = max(qualifies.keys())
         return newest, f"revision (sim {qualifies[newest]:.2f})"
 
-    # FIX [B]: syntax preference
     if path.endswith(".py"):
         import ast
         valid = []
@@ -225,7 +231,6 @@ def _dedup_pick(path: str,
         if 1 < len(valid) < len(fulls):
             fulls = valid
 
-    # 3. Modifier priority
     def mod_score(b):
         return MODIFIER_RANK.get((b.modifier or "").lower().strip(), 0)
 
@@ -237,7 +242,6 @@ def _dedup_pick(path: str,
         if len(winners) == 1:
             return winners[0], "modifier"
 
-    # 4. Prose-fix signal
     flagged = []
     for i in fulls:
         ctx = blocks_by_idx[i].context_before.lower()
@@ -246,7 +250,6 @@ def _dedup_pick(path: str,
     if len(flagged) == 1:
         return flagged[0], "prose_fix"
 
-    # 5. Syntax check
     if path.endswith(".py"):
         import ast
         valid = []
@@ -259,5 +262,4 @@ def _dedup_pick(path: str,
         if len(valid) == 1:
             return valid[0], "syntax"
 
-    # 6. Last-resort tiebreaker
     return fulls[-1], "last_full"

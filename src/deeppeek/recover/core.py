@@ -9,10 +9,24 @@ Sections:
     FENCE, DEL_MARKER_RE, DEFAULT_*        configuration constants
     phrase lists                           diff/reprint/fix heuristics
     _has_diff_signal, _narrow_context      narrow-window diff test
+    _looks_like_diff_body                  body-shape diff detector
+    _is_pure_deletion_diff_strict          pure-deletion predicate
+    _strip_diff_prefixes                   diff-prefix stripper
+    _is_deletion_instruction               "delete this block" test
     RECOVERED_META_RE                      signature of recover's own
                                            output in a later message
     Block, FileRecord                      the two dataclasses
     _del_marker_names, _basename           small shared helpers
+
+NEW (2026-10-30c) `_is_deletion_instruction` no longer fires the
+`has_prefix` check for non-diff bodies.  An indented code block — JS,
+Python, CSS — has every line starting with a space.  A space is also
+a diff's context prefix, so `has_prefix=True` was being set for any
+ordinary indented code snippet.  The prose signal ("Delete the
+whole block", "Remove the …") was then ignored, and the block was
+left to other patchers that couldn't handle it.  This is what
+dropped the panelState and PANEL FADE "delete this" blocks in the
+panel-fade conversation.
 """
 
 import os
@@ -85,6 +99,160 @@ def _narrow_context(context_before: str) -> str:
     return "\n".join(
         context_before.splitlines()[-_CONTEXT_WINDOW:]
     ).lower()
+
+
+_DELETE_SIGNAL_PHRASES = (
+    "delete",
+    "remove",
+    "get rid of",
+    "no longer",
+    "revert",
+    "drop",
+    "strip out",
+    "strip ",
+    "eliminate",
+    "take out",
+    "wipe",
+)
+
+
+def _has_deletion_signal(prose: str) -> bool:
+    """True iff the last three lines of `prose` contain a deletion-
+    signal phrase."""
+    narrow = "\n".join(prose.splitlines()[-3:]).lower()
+    return any(sig in narrow for sig in _DELETE_SIGNAL_PHRASES)
+
+
+def _looks_like_diff_body(body: str) -> bool:
+    """True iff `body` is a raw diff block.
+
+    Two shapes recognised:
+
+      · a unified-diff preamble (`---` / `+++` / `@@`) — matched
+        anywhere in the first five non-blank lines.  Definitive.
+
+      · a "prefix diff" without `@@` hunk headers — every non-blank
+        line starts with `+`, `-`, ` `, or `\\`, AND the body
+        contains at least one change (`+` or `-`).  This is the
+        shape LLMs most often emit: a straight copy of the base
+        with a few lines annotated.
+
+    The two-tier rule keeps ordinary code from tripping the check.
+    A Python file has lines like `def foo():` that don't start with
+    a diff prefix; the "every line starts with a prefix" clause
+    fails immediately.
+    """
+    lines = body.splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if len(lines) < 2:
+        return False
+
+    checked = 0
+    for ln in lines:
+        if not ln.strip():
+            continue
+        if ln.startswith(("---", "+++", "@@")):
+            return True
+        checked += 1
+        if checked >= 5:
+            break
+
+    n_add = 0
+    n_rem = 0
+    n_ctx = 0
+    for ln in lines:
+        if not ln:
+            continue
+        c = ln[0]
+        if c == "+" and not ln.startswith("+++"):
+            n_add += 1
+        elif c == "-" and not ln.startswith("---"):
+            n_rem += 1
+        elif c == " ":
+            n_ctx += 1
+        elif c == "\\":
+            continue
+        else:
+            return False
+
+    if n_add == 0 and n_rem == 0:
+        return False
+    if n_add > 0 and n_rem > 0:
+        return True
+    if n_ctx > 0:
+        return True
+    return (n_rem >= 3) or (n_add >= 3)
+
+
+def _is_pure_deletion_diff_strict(body: str) -> bool:
+    """True iff `body` is diff-shaped AND has NO `+` lines AND no
+    space-prefixed context lines.
+    """
+    for ln in body.splitlines():
+        if not ln:
+            continue
+        if ln.startswith("+") and not ln.startswith("+++"):
+            return False
+        if ln.startswith(" "):
+            return False
+    return any(
+        ln.startswith("-") and not ln.startswith("---")
+        for ln in body.splitlines()
+    )
+
+
+def _strip_diff_prefixes(body: str) -> str:
+    """Return `body` with diff-prefix characters stripped from each line.
+    """
+    out = []
+    for ln in body.splitlines():
+        if not ln:
+            out.append(ln)
+            continue
+        if ln.startswith(("+++", "---", "@@")):
+            continue
+        if ln[0] in ("+", "-", " "):
+            out.append(ln[1:])
+        else:
+            out.append(ln)
+    return "\n".join(out)
+
+
+def _is_deletion_instruction(body: str, context_before: str) -> bool:
+    """True iff `body` should be handled as a "delete this block"
+    instruction rather than a diff patch or object-literal
+    redeclaration.
+
+    Three cases, checked in order:
+
+      1. **Strict pure-deletion diff** (all `-` / unprefixed lines,
+         no ` ` context, no `+` lines).  This is the shape an LLM
+         emits when it wants to remove an entire block, and the
+         right patcher is `_delete_exact_block` (which strips the
+         prefixes and removes the whole block from the base).
+
+      2. **Mixed diff** (has `+` lines or ` ` context).  NOT a
+         deletion instruction — the block-deletion helper would
+         remove the context lines too.  Route to the diff patcher.
+
+      3. **Raw code block** with prose signalling deletion
+         ("Delete:", "Remove the …").  The code to remove is shown
+         as plain source, not as a diff.  Route to block deletion.
+
+    The critical difference from the pre-2026-10-30c version: for a
+    non-diff body, we no longer check whether *any* line starts with
+    a space.  Every indented code block (JS, Python, CSS) has lines
+    starting with a space, so that check fired `has_prefix=True` on
+    ordinary code and short-circuited the deletion-prose signal.
+    `has_prefix` is now only relevant to `_looks_like_diff_body`,
+    which does its own prefix verification.
+    """
+    if _is_pure_deletion_diff_strict(body):
+        return True
+    if _looks_like_diff_body(body):
+        return False
+    return _has_deletion_signal(context_before)
 
 
 FIX_PROSE_PHRASES = (
@@ -163,14 +331,6 @@ class Block:
     is_code_file: Optional[bool] = None
     kind: Optional[str] = None
     canonical_path: Optional[str] = None
-    # NEW: the resolved path this block's content belongs to.  For
-    # pre-existing baselines this equals canonical_path (already a
-    # full relative path).  For conversation blocks it is set by
-    # `resolve_paths()` — the real path in the target tree, resolved
-    # from header_path + content + context.  For orphans it stays
-    # None and is populated later by pass 4's attribution.  For
-    # standard (non --apply-to) recovery it equals canonical_path
-    # (basename).
     output_path: Optional[str] = None
     confidence: Optional[float] = None
     classified_by: str = "?"

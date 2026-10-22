@@ -40,6 +40,58 @@ on `$PATH`:
 For a frozen copy (no auto-pickup of edits), drop `--editable` and run
 `pipx reinstall deeppeek` after each source change.
 
+## Run the tests
+
+`tests/recover/` holds fixture-based tests for the recovery
+pipeline.  Each test spawns a real `deeppeek recover …` subprocess
+and diffs the output tree line-by-line.
+
+    python tests/recover/test_recover.py
+
+or via pytest:
+
+    python -m pytest tests/recover -v
+
+### Install the runtime dependency first
+
+The tests shell out to `deeppeek recover …` once per fixture.  The
+subprocess is resolved in this order:
+
+1. **`deeppeek` on `PATH`** — used if found.  `pipx install
+   --editable …` puts it there, and the pipx venv already carries
+   `markdown-it-py` (the project's only runtime dependency).
+   Nothing extra to install.
+
+2. **`python -m deeppeek`** — fallback when `deeppeek` is not on
+   `PATH`.  Requires `markdown-it-py` in the Python that runs the
+   tests.  Install it:
+
+       python -m pip install --user markdown-it-py
+
+   Or, for a project-local venv (isolated; preferred if you don't
+   want to touch user site-packages):
+
+       python -m venv .venv
+       .venv/bin/pip install -e ".[dev]"
+       .venv/bin/python tests/recover/test_recover.py
+
+### Failure mode to recognise
+
+A missing `markdown-it-py` does not surface as `ImportError` in
+the test runner.  Every recovery subprocess dies at its own
+import line, `out/files/` stays empty, and the test reports:
+
+    test_01: FAIL
+      01_reprint_later: expected output missing: bar.py
+    test_02: FAIL
+      02_subsection_patches: expected output missing: foo.js
+    ...
+    FileNotFoundError: …/manifest.json
+
+Six `expected output missing` lines in a row is this.  Fix it by
+either ensuring `deeppeek` is on `PATH`, or by running
+`python -m pip install --user markdown-it-py`.
+
 ## Load the extension into Zen
 
 Zen does not reliably read unsigned extensions placed on disk by a
@@ -117,6 +169,9 @@ Zen profile, and installed-extension state — start there.
   extension isn't loaded in the current tab.
 - **`extension watchdog …` says port 8765 in use** — another `deeppeek`
   command is running. Ctrl+C it, retry.
+- **Tests all fail with `expected output missing`** — see
+  [Run the tests](#run-the-tests); the Python running the tests
+  can't import `markdown-it-py`.
 
 ## License
 

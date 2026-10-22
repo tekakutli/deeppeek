@@ -21,14 +21,15 @@ DIFFICULT.  This module owns:
 
     NEW (2026-10-23)  Skip preexisting baselines (blocks with
               classified_by == "preexisting") during classification.
-              These blocks come from `_load_preexisting_blocks` in
-              pipeline.py: they were built from real files on disk,
-              they're already known to be full prints, and they have
-              no meaningful context_before.  Reclassifying them
-              would either leave them unchanged (heuristic path) or
-              accidentally escalate them to the LLM (which would
-              reclassify based on incomplete data).  Both are
-              avoided by the skip.
+
+    NEW (2026-10-30)  Diff fences and diff-shaped bodies are
+              classified as `partial` + is_code_file=True, so they
+              survive pass 3 and reach the patcher.  Previously
+              ` ```diff ` shared the "not_a_file" bucket with
+              ` ```bash ` and was silently dropped before pass 5
+              could attach it to its file as a patch — which is
+              why every "here's the diff" reply produced zero
+              applied changes.
 """
 
 import json
@@ -44,6 +45,7 @@ from .core import (
     RECOVERED_META_RE,
     _basename,
     _has_diff_signal,
+    _looks_like_diff_body,
     _narrow_context,
 )
 from .llm import LLMClient
@@ -69,7 +71,7 @@ For EACH block, decide:
                     "partial"   — only a fragment
                     "not_a_file" — not source code
 
-  canonical_path    basename of the file (e.g. "pg_state.py").
+  canonical_path    basename of the file (e.g., "pg_state.py").
 
   confidence        float in [0,1].  Use < 0.7 when unsure.
 
@@ -202,10 +204,19 @@ def _classify_one_heuristic(b: Block) -> None:
     b.canonical_path = path
     lang = b.fence_lang.lower()
 
-    if lang in ("bash", "sh", "text", "diff"):
+    # ---- shell / prose / inline snippets: definitely not code ----
+    if lang in ("bash", "sh", "text"):
         b.is_code_file = False
         b.kind = "not_a_file"
         b.confidence = 0.90
+        return
+
+    # ---- NEW: `diff` fences are patches, not files, but they ARE
+    # ---- code: they must survive to the patcher.
+    if lang == "diff":
+        b.is_code_file = True
+        b.kind = "partial"
+        b.confidence = 0.95
         return
 
     if lang in ("json", "yaml", "yml", "toml"):
@@ -222,6 +233,20 @@ def _classify_one_heuristic(b: Block) -> None:
         b.kind = "partial"
         b.confidence = 0.90
         return
+
+    # NEW: a code-fenced body (any of the source languages) whose
+    # line prefixes are `+`/`-`/` ` throughout is a patch the LLM
+    # emitted without labeling the fence `diff`.  Catch it here so
+    # it lands in the patcher instead of being classified `full`
+    # (which would make it a candidate base for its own file).
+    if lang in ("js", "mjs", "jsx", "ts", "tsx", "py", "python",
+                "rs", "go", "c", "cpp", "h", "hpp", "java",
+                "rb", "php", "css", "html", ""):
+        if _looks_like_diff_body(b.body):
+            b.is_code_file = True
+            b.kind = "partial"
+            b.confidence = 0.85
+            return
 
     if b.body_line_count < 20:
         b.is_code_file = True
