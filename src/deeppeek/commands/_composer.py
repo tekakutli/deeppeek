@@ -1,0 +1,111 @@
+"""Shared infrastructure for the composer commands.
+
+`deeppeek type` and `deeppeek enter` both talk to the extension over
+the same SSE transport as `deeppeek pipe`: broadcast a typed event,
+wait for a matching ack, report the result.  This module extracts
+that pattern so both commands — and a future combined `send` — share
+one implementation.
+
+Usage for a single command:
+
+    with composer_session(port, timeout) as server:
+        if server is None:
+            return 1
+        rc, result = broadcast_and_wait(
+            server, "type", {"text": text},
+            timeout=timeout, ack_name="type",
+        )
+
+A future `deeppeek send` opens ONE session and calls
+`broadcast_and_wait` twice — once for `type`, once for `enter` —
+so a single pass uses one server socket and one extension
+connection.
+"""
+
+import queue
+import sys
+import uuid
+from contextlib import contextmanager
+
+from ..capture.server import ExportServer
+
+
+@contextmanager
+def composer_session(port: int = 8765, timeout: float = 30.0):
+    """Open ExportServer, wait for the extension to connect.
+
+    Yields the connected server, or None if the extension never
+    connected or the port was in use.  Always cleans up on exit.
+    """
+    try:
+        server = ExportServer(port=port)
+        server.start()
+    except OSError as e:
+        if "Address already in use" in str(e):
+            print(f"error: port {port} is already in use — is another "
+                  f"`deeppeek` command running?", file=sys.stderr)
+            print("  stop it first (Ctrl+C the other command), then retry.",
+                  file=sys.stderr)
+            yield None
+            return
+        raise
+
+    try:
+        print(f"Waiting for extension on "
+              f"http://127.0.0.1:{port}/events "
+              f"(up to {timeout:.0f}s)...", file=sys.stderr)
+        if not server.wait_for_extension(timeout=timeout):
+            print("error: no extension connected within timeout.",
+                  file=sys.stderr)
+            print("  make sure Zen is open, the extension is loaded, and a "
+                  "deepseek.com tab is active.", file=sys.stderr)
+            yield None
+            return
+        yield server
+    finally:
+        server.stop()
+
+
+def broadcast_and_wait(
+    server: ExportServer,
+    event_name: str,
+    payload: dict,
+    *,
+    timeout: float,
+    ack_name: str,
+) -> tuple[int, dict]:
+    """Broadcast an SSE event, wait for its ack.
+
+    Returns (exit_code, result_dict):
+      0 — success (result.success is True)
+      1 — infrastructure failure (timeout, malformed ack, batch_id
+          mismatch)
+      2 — command failure (extension reported success:false)
+
+    `result_dict` is the extension's `result` sub-dict when one was
+    returned; empty dict otherwise.
+    """
+    batch_id = uuid.uuid4().hex[:12]
+    full_payload = {**payload, "batch_id": batch_id}
+    server._broadcast(event_name, full_payload)
+
+    try:
+        ack = server.wait_for_result(timeout=timeout)
+    except queue.Empty:
+        print("error: extension did not acknowledge within timeout.",
+              file=sys.stderr)
+        return 1, {}
+
+    if ack.get("__ack") != ack_name:
+        print(f"error: unexpected response: {ack!r}", file=sys.stderr)
+        return 1, {}
+    if ack.get("batch_id") != batch_id:
+        print(f"error: response batch_id mismatch "
+              f"(got {ack.get('batch_id')}, expected {batch_id})",
+              file=sys.stderr)
+        return 1, {}
+
+    result = ack.get("result") or {}
+    if result.get("success"):
+        return 0, result
+    return 2, result

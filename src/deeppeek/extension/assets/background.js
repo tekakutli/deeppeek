@@ -69,7 +69,7 @@ function attachHandlers(es) {
     });
   });
 
-  // NEW: attach event from `deeppeek pipe`
+  // ---- attach (deeppeek pipe) ----
   es.addEventListener("attach", async (e) => {
     let data = {};
     try { data = JSON.parse(e.data || "{}"); } catch (_) {}
@@ -108,6 +108,80 @@ function attachHandlers(es) {
           batch_id: batchId,
           result,
         }),
+      });
+    } catch (_) {}
+  });
+
+  // ---- type (deeppeek type) ----
+  es.addEventListener("type", async (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+    const batchId = data.batch_id;
+    const text = data.text || "";
+    const opts = data.opts || {};
+
+    console.log(`DSX: type received (batch=${batchId}, ${text.length} chars)`);
+
+    let result = { success: false, reason: "no active deepseek tab" };
+    try {
+      const [tab] = await browser.tabs.query({
+        active: true, currentWindow: true,
+      });
+      if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+        const resp = await browser.tabs.sendMessage(tab.id, {
+          type: "DSX_TYPE",
+          text,
+          opts,
+        });
+        result = resp || { success: false, reason: "no response from content script" };
+      }
+    } catch (err) {
+      result = { success: false, reason: `sendMessage threw: ${err.message}` };
+    }
+
+    console.log(`DSX: type result (batch=${batchId}):`, result);
+
+    try {
+      await fetch(`${DSX_URL}/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ __ack: "type", batch_id: batchId, result }),
+      });
+    } catch (_) {}
+  });
+
+  // ---- enter (deeppeek enter) ----
+  es.addEventListener("enter", async (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+    const batchId = data.batch_id;
+    const opts = data.opts || {};
+
+    console.log(`DSX: enter received (batch=${batchId})`);
+
+    let result = { success: false, reason: "no active deepseek tab" };
+    try {
+      const [tab] = await browser.tabs.query({
+        active: true, currentWindow: true,
+      });
+      if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+        const resp = await browser.tabs.sendMessage(tab.id, {
+          type: "DSX_ENTER",
+          opts,
+        });
+        result = resp || { success: false, reason: "no response from content script" };
+      }
+    } catch (err) {
+      result = { success: false, reason: `sendMessage threw: ${err.message}` };
+    }
+
+    console.log(`DSX: enter result (batch=${batchId}):`, result);
+
+    try {
+      await fetch(`${DSX_URL}/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ __ack: "enter", batch_id: batchId, result }),
       });
     } catch (_) {}
   });

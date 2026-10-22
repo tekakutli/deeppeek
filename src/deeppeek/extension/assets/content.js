@@ -82,6 +82,39 @@
       }
     }
 
+    if (msg.type === "DSX_TYPE") {
+      if (!(await ensurePageWorldFn("__dsx_type_json"))) {
+        console.error("DSX: page-world type unavailable.");
+        return { success: false, reason: "page-world type unavailable" };
+      }
+      try {
+        const argsJson = JSON.stringify({
+          text: msg.text || "",
+          opts: msg.opts || {},
+        });
+        const resultJson = await window.wrappedJSObject.__dsx_type_json(argsJson);
+        return JSON.parse(resultJson);
+      } catch (e) {
+        console.error("DSX: type threw:", e);
+        return { success: false, reason: `type threw: ${e.message}` };
+      }
+    }
+
+    if (msg.type === "DSX_ENTER") {
+      if (!(await ensurePageWorldFn("__dsx_enter_json"))) {
+        console.error("DSX: page-world enter unavailable.");
+        return { success: false, reason: "page-world enter unavailable" };
+      }
+      try {
+        const argsJson = JSON.stringify({ opts: msg.opts || {} });
+        const resultJson = await window.wrappedJSObject.__dsx_enter_json(argsJson);
+        return JSON.parse(resultJson);
+      } catch (e) {
+        console.error("DSX: enter threw:", e);
+        return { success: false, reason: `enter threw: ${e.message}` };
+      }
+    }
+
     return null;
   });
 

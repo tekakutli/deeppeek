@@ -2,6 +2,8 @@
 //   window.__dsx_extract()             — extraction (existing)
 //   window.__dsx_attach(files, opts)   — attach via objects (debug only)
 //   window.__dsx_attach_json(json)     — attach via JSON (bridge entry)
+//   window.__dsx_type_json(json)       — type text into composer (bridge entry)
+//   window.__dsx_enter_json(json)      — press Enter on composer (bridge entry)
 (function () {
   "use strict";
 
@@ -717,6 +719,184 @@
     const opts = (args.opts && typeof args.opts === "object") ? args.opts : {};
     const result = await doAttach(files, opts);
     console.log("[deeppeek:attach] result:", result);
+    return JSON.stringify(result);
+  };
+
+  // ==================================================================
+  // Part 8 — composer typing + submit
+  //
+  // Confirmed against live DeepSeek DOM (console tests, 2026-10-22):
+  //
+  //   SET   `document.execCommand('insertText')` on a focused,
+  //         selected textarea.  A native setter + InputEvent does
+  //         not satisfy React's state — the app sees the value but
+  //         never updates submit-readiness, and the send control
+  //         never mounts.  execCommand produces a trusted input
+  //         event that React treats like real typing.
+  //
+  //   ENTER dispatchEvent(KeyboardEvent) for keydown/keypress/keyup
+  //         with key=Enter.  DeepSeek's handler does not gate on
+  //         isTrusted, so this works.  keyCode/which are deprecated
+  //         but still read by the handler.
+  //
+  // Both are exposed as JSON-string entry points, matching the
+  // existing __dsx_attach_json bridge.
+  // ==================================================================
+
+  const COMPOSER_STRATEGIES = [
+    'textarea[placeholder*="Message DeepSeek"]',
+    'textarea[data-testid="chat-input"]',
+    '#chat-input',
+    'div[contenteditable][role="textbox"]',
+    'textarea',
+  ];
+
+  function findComposer() {
+    for (const sel of COMPOSER_STRATEGIES) {
+      const el = document.querySelector(sel);
+      if (el) return { el, selector: sel };
+    }
+    return { el: null, selector: null };
+  }
+
+  function setComposerValue(el, text) {
+    if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
+      el.focus();
+      if (typeof el.select === "function") el.select();
+      try {
+        if (document.execCommand("insertText", false, text)) return true;
+      } catch (_) { /* fall through */ }
+      const proto = el instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+      const desc = Object.getOwnPropertyDescriptor(proto, "value");
+      if (!desc || !desc.set) return false;
+      desc.set.call(el, text);
+      el.dispatchEvent(new InputEvent("input", {
+        bubbles: true, cancelable: true,
+        inputType: "insertText", data: text,
+      }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    }
+    if (el.isContentEditable) {
+      el.focus();
+      el.textContent = text;
+      el.dispatchEvent(new InputEvent("input", {
+        bubbles: true, cancelable: true,
+        inputType: "insertText", data: text,
+      }));
+      return true;
+    }
+    return false;
+  }
+
+  function pressEnter(el) {
+    const init = {
+      key: "Enter", code: "Enter", keyCode: 13, which: 13,
+      bubbles: true, cancelable: true, composed: true,
+    };
+    el.dispatchEvent(new KeyboardEvent("keydown", init));
+    el.dispatchEvent(new KeyboardEvent("keypress", init));
+    el.dispatchEvent(new KeyboardEvent("keyup", init));
+  }
+
+  async function doType(text, opts) {
+    const settleMs = Number(opts.settle_ms) || 300;
+    const { el, selector } = findComposer();
+    if (!el) return { success: false, reason: "no composer found on page" };
+
+    const before = el.value ?? el.textContent ?? "";
+    if (!setComposerValue(el, text)) {
+      return { success: false, reason: "could not set composer value" };
+    }
+    await new Promise((r) => setTimeout(r, settleMs));
+
+    const after = el.value ?? el.textContent ?? "";
+    const react_accepted = after === text;
+
+    return {
+      success: react_accepted,
+      composer_selector: selector,
+      value_before: before,
+      value_after: after,
+      react_accepted,
+      reason: react_accepted
+        ? undefined
+        : "React state did not accept the value",
+    };
+  }
+
+  async function doEnter(opts) {
+    const verifyMs = Number(opts.verify_ms) || 700;
+    const { el, selector } = findComposer();
+    if (!el) return { success: false, reason: "no composer found on page" };
+
+    const before = el.value ?? el.textContent ?? "";
+    if (!before) {
+      return {
+        success: false,
+        reason: "composer is empty — nothing to submit",
+        composer_selector: selector,
+      };
+    }
+
+    el.focus();
+    pressEnter(el);
+    await new Promise((r) => setTimeout(r, verifyMs));
+
+    const after = el.value ?? el.textContent ?? "";
+    const composer_cleared = after === "";
+
+    return {
+      success: composer_cleared,
+      composer_selector: selector,
+      value_before: before,
+      value_after: after,
+      submitted: true,
+      composer_cleared,
+      reason: composer_cleared
+        ? undefined
+        : "Enter fired but composer did not clear",
+    };
+  }
+
+  window.__dsx_type_json = async function (argsJson) {
+    let args;
+    try {
+      args = JSON.parse(argsJson);
+    } catch (e) {
+      return JSON.stringify({
+        success: false,
+        reason: `arg parse failed: ${e.message}`,
+      });
+    }
+    const text = typeof args.text === "string" ? args.text : "";
+    const opts = (args.opts && typeof args.opts === "object") ? args.opts : {};
+    if (!text) {
+      return JSON.stringify({ success: false, reason: "empty text" });
+    }
+    let result;
+    try {
+      result = await doType(text, opts);
+    } catch (e) {
+      result = { success: false, reason: `doType threw: ${e.message}` };
+    }
+    console.log("[deeppeek:type] result:", result);
+    return JSON.stringify(result);
+  };
+
+  window.__dsx_enter_json = async function (argsJson) {
+    let args = {};
+    try { args = JSON.parse(argsJson || "{}"); } catch (_) {}
+    const opts = (args.opts && typeof args.opts === "object") ? args.opts : {};
+    let result;
+    try {
+      result = await doEnter(opts);
+    } catch (e) {
+      result = { success: false, reason: `doEnter threw: ${e.message}` };
+    }
+    console.log("[deeppeek:enter] result:", result);
     return JSON.stringify(result);
   };
 })();
