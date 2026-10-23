@@ -4,7 +4,8 @@ Pipeline:
 
     assemble   validate paths, infer deeppeek-source
     generate   run the real commands to produce the four inputs:
-                 deeppeek capture -o <ws>/conversation.md --last N --watch
+                 deeppeek capture -o <ws>/conversation.md --last N --watch \
+                     --no-recover
                  deeppeek recover <conversation> --apply-to <target>
                  dump.py -r -o <ws>/project_dump_<target>.md
                  dump.py -r -o <ws>/project_dump_<source>.md
@@ -340,10 +341,15 @@ def _stage_generate(args: argparse.Namespace
         print(f"  conversation: using {conversation_path}", file=sys.stderr)
     else:
         conversation_path = ws / "conversation.md"
+        # --no-recover: evolve runs recovery itself in step 2, so the
+        # capture stage must only write the markdown.  Under the new
+        # "recover-by-default" behaviour of `deeppeek capture`, this
+        # flag is required to preserve that separation.
         cmd = prefix + [
             "capture", "-o", str(conversation_path),
             "--last", str(args.last),
             "--watch",
+            "--no-recover",
             "--timeout", str(args.capture_timeout),
         ]
         print("  conversation: capturing via deeppeek", file=sys.stderr)

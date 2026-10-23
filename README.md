@@ -6,9 +6,9 @@ into the chat input.
 
 Five subcommands, each with one job:
 
-- **`capture`** — extract the current conversation from the browser,
-  recover source files from it (in memory by default, or persist the
-  markdown with `-o`).
+- **`capture`** — extract the current conversation from the browser
+  and recover source files from it.  `-o` also persists the markdown
+  to disk; recovery runs either way.
 - **`recover`** — recover source files from an existing markdown dump
   on disk.
 - **`pipe`** — attach local files (images, documents, code) to the
@@ -117,7 +117,7 @@ Two examples covering the two directions.
 Recovered files land in `./recovered/files/`. The intermediate
 markdown stays in memory. To keep it on disk too, add `-o`:
 
-    deeppeek capture -o auto --recover --last 3
+    deeppeek capture -o auto --last 3
     # writes DeepSeek_<title>_<timestamp>.md, then recovers from it
 
 **Attach files to the current chat input:**
@@ -133,8 +133,12 @@ The files appear as chips in the input. Type your prompt and send —
 
     --last N            last N user turns (each turn = prompt + reply)
     --last-regex PAT    last prompt matching a regex, to end of conversation
-    -o PATH|auto        write the markdown; "auto" = timestamped default
-    --recover           run recovery even when -o writes a file
+    -o PATH|auto        write the markdown; "auto" = timestamped default.
+                        Recovery runs by default, with or without -o.
+    --no-recover        skip recovery; write the markdown file only
+                        (requires -o)
+    --recover           no-op; recovery is the default (kept for
+                        backward compatibility)
     --apply-to DIR      write recovered files directly into an existing tree
                         (deletes [DEL]-marked files, reports land beside them)
     --watch             auto-fire when the extension connects

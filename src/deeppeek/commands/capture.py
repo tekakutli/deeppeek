@@ -3,13 +3,17 @@
 Modes:
 
   capture                    recover in memory → ./recovered/
-  capture -o chat.md         write chat.md only
-  capture -o chat.md \
-      --recover              write chat.md AND recover from it
-  capture -o auto \
-      --recover              auto-named chat file + recover
+  capture -o chat.md         write chat.md AND recover from it
+  capture -o auto            auto-named chat file + recover
   capture --apply-to DIR     recover in memory → applied directly to DIR
+  capture --apply-here       recover in memory → applied directly to cwd
   capture --json -o chat.md  write JSON, no recovery
+  capture -o chat.md \
+      --no-recover           write chat.md only, no recovery
+
+Recovery is the default.  -o only adds an on-disk write of the
+markdown; it does not suppress recovery.  --no-recover is the
+opt-out, and it requires -o so the capture isn't discarded.
 
 When a file is written (via -o), recovery reads it back from disk so
 that manifest.dump.path records the real path rather than
@@ -18,8 +22,8 @@ text and the manifest records "<in-memory>".
 
 Output layout is derived, not user-set:
 
-    --apply-to set   → header (target tree preserved)
-    neither          → flat   (basenames only)
+    --apply-to / --apply-here set   → header (target tree preserved)
+    neither                          → flat   (basenames only)
 
 There is no user-facing layout flag and no --remap.
 """
@@ -39,23 +43,24 @@ from ..recover.pipeline import RecoverConfig, run as recover_run
 def register(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "capture",
-        help="Capture a DeepSeek conversation "
-             "(default: recover its files in memory)",
+        help="Capture a DeepSeek conversation and recover its files",
     )
     p.add_argument(
         "-o", "--output", type=str, default=None,
         metavar="PATH|auto",
-        help="write the markdown to PATH (or 'auto' for a timestamped "
-             "default like DeepSeek_2026-10-21_15-42-03.md).  Skips "
-             "recovery unless --recover or --apply-to is given.",
+        help="also write the markdown to PATH (or 'auto' for a "
+             "timestamped default like DeepSeek_2026-10-21_15-42-03.md). "
+             "Recovery runs by default; use --no-recover to skip it.",
     )
     p.add_argument(
         "--recover", action="store_true",
-        help="force recovery even when -o is given",
+        help="(no-op; recovery is now the default.  Kept for backward "
+             "compatibility — use --no-recover to opt out.)",
     )
     p.add_argument(
         "--no-recover", action="store_true",
-        help="skip recovery (requires -o; nothing would be saved otherwise)",
+        help="skip recovery; write the markdown file only (requires -o; "
+             "nothing would be saved otherwise)",
     )
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--watch", action="store_true")
@@ -86,6 +91,12 @@ def register(sub: argparse._SubParsersAction) -> None:
     # ---- recovery-side flags ----
     p.add_argument("--recover-to", type=Path, default=None)
     p.add_argument("--apply-to", type=Path, default=None, metavar="DIR")
+    p.add_argument(
+        "--apply-here", action="store_true",
+        help="shorthand for --apply-to with the current working directory "
+             "(resolved to an absolute path).  Mutually exclusive with "
+             "--apply-to and --recover-to.",
+    )
     p.add_argument("--min-trust", choices=["HIGH", "MEDIUM", "LOW"],
                    default="MEDIUM")
     p.add_argument("--llm-mode", choices=["off", "smart", "always"],
@@ -103,25 +114,29 @@ def register(sub: argparse._SubParsersAction) -> None:
 
 def run(args: argparse.Namespace) -> int:
     # ---- decide recovery intent ----
-    if args.apply_to is not None and args.recover_to is not None:
-        print("error: --apply-to and --recover-to are mutually exclusive",
+    if args.apply_here and args.apply_to is not None:
+        print("error: --apply-here and --apply-to are mutually exclusive",
               file=sys.stderr)
         return 3
-    if args.no_recover and args.apply_to is not None:
-        print("error: --no-recover and --apply-to are mutually exclusive "
-              "(--apply-to implies recovery)", file=sys.stderr)
+
+    apply_to = Path.cwd().resolve() if args.apply_here else args.apply_to
+
+    if apply_to is not None and args.recover_to is not None:
+        print("error: --apply-to/--apply-here and --recover-to are "
+              "mutually exclusive", file=sys.stderr)
+        return 3
+    if args.no_recover and apply_to is not None:
+        print("error: --no-recover and --apply-to/--apply-here are mutually "
+              "exclusive (--apply-to/--apply-here implies recovery)",
+              file=sys.stderr)
         return 3
 
-    if args.no_recover:
-        do_recover = False
-    elif args.apply_to is not None:
-        do_recover = True
-    elif args.recover:
-        do_recover = True
-    elif args.output:
-        do_recover = False
-    else:
-        do_recover = True
+    # Recovery is on by default — with or without -o, with or without
+    # --last, with or without --apply-to.  --no-recover is the only
+    # opt-out (and it requires -o so the capture isn't discarded).
+    # --recover is kept as an accepted-but-redundant flag for scripts
+    # written against the old behaviour.
+    do_recover = not args.no_recover
 
     if not do_recover and not args.output:
         print("error: --no-recover requires -o/--output "
@@ -186,7 +201,7 @@ def run(args: argparse.Namespace) -> int:
         dump_path=dump_path,
         dump_text=dump_text,
         out_dir=out_dir,
-        apply_to=args.apply_to,
+        apply_to=apply_to,
         min_trust=args.min_trust,
         llm_mode=args.llm_mode,
         llm_url=args.llm_url,

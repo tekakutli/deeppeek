@@ -4,156 +4,24 @@
 //   window.__dsx_attach_json(json)     — attach via JSON (bridge entry)
 //   window.__dsx_type_json(json)       — type text into composer (bridge entry)
 //   window.__dsx_enter_json(json)      — press Enter on composer (bridge entry)
+//
+// Extraction sources, tried in order: indexeddb, then fiber.
+// There is no DOM-sweep fallback — if both miss, extraction throws.
 (function () {
   "use strict";
 
   const config = {
     chatContainerSelector: ".ds-virtual-list-visible-items",
-    userMessageSelector: "._9663006",
-    aiClassPrefix: "_4f9bf79",
-    searchHintSelector: "._5255ff8._4d41763",
-    thinkingChainSelector: ".ds-think-content",
-    finalAnswerSelector: ".ds-message .ds-markdown:last-child",
     titleSelector: ".afa34042.e37a04e4.e0a1edb7",
-    answerMarkdownPath: "$0.return.return.return",
-    thinkingContentPath: "$0.return.return.return.return",
   };
 
   // ==================================================================
-  // Part 1 — DOM + fiber helpers
+  // Part 1 — page helpers
   // ==================================================================
-
-  function navigateFiberPathFromElement(element, pathString) {
-    if (!element || !pathString) return null;
-    const fiberKey = Object.keys(element).find((k) => k.startsWith("__reactFiber$"));
-    if (!fiberKey) return null;
-    let fiber = element[fiberKey];
-    const cleaned = pathString.replace(/^\$0\.*/, "");
-    if (!cleaned) return fiber;
-    for (const step of cleaned.split(".")) {
-      if (!step) continue;
-      fiber = fiber ? fiber[step] : null;
-      if (!fiber) return null;
-    }
-    return fiber;
-  }
-
-  function closeUnclosedFencedCodeBlocks(markdown) {
-    if (typeof markdown !== "string" || !markdown.length) return markdown;
-    let inFence = false;
-    for (const line of markdown.split(/\r?\n/)) {
-      const m = line.match(/^ {0,3}(```+)/);
-      if (!m) continue;
-      if (m[1].length === 3) inFence = !inFence;
-    }
-    return inFence ? markdown + "\n```" : markdown;
-  }
-
-  function findScrollParent(el) {
-    let p = el;
-    for (let i = 0; i < 40 && p && p !== document.body && p !== document.documentElement; i++) {
-      const st = window.getComputedStyle(p);
-      const oy = st.overflowY;
-      if ((oy === "auto" || oy === "scroll" || oy === "overlay") &&
-          p.scrollHeight > p.clientHeight + 4) return p;
-      p = p.parentElement;
-    }
-    p = el;
-    for (let i = 0; i < 40 && p && p !== document.body; i++) {
-      if (p.scrollHeight > p.clientHeight + 4) return p;
-      p = p.parentElement;
-    }
-    const doc = document.scrollingElement;
-    if (doc && doc.scrollHeight > doc.clientHeight + 4) return doc;
-    return null;
-  }
-
-  function tryGetMessageOrdinal(node) {
-    if (!node || node.nodeType !== 1) return null;
-    const direct = node.getAttribute("data-index");
-    if (direct != null && /^\d+$/.test(direct)) return parseInt(direct, 10);
-    const nested = node.querySelector("[data-index]");
-    if (nested) {
-      const v = nested.getAttribute("data-index");
-      if (v != null && /^\d+$/.test(v)) return parseInt(v, 10);
-    }
-    const fiberKey = Object.keys(node).find((k) => k.startsWith("__reactFiber$"));
-    if (!fiberKey) return null;
-    let fiber = node[fiberKey];
-    for (let depth = 0; depth < 80 && fiber; depth++) {
-      const mp = fiber.memoizedProps;
-      if (mp && typeof mp === "object") {
-        for (const k of ["index", "messageIndex", "msgIndex", "order"]) {
-          const v = mp[k];
-          if (typeof v === "number" && Number.isFinite(v)) return v;
-        }
-      }
-      fiber = fiber.return;
-    }
-    return null;
-  }
-
-  function hashString(s) {
-    let h = 0;
-    for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
-    return String(h);
-  }
-
-  function getUserMessage(node) {
-    const m = node.matches(config.userMessageSelector)
-      ? node : node.querySelector(config.userMessageSelector);
-    return m ? m.textContent.trim() : null;
-  }
-
-  function isAIMessage(node) {
-    return node.classList.contains(config.aiClassPrefix);
-  }
-
-  function extractSearchOrThinking(node) {
-    const hint = node.querySelector(config.searchHintSelector);
-    return hint ? hint.textContent.trim() : null;
-  }
-
-  function extractThinkingChain(node) {
-    const markdownEl = node.querySelector("div.ds-markdown");
-    const baseEl = markdownEl || node;
-    const nav = navigateFiberPathFromElement(baseEl, config.thinkingContentPath);
-    if (!nav || !nav.memoizedProps || !nav.memoizedProps.content) return null;
-    return closeUnclosedFencedCodeBlocks(nav.memoizedProps.content);
-  }
-
-  function extractFinalAnswer(node) {
-    let answerNode = null;
-    for (const el of node.querySelectorAll("div.ds-markdown")) {
-      if (!el.closest(config.thinkingChainSelector)) { answerNode = el; break; }
-    }
-    if (!answerNode) answerNode = node.querySelector(config.finalAnswerSelector);
-    if (!answerNode) return null;
-    const nav = navigateFiberPathFromElement(answerNode, config.answerMarkdownPath);
-    if (!nav || !nav.memoizedProps || !nav.memoizedProps.markdown) return null;
-    return closeUnclosedFencedCodeBlocks(nav.memoizedProps.markdown);
-  }
 
   function getChatTitle() {
     const el = document.querySelector(config.titleSelector);
     return el ? el.textContent.trim() : null;
-  }
-
-  function formatRow(node) {
-    const user = getUserMessage(node);
-    if (user) return { role: "user", content: user };
-    if (!isAIMessage(node)) return null;
-    const hint = extractSearchOrThinking(node);
-    const thinkingNode = node.querySelector(config.thinkingChainSelector);
-    const thinking = thinkingNode ? extractThinkingChain(thinkingNode) : null;
-    const content = extractFinalAnswer(node);
-    if (!content && !thinking && !hint) return null;
-    return {
-      role: "assistant",
-      content: content || "",
-      thinking: thinking || undefined,
-      hint: hint || undefined,
-    };
   }
 
   // ==================================================================
@@ -404,74 +272,7 @@
   }
 
   // ==================================================================
-  // Part 4 — DOM sweep fallback
-  // ==================================================================
-
-  async function sweep(chatContainer, scrollParent) {
-    const best = new Map();
-    const seen = new Set();
-    const consider = (node, pos, i) => {
-      const ord = tryGetMessageOrdinal(node);
-      if (ord != null && seen.has(ord)) return;
-      const msg = formatRow(node);
-      if (!msg) return;
-      const orderKey = ord != null ? ord : pos * 10000 + i;
-      const key = ord != null
-        ? `o:${ord}` : `h:${hashString(msg.role + "|" + (msg.content || ""))}`;
-      const prev = best.get(key);
-      if (!prev || orderKey < prev.orderKey) {
-        best.set(key, { orderKey, msg });
-        if (ord != null) seen.add(ord);
-      }
-    };
-    const collect = (pos) => {
-      for (let i = 0; i < chatContainer.children.length; i++) {
-        consider(chatContainer.children[i], pos, i);
-      }
-    };
-    if (!scrollParent) {
-      collect(0);
-      return Array.from(best.values()).sort((a, b) => a.orderKey - b.orderKey).map((e) => e.msg);
-    }
-    const saved = scrollParent.scrollTop;
-    let observer = null;
-    try {
-      scrollParent.scrollTop = scrollParent.scrollHeight;
-      await new Promise((r) => setTimeout(r, 800));
-      collect(scrollParent.scrollTop);
-      let mutCount = 0;
-      observer = new MutationObserver(() => { mutCount++; });
-      observer.observe(chatContainer, { childList: true, subtree: true, characterData: true });
-      for (let i = 0; i < 400; i++) {
-        const pos = scrollParent.scrollTop;
-        if (pos <= 0) break;
-        const mut = mutCount;
-        scrollParent.scrollTop = Math.max(0, pos - 300);
-        try {
-          scrollParent.dispatchEvent(new WheelEvent("wheel", {
-            deltaY: -300, bubbles: true, cancelable: true,
-          }));
-        } catch (_) {}
-        const t0 = Date.now();
-        while (mutCount === mut && Date.now() - t0 < 1000) {
-          await new Promise((r) => setTimeout(r, 30));
-        }
-        await new Promise((r) => setTimeout(r, 300));
-        const prevSize = best.size;
-        collect(scrollParent.scrollTop);
-        if (best.size === prevSize) {
-          if (i > 5) break;
-        }
-      }
-    } finally {
-      if (observer) observer.disconnect();
-      scrollParent.scrollTop = saved;
-    }
-    return Array.from(best.values()).sort((a, b) => a.orderKey - b.orderKey).map((e) => e.msg);
-  }
-
-  // ==================================================================
-  // Part 5 — orchestration (extract)
+  // Part 4 — orchestration (extract)
   // ==================================================================
 
   async function doExtraction() {
@@ -492,16 +293,7 @@
       } catch (e) { console.log("[deeppeek] fiber threw:", e); }
     }
     if (!messages || !messages.length) {
-      const container = document.querySelector(config.chatContainerSelector);
-      if (container) {
-        try {
-          messages = await sweep(container, findScrollParent(container));
-          if (messages && messages.length) source = "sweep";
-        } catch (e) { console.log("[deeppeek] sweep threw:", e); }
-      }
-    }
-    if (!messages || !messages.length) {
-      throw new Error("All extraction methods failed (indexeddb, fiber, sweep).");
+      throw new Error("All extraction methods failed (indexeddb, fiber).");
     }
 
     console.log(`[deeppeek] extract source=${source} count=${messages.length}`);
@@ -514,7 +306,7 @@
   }
 
   // ==================================================================
-  // Part 6 — file attachment
+  // Part 5 — file attachment
   //
   // Confirmed against DeepSeek's current DOM:
   //   · dragover + drop on textarea.parentElement → works (primary)
@@ -683,7 +475,7 @@
   }
 
   // ==================================================================
-  // Part 7 — exports
+  // Part 6 — exports
   // ==================================================================
 
   window.__dsx_extract = async function () {
@@ -723,7 +515,7 @@
   };
 
   // ==================================================================
-  // Part 8 — composer typing + submit
+  // Part 7 — composer typing + submit
   //
   // Confirmed against live DeepSeek DOM (console tests, 2026-10-22):
   //
