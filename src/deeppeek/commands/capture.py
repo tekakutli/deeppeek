@@ -2,8 +2,9 @@
 
 Modes:
 
-  capture                    recover in memory → ./recovered/
-  capture -o chat.md         write chat.md AND recover from it
+  capture                    recover in memory → ./deeppeek_recovered/
+  capture -o chat.md         write chat.md AND recover; the recovered
+                             dir is created next to chat.md
   capture -o auto            auto-named chat file + recover
   capture --apply-to DIR     recover in memory → applied directly to DIR
   capture --apply-here       recover in memory → applied directly to cwd
@@ -19,6 +20,11 @@ When a file is written (via -o), recovery reads it back from disk so
 that manifest.dump.path records the real path rather than
 "<in-memory>".  When -o is absent, recovery runs on the in-memory
 text and the manifest records "<in-memory>".
+
+The recovered directory defaults to `./deeppeek_recovered/`.  When
+`-o PATH` is given, it is created next to PATH instead — so
+`-o /tmp/conv.md` writes `/tmp/deeppeek_recovered/`, not into the
+current directory.
 
 Output layout is derived, not user-set:
 
@@ -50,6 +56,8 @@ def register(sub: argparse._SubParsersAction) -> None:
         metavar="PATH|auto",
         help="also write the markdown to PATH (or 'auto' for a "
              "timestamped default like DeepSeek_2026-10-21_15-42-03.md). "
+             "When PATH is given, the recovered directory is created "
+             "next to it (e.g. -o /tmp/conv.md → /tmp/deeppeek_recovered/). "
              "Recovery runs by default; use --no-recover to skip it.",
     )
     p.add_argument(
@@ -188,7 +196,17 @@ def run(args: argparse.Namespace) -> int:
     if not do_recover:
         return 0
 
-    out_dir = args.recover_to if args.recover_to is not None else Path("./recovered")
+    if args.recover_to is not None:
+        out_dir = args.recover_to
+    elif resolved_output is not None:
+        # Put the recovered directory next to the -o output, so
+        # `-o /tmp/conv.md` writes to `/tmp/deeppeek_recovered/`
+        # rather than littering the cwd.  `-o auto` and a bare
+        # filename both resolve to Path("."), so they land in the
+        # cwd — matching the no-`-o` default below.
+        out_dir = resolved_output.parent / "deeppeek_recovered"
+    else:
+        out_dir = Path("./deeppeek_recovered")
 
     if resolved_output is not None:
         dump_path: Optional[Path] = resolved_output

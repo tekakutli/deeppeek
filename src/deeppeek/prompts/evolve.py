@@ -176,6 +176,10 @@ Rules for the bash itself:
 This constraint is not stylistic.  It is the only way your fixes
 will reach my file system.  Ignore it and I cannot run what you
 produce.
+
+You will be focusing on deeppeek now, forget about our original project;
+print fully every file you edit or create of deeppeek to fix this failure
+by making it more robust.
 """
 
 

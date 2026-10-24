@@ -114,8 +114,11 @@ Two examples covering the two directions.
 
     deeppeek capture --last 3
 
-Recovered files land in `./recovered/files/`. The intermediate
-markdown stays in memory. To keep it on disk too, add `-o`:
+Recovered files land in `./deeppeek_recovered/files/`. When `-o` is
+given, the recovered directory is created next to the output file
+instead (`-o /tmp/conv.md` → `/tmp/deeppeek_recovered/`). The
+intermediate markdown stays in memory. To keep it on disk too, add
+`-o`:
 
     deeppeek capture -o auto --last 3
     # writes DeepSeek_<title>_<timestamp>.md, then recovers from it
@@ -135,6 +138,8 @@ The files appear as chips in the input. Type your prompt and send —
     --last-regex PAT    last prompt matching a regex, to end of conversation
     -o PATH|auto        write the markdown; "auto" = timestamped default.
                         Recovery runs by default, with or without -o.
+                        When PATH is given, the recovered directory
+                        (deeppeek_recovered/) is created next to it.
     --no-recover        skip recovery; write the markdown file only
                         (requires -o)
     --recover           no-op; recovery is the default (kept for

@@ -87,7 +87,7 @@ from .write import pass9_write
 class RecoverConfig:
     dump_path: Optional[Path] = None
     dump_text: Optional[str] = None
-    out_dir: Path = field(default_factory=lambda: Path("./recovered"))
+    out_dir: Path = field(default_factory=lambda: Path("./deeppeek_recovered"))
     apply_to: Optional[Path] = None
     min_trust: str = "MEDIUM"
     llm_mode: str = "off"
@@ -123,7 +123,7 @@ def _validate_apply_to(cfg: RecoverConfig) -> Optional[int]:
     if not cfg.apply_to.exists():
         print(f"error: --apply-to directory does not exist: {cfg.apply_to}",
               file=sys.stderr)
-        print("  (create it first, or omit --apply-to to use ./recovered/)",
+        print("  (create it first, or omit --apply-to to use ./deeppeek_recovered/)",
               file=sys.stderr)
         return 3
     if not cfg.apply_to.is_dir():

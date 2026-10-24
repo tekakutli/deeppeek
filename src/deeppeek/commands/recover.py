@@ -11,7 +11,8 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--out", type=Path, default=None,
         help="output directory for the standard layout "
-             "(default: ./recovered).  Mutually exclusive with --apply-to.",
+             "(default: ./deeppeek_recovered).  Mutually exclusive with "
+             "--apply-to.",
     )
     p.add_argument(
         "--apply-to", type=Path, default=None, metavar="DIR",
@@ -52,7 +53,7 @@ def run(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 3
 
-    out_dir = args.out if args.out is not None else Path("./recovered")
+    out_dir = args.out if args.out is not None else Path("./deeppeek_recovered")
 
     cfg = RecoverConfig(
         dump_path=args.dump,
