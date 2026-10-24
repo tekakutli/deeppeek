@@ -12,6 +12,7 @@ from .commands import (
     type as type_cmd,
     enter as enter_cmd,
     prompt as prompt_cmd,
+    test_recover as test_recover_cmd,
 )
 
 
@@ -32,6 +33,7 @@ def _build_root_parser() -> argparse.ArgumentParser:
     prompt_cmd.register(sub)
     extension_cmd.register(sub)
     diagnose_cmd.register(sub)
+    test_recover_cmd.register(sub)
     return p
 
 
@@ -44,6 +46,7 @@ _DISPATCH = {
     "prompt": prompt_cmd.run,
     "extension": extension_cmd.run,
     "diagnose": diagnose_cmd.run,
+    "test_recover": test_recover_cmd.run,
 }
 
 
