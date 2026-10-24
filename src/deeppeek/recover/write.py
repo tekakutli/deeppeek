@@ -1,56 +1,11 @@
 """
 recover.write — Pass 9 (write files, manifest, warnings).
 
-DIFFICULT.  Owns:
-
-    FIX [D]   --min-trust-filtered files are written to a shadow
-              directory instead of being silently dropped.
-
-    FIX [6]   Per-file skip detail is gated behind --trace (verbose).
-
-    FIX [7]   Category summary at end of skips.
-
-    FIX [8]   manifest.decisions section for auditing missing files.
-
-    FIX [E]   MISSING_FILES.txt double-filtered (extension + prefix).
-
-    NEW (2026-10-21)   Basename-collision detection.
-
-    NEW (2026-10-21b)  Unique-missing-modules summary line.
-
-    NEW (2026-10-22)   Pre-existing file preservation report.
-
-    NEW (2026-10-23)   Manifest accepts dump_display/dump_size.
-
-    NEW (2026-10-24)   --apply-to mode.
-
-    NEW (2026-10-25)   Preexisting-baseline skip.
-
-    NEW (2026-10-26)   Layout simplification (--layout / --remap
-                       removed).
-
-    NEW (2026-10-27)   Path resolution reporting + recursive
-                       deletion.
-
-    NEW (2026-10-31)   Reports directory move.  In `--apply-to` mode
-                       the four report files (warnings.txt,
-                       manifest.json, deleted.txt, MISSING_FILES.txt)
-                       and the low_trust/ directory now live inside
-                       `apply_to/deeppeek/` (visible) rather than at
-                       the top of `apply_to/`.  The directory is
-                       wiped by `pipeline.run` on each invocation
-                       (preserving `cache/`), so reports never
-                       accumulate across runs.  A leftover
-                       `.deeppeek/` from an older install is
-                       ignored by the pre-existing-baseline scan
-                       and by the DEL-marker recursive search, but
-                       is not auto-deleted.
-
-                       In standard mode (`--out`), the layout is
-                       unchanged: reports go directly into out_dir.
-
-    NEW (2026-10-27)   Path resolution reporting + recursive
-                       deletion.
+New in 2026-11-01: `sanity_rejected` branch.  A file marked with
+`sanity_rejected = True` by `apply_patches` is treated exactly like
+a `LOW`-trust file: not written to the target tree, reported in
+`warnings.txt`, and preserved as-is.  This is the last line of
+defence against over-deletion.
 """
 
 import hashlib
@@ -147,12 +102,6 @@ def _apply_deletions(apply_to: Path,
                 target = c
                 break
 
-        # NEW (2026-10-31): skip our own reports directory when
-        # recursively searching for a basename match.  A `[DEL]
-        # foo.py` marker should never delete a `foo.py` that only
-        # exists inside `deeppeek/low_trust/`; that file is a
-        # produced artefact, not the user's source.  ".deeppeek"
-        # is kept for backward compatibility with older installs.
         if target is None and base:
             matches = [
                 p for p in apply_to.rglob(base)
@@ -254,6 +203,28 @@ def pass9_write(records: dict[str, FileRecord],
                 f"[{path}] [INFO] file deleted by conversation")
             continue
 
+        # NEW: sanity-rejected files go to the same skip path as
+        # LOW-trust files — never written, base preserved.
+        if getattr(rec, "sanity_rejected", False):
+            reason = ("sanity gate rejected write (over-deletion, "
+                      "empty result, or unrelated content)")
+            warnings_lines.append(
+                f"[{path}] [SANITY] {reason}; target file preserved")
+            skipped.append({
+                "path": path,
+                "state": rec.state,
+                "reason": reason,
+                "sanity_rejected": True,
+                "source_blocks": rec.source_blocks,
+                "warnings": rec.warnings,
+                "verification": rec.verification,
+            })
+            if verbose:
+                print(f"  SKIPPED {path} (sanity): {reason}",
+                      file=sys.stderr)
+            exit_code = max(exit_code, 2)
+            continue
+
         if rec.state in ("PARTIAL_ONLY", "MISSING"):
             reason = f"no full print (state={rec.state})"
             warnings_lines.append(
@@ -295,6 +266,7 @@ def pass9_write(records: dict[str, FileRecord],
                 p.get("applied_by") in ("deterministic", "llm")
                 for p in rec.patches
             )
+            and not rec.pairs
         )
         if preexisting_unmodified:
             reason = ("pre-existing file with no conversation "
@@ -401,6 +373,11 @@ def pass9_write(records: dict[str, FileRecord],
             "patches": [
                 {"idx": p["idx"], "applied_by": p.get("applied_by", "?")}
                 for p in rec.patches
+            ],
+            "pairs": [
+                {"old_idx": p["old_idx"], "new_idx": p["new_idx"],
+                 "scope_hint": p["scope_hint"]}
+                for p in rec.pairs
             ],
             "is_new": rec.is_new,
             "is_deleted": False,
@@ -512,12 +489,6 @@ def pass9_write(records: dict[str, FileRecord],
             f"— see MISSING_FILES.txt")
         exit_code = max(exit_code, 2)
     else:
-        # The reports directory always contains all four files, so a
-        # consumer can check any of them without first knowing
-        # whether the tool got as far as producing it.  An empty
-        # MISSING_FILES.txt (or one that just says "none") means the
-        # run genuinely had no missing files, not that the file was
-        # skipped.
         (reports_dir / "MISSING_FILES.txt").write_text(
             "# No missing files.\n"
             "# This file is written on every --apply-to run.  An "
@@ -591,8 +562,10 @@ def pass9_write(records: dict[str, FileRecord],
             "chosen_by": rec.dedup_reason,
             "trust": rec.trust,
             "preexisting_base": rec.preexisting_base,
+            "sanity_rejected": getattr(rec, "sanity_rejected", False),
             "written": path in written,
             "patch_count": len(rec.patches),
+            "pair_count": len(rec.pairs),
             "patch_failures": [
                 p["idx"] for p in rec.patches
                 if p.get("applied_by") == "failed"
@@ -647,6 +620,7 @@ def pass9_write(records: dict[str, FileRecord],
         by_reason: dict[str, list[str]] = {
             "no_full":     [],
             "low_trust":   [],
+            "sanity":      [],
             "no_content":  [],
             "collision":   [],
             "preexisting": [],
@@ -656,6 +630,8 @@ def pass9_write(records: dict[str, FileRecord],
             r = s.get("reason", "")
             if "no full print" in r:
                 by_reason["no_full"].append(s["path"])
+            elif "sanity gate rejected" in r:
+                by_reason["sanity"].append(s["path"])
             elif "trust=" in r:
                 by_reason["low_trust"].append(s["path"])
             elif "content is None" in r:

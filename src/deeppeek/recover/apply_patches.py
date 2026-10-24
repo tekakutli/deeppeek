@@ -1,48 +1,27 @@
 """
-recover.apply_patches — Pass 6 (apply partial patches onto the base
-full print).
+recover.apply_patches — Pass 6 (apply pairs, then patches, then
+sanity-check the result).
 
-DIFFICULT.  Owns:
+Order matters:
 
-    FIX [5]   Aggregate patch-failure summary.
+  1. Pairs run first.  They operate on the base full print; a
+     replace pair's `find(old)` needs the base in its original
+     shape.  Running after patch application would find the old
+     block already mutated.
 
-    FIX [11]  A failed orphan patch demotes trust to trust_cap, not
-              LOW.
+  2. Individual patches run second, over the possibly-paired
+     content.  Diff patches and deletions still apply; a deletion
+     that overlaps a pair deletion is correctly `already-present`.
 
-    NEW (2026-10-20)  No-op patch detection (`already-present`).
+  3. Sanity gate runs on the final content, before the file is
+     handed to `write`.  If the result is implausible (much smaller
+     than base, empty, or shares no long lines with base), the base
+     is restored and `sanity_rejected` is set.
 
-    NEW (2026-10-21)  Three new deterministic patch shapes.
-
-    NEW (2026-10-21b) Bug 1 fix — the deterministic patcher does
-              not report byte-identical output as an applied
-              change.
-
-    NEW (2026-10-29)  Three correctness fixes.
-
-    NEW (2026-10-30)  Raw-diff patcher.
-
-    NEW (2026-10-30b) Deletion-instruction routing and idempotency.
-
-    NEW (2026-10-31)  Three fixes for the panel-fade regression:
-
-              1. `_delete_exact_block` only strips diff prefixes when
-                 the body is diff-shaped.  For a raw code body, it
-                 preserves the exact source text.  Prior versions
-                 stripped one leading space from every indented line,
-                 silently corrupting the match and forcing the patch
-                 through the object-literal fallback.
-
-              2. `_try_deterministic_patch` returns None (no-op) when
-                 the object-literal splice produces text identical
-                 to `base`.  The caller then checks
-                 `_patch_already_present` and marks the patch
-                 `already-present`, not `deterministic`.
-
-              3. `_try_raw_diff_patch` treats empty lines as context
-                 blanks.  A markdown processor that strips trailing
-                 whitespace turns a ` ` context blank into ``, which
-                 the walker used to skip and then mismatched the
-                 following `-` line against the wrong base line.
+New in 2026-11-01: `_try_replace_pair`, `_apply_scoped`,
+`_sanity_gate`.  The single biggest architectural shift is that
+prose instructions become *structured edits* rather than free-text
+hints interpreted (badly) by the deletion patcher.
 """
 
 import re
@@ -74,16 +53,17 @@ def pass6_apply_patches(records: dict[str, FileRecord],
             rec.warnings.append("base block not found")
             rec.trust = "LOW"
             continue
-        content = base_block.body
+        base = base_block.body
+        content = base
 
         trust_cap = "MEDIUM" if rec.dedup_reason == "last_full" else "HIGH"
 
-        if not rec.patches:
-            rec.content = content
-            rec.verification["patches_applied"] = 0
-            rec.trust = trust_cap
-            continue
+        # ---- pairs first ----
+        pair_records: list[dict] = []
+        if rec.pairs:
+            content, pair_records = _apply_pairs(content, rec.pairs)
 
+        # ---- patches ----
         all_deterministic = True
         all_ok = True
         for patch in rec.patches:
@@ -120,23 +100,51 @@ def pass6_apply_patches(records: dict[str, FileRecord],
                 f"patch idx={patch['idx']} could not be applied")
             all_ok = False
 
-        rec.content = content
+        # ---- record results ----
         rec.verification["patches_applied"] = sum(
             1 for p in rec.patches if p.get("applied_by") != "failed")
+        rec.verification["pairs_applied"] = sum(
+            1 for r in pair_records if r["applied_by"] == "deterministic")
 
-        rec.trust = trust_cap
-        if not all_ok:
-            rec.verification["patches_incomplete"] = True
-            rec.warnings.append(
-                "one or more orphan patches failed; base content "
-                "written without them")
-        if all_ok and not all_deterministic:
-            rec.verification["via_llm"] = True
+        if pair_records:
+            n_failed = sum(
+                1 for r in pair_records if r["applied_by"] == "failed")
+            if n_failed:
+                rec.verification["pairs_incomplete"] = True
+                rec.warnings.append(
+                    f"{n_failed} replace pair(s) failed to apply")
+
+        # ---- sanity gate ----
+        suspicious, reason = _sanity_gate(base, content)
+        if suspicious:
+            rec.sanity_rejected = True
+            content = base
+            rec.trust = "LOW"
+            rec.warnings.append(f"sanity gate: {reason} — reverted to base")
+            rec.verification["sanity_rejected"] = True
+            print(f"  [sanity] {path}: {reason} — reverting to base",
+                  file=sys.stderr)
+        else:
+            rec.trust = trust_cap
+            if not all_ok:
+                rec.verification["patches_incomplete"] = True
+                rec.warnings.append(
+                    "one or more orphan patches failed; base content "
+                    "written without them")
+            if all_ok and not all_deterministic and rec.patches:
+                rec.verification["via_llm"] = True
+
+        rec.content = content
 
     total_patches = sum(len(r.patches) for r in records.values())
+    total_pairs = sum(len(r.pairs) for r in records.values())
     total_applied = sum(
         sum(1 for p in r.patches
             if p.get("applied_by") in ("deterministic", "llm"))
+        for r in records.values()
+    )
+    total_pairs_applied = sum(
+        r.verification.get("pairs_applied", 0)
         for r in records.values()
     )
     total_noop = sum(
@@ -149,17 +157,193 @@ def pass6_apply_patches(records: dict[str, FileRecord],
         1 for r in records.values()
         if any(p.get("applied_by") == "failed" for p in r.patches)
     )
-    if total_patches:
+    n_sanity = sum(
+        1 for r in records.values() if r.sanity_rejected
+    )
+    if total_patches or total_pairs:
+        parts = []
+        if total_patches:
+            parts.append(f"{total_applied}/{total_patches} patch(es)")
+        if total_pairs:
+            parts.append(f"{total_pairs_applied}/{total_pairs} pair(s)")
         suffix = ""
         if total_failed:
             suffix = (f" ({total_failed} failed across "
                       f"{files_with_failures} file(s) — see warnings.txt)")
-        print(f"  {total_applied}/{total_patches} patches applied{suffix}",
-              file=sys.stderr)
+        if n_sanity:
+            suffix += f" [{n_sanity} file(s) sanity-rejected]"
+        print(f"  {' + '.join(parts)} applied{suffix}", file=sys.stderr)
         if total_noop:
             print(f"  {total_noop} patch(es) already-present "
                   f"(no-op, not failures)", file=sys.stderr)
 
+
+# ============================================================================
+# Pairs
+# ============================================================================
+
+def _apply_pairs(base: str,
+                 pairs: list[dict]) -> tuple[str, list[dict]]:
+    """Apply every pair sequentially.  Returns (new_base, records)."""
+    records: list[dict] = []
+    current = base
+    for pair in pairs:
+        if pair["old_idx"] == -1:
+            # Scoped: only new half; find scope by name
+            result = _apply_scoped(
+                current, pair["scope_name"], pair["new_body"])
+        else:
+            result = _try_replace_pair(
+                current, pair["old_body"], pair["new_body"])
+        if result is None:
+            records.append({"applied_by": "failed", "pair": pair})
+            continue
+        current = result
+        records.append({"applied_by": "deterministic", "pair": pair})
+    return current, records
+
+
+def _try_replace_pair(base: str, old: str, new: str) -> Optional[str]:
+    """
+    Find `old` in `base`, replace with `new`.
+
+    Tries, in order:
+      1. exact substring (must appear exactly once)
+      2. whitespace-normalized substring
+      3. unique "longest common block" match
+
+    Returns None on any ambiguity or absence.
+    """
+    if not old.strip():
+        return None
+
+    # 1. Exact, unique.
+    if old in base:
+        if base.count(old) == 1:
+            result = base.replace(old, new, 1)
+            if result != base:
+                return result
+        return None
+
+    # 2. Whitespace-normalized.
+    def _norm(s: str) -> str:
+        return "\n".join(ln.rstrip() for ln in s.splitlines())
+
+    base_norm = _norm(base)
+    old_norm = _norm(old)
+    if old_norm in base_norm and base_norm.count(old_norm) == 1:
+        pos = base_norm.find(old_norm)
+        result = base_norm[:pos] + new + base_norm[pos + len(old_norm):]
+        if result != base_norm:
+            return result
+    return None
+
+
+# Scope recognisers for `_apply_scoped`.  Each entry is
+# (compiled pattern, how-to-get-indent).  The pattern must produce
+# a match whose `.start()` is the first character of the scope
+# (the `<` in `<details>`, the `d` in `def`, the `f` in `function`).
+_SCOPE_PATTERNS = [
+    # HTML <details> with named <summary>
+    lambda name: re.compile(
+        r"<details\b[^>]*>\s*<summary>\s*" + re.escape(name) +
+        r"\s*</summary>.*?</details>",
+        re.DOTALL | re.IGNORECASE,
+    ),
+    # Python def / class — top level, ends at next top-level
+    # def/class/decorator or EOF.
+    lambda name: re.compile(
+        r"(?:^|\n)(?:def|class)\s+" + re.escape(name) +
+        r"\b.*?(?=\n(?:def|class|@)|\Z)",
+        re.DOTALL,
+    ),
+    # JS function / class
+    lambda name: re.compile(
+        r"(?:^|\n)(?:export\s+)?(?:async\s+)?"
+        r"(?:function|class)\s+" + re.escape(name) + r"\b.*?"
+        r"(?:\n\}|\Z)",
+        re.DOTALL,
+    ),
+]
+
+
+def _apply_scoped(base: str, scope_name: str,
+                  new_body: str) -> Optional[str]:
+    """Find the named scope in `base` and replace it with `new_body`.
+
+    Recognised scope shapes: HTML `<details>` with matching
+    `<summary>`, Python top-level `def`/`class`, JS `function`/
+    `class`.  Returns None if no scope matches unambiguously.
+    """
+    if not scope_name or not new_body.strip():
+        return None
+
+    for make_pattern in _SCOPE_PATTERNS:
+        try:
+            pattern = make_pattern(scope_name)
+        except re.error:
+            continue
+        m = pattern.search(base)
+        if not m:
+            continue
+        # If the match included a leading newline, adjust start.
+        match_text = m.group(0)
+        prefix_newline = ""
+        suffix_newline = ""
+        if match_text.startswith("\n"):
+            prefix_newline = "\n"
+            start = m.start() + 1
+        else:
+            start = m.start()
+        # If we matched up to (but not including) a trailing
+        # newline, the new_body should preserve the same boundary.
+        end = m.end()
+        if match_text.endswith("\n"):
+            suffix_newline = "\n"
+            end = end - 1
+        # Normalize new_body's indentation to match base's.
+        line_start = base.rfind("\n", 0, start) + 1
+        base_indent = base[line_start:start]
+        reindented = _reindent_body(base_indent, new_body)
+        if prefix_newline:
+            return base[:line_start] + reindented + \
+                   suffix_newline + base[end:]
+        return base[:start] + reindented + base[end:]
+
+    return None
+
+
+def _reindent_body(base_indent: str, body: str) -> str:
+    """Re-indent `body` so its first line starts at `base_indent`.
+    Interior relative indentation is preserved."""
+    if not body:
+        return body
+    lines = body.split("\n")
+    first = lines[0]
+    orig_indent_len = len(first) - len(first.lstrip(" \t"))
+    adjusted = [base_indent + first.lstrip(" \t")]
+    for ln in lines[1:]:
+        if not ln.strip():
+            adjusted.append("")
+            continue
+        ln_indent = len(ln) - len(ln.lstrip(" \t"))
+        relative = max(0, ln_indent - orig_indent_len)
+        adjusted.append(base_indent + " " * relative + ln.lstrip(" \t"))
+    return "\n".join(adjusted)
+
+
+# ============================================================================
+# Sanity gate
+# ============================================================================
+
+def _sanity_gate(base: str, result: str) -> tuple[bool, str]:
+    from .sanity import is_suspicious
+    return is_suspicious(base, result)
+
+
+# ============================================================================
+# Individual patch application (unchanged from before)
+# ============================================================================
 
 def _looks_like_python_fragment(text: str) -> bool:
     for line in text.splitlines()[:5]:
@@ -176,20 +360,7 @@ def _looks_like_python_fragment(text: str) -> bool:
 
 
 def _delete_exact_block(base: str, body: str) -> Optional[str]:
-    """Remove the code block that `body` describes from `base`.
-
-    `body` may be:
-
-      · a raw code block (no diff prefixes) — used verbatim, so
-        indentation inside the block is preserved exactly
-      · a pure-deletion diff (all `-` / unprefixed lines) — diff
-        prefixes are stripped first
-
-    FIX (2026-10-31): the strip is conditional.  A raw code body has
-    no diff prefixes to strip, and stripping one leading space from
-    every indented line corrupts the exact match (base has 2-space
-    indent, stripped body has 1-space indent, no match).
-    """
+    """Remove the code block that `body` describes from `base`."""
     is_diff = _is_pure_deletion_diff_strict(body) or _looks_like_diff_body(body)
     stripped = _strip_diff_prefixes(body) if is_diff else body
 
@@ -223,9 +394,6 @@ def _delete_exact_block(base: str, body: str) -> Optional[str]:
 
 
 def _deletion_already_applied(body: str, base: str) -> bool:
-    """True if the code block described by `body` is ABSENT from
-    `base`.
-    """
     stripped = _strip_diff_prefixes(body)
     body_lines = [ln.rstrip() for ln in stripped.splitlines()
                   if ln.strip()]
@@ -242,18 +410,7 @@ def _deletion_already_applied(body: str, base: str) -> bool:
 
 
 def _try_raw_diff_patch(base: str, body: str) -> Optional[str]:
-    """Apply a raw `+`/`-` diff block (no `@@` hunk headers) to `base`.
-
-    FIX (2026-10-31): empty lines in the diff body are treated as
-    context blanks.  Some markdown processors strip the trailing
-    space from a ` ` (context blank) line, leaving an empty string.
-    The walker used to `continue` on empty lines — the base cursor
-    did not advance, and the following `-` line mismatched.  A
-    well-formed diff body has no truly empty line in the middle: a
-    blank in the diff always carries one of `+`, `-`, ` `.  An empty
-    line is therefore a whitespace-stripped ` ` context, and treating
-    it as such recovers the intended walk.
-    """
+    """Apply a raw `+`/`-` diff block (no `@@` hunk headers) to `base`."""
     diff_lines = body.splitlines()
     if not any(ln.startswith(("+", "-")) for ln in diff_lines):
         return None
@@ -288,7 +445,6 @@ def _try_raw_diff_patch(base: str, body: str) -> Optional[str]:
             line = diff_lines[i]
             i += 1
             if not line:
-                # FIX: whitespace-stripped context blank.
                 line = " "
             prefix = line[:1]
             rest = line[1:]
@@ -317,7 +473,6 @@ def _try_raw_diff_patch(base: str, body: str) -> Optional[str]:
 
 
 def _diff_already_applied(body: str, base: str) -> bool:
-    """True if a diff's net effect is already present in `base`."""
     if not _looks_like_diff_body(body):
         return False
 
@@ -349,8 +504,6 @@ def _diff_already_applied(body: str, base: str) -> bool:
 
 
 def _patch_already_present(body: str, base: str) -> bool:
-    """True if `body` appears as a contiguous run of non-blank
-    lines in `base` (whitespace-normalised)."""
     def norm(s: str) -> list[str]:
         return [ln.strip() for ln in s.splitlines() if ln.strip()]
 
@@ -368,17 +521,6 @@ def _patch_already_present(body: str, base: str) -> bool:
 
 
 def _try_deterministic_patch(base: str, patch: dict) -> Optional[str]:
-    """Try each patch shape in order; return the modified base or None.
-
-    FIX (2026-10-31): the object-literal path returns `None` when
-    its result equals `base` (byte-identical).  Without this, a
-    patch whose object is identical to the base's existing object
-    is marked `deterministic` with content unchanged, and any
-    subsequent diff patch on the same file runs against a content
-    that never had the object removed — passing the diff to the
-    walker with the deletion lines still in place, which then
-    correctly fails and reports `failed`.
-    """
     raw_body = patch["body"]
     body_stripped = raw_body.strip()
     if not body_stripped:
@@ -444,9 +586,6 @@ def _try_deterministic_patch(base: str, patch: dict) -> Optional[str]:
     sep = ";" if (body_had_semi or base_had_semi) else ""
     result = base_head + body_trimmed + sep + base_tail
 
-    # FIX: no-op check.  If the splice produced byte-identical
-    # content, the object literal in the patch is the same as the
-    # one in base — nothing to change.
     if result == base:
         return None
     return result

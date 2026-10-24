@@ -5,9 +5,15 @@ test_recover.py — fixture tests for recover.py.
 Fixtures 01–06 exercise the standard `--out` path (self-contained
 markdown, no pre-existing tree).
 
-Fixture 07 exercises the `--apply-to` path: the fixture markdown
-carries only patches, and the pre-existing source tree is provided
-by `preexisting/<fixture>/`.
+Fixtures 07, 08, and 09 exercise the `--apply-to` path: the fixture
+markdown carries only patches, and the pre-existing source tree is
+provided by `preexisting/<fixture>/`.
+
+Fixture 09 specifically tests that pair detection fires when the
+SECOND block's prose is a `with:`-style connective, even if the
+FIRST block's prose does not match any specific `_REPLACE_PROSE`
+phrase.  This is the shape-driven detection rule that replaced the
+old prose-driven rule after the pg_inpaint.py failure.
 
 Run:
     python tests/recover/test_recover.py
@@ -68,13 +74,7 @@ def run_recover(fixture: Path, out: Path) -> dict:
 
 
 def run_recover_apply(fixture: Path, apply_to: Path) -> dict:
-    """Run recover in --apply-to mode and load the manifest.
-
-    FIX (2026-10-31): the manifest now lives at
-    `apply_to/deeppeek/manifest.json` rather than at the top of
-    `apply_to/`.  Reports moved into `deeppeek/` so a stale manifest
-    from a previous run can never be mistaken for this run's output.
-    """
+    """Run recover in --apply-to mode and load the manifest."""
     cmd = [
         sys.executable, "-m", "deeppeek", "recover", str(fixture),
         "--apply-to", str(apply_to),
@@ -111,8 +111,7 @@ def _show_diff(exp_file: Path, act_file: Path) -> str:
     return "\n".join(out)
 
 
-def check(fixture_name: str, extra=None, skip_file_compare=False,
-          tmp_holder=None):
+def check(fixture_name: str, extra=None, skip_file_compare=False):
     """Standard-mode test: `--out` with no pre-existing tree."""
     fixture = FIXTURES / f"{fixture_name}.md"
     expected_dir = EXPECTED / fixture_name
@@ -143,12 +142,7 @@ def check(fixture_name: str, extra=None, skip_file_compare=False,
 
 def check_apply(fixture_name: str, extra=None, skip_file_compare=False):
     """`--apply-to` mode: pre-existing tree provided by
-    `preexisting/<fixture_name>/`.
-
-    When `skip_file_compare=True`, the expected/<fixture>/ contents
-    are not compared byte-for-byte; the caller's `extra` callback is
-    responsible for whatever assertions matter.
-    """
+    `preexisting/<fixture_name>/`."""
     fixture = FIXTURES / f"{fixture_name}.md"
     preexisting_dir = PREEXISTING / fixture_name
     expected_dir = EXPECTED / fixture_name
@@ -213,14 +207,18 @@ def check_apply(fixture_name: str, extra=None, skip_file_compare=False):
 def test_01():
     check("01_reprint_later")
 
+
 def test_02():
     check("02_subsection_patches")
+
 
 def test_03():
     check("03_multi_fence")
 
+
 def test_04():
     check("04_prose_override")
+
 
 def test_05():
     def extra(out, run):
@@ -235,6 +233,7 @@ def test_05():
             f"expected core_helpers.py in manifest missing_files"
         )
     check("05_missing_file", extra)
+
 
 def test_06():
     check("06_superset_wins")
@@ -319,7 +318,7 @@ def test_07():
             f"Full content:\n{content}"
         )
 
-        # NEW (2026-10-31): reports live in deeppeek/.
+        # Reports live in deeppeek/.
         reports_dir = target / "deeppeek"
         assert reports_dir.is_dir(), (
             f"sample.js: expected {reports_dir} to be created"
@@ -333,11 +332,127 @@ def test_07():
     check_apply("07_deletion_shapes", extra, skip_file_compare=True)
 
 
+def test_08():
+    """Replace-pair edits on an existing file (--apply-to mode).
+
+    The fixture carries two 5-line `partial` blocks — an OLD and a
+    NEW half — plus a `### Dark theme` heading between the prose and
+    the OLD block.  In standard `--out` mode neither half is `full`,
+    so the record would fall back to `PARTIAL_ONLY` and the pair
+    would never apply (no base to operate on).  `--apply-to` mode
+    provides the base from `preexisting/08_replace_pairs/colors.js`,
+    which is what a replace-pair edit operates on in the first
+    place.
+
+    The byte comparison of `expected/08_replace_pairs/colors.js`
+    against the post-run target is done by `check_apply` itself.
+    The `extra` hook adds semantic assertions the byte compare
+    cannot express: that the pair is recorded as applied, that the
+    sanity gate did not reject the write, that trust stayed at HIGH,
+    and that the pre-existing baseline is what the pair was applied
+    on top of.
+    """
+
+    def extra(target, run):
+        rec = run["manifest"].get("files", {}).get("colors.js", {})
+        assert rec, (
+            f"colors.js missing from manifest files; "
+            f"manifest files: {list(run['manifest'].get('files', {}))}"
+        )
+        assert rec.get("verification", {}).get("pairs_applied", 0) == 1, (
+            f"expected 1 pair applied, got: {rec}"
+        )
+        assert not rec.get("verification", {}).get("sanity_rejected"), (
+            f"sanity gate rejected the write: {rec}"
+        )
+        assert rec.get("trust") == "HIGH", (
+            f"expected trust=HIGH, got {rec.get('trust')}"
+        )
+        assert rec.get("preexisting_base") is True, (
+            f"expected preexisting_base=True, got "
+            f"{rec.get('preexisting_base')}"
+        )
+
+        content = (target / "colors.js").read_text()
+        assert "#88c0d0" in content, (
+            f"new value missing from target:\n{content}"
+        )
+        assert "#ff0000" not in content, (
+            f"old value still present in target:\n{content}"
+        )
+        assert "paint" in content, (
+            f"file truncated — paint() gone:\n{content}"
+        )
+        assert "el.style.background = colors.secondary;" in content, (
+            f"paint() body gone:\n{content}"
+        )
+
+    check_apply("08_replace_pairs", extra)
+
+
+def test_09():
+    """Replace-pair detection must fire when the second block's
+    prose is a `with:`-style connective, even if the first block's
+    prose does not match any specific `_REPLACE_PROSE` phrase.
+
+    Reproduces the pg_inpaint.py failure: "Replace the doc comment
+    above X:" / "with:" was silently missed, so the old comment
+    block was dropped and the new comment block was dropped too,
+    and the file was written with only the second half of each edit.
+
+    The shape being tested: two adjacent partials, where the second
+    one's prose begins with "with:" (or "to:", "becomes:",
+    "new code:", etc.).  That is the structural tell for a replace
+    pair — the AI writing "with:" between two code blocks is
+    describing "the block above is old, the block below is new",
+    regardless of what verb introduced the old block.
+
+    The fixture also exercises "And replace the function body:" as
+    the first block's prose, which was another form the old
+    prose-driven detection missed.
+    """
+
+    def extra(target, run):
+        rec = run["manifest"].get("files", {}).get("paint.js", {})
+        assert rec, (
+            f"paint.js missing from manifest files; "
+            f"manifest files: {list(run['manifest'].get('files', {}))}"
+        )
+        assert rec.get("verification", {}).get("pairs_applied", 0) == 2, (
+            f"expected 2 pairs applied, got: {rec}"
+        )
+        assert not rec.get("verification", {}).get("pairs_incomplete"), (
+            f"a pair failed to apply: {rec}"
+        )
+        assert not rec.get("verification", {}).get("sanity_rejected"), (
+            f"sanity gate rejected the write: {rec}"
+        )
+        assert rec.get("trust") == "HIGH", (
+            f"expected trust=HIGH, got {rec.get('trust')}"
+        )
+
+        content = (target / "paint.js").read_text()
+        assert "New comment: v2" in content, (
+            f"new comment missing from target:\n{content}"
+        )
+        assert "Old comment: v1" not in content, (
+            f"old comment still present in target:\n{content}"
+        )
+        assert "#88c0d0" in content, (
+            f"new color missing from target:\n{content}"
+        )
+        assert "#ff0000" not in content, (
+            f"old color still present in target:\n{content}"
+        )
+
+    check_apply("09_replace_pair_docstring", extra)
+
+
 def main():
     tests = [
         ("01", test_01), ("02", test_02), ("03", test_03),
         ("04", test_04), ("05", test_05), ("06", test_06),
-        ("07", test_07),
+        ("07", test_07), ("08", test_08), ("09", test_09),
     ]
     failed = 0
     for name, fn in tests:

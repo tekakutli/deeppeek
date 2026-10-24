@@ -1,47 +1,16 @@
 """
-recover.dedup — Pass 5 (pick one full-print winner per file).
+recover.dedup — Pass 5 (pick one full-print winner per file) plus
+pair detection.
 
-DIFFICULT.  Owns:
+Pair detection (new in 2026-11-01) runs first.  Any block that is
+half of a replace pair or the single half of a scoped replacement
+is *removed* from the normal trailing-patch path — it becomes a
+structured edit that `apply_patches` handles separately.
 
-    FIX [B]   Syntax-preference step between "revision" (2.5) and
-              "modifier" (3).
-
-    FIX [C]   Filter spurious trailing "patches".  A partial block
-              after the chosen full print becomes a real patch only
-              if it satisfies one of:
-
-                · override_reason is a diff- or reprint-context anchor
-
-                · the body is a deletion instruction —
-                  `_is_deletion_instruction(body, context_before)`
-                  — i.e. a pure-deletion diff or a raw code block
-                  preceded by "Delete:" / "Remove:"
-
-                · the body's first line is a structural diff target —
-                  an object-literal re-declaration
-
-                · the body is a unified diff hunk
-
-                · the body is a raw prefix diff (every line prefixed
-                  with `+`/`-`/` `)
-
-              Everything else is dropped.
-
-    NEW (2026-10-23)  Preexisting-vs-real split.
-
-    NEW (2026-10-30)  Diff-shaped patches survive the real-patch
-              filter.
-
-    NEW (2026-10-30b) Deletion instructions survive the real-patch
-              filter.  This is the case that made the panel-fade
-              conversation fail: assistant #1 emitted the `panelState`
-              removal as a ```js body with "Delete:" prose, not as a
-              diff.  Without this change, that block was dropped by
-              pass 5, never landed in `rec.patches`, and the diff
-              fence from assistant #2 that DID survive had no
-              sibling to verify against — but worse, when it did
-              land, `validate` demanded the code be present after
-              it was deliberately removed.
+Without this, a replace pair was being mangled: the OLD block was
+seen as a delete (matched the base exactly), the NEW block was
+dropped as an unclassifiable snippet (no anchor in base).  Result:
+half the transformation applied.
 """
 
 import re
@@ -53,11 +22,16 @@ from .core import (
     _is_deletion_instruction,
     _looks_like_diff_body,
 )
+from .pairing import detect_all, build_pairs
 
 
 def pass5_deduplicate(records: dict[str, FileRecord],
                       blocks_by_idx: dict[int, Block],
                       verbose: bool) -> None:
+    # ---- new: detect replace / scoped pairs first ----
+    detect_all(list(blocks_by_idx.values()), blocks_by_idx)
+    global_pairs = build_pairs(blocks_by_idx)
+
     for path, rec in records.items():
         all_fulls = [i for i in rec.source_blocks
                      if blocks_by_idx[i].kind == "full"]
@@ -76,17 +50,62 @@ def pass5_deduplicate(records: dict[str, FileRecord],
             fulls = []
             rec.preexisting_base = False
 
+        # ---- new: pair-assigned blocks are excluded from patches ----
+        pair_idxs_for_this_file = set()
+        for anchor, pair in global_pairs.items():
+            if pair["old_idx"] == -1:
+                # Scoped: block anchor is both old and new
+                b = blocks_by_idx[anchor]
+                if b.output_path == path:
+                    pair_idxs_for_this_file.add(anchor)
+                    rec.pairs.append({
+                        "old_idx": -1,
+                        "new_idx": anchor,
+                        "scope_hint": "scoped",
+                        "scope_name": pair["scope_name"],
+                        "new_body": pair["new_body"],
+                    })
+            else:
+                b_old = blocks_by_idx[pair["old_idx"]]
+                b_new = blocks_by_idx[pair["new_idx"]]
+                if b_old.output_path != path and \
+                   b_new.output_path != path:
+                    continue
+                pair_idxs_for_this_file.add(pair["old_idx"])
+                pair_idxs_for_this_file.add(pair["new_idx"])
+                rec.pairs.append({
+                    "old_idx": pair["old_idx"],
+                    "new_idx": pair["new_idx"],
+                    "scope_hint": "replace",
+                    "old_body": pair["old_body"],
+                    "new_body": pair["new_body"],
+                })
+
         partials = [i for i in rec.source_blocks
-                    if blocks_by_idx[i].kind == "partial"]
+                    if blocks_by_idx[i].kind == "partial"
+                    and i not in pair_idxs_for_this_file]
         orphan_patches = [
             b.idx for b in blocks_by_idx.values()
             if b.is_orphan and b.attributed_to == path
             and b.kind != "full"
+            and b.idx not in pair_idxs_for_this_file
         ]
         partials = sorted(partials + orphan_patches)
 
+        if verbose and rec.pairs:
+            print(f"  [pass 5] {path}: {len(rec.pairs)} pair(s)",
+                  file=sys.stderr)
+
         if not fulls:
-            rec.state = "PARTIAL_ONLY" if partials else "MISSING"
+            # Pairs require a base to operate on.  If there's no full
+            # print, the pair cannot apply.
+            if rec.pairs:
+                rec.state = "PARTIAL_ONLY"
+                if verbose:
+                    print(f"  [pass 5] {path}: pairs but no full print; "
+                          f"pairs cannot apply", file=sys.stderr)
+            else:
+                rec.state = "PARTIAL_ONLY" if partials else "MISSING"
             continue
 
         rec.all_full_idxs = fulls[:]
@@ -110,6 +129,8 @@ def pass5_deduplicate(records: dict[str, FileRecord],
         chosen_idx = rec.chosen_full_idx
 
         def _is_real_patch(p_idx: int) -> bool:
+            if p_idx in pair_idxs_for_this_file:
+                return False
             b = blocks_by_idx[p_idx]
             if b.override_reason == "recovered-meta listing":
                 return False
@@ -122,8 +143,6 @@ def pass5_deduplicate(records: dict[str, FileRecord],
             if not body:
                 return False
 
-            # Deletion instruction: covers both pure-deletion diffs
-            # and raw code blocks with "Delete:" prose.
             if _is_deletion_instruction(body, b.context_before):
                 return True
 
@@ -161,6 +180,11 @@ def pass5_deduplicate(records: dict[str, FileRecord],
             rec.state = "SINGLE_FULL"
         else:
             rec.state = "MULTI_FULL"
+
+        # A file with only pairs (no trailing patches, one full
+        # print) still needs FULL_PLUS_PATCH so apply_patches runs.
+        if rec.pairs and rec.state == "SINGLE_FULL":
+            rec.state = "FULL_PLUS_PATCH"
 
 
 def _dedup_pick(path: str,

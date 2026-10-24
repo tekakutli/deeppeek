@@ -1,35 +1,17 @@
 """
-recover.classify — Pass 2 (block classification).
+recover.classify — Pass 2 (block classification) plus intent parsing.
 
-DIFFICULT.  This module owns:
+Every block gets:
+  · kind       (full / partial / not_a_file / recovered_meta)
+  · confidence
+  · intent     (from prose.parse_intent)
+  · scope_hint / scope_name  (only for scoped-replace blocks)
 
-    FIX [A]   RECOVERED_META_RE now matches "FILE N/M: <path>" in any
-              form.  The previous regex required "files/" immediately
-              after the colon; recover's own header-layout output uses
-              "recovered/files/..." which didn't match, so the
-              project_dump_recover.md passthrough survived Pass 2,
-              its fences got attributed as patches, every patch
-              failed, and 6 good files were dropped.
-    FIX [4]   narrow-context diff detection via _has_diff_signal /
-              _narrow_context from core.
-    FIX [1]   structural fallback for .py bodies that fail ast.parse
-              because they embed raw JS/CSS.
-    FIX [2]   the same fallback inside _looks_like_full_file.
-    FIX [3]   the same fallback inside _looks_truncated.
-    FIX [9]   escalate-batch detail log gated by `verbose` and capped
-              at 10 entries.
-
-    NEW (2026-10-23)  Skip preexisting baselines (blocks with
-              classified_by == "preexisting") during classification.
-
-    NEW (2026-10-30)  Diff fences and diff-shaped bodies are
-              classified as `partial` + is_code_file=True, so they
-              survive pass 3 and reach the patcher.  Previously
-              ` ```diff ` shared the "not_a_file" bucket with
-              ` ```bash ` and was silently dropped before pass 5
-              could attach it to its file as a patch — which is
-              why every "here's the diff" reply produced zero
-              applied changes.
+New in 2026-11-01: the intent tracking.  Instead of the patcher
+re-deriving "is this a delete / a replace / an insert" from prose on
+every pass, we parse it once here and record it on the Block.
+`pass5_deduplicate` reads `intent` and `paired_with`; `pass6` reads
+the same.  Adding a new prose pattern is one entry in `prose.py`.
 """
 
 import json
@@ -49,6 +31,7 @@ from .core import (
     _narrow_context,
 )
 from .llm import LLMClient
+from .prose import parse_intent
 
 
 CLASSIFY_PROMPT = """You are analyzing a code-refactor conversation
@@ -90,14 +73,21 @@ def pass2_classify(blocks: list[Block], llm: Optional[LLMClient],
         return
 
     for b in blocks:
-        # NEW: preexisting baselines are already known-good full prints
-        # — never reclassify them.
         if b.classified_by == "preexisting":
             b.heuristic_kind = b.kind
+            b.intent = "full"
             continue
         _classify_one_heuristic(b)
         b.classified_by = "heuristic"
         b.heuristic_kind = b.kind
+
+        # NEW: parse prose intent now, once per block.  Attaches
+        # b.intent, b.scope_hint, b.scope_name.  Downstream passes
+        # read those instead of re-deriving them.
+        intent = parse_intent(b.context_before)
+        b.intent = intent.action
+        b.scope_hint = intent.scope_hint
+        b.scope_name = intent.scope_name
 
     if mode == "off":
         _apply_hard_overrides(blocks, verbose)
@@ -106,7 +96,6 @@ def pass2_classify(blocks: list[Block], llm: Optional[LLMClient],
     if mode == "smart":
         ambiguous = []
         for b in blocks:
-            # NEW: never escalate a preexisting baseline to the LLM.
             if b.classified_by == "preexisting":
                 continue
             reason = _escalation_reason(b, escalate_below)
@@ -156,11 +145,9 @@ def _escalation_reason(b: Block, threshold: float) -> Optional[str]:
 def _apply_hard_overrides(blocks: list[Block],
                           verbose: bool = False) -> None:
     for b in blocks:
-        # NEW: preexisting baselines are untouched by hard overrides.
         if b.classified_by == "preexisting":
             continue
 
-        # ---- recovered-meta filter ----
         if (RECOVERED_META_RE.search(b.context_before) is not None
                 or "SCANNED DIRECTORY" in b.context_before):
             if b.kind != "recovered_meta" and verbose:
@@ -197,22 +184,16 @@ def _apply_hard_overrides(blocks: list[Block],
 
 
 def _classify_one_heuristic(b: Block) -> None:
-    """Deterministic classifier.  Confidences tuned so that a
-    well-structured dump makes zero LLM escalations even under
-    `--llm-mode smart`."""
     path = _basename(b.header_path) or f"unknown_{b.idx}"
     b.canonical_path = path
     lang = b.fence_lang.lower()
 
-    # ---- shell / prose / inline snippets: definitely not code ----
     if lang in ("bash", "sh", "text"):
         b.is_code_file = False
         b.kind = "not_a_file"
         b.confidence = 0.90
         return
 
-    # ---- NEW: `diff` fences are patches, not files, but they ARE
-    # ---- code: they must survive to the patcher.
     if lang == "diff":
         b.is_code_file = True
         b.kind = "partial"
@@ -234,11 +215,6 @@ def _classify_one_heuristic(b: Block) -> None:
         b.confidence = 0.90
         return
 
-    # NEW: a code-fenced body (any of the source languages) whose
-    # line prefixes are `+`/`-`/` ` throughout is a patch the LLM
-    # emitted without labeling the fence `diff`.  Catch it here so
-    # it lands in the patcher instead of being classified `full`
-    # (which would make it a candidate base for its own file).
     if lang in ("js", "mjs", "jsx", "ts", "tsx", "py", "python",
                 "rs", "go", "c", "cpp", "h", "hpp", "java",
                 "rb", "php", "css", "html", ""):

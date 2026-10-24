@@ -67,10 +67,13 @@ I attempted to apply the extracted patches to a target project with:
 
     deeppeek recover {conversation} --apply-to {target}
 
-The result was a failure: no project files were created or modified,
-apart from metadata artifacts. Those metadata files are under
-{meta} and contain errors, warnings, and other side effects from
-the attempted apply.
+The outcome of that attempt may be a full success, a partial success,
+a silent no-op, or a hard failure — the only way to know is to read
+the metadata.  Metadata files are under {meta} and record what
+deeppeek actually did: warnings, errors, applied patches, skipped
+files, sanity rejections, and other side effects from the run.  Inspect
+those first, then the target dump, then the CLI itself.  Diagnose from
+what is there, not from what this prompt assumes about it.
 
 I am providing the following inputs, attached to this message as
 files:
@@ -94,6 +97,85 @@ than only tuning the existing parser.
 The goal is a general-purpose utility that reliably extracts and
 applies code patches from AI conversations, not a one-off fix for
 this single conversation.
+
+---
+
+HARD CONSTRAINT — HOW TO EMIT FILES
+
+This conversation is happening through a GUI that renders markdown
+imperfectly. In particular, it mangles nested code fences. Any file
+you emit whose content itself contains a three-backtick fence marker
+will come back to me as broken text, and I will not be able to
+recover the file from the transcript. A Python file with a docstring
+that illustrates markdown, a test fixture that itself contains
+fenced code, a README that documents code — all of these are
+affected.
+
+The rule: NEVER emit file contents as raw markdown. NEVER wrap a
+bash command in a markdown code fence. ALWAYS emit files via a bash
+heredoc piped through python3, and construct any backtick characters
+with chr(96).
+
+Canonical pattern for a single file:
+
+    python3 - <<'PYEOF'
+    from pathlib import Path
+    B = chr(96) * 3   # three backticks; chr(96) is the backtick
+    content = "\\n".join([
+        "# heading",
+        "",
+        B + "js",
+        "const x = 1;",
+        B,
+        "",
+    ])
+    Path("path/to/file.md").write_text(content)
+    print("wrote path/to/file.md")
+    PYEOF
+
+Canonical pattern for multiple files in one block:
+
+    python3 - <<'PYEOF'
+    from pathlib import Path
+    B = chr(96) * 3
+
+    def w(path, lines):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text("\\n".join(lines) + "\\n")
+        print("wrote", path)
+
+    w("a/b.py", [
+        "'''docstring'''",
+        "def f():",
+        "    return 1",
+    ])
+    w("a/c.md", [
+        "# heading",
+        B + "python",
+        "x = 1",
+        B,
+    ])
+    PYEOF
+
+Rules for the bash itself:
+
+  · Use a QUOTED heredoc (`<<'PYEOF'`), so bash does not expand
+    anything inside.  This is what makes dollar signs, backticks,
+    and quotes safe.
+  · Do not put a literal backtick character in the bash you emit.
+    Use chr(96) — or chr(96)*3 — to build backticks at Python
+    runtime.
+  · Do not wrap the bash itself in a markdown code fence.  Present
+    it as plain text.
+  · Multiple files per heredoc block is preferred: it keeps the
+    response short and means fewer chances for the GUI to mangle
+    something.
+  · Each file write prints "wrote <path>", so you can verify the
+    whole block succeeded from its output alone.
+
+This constraint is not stylistic.  It is the only way your fixes
+will reach my file system.  Ignore it and I cannot run what you
+produce.
 """
 
 
@@ -262,7 +344,11 @@ def _build_prompt(inputs: _Inputs, capture_cmd: Optional[str]) -> str:
         )
     else:
         extraction = (
-            "The conversation is a pre-existing Markdown export.\n"
+            "The conversation is a pre-existing Markdown export, and "
+            "very likely the very same one you and I are having right "
+            "now — so this is a self-referential debugging exercise: "
+            "you are looking at a conversation that describes its own "
+            "state."
         )
 
     return TASK_PROMPT_TEMPLATE.format(
@@ -361,8 +447,8 @@ def _stage_generate(args: argparse.Namespace
     if args.skip_recover:
         print("  recover: SKIPPED via --skip-recover", file=sys.stderr)
     else:
-        print("  recover: attempting (this is expected to fail)",
-              file=sys.stderr)
+        print("  recover: attempting (this may fail — that's the "
+              "point)", file=sys.stderr)
         cmd = prefix + [
             "recover", str(conversation_path),
             "--apply-to", str(args.target),
