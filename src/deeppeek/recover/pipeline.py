@@ -79,7 +79,9 @@ from .resolve import resolve_paths
 from .attribute import pass4_attribute_orphans
 from .dedup import pass5_deduplicate
 from .apply_patches import pass6_apply_patches
-from .validate import pass7_cross_validate, pass8_verify
+from .validate import (
+    pass7_cross_validate, pass8_verify, pass8_5_check_symbols,
+)
 from .write import pass9_write
 
 
@@ -398,6 +400,9 @@ def run(cfg: RecoverConfig) -> int:
 
     print("[pass 8] verifying...")
     pass8_verify(records, blocks_by_idx=blocks_by_idx)
+
+    print("[pass 8.5] checking symbol resolution...")
+    pass8_5_check_symbols(records, blocks_by_idx=blocks_by_idx)
 
     from .cross_file import find_cross_file_duplicates
     cross_file_dups = find_cross_file_duplicates(

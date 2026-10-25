@@ -1,27 +1,31 @@
 """Regression tests for the heredoc prompt text.
 
-These guard two properties the prompt depends on:
+The prompt shipped by `deeppeek prompt heredoc` is a standing
+order that teaches the AI how to emit files. These tests guard
+the properties the prompt must have, matching the rules in
+docs/EMISSION.md.
 
-  1. The prompt ITSELF must be backtick-free — no literal backtick,
-     no triple-backtick fence.  If a prompt contained a raw fence,
-     the same GUI that mangles file emissions would mangle the
-     instruction that fixes file emissions.
+Key properties:
 
-  2. The prompt must contain the specific markers an AI would
-     follow: PYEOF (canonical heredoc delimiter), chr(96) (the
-     backtick workaround), and language that makes the order
-     STANDING rather than per-task.
+  1. Actionable markers. The prompt must contain the specific
+     markers an AI needs to follow: PYEOF (the canonical
+     heredoc delimiter), chr(96) (the backtick workaround), and
+     the fence-wrapping rule (rule 3 of EMISSION.md).
 
-Plus a few structural sanity checks on length, coverage, and
-recovery awareness.
+  2. Standing order. The prompt must use forward-looking
+     language and must tell the AI to re-emit already-broken
+     files.
 
-Whitespace handling: prompt text is wrapped for readability at ~72
-columns, so any two-word phrase can land on either side of a newline.
-Text-matching tests therefore normalise whitespace before matching
-(see `_norm`) rather than requiring the prompt to break lines at
-specific points.  This keeps the tests semantic — "the prompt
-mentions X" — instead of brittle — "the prompt mentions X with a
-single space and no newline".
+  3. Consistent with EMISSION.md. When the document says
+     "wrap the bash in a markdown fence", the prompt must say
+     the same. When the document says "use chr(96) in the
+     body", the prompt must say the same.
+
+Whitespace handling: prompt text is wrapped for readability, so
+any two-word phrase can land on either side of a newline.
+Text-matching tests normalise whitespace before matching (see
+`_norm`) rather than requiring the prompt to break lines at
+specific points.
 """
 import re
 import sys
@@ -35,12 +39,7 @@ from deeppeek.prompts.heredoc import HEREDOC_PROMPT
 
 
 def _norm(text: str) -> str:
-    """Lowercase and collapse all whitespace runs to a single space.
-
-    The prompt is wrapped for readability; two-word phrases can span
-    a newline.  Normalising before matching makes the checks
-    insensitive to where the author chose to break a line.
-    """
+    """Lowercase and collapse all whitespace runs to a single space."""
     return re.sub(r"\s+", " ", text.lower())
 
 
@@ -50,44 +49,42 @@ def test_prompt_is_not_empty():
         "prompt is too short to be a comprehensive instruction")
 
 
-def test_prompt_has_no_raw_backticks():
-    """The whole point of the prompt is to replace backticks.  If it
-    contained any itself, it would be self-defeating."""
-    assert "`" not in HEREDOC_PROMPT, (
-        "prompt contains a literal backtick; the constraint it asks "
-        "for is 'use chr(96), never a raw backtick'.  The prompt "
-        "must obey the same rule it prescribes.")
-
-
-def test_prompt_has_no_triple_backtick_fence():
-    """Stronger than the single-backtick check: no fenced code block
-    anywhere in the prompt text."""
-    assert "```" not in HEREDOC_PROMPT, (
-        "prompt contains a triple-backtick fence; file content must "
-        "be emitted via heredoc, and the instruction must not "
-        "itself use a markdown fence.")
-
-
 def test_prompt_mentions_heredoc_marker():
-    """PYEOF is the canonical heredoc delimiter used in every
-    existing prompt (evolve, reprint_markdown).  If it's missing,
-    the AI would invent its own and lose the safety properties."""
+    """PYEOF is the canonical heredoc delimiter."""
     assert "PYEOF" in HEREDOC_PROMPT
     assert "python3 - <<'PYEOF'" in HEREDOC_PROMPT
 
 
 def test_prompt_mentions_chr96_workaround():
-    """The backtick workaround is the non-obvious bit.  Both
-    `chr(96)` and `chr(96) * 3` must be present so the AI sees both
-    a single-backtick and a fence construction."""
+    """The backtick workaround must appear as both a single-
+    backtick reference and a fence construction."""
     assert "chr(96)" in HEREDOC_PROMPT
     assert "chr(96) * 3" in HEREDOC_PROMPT
 
 
+def test_prompt_mentions_fence_wrapping():
+    """Rule 3 of EMISSION.md: wrap the whole bash in a markdown
+    fence. The prompt must teach this."""
+    lower = _norm(HEREDOC_PROMPT)
+    assert ("markdown code fence" in lower
+            or "markdown fence" in lower
+            or "wrap the whole bash" in lower), (
+        "prompt must mention the fence-wrapping rule (rule 3)")
+
+
+def test_prompt_mentions_four_backtick_escape():
+    """The four-backtick escape hatch is required when the body
+    itself must display three-backtick examples."""
+    lower = _norm(HEREDOC_PROMPT)
+    assert ("four-backtick" in lower
+            or "four backtick" in lower
+            or "4-backtick" in lower
+            or "4 backtick" in lower), (
+        "prompt must mention the four-backtick escape hatch")
+
+
 def test_prompt_is_standing_order():
-    """The instruction must be forward-looking, not task-scoped.
-    This is the difference between a useful constraint and one the
-    AI ignores on the next turn."""
+    """The instruction must be forward-looking, not task-scoped."""
     lower = _norm(HEREDOC_PROMPT)
     assert ("standing order" in lower
             or "from now on" in lower
@@ -96,8 +93,8 @@ def test_prompt_is_standing_order():
 
 
 def test_prompt_is_recovery_aware():
-    """A conversation already broken by raw-fence emission must be
-    healable in place.  The prompt must tell the AI to re-emit."""
+    """A conversation already broken by raw-fence emission must
+    be healable in place. The prompt must tell the AI to re-emit."""
     lower = _norm(HEREDOC_PROMPT)
     assert ("re-emit" in lower
             or "reemit" in lower
@@ -106,65 +103,51 @@ def test_prompt_is_recovery_aware():
 
 
 def test_prompt_covers_non_code_files():
-    """The constraint applies to markdown, docs, configs, etc., not
-    just source files.  If only code is mentioned, the AI will
-    happily emit a broken README."""
+    """The constraint applies to markdown, docs, configs, not
+    just source files."""
     lower = _norm(HEREDOC_PROMPT)
     assert "markdown" in lower or "documentation" in lower
     assert "config" in lower or "tests" in lower or "test " in lower
 
 
-def test_prompt_forbids_raw_markdown():
-    """The prohibition must be explicit.  An AI reading only 'use
-    heredoc' might assume a markdown fence *around* a heredoc is
-    fine."""
+def test_prompt_forbids_raw_backticks_in_body():
+    """Rule 2 of EMISSION.md: no literal backticks in the body.
+    The prompt must teach this explicitly, naming chr(96) as the
+    workaround."""
     lower = _norm(HEREDOC_PROMPT)
-    assert ("do not emit file content as raw markdown" in lower
-            or "never emit file content as raw markdown" in lower), (
-        "prompt must explicitly forbid emitting file content as "
-        "raw markdown")
-
-
-def test_prompt_forbids_wrapping_bash_in_fence():
-    """The most common mistake: wrapping the heredoc in a markdown
-    code fence.  Must be explicitly prohibited."""
-    lower = _norm(HEREDOC_PROMPT)
-    assert ("do not wrap bash in a markdown code fence" in lower
-            or "never wrap the bash itself in a markdown code fence"
-            in lower), (
-        "prompt must explicitly forbid wrapping the emitted bash "
-        "in a markdown code fence")
+    assert ("never put a literal backtick" in lower
+            or "never put a raw backtick" in lower
+            or "no literal backtick" in lower), (
+        "prompt must explicitly forbid literal backticks in the body")
 
 
 def test_prompt_explains_quoting():
-    """The `<<'PYEOF'` quoting (single-quote around the delimiter)
-    is what makes the body safe from bash expansion.  Without the
-    explanation, an AI might use `<<PYEOF` (unquoted) and get its
-    dollar signs and backticks silently expanded."""
+    """The <<'PYEOF' quoting is what makes the body safe from
+    bash expansion."""
     lower = _norm(HEREDOC_PROMPT)
-    assert "quoted heredoc" in lower or "quoting" in lower, (
+    assert ("quoted heredoc" in lower
+            or "quoting" in lower
+            or "single quotes around pyeof" in lower), (
         "prompt must explain why the heredoc delimiter is quoted")
 
 
 def main():
     tests = [
         ("prompt is not empty", test_prompt_is_not_empty),
-        ("prompt has no raw backticks",
-         test_prompt_has_no_raw_backticks),
-        ("prompt has no triple-backtick fence",
-         test_prompt_has_no_triple_backtick_fence),
         ("prompt mentions heredoc marker",
          test_prompt_mentions_heredoc_marker),
         ("prompt mentions chr96 workaround",
          test_prompt_mentions_chr96_workaround),
+        ("prompt mentions fence wrapping",
+         test_prompt_mentions_fence_wrapping),
+        ("prompt mentions four-backtick escape",
+         test_prompt_mentions_four_backtick_escape),
         ("prompt is standing order", test_prompt_is_standing_order),
         ("prompt is recovery aware", test_prompt_is_recovery_aware),
         ("prompt covers non-code files",
          test_prompt_covers_non_code_files),
-        ("prompt forbids raw markdown",
-         test_prompt_forbids_raw_markdown),
-        ("prompt forbids wrapping bash in fence",
-         test_prompt_forbids_wrapping_bash_in_fence),
+        ("prompt forbids raw backticks in body",
+         test_prompt_forbids_raw_backticks_in_body),
         ("prompt explains quoting", test_prompt_explains_quoting),
     ]
     failed = 0

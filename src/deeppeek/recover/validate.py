@@ -42,6 +42,15 @@ framework namespaces (`pgkit.*`), contentless records, stdlib
 modules shadowing local basenames.  All are handled by
 `_resolve_module` and `_is_likely_local` below, and shared with
 `write._aggregate_missing_imports`.
+
+NEW (2026-11-03) **Pass 8.5 — symbol resolution.**
+
+`pass8_5_check_symbols` cross-references patch-introduced bare calls
+against each file's imports and declarations.  An unresolved call
+introduced by a patch almost certainly means the block was
+attributed to the wrong file.  Demote the record to LOW trust so
+the fail-closed policy preserves the target.  See `symbols.py` for
+the extraction rules and the motivating case.
 """
 
 import ast
@@ -655,3 +664,59 @@ def pass8_verify(records: dict[str, FileRecord],
                       file=sys.stderr)
             else:
                 v["patch_presence"] = "ok"
+
+
+def pass8_5_check_symbols(records: dict[str, FileRecord],
+                          blocks_by_idx: Optional[dict] = None) -> None:
+    """Cross-reference patch-introduced bare calls against each file's
+    imports and declarations.
+
+    An unresolved call introduced by a patch almost certainly means
+    the block was attributed to the wrong file — e.g. a
+    `pgkitRegisterField(...)` block landing in a module that imports
+    `pgkitRegisterAction` but not `pgkitRegisterField`, which throws
+    `ReferenceError` at load time and blanks the target's UI.
+
+    Records with at least one unresolved call are demoted to LOW
+    trust so the fail-closed policy preserves the target and routes
+    the attempt into `deeppeek/low_trust/`.  The failure, the call
+    names, and the file path are all recorded in `warnings.txt` and
+    `manifest.json`.
+
+    Runs after `pass8_verify` so structural / parse failures already
+    have their say first.  A record that already fail-closed for
+    structural reasons is not re-demoted here; only the
+    `unresolved_calls` list is recorded for completeness.
+    """
+    from .symbols import find_unresolved_calls
+
+    for path, rec in records.items():
+        if rec.content is None:
+            continue
+        if rec.is_deleted:
+            continue
+        if not (rec.patches or rec.pairs):
+            continue
+
+        base = None
+        if blocks_by_idx is not None and rec.last_full_idx is not None:
+            base_block = blocks_by_idx.get(rec.last_full_idx)
+            if base_block is not None:
+                base = base_block.body
+
+        unresolved = find_unresolved_calls(rec, base, records)
+        if not unresolved:
+            continue
+
+        rec.verification["unresolved_calls"] = unresolved
+        rec.trust = "LOW"
+        rec.warnings.append(
+            "unresolved symbol reference(s) introduced by patch: "
+            + ", ".join(unresolved)
+            + " (patch almost certainly targeted the wrong file)"
+        )
+        preview = ", ".join(unresolved[:5])
+        suffix = " ..." if len(unresolved) > 5 else ""
+        print(f"  [symbols] {path}: {len(unresolved)} unresolved "
+              f"call(s): {preview}{suffix}",
+              file=sys.stderr)

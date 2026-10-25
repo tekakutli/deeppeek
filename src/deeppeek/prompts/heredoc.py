@@ -61,84 +61,119 @@ from typing import Optional
 HEREDOC_PROMPT = """\
 STANDING ORDER — HOW TO EMIT FILES IN THIS CONVERSATION
 
-This conversation is happening through a GUI that renders markdown
-imperfectly. In particular, it mangles nested code fences. Any file
-you emit whose content itself contains a three-backtick fence marker
-will come back to me as broken text, and I will not be able to
-recover the file from the transcript.
+This conversation is happening through a GUI that renders
+markdown imperfectly. In particular, it mangles nested code
+fences. Any file you emit whose content itself contains a
+three-backtick fence marker will come back to me as broken
+text, and I will not be able to recover the file from the
+transcript.
 
-From now on — for every file you write, edit, create, or reprint in
-this conversation, including code, markdown, configs, tests, and
-documentation — you MUST use the bash-heredoc pattern below. Do not
-emit file content as raw markdown. Do not wrap bash in a markdown
-code fence. Do not assume a previous emission was "close enough."
+From now on — for every file you write, edit, create, or reprint
+in this conversation, including code, markdown, configs, tests,
+and documentation — you MUST follow these rules.
+
+RULE 1. Use a quoted bash heredoc.
+
+    python3 - <<'PYEOF'
+    ...
+    PYEOF
+
+The single quotes around PYEOF disable bash expansion. Without
+them, dollar signs, backticks, and quotes inside the body would
+be expanded at execution time.
+
+RULE 2. Never put a literal backtick in the heredoc body. Build
+every backtick at Python runtime with chr(96):
+
+  - chr(96)        — one backtick
+  - chr(96) * 3    — the three-backtick fence marker
+  - chr(96) * 4    — a four-backtick fence, if needed
+
+This is the load-bearing rule. If the body contains a raw
+three-backtick run, the markdown renderer treats it as a fence
+boundary and cuts the message short. chr(96) delays construction
+past the renderer's parser.
+
+RULE 3. Wrap the whole bash in a markdown code fence.
+
+Open with a line that is ```bash, close with ``` alone. This
+gives me a one-click copy button. If the body must display
+three-backtick fences as examples (a doc about markdown, a
+fixture containing a fence, a README documenting code-fenced
+code), use a four-backtick opening line (````bash) instead.
+Rule: outer fence width must exceed the widest inner fence.
+
+RULE 4. Batch files into one heredoc block.
+
+One block, many w(...) calls, one renderer round-trip. Ten w()
+calls in one block is strictly safer than ten blocks with one
+call each.
+
+RULE 5. Never nest the same triple-quote style in Python
+strings.
+
+No triple-single-quote inside a triple-single-quoted string,
+and no triple-double-quote inside a triple-double-quoted
+string. Use def-based examples (no docstring), flip one side,
+or construct via chr(34) * 3 / chr(39) * 3.
+
+RULE 6. Verify before write.
+
+Any string manipulation that produces a .py file: ast.parse
+the result before writing it. If parsing fails, do not write.
+Read-only probe first, verified write second, idempotent
+patches so a re-run is a no-op.
+
+---
 
 Canonical pattern for a single file:
 
-    python3 - <<'PYEOF'
-    from pathlib import Path
-    B = chr(96) * 3   # three backticks; chr(96) is the backtick
-    content = "\\n".join([
-        "# heading",
-        "",
-        B + "python",
-        "x = 1",
-        B,
-        "",
-    ])
-    Path("path/to/file.md").write_text(content)
-    print("wrote path/to/file.md")
-    PYEOF
+```bash
+python3 - <<'PYEOF'
+from pathlib import Path
+B = chr(96) * 3   # three backticks; chr(96) is the backtick
+content = "\\n".join([
+    "# heading",
+    "",
+    B + "python",
+    "x = 1",
+    B,
+])
+Path("path/to/file.md").write_text(content)
+print("wrote path/to/file.md")
+PYEOF
+```
 
 Canonical pattern for multiple files in one block:
 
-    python3 - <<'PYEOF'
-    from pathlib import Path
-    B = chr(96) * 3
+```bash
+python3 - <<'PYEOF'
+from pathlib import Path
+B = chr(96) * 3
 
-    def w(path, lines):
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text("\\n".join(lines) + "\\n")
-        print("wrote", path)
+def w(path, lines):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text("\\n".join(lines) + "\\n")
+    print("wrote", path)
 
-    w("a/b.py", [
-        "def f():",
-        "    return 1",
-    ])
-    w("a/c.md", [
-        "# heading",
-        B + "python",
-        "x = 1",
-        B,
-    ])
-    PYEOF
+w("a/b.py", [
+    "def f():",
+    "    return 1",
+])
+w("a/c.md", [
+    "# heading",
+    B + "python",
+    "x = 1",
+    B,
+])
+PYEOF
+```
 
-Rules for the bash itself:
-
-  · Use a QUOTED heredoc (<<'PYEOF'), so bash does not expand
-    dollar signs, backticks, or quotes inside the body. This is what
-    makes the body safe to carry arbitrary content.
-
-  · Never put a literal backtick character in the bash you emit.
-    Use chr(96) — or chr(96)*3 — to construct backticks at Python
-    runtime. A literal backtick in the bash text will be mangled by
-    the GUI before it reaches me.
-
-  · Never wrap the bash itself in a markdown code fence. Present it
-    as plain text.
-
-  · Multiple files per heredoc block is preferred: it keeps the
-    response short and means fewer chances for the GUI to mangle
-    something.
-
-  · Each file write prints "wrote <path>", so the block's success is
-    verifiable from its own output alone.
-
-This is a standing order. It applies to every file you emit in this
-conversation from this point forward, not only the next one. If you
-have already emitted a file that arrived broken because it contained
-raw markdown fences or literal backticks, re-emit it now using the
-pattern above.
+This is a standing order. It applies to every file you emit in
+this conversation from this point forward, not only the next
+one. If you have already emitted a file that arrived broken
+because it contained raw markdown fences or literal backticks,
+re-emit it now using the pattern above.
 """
 
 

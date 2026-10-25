@@ -1413,6 +1413,116 @@ def test_31():
     check_apply("31_duplicate_if_blocks", extra)
 
 
+def test_32():
+    """Symbol resolution catches wrong-file placement.
+
+    bindings.js imports registerAction but NOT registerField.  The
+    block calls registerField.  Pass 8.5 must catch this and demote
+    the record to LOW trust, preserving the target and writing the
+    attempt to deeppeek/low_trust/.
+
+    This is the fixture that would have caught the real
+    pgkitRegisterField bug: an unresolved bare call introduced by a
+    patch is the concrete signal that the block was attributed to
+    the wrong destination file.
+    """
+
+    def extra(target, run):
+        decisions = run["manifest"].get("decisions", {})
+        dec = decisions.get("bindings.js", {})
+        assert dec, (
+            f"bindings.js missing from manifest decisions; "
+            f"decisions keys: {list(decisions)}"
+        )
+        assert dec.get("trust") == "LOW", (
+            f"expected trust=LOW, got {dec.get('trust')}; "
+            f"verification: {dec.get('verification')}"
+        )
+        assert dec.get("written") is False, (
+            f"expected written=False (fail-closed), got "
+            f"{dec.get('written')}"
+        )
+        unresolved = dec["verification"].get("unresolved_calls", [])
+        assert "registerField" in unresolved, (
+            f"expected 'registerField' in unresolved_calls, got "
+            f"{unresolved!r}; verification: {dec.get('verification')}"
+        )
+
+        content = (target / "bindings.js").read_text()
+        assert "newValue" not in content, (
+            f"new block leaked to target:\n{content}"
+        )
+        assert "registerField" not in content, (
+            f"unresolved call leaked to target:\n{content}"
+        )
+        assert "registerAction" in content, (
+            f"base import lost from target:\n{content}"
+        )
+
+        low_trust = (target / "deeppeek" / "low_trust" / "bindings.js")
+        assert low_trust.exists(), (
+            f"expected {low_trust} to exist (LOW trust file)"
+        )
+
+        warnings = (target / "deeppeek" / "warnings.txt").read_text()
+        assert "unresolved symbol" in warnings, (
+            f"warnings.txt missing 'unresolved symbol' entry:\n"
+            f"{warnings}"
+        )
+
+    check_apply("32_symbol_check_wrong_file", extra,
+                skip_file_compare=True, min_trust="MEDIUM")
+
+
+def test_33():
+    """Symbol resolution does not over-trigger on correct placement.
+
+    Same block as fixture 32, but scrubs.js DOES import registerField.
+    The call resolves, the record writes normally, and the target
+    file gains the new block.
+
+    The regression guard against over-triggering: if the check
+    demoted every record whose patch introduces a bare call, half
+    the tool's patches would fail-closed on a legitimate match.
+    """
+
+    def extra(target, run):
+        decisions = run["manifest"].get("decisions", {})
+        dec = decisions.get("scrubs.js", {})
+        assert dec, (
+            f"scrubs.js missing from manifest decisions; "
+            f"decisions keys: {list(decisions)}"
+        )
+        assert dec.get("trust") != "LOW", (
+            f"expected trust >= MEDIUM (not LOW), got "
+            f"{dec.get('trust')!r}; "
+            f"unresolved_calls="
+            f"{dec['verification'].get('unresolved_calls')!r}; "
+            f"verification={dec.get('verification')!r}"
+        )
+        assert dec.get("written") is True, (
+            f"expected written=True, got {dec.get('written')}"
+        )
+        unresolved = dec["verification"].get("unresolved_calls", [])
+        assert not unresolved, (
+            f"expected no unresolved calls, got {unresolved!r}"
+        )
+
+        content = (target / "scrubs.js").read_text()
+        assert 'registerField("new.field"' in content, (
+            f"new block missing from target:\n{content}"
+        )
+        assert "registerField" in content, (
+            f"base import lost from target:\n{content}"
+        )
+        assert content.count("{") == content.count("}"), (
+            f"target file has unbalanced braces:\n{content}"
+        )
+
+    check_apply("33_symbol_check_right_file", extra,
+                skip_file_compare=True, min_trust="MEDIUM")
+
+
 def main():
     tests = [
         ("01", test_01), ("02", test_02), ("03", test_03),
@@ -1421,7 +1531,7 @@ def main():
         ("10", test_10), ("11", test_11),
         ("12", test_12), ("13", test_13), ("14", test_14),
         ("15", test_15), ("16", test_16), ("17", test_17), ("19", test_19), ("20", test_20), ("21", test_21),
-        ("18", test_18), ("22", test_22), ("23", test_23), ("24", test_24), ("25", test_25), ("26", test_26), ("27", test_27), ("28", test_28), ("29", test_29), ("30", test_30), ("31", test_31)]
+        ("18", test_18), ("22", test_22), ("23", test_23), ("24", test_24), ("25", test_25), ("26", test_26), ("27", test_27), ("28", test_28), ("29", test_29), ("30", test_30), ("31", test_31), ("32", test_32), ("33", test_33)]
     failed = 0
     for name, fn in tests:
         try:
