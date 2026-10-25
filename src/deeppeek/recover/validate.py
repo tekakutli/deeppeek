@@ -333,11 +333,80 @@ def pass8_verify(records: dict[str, FileRecord],
                         stripped):
                     allow_missing.add(m.group(1))
 
+        # Deduplicate blocks that were applied twice.  Runs on the raw
+        # patched content BEFORE validate_content, so a file whose only
+        # validation error was a duplicate block gets cleaned up and
+        # passes instead of fail-closing.  Two classes are handled:
+        # duplicate `if (COND) { ... }` with identical normalized
+        # bodies in the same scope, and duplicate module-scope
+        # `const NAME = ...;` (plus its trailing `if (NAME) { ... }`).
+        # This is the fix for test_31 (duplicate if-guards) and for
+        # the pg_panel_scrubs.py "duplicate top-level declaration"
+        # fail-closed case in the real conversation.
+        from .validate_output import _dedup_duplicate_blocks
+        deduped, n_removed = _dedup_duplicate_blocks(rec.content, path)
+        if n_removed > 0:
+            rec.content = deduped
+            rec.verification["deduped_blocks"] = n_removed
+            print(f"  [dedup] {path}: removed {n_removed} duplicate "
+                  f"block(s)", file=sys.stderr)
+
         structural_err = validate_content(
             rec.content, path, base=base_for_check,
             allow_missing=allow_missing)
         if structural_err:
             v["content_valid"] = f"FAIL: {structural_err}"
+
+            # Structural brace repair: suggestion only.  Fires only
+            # when the failure is exactly `unbalanced braces (+N)`
+            # and the block is unambiguously structural (no trailing
+            # siblings, complete last statement).  Never auto-writes
+            # to the target — the suggestion lands in low_trust/ for
+            # user review.
+            repair_result = None
+            repair_raised = None
+            if blocks_by_idx is not None:
+                try:
+                    from .repair import try_repair
+                    repair_result = try_repair(
+                        rec=rec,
+                        structural_err=structural_err,
+                        blocks_by_idx=blocks_by_idx,
+                        path=path,
+                    )
+                except Exception as e:
+                    repair_raised = str(e)
+                    print(f"  [repair] {path}: repair attempt "
+                          f"raised: {e}", file=sys.stderr)
+
+            if repair_raised is not None:
+                v["sanity_repair_available"] = False
+                v["sanity_repair_reason"] = (
+                    f"repair attempt raised: {repair_raised}")
+            elif repair_result is not None and \
+                 repair_result.get("repaired_content"):
+                rec.repair_content = repair_result["repaired_content"]
+                v["sanity_repair_available"] = True
+                v["sanity_repair_closers"] = repair_result["closers_added"]
+                v["sanity_repair_reason"] = None
+                print(f"  [repair] {path}: suggestion produced "
+                      f"(+{repair_result['closers_added']} closer(s))",
+                      file=sys.stderr)
+            elif repair_result is not None:
+                # Attempted but refused — record why so the manifest
+                # is not silent about what specific criterion fired.
+                reason = (repair_result.get("refused_reason")
+                          or "refused (no reason recorded)")
+                v["sanity_repair_available"] = False
+                v["sanity_repair_reason"] = reason
+                print(f"  [repair] {path}: refused ({reason})",
+                      file=sys.stderr)
+            else:
+                # try_repair returned None — not a brace failure.
+                v["sanity_repair_available"] = False
+                v["sanity_repair_reason"] = (
+                    "not applicable (not a brace-unbalance failure)")
+
             rec.trust = "LOW"
             rec.sanity_rejected = True
             rec.verification["sanity_reason"] = structural_err

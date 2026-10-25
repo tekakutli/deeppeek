@@ -301,3 +301,13 @@ class FileRecord:
     # NEW (2026-11-01): pair tracking.
     pairs: list = field(default_factory=list)
     sanity_rejected: bool = False
+    # NEW (2026-11-02): structural-brace-repair suggestion, if any.
+    # Populated by `validate.pass8_verify` when a sanity-rejected
+    # record's failure is exactly `unbalanced braces (+N)` and the
+    # block shape meets `repair.try_repair`'s high-confidence
+    # criteria.  Contains the full file content (base + repaired
+    # block inserted) ready to `cp` over the target.  Never written
+    # to the target by `pass9_write` — a `.repaired` suggestion
+    # lands in `low_trust/` and the manifest records
+    # `verification.sanity_repair_available: true`.
+    repair_content: Optional[str] = None

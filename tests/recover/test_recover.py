@@ -1291,6 +1291,128 @@ def test_23():
     check_apply("23_identifier_block_anchor", extra)
 
 
+def test_28():
+    """Structural brace repair suggestion is produced.
+
+    The block ends after `doB();` with one unclosed `{`.  Every
+    line after that opener is deeper-indented, so the truncation is
+    purely structural.  `try_repair` appends one `}`, re-inserts
+    into `syncPanelFields`, and writes the suggestion to
+    `low_trust/panel.js.repaired`.  Target preserved.
+    """
+    def extra(target, run):
+        dec = run["manifest"].get("decisions", {}).get("panel.js", {})
+        assert dec, "panel.js missing from manifest decisions"
+        assert dec.get("written") is False, (
+            f"expected written=False (suggestion only), got "
+            f"{dec.get('written')}")
+        assert dec.get("sanity_rejected") is True, (
+            "expected sanity_rejected=True")
+        assert dec["verification"].get("sanity_repair_available") is True, (
+            f"expected sanity_repair_available=True, got "
+            f"{dec['verification'].get('sanity_repair_available')}")
+
+        repaired = target / "deeppeek" / "low_trust" / "panel.js.repaired"
+        assert repaired.is_file(), (
+            f"no suggestion file at {repaired}")
+        content = repaired.read_text()
+
+        # Balanced
+        assert content.count("{") == content.count("}"), (
+            f"suggestion unbalanced:\n{content}")
+
+        # Base survived + block inserted inside syncPanelFields
+        assert "syncPanelFields" in content
+        assert "if (cond) {" in content
+        assert "doA()" in content
+        assert "doB()" in content
+
+        # Original target file untouched
+        original = (target / "panel.js").read_text()
+        assert "if (cond)" not in original, (
+            f"target file was modified:\n{original}")
+
+    check_apply("28_structural_brace_repair", extra,
+                skip_file_compare=True, min_trust="MEDIUM")
+
+
+def test_29():
+    """Semantic truncation must refuse repair.
+
+    The block has a sibling-level statement (`if (B) doB();`) after
+    the last unclosed opener.  Naive brace insertion would nest it
+    inside `if (A)`, changing semantics.  `try_repair` refuses,
+    `sanity_repair_available` is False, no `.repaired` file.
+    """
+    def extra(target, run):
+        dec = run["manifest"].get("decisions", {}).get("panel.js", {})
+        assert dec, "panel.js missing from manifest decisions"
+        assert dec.get("written") is False
+        assert dec.get("sanity_rejected") is True
+        assert dec["verification"].get("sanity_repair_available") is False, (
+            f"expected sanity_repair_available=False (semantic truncation), "
+            f"got {dec['verification'].get('sanity_repair_available')}")
+
+        repaired = target / "deeppeek" / "low_trust" / "panel.js.repaired"
+        assert not repaired.exists(), (
+            f"unexpected suggestion file at {repaired}")
+
+        # Target untouched
+        original = (target / "panel.js").read_text()
+        assert "if (A)" not in original
+        assert "doA()" not in original
+
+    check_apply("29_semantic_truncation_no_repair", extra,
+                skip_file_compare=True, min_trust="MEDIUM")
+
+
+def test_30():
+    """_filter_new preserves structural closers.
+
+    Regression for the pg_panel_fields.py +1-brace corruption.  Body's
+    first line is a unique anchor in base; body has its own balanced
+    `{ ... }`.  Pre-fix, `_filter_new` drops the `}` (present elsewhere
+    in base) and the result is unbalanced.  Post-fix, the closer is
+    preserved and the record writes cleanly.
+    """
+    def extra(target, run):
+        rec = run["manifest"].get("files", {}).get("panel.js", {})
+        assert rec, "panel.js missing from manifest files"
+        assert rec.get("trust") == "HIGH", (
+            f"expected trust=HIGH, got {rec.get('trust')}; "
+            f"verification: {rec.get('verification')}")
+        content = (target / "panel.js").read_text()
+        delta = content.count("{") - content.count("}")
+        assert delta == 0, (
+            f"result has {delta:+d} brace imbalance:\n{content}")
+        assert "e.inpaintFullCanvas.checked" in content
+        assert "e.inpaintPrompt.disabled" in content
+
+    check_apply("30_filter_new_preserves_closers", extra)
+
+
+def test_31():
+    """Duplicate if-blocks are deduped before write.
+
+    Two source blocks both insert the same guard.  Pre-fix, both
+    applied and the result had the guard twice.  Post-fix,
+    `_dedup_duplicate_blocks` removes the second copy so the
+    record writes cleanly with just one.
+    """
+    def extra(target, run):
+        rec = run["manifest"].get("files", {}).get("panel.js", {})
+        assert rec, "panel.js missing from manifest files"
+        assert rec.get("trust") == "HIGH", (
+            f"expected trust=HIGH, got {rec.get('trust')}")
+        content = (target / "panel.js").read_text()
+        count = content.count("if (e.fullCanvas && document.activeElement")
+        assert count == 1, (
+            f"expected 1 guard, got {count} in:\n{content}")
+        assert "e.prompt.disabled" in content
+
+    check_apply("31_duplicate_if_blocks", extra)
+
+
 def main():
     tests = [
         ("01", test_01), ("02", test_02), ("03", test_03),
@@ -1299,8 +1421,7 @@ def main():
         ("10", test_10), ("11", test_11),
         ("12", test_12), ("13", test_13), ("14", test_14),
         ("15", test_15), ("16", test_16), ("17", test_17), ("19", test_19), ("20", test_20), ("21", test_21),
-        ("18", test_18), ("22", test_22), ("23", test_23), ("24", test_24), ("25", test_25), ("26", test_26), ("27", test_27)
-    ]
+        ("18", test_18), ("22", test_22), ("23", test_23), ("24", test_24), ("25", test_25), ("26", test_26), ("27", test_27), ("28", test_28), ("29", test_29), ("30", test_30), ("31", test_31)]
     failed = 0
     for name, fn in tests:
         try:

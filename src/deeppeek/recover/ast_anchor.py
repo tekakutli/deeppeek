@@ -604,12 +604,17 @@ def _has_venv_ast() -> bool:
     if py is None:
         _VENV_AST_AVAILABLE = False
         return False
-    try:
-        if Path(sys.executable).resolve() == py.resolve():
-            _VENV_AST_AVAILABLE = False
-            return False
-    except (OSError, ValueError):
-        pass
+    # No self-comparison here.  `try_ast_anchor` only calls this
+    # function after `_has_inprocess_ast()` returned False, so we
+    # already know the current interpreter has no tree-sitter.  The
+    # previous version compared `sys.executable.resolve()` with
+    # `py.resolve()`: when a pipx venv and a repo venv share the same
+    # base Python binary (the common case — both symlink to
+    # /usr/bin/pythonX.Y), they both `.resolve()` to the same path,
+    # so the probe was skipped even when the repo venv had tree-sitter
+    # and the pipx venv did not.  That was the root cause of
+    # `ast: {in_process: false, via_venv: false}` on every recovery
+    # manifest.
     probe = (
         "import sys\n"
         f"sys.path.insert(0, {str(_src_dir())!r})\n"
@@ -631,8 +636,18 @@ def _has_venv_ast() -> bool:
             [str(py), "-c", probe],
             capture_output=True, timeout=5.0,
         )
-        _VENV_AST_AVAILABLE = (proc.returncode == 0)
-    except (subprocess.SubprocessError, OSError):
+        if proc.returncode == 0:
+            _VENV_AST_AVAILABLE = True
+        else:
+            err = (proc.stderr or b"")[:300].decode(
+                "utf-8", errors="replace")
+            print(f"  [ast] venv probe via {py} failed "
+                  f"(exit {proc.returncode}): {err}",
+                  file=sys.stderr)
+            _VENV_AST_AVAILABLE = False
+    except (subprocess.SubprocessError, OSError) as e:
+        print(f"  [ast] venv probe via {py} raised: {e}",
+              file=sys.stderr)
         _VENV_AST_AVAILABLE = False
     return _VENV_AST_AVAILABLE
 

@@ -913,6 +913,21 @@ def _reindent_body(base_indent, body):
 _CONTEXT_INSERT_MAX_LINES = 30
 _CONTEXT_INSERT_MIN_ANCHOR_CHARS = 8
 
+# A "structural line" is a bare closing delimiter — `}`, `});`, `};`,
+# `]`, `])` etc., optionally followed by `;` or `,`.  These appear in
+# every JS file at the end of every block, so `stripped not in base` is
+# always False for them (base contains `}` somewhere).  Dropping them
+# while keeping the corresponding opener is what silently corrupted the
+# pg_panel_fields.py case: `_filter_new` was treating a `}` from a
+# balanced body as "already present, remove it" — leaving the inserted
+# `if (...) {` with no closer.
+_STRUCTURAL_LINE_RE = re.compile(
+    r"^\s*"
+    r"[}\])]+"
+    r"[;,)]*"
+    r"\s*$"
+)
+
 
 def _try_context_insert(base, body):
     if not body or not body.strip():
@@ -937,7 +952,13 @@ def _try_context_insert(base, body):
 
     def _absent(line):
         stripped = line.strip()
-        return not stripped or stripped not in base
+        if not stripped:
+            return True
+        # Structural closers are never dropped.  See _STRUCTURAL_LINE_RE
+        # above for why this matters.
+        if _STRUCTURAL_LINE_RE.match(stripped):
+            return True
+        return stripped not in base
 
     def _filter_new(lines):
         return [ln for ln in lines if _absent(ln)]
@@ -977,7 +998,20 @@ def _try_context_insert(base, body):
                 return result
 
     first_line = body_lines[0]
-    if _unique(first_line):
+    # The "insert body[1:] after a unique first line" strategy only
+    # works when the first line is a STANDALONE statement.  If the
+    # first line is a block opener (`if (...) {`, `function foo() {`,
+    # `for (...) {`, etc.), then body[1:] contains the closer for
+    # that opener.  Inserting body[1:] after base's matching opener
+    # means the inserted closer closes base's opener, and base's
+    # original closer becomes unmatched — net -1 brace.  This was the
+    # -1 brace bug in the pg_panel_fields.py reproducer.  Refuse
+    # block-opener-first-line cases and let the caller fall through
+    # to `_try_insert_after_anchor` (which inserts the whole body
+    # after the anchor identifier — the correct strategy for
+    # multi-block bodies).
+    first_line_opens = first_line.count("{") - first_line.count("}")
+    if first_line_opens <= 0 and _unique(first_line):
         candidates = _filter_new(body_lines[1:])
         if candidates:
             anchor_stripped = first_line.strip()
@@ -1186,7 +1220,17 @@ def _try_insert_after_anchor(base, body, context_before):
         else:
             line_end += 1
 
-        reindented = _reindent_body(anchor_indent, body_stripped)
+        # NB: pass the un-stripped body (only trimming blank leading /
+        # trailing lines) so `_reindent_body` computes the relative
+        # indent from the first content line's ORIGINAL indent.  Passing
+        # `body_stripped` (whose first line is 0-indented because
+        # `.strip()` removed the leading whitespace) makes
+        # `orig_indent_len = 0`, so every subsequent line gets its full
+        # original indent added on top of `anchor_indent` — the block
+        # ends up over-indented by its own original first-line indent.
+        # That's the bug behind test_31's 2/6/4 output (should be 2/4/2).
+        reindented = _reindent_body(anchor_indent,
+                                    body.lstrip("\n").rstrip())
         insertion = reindented.rstrip() + "\n"
         result = base[:line_end] + insertion + base[line_end:]
         if result != base:
@@ -1394,6 +1438,10 @@ def _patch_already_present(body, base):
 
 
 def _try_deterministic_patch(base, patch, path=""):
+    return _try_deterministic_patch_inner(base, patch, path)
+
+
+def _try_deterministic_patch_inner(base, patch, path=""):
     raw_body = patch["body"]
     body_stripped = raw_body.strip()
     if not body_stripped:
@@ -1442,7 +1490,12 @@ def _try_deterministic_patch(base, patch, path=""):
             if ast_result is not None:
                 line_idx, indent, evidence = ast_result
                 patch["ast_evidence"] = evidence
-                reindented = _reindent_body(indent, body_stripped)
+                # Same reindent-parameter subtlety as in
+                # `_try_insert_after_anchor`: pass the un-stripped body
+                # so `_reindent_body` computes relative indent from the
+                # first content line's ORIGINAL indent, not 0.
+                reindented = _reindent_body(
+                    indent, raw_body.lstrip("\n").rstrip())
                 lines = base.split("\n")
                 new_lines = reindented.split("\n")
                 result = "\n".join(

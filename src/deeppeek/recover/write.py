@@ -282,6 +282,39 @@ def pass9_write(records: dict,
                 "or unrelated content)")
             warnings_lines.append(
                 f"[{path}] [SANITY] {reason}; target file preserved")
+
+            # Structural brace repair suggestion, if any.  Written to
+            # low_trust/<name>.repaired alongside the original.  The
+            # target file remains the pre-existing version; the user
+            # reviews the suggestion and copies it over manually if
+            # they accept it.
+            if rec.content is not None:
+                rejected_dir = aux_dir / "rejected"
+                rejected_dir.mkdir(parents=True, exist_ok=True)
+                rejected_target = rejected_dir / out_name
+                rejected_target.parent.mkdir(parents=True, exist_ok=True)
+                rejected_content = rec.content
+                if not rejected_content.endswith("\n"):
+                    rejected_content += "\n"
+                rejected_target.write_text(rejected_content)
+
+            if getattr(rec, "repair_content", None):
+                low_dir.mkdir(parents=True, exist_ok=True)
+                repaired_name = f"{out_name}.repaired"
+                repaired_path = low_dir / repaired_name
+                repaired_path.parent.mkdir(parents=True, exist_ok=True)
+                repaired_path.write_text(rec.repair_content)
+                closers = rec.verification.get(
+                    "sanity_repair_closers", "?")
+                warnings_lines.append(
+                    f"[{path}] [REPAIR] suggestion written to "
+                    f"{'deeppeek/low_trust/' if apply_to is not None else 'files_low_trust/'}"
+                    f"{repaired_name} (+{closers} closer(s); "
+                    f"review before adopting)")
+                if verbose:
+                    print(f"  [repair] {path}: suggestion at "
+                          f"{repaired_path}", file=sys.stderr)
+
             skipped.append({
                 "path": path,
                 "state": rec.state,
@@ -606,6 +639,32 @@ def pass9_write(records: dict,
             warnings_lines.append(f"  {name}")
         for name in sorted(overwritten_low):
             warnings_lines.append(f"  deeppeek/low_trust/{name}")
+
+    # Consolidated repair-suggestion index.  One entry per
+    # sanity-rejected record that has a `.repaired` suggestion ready.
+    repairs_manifest = {}
+    for rec_path, rec in records.items():
+        if not getattr(rec, "repair_content", None):
+            continue
+        rec_out_name = (
+            os.path.basename(rec_path) if layout == "flat"
+            else rec_path
+        )
+        repairs_manifest[rec_path] = {
+            "failure_reason": rec.verification.get("sanity_reason"),
+            "closers_added": rec.verification.get(
+                "sanity_repair_closers"),
+            "suggested_file": f"{rec_out_name}.repaired",
+        }
+    # Always write repairs.json, even when empty.  An empty `{}` is
+    # the honest, predictable answer: "we scanned every sanity-rejected
+    # record, none produced a suggestion."  Its absence was previously
+    # indistinguishable from "write.py never ran the repair scan".
+    # Per-file refusal reasons live on each record's
+    # `verification.sanity_repair_reason` in the manifest; this file is
+    # the consolidated index of suggestions actually produced.
+    (reports_dir / "repairs.json").write_text(
+        json.dumps(repairs_manifest, indent=2))
 
     warnings_text = "\n".join(warnings_lines)
     if warnings_text:
