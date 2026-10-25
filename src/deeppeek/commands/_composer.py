@@ -1,29 +1,29 @@
 """Shared infrastructure for the composer commands.
 
-`deeppeek type` and `deeppeek enter` both talk to the extension over
-the same SSE transport as `deeppeek pipe`: broadcast a typed event,
-wait for a matching ack, report the result.  This module extracts
-that pattern so both commands — and a future combined `send` — share
-one implementation.
+`deeppeek type`, `deeppeek enter`, and `deeppeek pipe` all talk to the
+extension over the same SSE transport: broadcast a typed event, wait
+for a matching ack, report the result.  This module extracts that
+pattern.
 
-Usage for a single command:
+Two entry points:
 
-    with composer_session(port, timeout) as server:
-        if server is None:
-            return 1
-        rc, result = broadcast_and_wait(
-            server, "type", {"text": text},
-            timeout=timeout, ack_name="type",
-        )
+    broadcast_and_wait(server, event, payload, timeout, ack_name)
+        one event, one ack.  Used by `type` / `enter` / `pipe`.
 
-A future `deeppeek send` opens ONE session and calls
-`broadcast_and_wait` twice — once for `type`, once for `enter` —
-so a single pass uses one server socket and one extension
-connection.
+    broadcast_many(server, specs, timeout)
+        N events fired back-to-back on ONE connection, N acks
+        collected and matched by batch_id.  Used by prompts that
+        want the attachments and the composer text to land in
+        parallel rather than one after the other.
+
+The second form is what eliminates the port-8765 serialisation
+between `pipe` and `type` that the subprocess-based prompts
+inherit.
 """
 
 import queue
 import sys
+import time
 import uuid
 from contextlib import contextmanager
 
@@ -81,9 +81,6 @@ def broadcast_and_wait(
       1 — infrastructure failure (timeout, malformed ack, batch_id
           mismatch)
       2 — command failure (extension reported success:false)
-
-    `result_dict` is the extension's `result` sub-dict when one was
-    returned; empty dict otherwise.
     """
     batch_id = uuid.uuid4().hex[:12]
     full_payload = {**payload, "batch_id": batch_id}
@@ -109,3 +106,64 @@ def broadcast_and_wait(
     if result.get("success"):
         return 0, result
     return 2, result
+
+
+def broadcast_many(server: ExportServer, specs: list[dict],
+                   *, timeout: float) -> dict:
+    """Broadcast N events back-to-back on one connection, collect N acks.
+
+    `specs` is a list of dicts:
+        {"tag": str,           # caller-facing label for the result
+         "event": str,         # SSE event name (attach / type / enter)
+         "payload": dict,      # event body (batch_id will be added)
+         "ack_name": str}      # expected __ack value
+
+    Each broadcast gets its own batch_id.  Acks are matched back by
+    batch_id, so the return value is keyed by `tag` and is independent
+    of arrival order.  If the same event name is fired twice, tags
+    keep the results distinct.
+
+    Returns: dict tag -> {"exit_code": int, "result": dict}
+      exit_code as in `broadcast_and_wait`.
+    """
+    pending: dict[str, dict] = {}
+    for spec in specs:
+        batch_id = uuid.uuid4().hex[:12]
+        full_payload = {**spec.get("payload", {}), "batch_id": batch_id}
+        server._broadcast(spec["event"], full_payload)
+        pending[batch_id] = spec
+
+    results: dict[str, dict] = {}
+    deadline = time.monotonic() + timeout
+    while pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            ack = server.wait_for_result(timeout=remaining)
+        except queue.Empty:
+            break
+        batch_id = ack.get("batch_id")
+        spec = pending.pop(batch_id, None)
+        if spec is None:
+            continue  # unknown ack — ignore
+        tag = spec["tag"]
+        if ack.get("__ack") != spec["ack_name"]:
+            results[tag] = {
+                "exit_code": 1,
+                "result": {"error": f"unexpected ack: {ack!r}"},
+            }
+            continue
+        result = ack.get("result") or {}
+        if result.get("success"):
+            results[tag] = {"exit_code": 0, "result": result}
+        else:
+            results[tag] = {"exit_code": 2, "result": result}
+
+    # Anything still pending timed out.
+    for batch_id, spec in pending.items():
+        results[spec["tag"]] = {
+            "exit_code": 1,
+            "result": {"error": "timeout waiting for ack"},
+        }
+    return results

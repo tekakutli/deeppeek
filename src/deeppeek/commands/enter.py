@@ -3,6 +3,9 @@
 Submits whatever text is already in the composer, whether it was set
 by `deeppeek type`, attached by `deeppeek pipe`, or typed by hand.
 Fails fast if the composer is empty — no-op Enters just confuse.
+
+Composer targeting uses the same `findComposer` as `type`: active
+element first, strategy list second.  See `injected.js` Part 7.
 """
 import argparse
 import sys
@@ -38,13 +41,16 @@ def run(args: argparse.Namespace) -> int:
 
         if rc == 0:
             sel = result.get("composer_selector") or "(unknown)"
-            print(f"OK — submitted via {sel}", file=sys.stderr)
+            source = result.get("composer_source") or "?"
+            print(f"OK — submitted via {sel} (source={source})",
+                  file=sys.stderr)
             return 0
         if rc == 2:
             print(f"Enter failed: {result.get('reason') or '(no reason)'}",
                   file=sys.stderr)
-            for k in ("composer_selector", "submitted",
-                      "composer_cleared"):
+            for k in ("composer_selector", "composer_source",
+                      "submitted", "composer_cleared",
+                      "composer_element_info", "active_element_info"):
                 if k in result:
                     print(f"  {k}: {result[k]}", file=sys.stderr)
             return 2

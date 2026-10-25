@@ -463,6 +463,98 @@ def _resolve_composer_text(args: argparse.Namespace,
     )
 
 
+
+def _stage_emit_parallel(prompt, files, args):
+    """Open one composer session, fire attach + type back-to-back,
+    collect acks.  Replaces the sequential pipe + type subprocess
+    calls, roughly halving the wall-time cost of the emit stage.
+
+    `files` may be empty/None to skip the pipe event; `prompt` may be
+    None to skip the type event.  If both are absent, this is a no-op
+    (returns 0).  Empty-string `prompt` (but not None) is an error,
+    matching `commands/type.py`'s rejection of empty composer text.
+    """
+    import base64
+    import mimetypes
+    from ..commands._composer import broadcast_many, composer_session
+
+    if prompt is not None and not prompt.strip():
+        print("error: composer text is empty/whitespace-only",
+              file=sys.stderr)
+        return 1
+
+    event_specs = []
+
+    if files:
+        payload_files = []
+        for f in files:
+            if not f.is_file():
+                print(f"  skipped (not a regular file): {f}",
+                      file=sys.stderr)
+                continue
+            data = f.read_bytes()
+            mime = (mimetypes.guess_type(f.name)[0]
+                    or "application/octet-stream")
+            payload_files.append({
+                "name": f.name,
+                "mime": mime,
+                "base64": base64.b64encode(data).decode("ascii"),
+            })
+            print(f"  {f.name}  ({len(data):,} bytes)",
+                  file=sys.stderr)
+        if payload_files:
+            event_specs.append({
+                "tag": "pipe",
+                "event": "attach",
+                "payload": {
+                    "files": payload_files,
+                    "opts": {"delay_ms": 0},
+                },
+                "ack_name": "attach",
+            })
+
+    if prompt:
+        event_specs.append({
+            "tag": "type",
+            "event": "type",
+            "payload": {"text": prompt},
+            "ack_name": "type",
+        })
+
+    if not event_specs:
+        return 0
+
+    timeout = max(
+        getattr(args, "pipe_timeout", 180.0),
+        getattr(args, "type_timeout", 300.0),
+    )
+    with composer_session(port=getattr(args, "port", 8765),
+                         timeout=timeout) as server:
+        if server is None:
+            return 1
+        print(f"[parallel] firing {len(event_specs)} event(s):",
+              file=sys.stderr)
+        for s in event_specs:
+            print(f"  {s['event']} (tag={s['tag']})",
+                  file=sys.stderr)
+        results = broadcast_many(server, event_specs, timeout=timeout)
+        rc = 0
+        for s in event_specs:
+            r = results.get(s["tag"],
+                            {"exit_code": 1, "result": {}})
+            if r["exit_code"] == 0:
+                print(f"  OK - {s['tag']}", file=sys.stderr)
+            else:
+                reason = (r["result"].get("reason")
+                          or r["result"].get("error")
+                          or "(no reason)")
+                print(f"  FAIL - {s['tag']}: {reason}",
+                      file=sys.stderr)
+                if rc == 0:
+                    rc = r["exit_code"]
+        return rc
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -529,15 +621,11 @@ def run(args: argparse.Namespace) -> int:
         print(composer_text)
         return 0
 
-    if not args.no_pipe:
-        rc = _stage_pipe([status_path], args)
-        if rc != 0:
-            return rc
-        rc = _stage_pipe(meta_files, args)
-        if rc != 0:
-            return rc
-
-    return _stage_type(composer_text, args)
+    if args.no_pipe:
+        files = []
+    else:
+        files = [status_path, *meta_files]
+    return _stage_emit_parallel(composer_text, files, args)
 
 
 # ---------------------------------------------------------------------------

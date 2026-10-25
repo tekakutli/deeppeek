@@ -308,6 +308,642 @@ def test_parse_file_header_markdown_link():
     assert r is not None and r[0] == "file.py"
 
 
+# ============================================================
+# Patch-insertion filtering (High impact)
+# ============================================================
+
+def test_collect_inserted_lines_basic():
+    from deeppeek.recover.apply_patches import _collect_inserted_lines
+    result = _collect_inserted_lines("a\nb\nc\n", "a\nb\nc\nd\ne\n")
+    assert result == {"d", "e"}
+
+
+def test_collect_inserted_lines_replaced():
+    from deeppeek.recover.apply_patches import _collect_inserted_lines
+    result = _collect_inserted_lines("a\nb\nc\n", "a\nb\nX\n")
+    assert "X" in result
+    assert "c" not in result
+
+
+def test_split_body_into_blocks_statements():
+    from deeppeek.recover.apply_patches import _split_body_into_blocks
+    blocks = _split_body_into_blocks("a();\nb();\nc();")
+    assert len(blocks) == 3
+    assert blocks[0] == "a();"
+
+
+def test_split_body_into_blocks_brace_block():
+    from deeppeek.recover.apply_patches import _split_body_into_blocks
+    blocks = _split_body_into_blocks("if (x) {\n  a();\n}\nb();")
+    assert len(blocks) == 2
+    assert "if (x) {" in blocks[0]
+    assert blocks[1] == "b();"
+
+
+def test_filter_body_by_blocks_basic():
+    from deeppeek.recover.apply_patches import _filter_body_by_blocks
+    body = "a();\nb();\nc();"
+    record_inserted = {"a();", "b();"}
+    filtered, was_filtered = _filter_body_by_blocks(
+        body, set(), record_inserted
+    )
+    assert was_filtered is True
+    assert "a();" not in filtered
+    assert "b();" not in filtered
+    assert "c();" in filtered
+
+
+def test_filter_body_by_blocks_context_preserved():
+    from deeppeek.recover.apply_patches import _filter_body_by_blocks
+    body = "a();\nb();"
+    base_stripped = {"a();"}
+    record_inserted = {"b();"}
+    filtered, was_filtered = _filter_body_by_blocks(
+        body, base_stripped, record_inserted
+    )
+    # a(); is context (in base) -> block kept
+    # b(); is non-context but in record_inserted -> block filtered
+    assert "a();" in filtered
+    assert "b();" not in filtered
+
+
+def test_filter_body_by_blocks_partial_duplicate_kept():
+    """A block with even one new line is preserved whole."""
+    from deeppeek.recover.apply_patches import _filter_body_by_blocks
+    body = "if (x) {\n  a();\n}"
+    # Prior insertion covered the opener and closer but not the body
+    record_inserted = {"if (x) {", "}"}
+    filtered, was_filtered = _filter_body_by_blocks(
+        body, set(), record_inserted
+    )
+    # a(); is new -> whole block kept
+    assert was_filtered is False
+    assert "if (x) {" in filtered
+    assert "a();" in filtered
+    assert "}" in filtered
+
+
+def test_filter_body_by_blocks_all_filtered():
+    from deeppeek.recover.apply_patches import _filter_body_by_blocks
+    body = "a();\nb();"
+    record_inserted = {"a();", "b();"}
+    filtered, was_filtered = _filter_body_by_blocks(
+        body, set(), record_inserted
+    )
+    assert was_filtered is True
+    assert not filtered.strip()
+
+
+def test_insert_filter_end_to_end():
+    """Two patches with overlapping content.  Second's duplicate block
+    should be filtered before insertion."""
+    from deeppeek.recover.apply_patches import pass6_apply_patches
+    from deeppeek.recover.core import FileRecord, Block
+
+    base_body = "function f() {\n  a = 1;\n}\n"
+    base_block = Block(
+        idx=0, header_path="foo.js", modifier=None, fence_lang="js",
+        body=base_body, body_line_count=3, context_before="",
+        line_start=0, line_end=3, is_orphan=False, is_code_file=True,
+        kind="full", canonical_path="foo.js", output_path="foo.js",
+        classified_by="preexisting",
+    )
+
+    rec = FileRecord(path="foo.js", state="FULL_PLUS_PATCH")
+    rec.last_full_idx = 0
+    rec.patches = [
+        {"idx": 1,
+         "body": "if (x) y = z;\nw = 2;\nu = 3;",
+         "context_before": "After `a = 1;`:",
+         "fence_lang": "js"},
+        {"idx": 2,
+         "body": "if (x) y = z;\nv = 4;\nt = 5;",
+         "context_before": "After `a = 1;`:",
+         "fence_lang": "js"},
+    ]
+
+    blocks_by_idx = {0: base_block}
+    pass6_apply_patches({"foo.js": rec}, blocks_by_idx, None)
+
+    assert rec.content is not None
+    count = rec.content.count("if (x) y = z;")
+    assert count == 1, (
+        f"expected 1 occurrence of `if (x) y = z;`, got {count}:\n"
+        f"{rec.content}"
+    )
+    assert "v = 4;" in rec.content
+    assert "t = 5;" in rec.content
+    assert "w = 2;" in rec.content
+    assert "u = 3;" in rec.content
+
+
+# ============================================================
+# Dedup for multi-line block headers (Medium impact)
+# ============================================================
+
+def test_dedup_func_block_removes_duplicate():
+    """Two identical `function foo() { body }` at column 0 in the
+    same scope: the second is removed."""
+    from deeppeek.recover.validate_output import _dedup_duplicate_blocks
+    content = (
+        "function foo() {\n"
+        "  return 1;\n"
+        "}\n"
+        "function foo() {\n"
+        "  return 1;\n"
+        "}\n"
+    )
+    out, n = _dedup_duplicate_blocks(content, "test.js")
+    assert n == 1, f"expected 1 removal, got {n}:\n{out}"
+    assert out.count("function foo()") == 1
+
+
+def test_dedup_func_block_keeps_different_name():
+    from deeppeek.recover.validate_output import _dedup_duplicate_blocks
+    content = (
+        "function foo() {\n  return 1;\n}\n"
+        "function bar() {\n  return 1;\n}\n"
+    )
+    out, n = _dedup_duplicate_blocks(content, "test.js")
+    assert n == 0, f"different names should not dedupe, got {n}"
+
+
+def test_dedup_func_block_keeps_different_body():
+    from deeppeek.recover.validate_output import _dedup_duplicate_blocks
+    content = (
+        "function foo() {\n  return 1;\n}\n"
+        "function foo() {\n  return 2;\n}\n"
+    )
+    out, n = _dedup_duplicate_blocks(content, "test.js")
+    assert n == 0, f"different bodies should not dedupe, got {n}"
+
+
+def test_dedup_func_block_keeps_different_params():
+    from deeppeek.recover.validate_output import _dedup_duplicate_blocks
+    content = (
+        "function foo() {\n  return 1;\n}\n"
+        "function foo(x) {\n  return 1;\n}\n"
+    )
+    out, n = _dedup_duplicate_blocks(content, "test.js")
+    assert n == 0, (
+        f"different param lists should not dedupe, got {n}:\n{out}"
+    )
+
+
+def test_dedup_func_block_keeps_different_scope():
+    """Identical nested functions in different outer functions: not
+    deduped (their `enclosing scope` differs)."""
+    from deeppeek.recover.validate_output import _dedup_duplicate_blocks
+    content = (
+        "function outer1() {\n"
+        "  function foo() {\n    return 1;\n  }\n"
+        "}\n"
+        "function outer2() {\n"
+        "  function foo() {\n    return 1;\n  }\n"
+        "}\n"
+    )
+    out, n = _dedup_duplicate_blocks(content, "test.js")
+    assert n == 0, f"different scopes should not dedupe, got {n}"
+
+
+def test_dedup_class_block_removes_duplicate():
+    from deeppeek.recover.validate_output import _dedup_duplicate_blocks
+    content = (
+        "class Foo {\n"
+        "  bar() { return 1; }\n"
+        "}\n"
+        "class Foo {\n"
+        "  bar() { return 1; }\n"
+        "}\n"
+    )
+    out, n = _dedup_duplicate_blocks(content, "test.js")
+    assert n == 1, f"expected 1 removal, got {n}:\n{out}"
+    assert out.count("class Foo") == 1
+
+
+def test_dedup_func_block_markdown_skipped():
+    from deeppeek.recover.validate_output import _dedup_duplicate_blocks
+    content = (
+        "function foo() {\n  return 1;\n}\n"
+        "function foo() {\n  return 1;\n}\n"
+    )
+    out, n = _dedup_duplicate_blocks(content, "readme.md")
+    assert n == 0
+    assert out == content
+
+
+def test_dedup_func_block_export_prefix():
+    """`export function foo` also deduped (same name, same body,
+    same scope)."""
+    from deeppeek.recover.validate_output import _dedup_duplicate_blocks
+    content = (
+        "export function foo() {\n  return 1;\n}\n"
+        "export function foo() {\n  return 1;\n}\n"
+    )
+    out, n = _dedup_duplicate_blocks(content, "test.js")
+    assert n == 1, f"expected 1 removal, got {n}:\n{out}"
+    assert out.count("export function foo") == 1
+
+
+def test_dedup_func_block_async():
+    from deeppeek.recover.validate_output import _dedup_duplicate_blocks
+    content = (
+        "async function fetch() {\n  return 1;\n}\n"
+        "async function fetch() {\n  return 1;\n}\n"
+    )
+    out, n = _dedup_duplicate_blocks(content, "test.js")
+    assert n == 1, f"expected 1 removal, got {n}:\n{out}"
+    assert out.count("async function fetch") == 1
+
+
+
+def test_dedup_func_block_python_different_strings_kept():
+    """Identical functions inside two different embedded JS string
+    literals of a .py file must NOT be deduped -- that would empty
+    one string and corrupt the Python file."""
+    from deeppeek.recover.validate_output import _dedup_duplicate_blocks
+    Q = chr(34) * 3
+    content = (
+        "A_JS = r" + Q + "\n"
+        "function foo() {\n"
+        "  return 1;\n"
+        "}\n"
+        + Q + "\n"
+        "\n"
+        "B_JS = r" + Q + "\n"
+        "function foo() {\n"
+        "  return 1;\n"
+        "}\n"
+        + Q + "\n"
+    )
+    out, n = _dedup_duplicate_blocks(content, "test.py")
+    assert n == 0, (
+        f"cross-string dup should not dedupe, got {n}:\n{out}"
+    )
+    assert out.count("function foo()") == 2
+    assert out == content
+
+
+def test_dedup_func_block_python_same_string_removed():
+    """Same guard the other way: identical functions inside the SAME
+    string literal ARE deduped."""
+    from deeppeek.recover.validate_output import _dedup_duplicate_blocks
+    Q = chr(34) * 3
+    content = (
+        "JS = r" + Q + "\n"
+        "function foo() {\n"
+        "  return 1;\n"
+        "}\n"
+        "function foo() {\n"
+        "  return 1;\n"
+        "}\n"
+        + Q + "\n"
+    )
+    out, n = _dedup_duplicate_blocks(content, "test.py")
+    assert n == 1, f"same-string dup should be deduped, got {n}"
+    assert out.count("function foo()") == 1
+
+
+
+
+
+def _long_body(name="processData"):
+    body = f"function {name}(x) {{\n"
+    for i in range(12):
+        body += f"  step{i}(x);\n"
+    body += "  return x;\n}\n"
+    return body
+
+
+def test_cross_file_empty_when_no_records():
+    from deeppeek.recover.cross_file import find_cross_file_duplicates
+    assert find_cross_file_duplicates({}, None) == []
+
+
+def test_cross_file_detects_identical_long_functions():
+    from deeppeek.recover.cross_file import find_cross_file_duplicates
+    from deeppeek.recover.core import FileRecord
+    body = _long_body()
+    rec_a = FileRecord(path="a.js", state="SINGLE_FULL")
+    rec_a.content = body
+    rec_b = FileRecord(path="b.js", state="SINGLE_FULL")
+    rec_b.content = body
+    dups = find_cross_file_duplicates(
+        {"a.js": rec_a, "b.js": rec_b}, None)
+    assert len(dups) == 1
+    assert dups[0]["name"] == "processData"
+    assert dups[0]["kind"] == "function"
+    assert set(dups[0]["files"]) == {"a.js", "b.js"}
+    assert dups[0]["line_count"] >= 10
+
+
+def test_cross_file_ignores_short_functions():
+    from deeppeek.recover.cross_file import find_cross_file_duplicates
+    from deeppeek.recover.core import FileRecord
+    body = "function tiny(x) {\n  return x;\n}\n"
+    rec_a = FileRecord(path="a.js", state="SINGLE_FULL")
+    rec_a.content = body
+    rec_b = FileRecord(path="b.js", state="SINGLE_FULL")
+    rec_b.content = body
+    dups = find_cross_file_duplicates(
+        {"a.js": rec_a, "b.js": rec_b}, None)
+    assert dups == []
+
+
+def test_cross_file_ignores_preexisting():
+    from deeppeek.recover.cross_file import find_cross_file_duplicates
+    from deeppeek.recover.core import FileRecord, Block
+    body = _long_body()
+    def _base(idx, name):
+        return Block(
+            idx=idx, header_path=name, modifier=None, fence_lang="js",
+            body=body, body_line_count=body.count(chr(10)) + 1,
+            context_before="", line_start=0, line_end=0,
+            is_orphan=False, is_code_file=True, kind="full",
+            canonical_path=name, output_path=name,
+            classified_by="preexisting")
+    base_a = _base(0, "a.js")
+    base_b = _base(1, "b.js")
+    blocks_by_idx = {0: base_a, 1: base_b}
+    rec_a = FileRecord(path="a.js", state="SINGLE_FULL")
+    rec_a.content = body
+    rec_a.last_full_idx = 0
+    rec_b = FileRecord(path="b.js", state="SINGLE_FULL")
+    rec_b.content = body
+    rec_b.last_full_idx = 1
+    dups = find_cross_file_duplicates(
+        {"a.js": rec_a, "b.js": rec_b}, blocks_by_idx)
+    assert dups == []
+
+
+def test_cross_file_ignores_same_file_duplicates():
+    from deeppeek.recover.cross_file import find_cross_file_duplicates
+    from deeppeek.recover.core import FileRecord
+    body = _long_body()
+    rec = FileRecord(path="a.js", state="SINGLE_FULL")
+    rec.content = body + "\n" + body
+    dups = find_cross_file_duplicates({"a.js": rec}, None)
+    assert dups == []
+
+
+def test_cross_file_ignores_partial_only():
+    from deeppeek.recover.cross_file import find_cross_file_duplicates
+    from deeppeek.recover.core import FileRecord
+    body = _long_body()
+    rec_a = FileRecord(path="a.js", state="PARTIAL_ONLY")
+    rec_a.content = None
+    rec_b = FileRecord(path="b.js", state="SINGLE_FULL")
+    rec_b.content = body
+    dups = find_cross_file_duplicates(
+        {"a.js": rec_a, "b.js": rec_b}, None)
+    assert dups == []
+
+
+# ============================================================
+# Prose/UI pre-filter (pruning orphans earlier)
+# ============================================================
+
+def test_looks_like_prose_ui_ui_mockup():
+    from deeppeek.recover.prose_filter import looks_like_prose_ui
+    assert looks_like_prose_ui("[Inpaint] [Cancel]") is True
+    assert looks_like_prose_ui("(•) Rect  ( ) Full canvas") is True
+    assert looks_like_prose_ui("[x] Use full canvas") is True
+
+
+def test_looks_like_prose_ui_prose():
+    from deeppeek.recover.prose_filter import looks_like_prose_ui
+    assert looks_like_prose_ui(
+        "Drag the context rectangle to move it, handles to resize."
+    ) is True
+
+
+def test_looks_like_prose_ui_code():
+    from deeppeek.recover.prose_filter import looks_like_prose_ui
+    assert looks_like_prose_ui("if (x) { y(); }") is False
+    assert looks_like_prose_ui("function foo() { return 1; }") is False
+    assert looks_like_prose_ui("const x = 1;") is False
+    assert looks_like_prose_ui('<div class="field">') is False
+
+
+def test_looks_like_prose_ui_docstring_kept():
+    from deeppeek.recover.prose_filter import looks_like_prose_ui
+    # Docstrings are code, even when the text reads as prose.
+    assert looks_like_prose_ui(
+        '"""This function does X, Y, and Z."""'
+    ) is False
+
+
+def test_looks_like_prose_ui_filename_kept():
+    from deeppeek.recover.prose_filter import looks_like_prose_ui
+    # Filename mention: might be attributable, keep.
+    assert looks_like_prose_ui(
+        "// pg_base.py Inpainting section"
+    ) is False
+
+
+def test_looks_like_prose_ui_too_short():
+    from deeppeek.recover.prose_filter import looks_like_prose_ui
+    assert looks_like_prose_ui("") is False
+    assert looks_like_prose_ui("abc") is False
+
+
+# ============================================================
+# Body-filename orphan attribution
+# ============================================================
+
+def test_filename_in_orphan_header_basic():
+    from deeppeek.recover.prose_filter import filename_in_orphan_header
+    body = "// pg_base.py Inpainting section\nsome();\n"
+    r = filename_in_orphan_header(body, ["pg_base.py", "other.py"])
+    assert r == ["pg_base.py"]
+
+
+def test_filename_in_orphan_header_not_in_first_3_lines():
+    from deeppeek.recover.prose_filter import filename_in_orphan_header
+    body = "line1\nline2\nline3\n// pg_base.py\n"
+    r = filename_in_orphan_header(body, ["pg_base.py"])
+    assert r == []
+
+
+def test_filename_in_orphan_header_multiple_matches():
+    from deeppeek.recover.prose_filter import filename_in_orphan_header
+    body = "// pg_base.py and other.py\n"
+    r = filename_in_orphan_header(body, ["pg_base.py", "other.py"])
+    assert len(r) == 2
+
+
+# ============================================================
+# Integration: pass 2 pre-filter
+# ============================================================
+
+def test_pass2_classify_filters_prose():
+    from deeppeek.recover.classify import pass2_classify
+    from deeppeek.recover.core import Block
+    prose = Block(
+        idx=0, header_path=None, modifier=None, fence_lang="",
+        body="[Inpaint] [Cancel]",
+        body_line_count=1, context_before="",
+        line_start=0, line_end=1, is_orphan=True,
+    )
+    pass2_classify([prose], None, "off", 0.85, False)
+    assert prose.kind == "not_a_file"
+    assert prose.is_code_file is False
+    assert prose.disposition == "orphan_prose"
+
+
+def test_pass4_attributes_via_body_filename():
+    from deeppeek.recover.attribute import pass4_attribute_orphans
+    from deeppeek.recover.core import Block, FileRecord
+
+    orphan = Block(
+        idx=0, header_path=None, modifier=None, fence_lang="js",
+        body="// pg_base.py Inpainting section\nsome_code();\n",
+        body_line_count=2, context_before="",
+        line_start=0, line_end=2, is_orphan=True,
+        is_code_file=True, kind="partial",
+    )
+    base = Block(
+        idx=1, header_path="pg_base.py", modifier=None, fence_lang="js",
+        body="original content\n", body_line_count=1,
+        context_before="", line_start=0, line_end=1,
+        is_orphan=False, is_code_file=True, kind="full",
+        canonical_path="pg_base.py", output_path="pg_base.py",
+    )
+    rec = FileRecord(path="pg_base.py", state="SINGLE_FULL")
+    rec.source_blocks = [1]
+
+    blocks = [orphan, base]
+    blocks_by_idx = {0: orphan, 1: base}
+    records = {"pg_base.py": rec}
+
+    pass4_attribute_orphans(blocks, blocks_by_idx, records, False)
+
+    assert orphan.attributed_to == "pg_base.py"
+    assert orphan.attributed_by == "body_header"
+
+
+# ============================================================
+# Disposition computation
+# ============================================================
+
+def test_compute_block_disposition_applied():
+    from deeppeek.recover.write import _compute_block_disposition
+    from deeppeek.recover.core import Block, FileRecord
+    b = Block(
+        idx=0, header_path="a.js", modifier=None, fence_lang="js",
+        body="x", body_line_count=1, context_before="",
+        line_start=0, line_end=1, is_orphan=False,
+        is_code_file=True, kind="full",
+        canonical_path="a.js", output_path="a.js",
+    )
+    rec = FileRecord(path="a.js", state="SINGLE_FULL")
+    disp = _compute_block_disposition(b, {"a.js": rec})
+    assert disp == "applied"
+
+
+def test_compute_block_disposition_orphan_prose():
+    from deeppeek.recover.write import _compute_block_disposition
+    from deeppeek.recover.core import Block
+    b = Block(
+        idx=0, header_path=None, modifier=None, fence_lang="",
+        body="[Inpaint] [Cancel]", body_line_count=1,
+        context_before="", line_start=0, line_end=1,
+        is_orphan=True, is_code_file=False,
+        kind="not_a_file", disposition="orphan_prose",
+    )
+    disp = _compute_block_disposition(b, {})
+    assert disp == "orphan_prose"
+
+
+def test_compute_block_disposition_preexisting():
+    from deeppeek.recover.write import _compute_block_disposition
+    from deeppeek.recover.core import Block
+    b = Block(
+        idx=0, header_path="a.js", modifier=None, fence_lang="js",
+        body="x", body_line_count=1, context_before="",
+        line_start=0, line_end=1, is_orphan=False,
+        is_code_file=True, kind="full",
+        canonical_path="a.js", output_path="a.js",
+        classified_by="preexisting",
+    )
+    disp = _compute_block_disposition(b, {})
+    assert disp == "preexisting"
+
+
+
+
+def test_pass4_marks_not_a_file_as_attributed():
+    """A prose block from pass2 (kind=not_a_file) is marked
+    attributed_by='not_a_file' by pass4 — not left as unattributed.
+    The classify-set disposition=orphan_prose must be preserved."""
+    from deeppeek.recover.attribute import pass4_attribute_orphans
+    from deeppeek.recover.core import Block, FileRecord
+
+    prose = Block(
+        idx=0, header_path=None, modifier=None, fence_lang="",
+        body="[Inpaint] [Cancel]", body_line_count=1,
+        context_before="", line_start=0, line_end=1,
+        is_orphan=True, is_code_file=False,
+        kind="not_a_file", disposition="orphan_prose",
+        classified_by="heuristic",
+    )
+    base = Block(
+        idx=1, header_path="pg_base.py", modifier=None, fence_lang="py",
+        body="original\n", body_line_count=1,
+        context_before="", line_start=0, line_end=1,
+        is_orphan=False, is_code_file=True, kind="full",
+        canonical_path="pg_base.py", output_path="pg_base.py",
+    )
+    rec = FileRecord(path="pg_base.py", state="SINGLE_FULL")
+    rec.source_blocks = [1]
+    blocks = [prose, base]
+    records = {"pg_base.py": rec}
+
+    pass4_attribute_orphans(blocks, {0: prose, 1: base}, records, False)
+
+    assert prose.attributed_by == "not_a_file", (
+        f"expected attributed_by='not_a_file', got "
+        f"{prose.attributed_by!r}")
+    assert prose.disposition == "orphan_prose", (
+        f"expected disposition='orphan_prose' preserved, got "
+        f"{prose.disposition!r}")
+
+
+def test_pass4_marks_bash_not_a_file_as_orphan_not_code():
+    """Non-prose not-a-file (bash without a target) gets
+    disposition='orphan_not_code' from pass4's fallback."""
+    from deeppeek.recover.attribute import pass4_attribute_orphans
+    from deeppeek.recover.core import Block, FileRecord
+
+    bash = Block(
+        idx=0, header_path=None, modifier=None, fence_lang="bash",
+        body="ls -la && echo hi\n", body_line_count=1,
+        context_before="", line_start=0, line_end=1,
+        is_orphan=True, is_code_file=False,
+        kind="not_a_file", disposition=None,
+        classified_by="heuristic",
+    )
+    base = Block(
+        idx=1, header_path="pg_base.py", modifier=None, fence_lang="py",
+        body="x\n", body_line_count=1,
+        context_before="", line_start=0, line_end=1,
+        is_orphan=False, is_code_file=True, kind="full",
+        canonical_path="pg_base.py", output_path="pg_base.py",
+    )
+    rec = FileRecord(path="pg_base.py", state="SINGLE_FULL")
+    rec.source_blocks = [1]
+    blocks = [bash, base]
+    records = {"pg_base.py": rec}
+
+    pass4_attribute_orphans(blocks, {0: bash, 1: base}, records, False)
+
+    assert bash.attributed_by == "not_a_file"
+    assert bash.disposition == "orphan_not_code", (
+        f"expected disposition='orphan_not_code', got "
+        f"{bash.disposition!r}")
+
+
+
 def main():
     tests = [
         ("walker no comment returns input", test_walker_no_comment_returns_input),
@@ -340,6 +976,90 @@ def main():
          test_dedup_stmt_base_required_for_any_action),
         ("parse_file_header markdown link",
          test_parse_file_header_markdown_link),
+        ("collect_inserted_lines basic",
+         test_collect_inserted_lines_basic),
+        ("collect_inserted_lines replaced",
+         test_collect_inserted_lines_replaced),
+        ("split_body_into_blocks statements",
+         test_split_body_into_blocks_statements),
+        ("split_body_into_blocks brace block",
+         test_split_body_into_blocks_brace_block),
+        ("filter_body_by_blocks basic",
+         test_filter_body_by_blocks_basic),
+        ("filter_body_by_blocks context preserved",
+         test_filter_body_by_blocks_context_preserved),
+        ("filter_body_by_blocks partial dup kept",
+         test_filter_body_by_blocks_partial_duplicate_kept),
+        ("filter_body_by_blocks all filtered",
+         test_filter_body_by_blocks_all_filtered),
+        ("insert_filter end-to-end",
+         test_insert_filter_end_to_end),
+        ("dedup_func_block removes duplicate",
+         test_dedup_func_block_removes_duplicate),
+        ("dedup_func_block keeps different name",
+         test_dedup_func_block_keeps_different_name),
+        ("dedup_func_block keeps different body",
+         test_dedup_func_block_keeps_different_body),
+        ("dedup_func_block keeps different params",
+         test_dedup_func_block_keeps_different_params),
+        ("dedup_func_block keeps different scope",
+         test_dedup_func_block_keeps_different_scope),
+        ("dedup_class_block removes duplicate",
+         test_dedup_class_block_removes_duplicate),
+        ("dedup_func_block markdown skipped",
+         test_dedup_func_block_markdown_skipped),
+        ("dedup_func_block export prefix",
+         test_dedup_func_block_export_prefix),
+        ("dedup_func_block async",
+         test_dedup_func_block_async),
+        ("dedup_func_block python different strings kept",
+         test_dedup_func_block_python_different_strings_kept),
+        ("dedup_func_block python same string removed",
+         test_dedup_func_block_python_same_string_removed),
+        ("cross_file empty when no records",
+         test_cross_file_empty_when_no_records),
+        ("cross_file detects identical long functions",
+         test_cross_file_detects_identical_long_functions),
+        ("cross_file ignores short functions",
+         test_cross_file_ignores_short_functions),
+        ("cross_file ignores preexisting",
+         test_cross_file_ignores_preexisting),
+        ("cross_file ignores same file duplicates",
+         test_cross_file_ignores_same_file_duplicates),
+        ("cross_file ignores partial only",
+         test_cross_file_ignores_partial_only),
+        ("looks_like_prose_ui ui mockup",
+         test_looks_like_prose_ui_ui_mockup),
+        ("looks_like_prose_ui prose",
+         test_looks_like_prose_ui_prose),
+        ("looks_like_prose_ui code",
+         test_looks_like_prose_ui_code),
+        ("looks_like_prose_ui docstring kept",
+         test_looks_like_prose_ui_docstring_kept),
+        ("looks_like_prose_ui filename kept",
+         test_looks_like_prose_ui_filename_kept),
+        ("looks_like_prose_ui too short",
+         test_looks_like_prose_ui_too_short),
+        ("filename_in_orphan_header basic",
+         test_filename_in_orphan_header_basic),
+        ("filename_in_orphan_header not in first 3",
+         test_filename_in_orphan_header_not_in_first_3_lines),
+        ("filename_in_orphan_header multiple matches",
+         test_filename_in_orphan_header_multiple_matches),
+        ("pass2 classify filters prose",
+         test_pass2_classify_filters_prose),
+        ("pass4 attributes via body filename",
+         test_pass4_attributes_via_body_filename),
+        ("compute_block_disposition applied",
+         test_compute_block_disposition_applied),
+        ("compute_block_disposition orphan_prose",
+         test_compute_block_disposition_orphan_prose),
+        ("compute_block_disposition preexisting",
+         test_compute_block_disposition_preexisting),
+        ("pass4 marks not_a_file as attributed",
+         test_pass4_marks_not_a_file_as_attributed),
+        ("pass4 marks bash not_a_file as orphan_not_code",
+         test_pass4_marks_bash_not_a_file_as_orphan_not_code),
     ]
     failed = 0
     for name, fn in tests:

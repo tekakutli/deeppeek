@@ -5,6 +5,11 @@ with a future combined command for a single pass.  The text is set
 via `execCommand('insertText')` in the page world, which is the only
 path React's onChange accepts on the current DeepSeek build — see the
 comment block in `extension/assets/injected.js` Part 8.
+
+Composer targeting uses `document.activeElement` first, falling back
+to the strategy list.  See `findComposer` in `injected.js` for the
+priority order.  The ack carries `composer_source` so the caller can
+tell *how* the element was chosen.
 """
 import argparse
 import sys
@@ -73,13 +78,16 @@ def run(args: argparse.Namespace) -> int:
 
         if rc == 0:
             sel = result.get("composer_selector") or "(unknown)"
-            print(f"OK — {len(text):,} chars in composer via {sel}",
-                  file=sys.stderr)
+            source = result.get("composer_source") or "?"
+            print(f"OK — {len(text):,} chars in composer via "
+                  f"{sel} (source={source})", file=sys.stderr)
             return 0
         if rc == 2:
             print(f"Type failed: {result.get('reason') or '(no reason)'}",
                   file=sys.stderr)
-            for k in ("composer_selector", "react_accepted"):
+            for k in ("composer_selector", "composer_source",
+                      "react_accepted",
+                      "composer_element_info", "active_element_info"):
                 if k in result:
                     print(f"  {k}: {result[k]}", file=sys.stderr)
             return 2

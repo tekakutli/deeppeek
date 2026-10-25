@@ -27,6 +27,7 @@ target tree is preserved.  Override with `--min-trust LOW`.
 import os
 import re
 import sys
+from collections import Counter
 from typing import Optional
 
 from .core import (
@@ -289,6 +290,83 @@ def _try_ellipsis_splice(base, body, context_before=""):
 # Main loop
 # ---------------------------------------------------------------------------
 
+def _collect_inserted_lines(old_content, new_content):
+    """Return the set of stripped lines whose count increased
+    old_content -> new_content.  Used to track what each pair/patch has
+    added to a record so later patches can be filtered against it."""
+    old_count = Counter(
+        line.strip() for line in old_content.split("\n") if line.strip()
+    )
+    new_count = Counter(
+        line.strip() for line in new_content.split("\n") if line.strip()
+    )
+    return {
+        line for line, count in new_count.items()
+        if count > old_count.get(line, 0)
+    }
+
+
+def _split_body_into_blocks(body):
+    """Split body into top-level blocks.  A block is either:
+         - a statement ending in `;` when brace-depth is 0, or
+         - a brace-block ending in `}` when depth returns to 0.
+    Comments immediately preceding a block are attached to it.
+    Blank lines are attached to the following block.
+
+    Limitation: braces inside comments or strings can confuse depth
+    tracking.  This is rare enough that the conservative behaviour
+    (treating everything as one block) is safe: filtering then does
+    nothing, and pass-8 dedup remains the safety net.
+    """
+    blocks = []
+    current = []
+    depth = 0
+    for line in body.split("\n"):
+        current.append(line)
+        depth += line.count("{") - line.count("}")
+        stripped = line.strip()
+        if depth == 0 and stripped.endswith((";", "}")):
+            blocks.append("\n".join(current))
+            current = []
+    if current:
+        blocks.append("\n".join(current))
+    return blocks
+
+
+def _filter_body_by_blocks(body, base_stripped_set, record_inserted):
+    """Remove blocks whose non-context lines are ALL already inserted
+    by prior pairs/patches in this record.  A block that has any new
+    non-context content is preserved whole.
+
+    Conservative rules:
+      - Context lines (present in the base) are never filtered.
+      - A block is only removed if EVERY non-context line is a duplicate.
+        A single new line anywhere in the block keeps the whole block.
+      - Structural integrity is preserved because filtering is per
+        whole block, not per line.
+
+    Returns (filtered_body, any_removed).  any_removed is True iff at
+    least one block was filtered.
+    """
+    if not body.strip():
+        return body, False
+    blocks = _split_body_into_blocks(body)
+    kept = []
+    any_removed = False
+    for block in blocks:
+        non_context = [
+            ln.strip() for ln in block.split("\n")
+            if ln.strip() and ln.strip() not in base_stripped_set
+        ]
+        if non_context and all(
+            ln in record_inserted for ln in non_context
+        ):
+            any_removed = True
+            continue
+        kept.append(block)
+    return "\n".join(kept), any_removed
+
+
 def pass6_apply_patches(records, blocks_by_idx, llm):
     for path, rec in records.items():
         if rec.state not in ("SINGLE_FULL", "MULTI_FULL", "FULL_PLUS_PATCH"):
@@ -305,44 +383,109 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
         base = base_block.body
         content = base
 
+        # Base-line set and per-record insertion tracker for
+        # patch-insertion filtering.
+        base_stripped_set = {
+            line.strip() for line in base.split("\n") if line.strip()
+        }
+        record_inserted = set()
+
         trust_cap = "MEDIUM" if rec.dedup_reason == "last_full" else "HIGH"
 
         pair_records = []
         if rec.pairs:
             content, pair_records = _apply_pairs(content, rec.pairs)
+            record_inserted |= _collect_inserted_lines(base, content)
             rec.verification["pair_records"] = pair_records
 
         all_deterministic = True
         all_ok = True
         for patch in rec.patches:
+            # Filter whole blocks whose non-context lines are all
+            # already inserted by prior pairs/patches in this
+            # record.  Filtering is per-block (brace-aware), not
+            # per-line, so structural integrity is preserved even
+            # when a block is partially duplicated.
+            original_body = patch["body"]
+            filtered_body, was_filtered = _filter_body_by_blocks(
+                original_body, base_stripped_set, record_inserted,
+            )
+            if was_filtered:
+                patch["filtered_duplicate_lines"] = True
+                if not filtered_body.strip():
+                    patch["applied_by"] = "already-present"
+                    print(
+                        f"  [insert-filter] {path} "
+                        f"idx={patch['idx']}: filtered to empty",
+                        file=sys.stderr,
+                    )
+                    continue
+                patch_to_apply = {**patch, "body": filtered_body}
+                print(
+                    f"  [insert-filter] {path} "
+                    f"idx={patch['idx']}: filtered duplicate "
+                    f"block(s)",
+                    file=sys.stderr,
+                )
+            else:
+                patch_to_apply = patch
+
             # AST anchor is threaded through via `path`.  The function
             # tries text heuristics first, then AST, and returns the
             # new content on success.  Any failure leaves `patch` with
             # `applied_by = "failed"` and a `failure_reason` string.
-            result = _try_deterministic_patch(content, patch, path)
+            result = _try_deterministic_patch(
+                content, patch_to_apply, path)
             if result is not None:
+                record_inserted |= _collect_inserted_lines(
+                    content, result)
                 content = result
                 patch["applied_by"] = "deterministic"
                 continue
 
-            if _patch_already_present(patch["body"], content):
+            # Filtered body failed; fall back to unfiltered so
+            # content is not lost.  Pass-8 dedup catches any
+            # residual duplicate this introduces.
+            if was_filtered:
+                result = _try_deterministic_patch(
+                    content, patch, path)
+                if result is not None:
+                    record_inserted |= _collect_inserted_lines(
+                        content, result)
+                    content = result
+                    patch["applied_by"] = "deterministic"
+                    patch["filter_fallback"] = True
+                    print(
+                        f"  [insert-filter] {path} "
+                        f"idx={patch['idx']}: filtered body "
+                        f"failed, applied unfiltered",
+                        file=sys.stderr,
+                    )
+                    continue
+
+            if _patch_already_present(patch_to_apply["body"], content):
                 patch["applied_by"] = "already-present"
                 continue
 
-            if _diff_already_applied(patch["body"], content):
+            if _diff_already_applied(patch_to_apply["body"], content):
                 patch["applied_by"] = "already-present"
                 continue
 
             if _is_deletion_instruction(
-                    patch["body"], patch.get("context_before", "")):
-                if _deletion_already_applied(patch["body"], content):
+                    patch_to_apply["body"],
+                    patch.get("context_before", "")):
+                if _deletion_already_applied(
+                        patch_to_apply["body"], content):
                     patch["applied_by"] = "already-present"
                     continue
 
             all_deterministic = False
             if llm is not None:
-                result = _try_llm_patch(content, patch, llm, path)
+                result = _try_llm_patch(
+                    content, patch_to_apply, llm, path)
                 if result is not None:
+                    record_inserted |= _collect_inserted_lines(
+                        content, result)
                     content = result
                     patch["applied_by"] = "llm"
                     continue
@@ -353,10 +496,34 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
             rec.warnings.append(
                 f"patch idx={patch['idx']} could not be applied "
                 f"({patch['failure_reason']})")
-            all_ok = False
+
+            # Soft-fail body_header attribution.  When an
+            # orphan names its target file only in its opening
+            # comment, that is a weak signal; if the body does
+            # not fit as a patch, the block is a descriptive
+            # fragment, not a failed patch.  Demote the patch
+            # to unattributed but do NOT fail the record —
+            # otherwise an incidental fragment blocks the
+            # record's real success (e.g. the pg_base.py
+            # Inpainting pair that DID apply).
+            _block_for_patch = blocks_by_idx.get(patch["idx"])
+            if (_block_for_patch is not None
+                    and _block_for_patch.attributed_by
+                    == "body_header"):
+                patch["applied_by"] = "skipped_weak_attribution"
+                patch["attribution_demoted"] = True
+                rec.warnings.append(
+                    f"patch idx={patch['idx']} body_header "
+                    f"attribution could not be applied — "
+                    f"demoted to unattributed fragment "
+                    f"(record not failed)")
+            else:
+                all_ok = False
 
         rec.verification["patches_applied"] = sum(
-            1 for p in rec.patches if p.get("applied_by") != "failed")
+            1 for p in rec.patches
+            if p.get("applied_by")
+            not in ("failed", "skipped_weak_attribution"))
         rec.verification["pairs_applied"] = sum(
             1 for r in pair_records if r["applied_by"] == "deterministic")
 

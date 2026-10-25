@@ -322,6 +322,11 @@
   }
 
   function findTextarea() {
+    const active = document.activeElement;
+    if (active && active.tagName === "TEXTAREA") {
+      const r = active.getBoundingClientRect();
+      if (r.width > 100 && r.height > 20) return active;
+    }
     return [...document.querySelectorAll("textarea")].find((el) => {
       const r = el.getBoundingClientRect();
       return r.width > 100 && r.height > 20;
@@ -543,12 +548,128 @@
     'textarea',
   ];
 
-  function findComposer() {
-    for (const sel of COMPOSER_STRATEGIES) {
-      const el = document.querySelector(sel);
-      if (el) return { el, selector: sel };
+  // ---- composer discovery -----------------------------------------
+  //
+  // Priority order (see the chat-side rationale in commands/type.py):
+  //   1. active element that matches a strategy
+  //   2. active element that is the largest visible editable
+  //   3. first visible strategy match
+  //   4. largest visible editable
+  //   5. none -> error
+  //
+  // The previous version picked the first DOM match, which
+  // mis-targeted any page with a search box, sidebar input, or
+  // hidden textarea appearing before the composer.
+
+  function _isEditable(el) {
+    if (!el) return false;
+    if (el.isContentEditable) return true;
+    const tag = (el.tagName || "").toLowerCase();
+    if (tag === "textarea") return true;
+    if (tag === "input") {
+      const t = (el.type || "text").toLowerCase();
+      return ["text", "search", "email", "url", "tel", "password"]
+        .includes(t);
     }
-    return { el: null, selector: null };
+    return false;
+  }
+
+  function _isVisible(el) {
+    if (!el || !el.isConnected) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden")
+      return false;
+    if (parseFloat(style.opacity) === 0) return false;
+    const r = el.getBoundingClientRect();
+    return r.width >= 50 && r.height >= 15;
+  }
+
+  function _describeEl(el) {
+    if (!el) return null;
+    return {
+      tag: el.tagName || null,
+      id: el.id || null,
+      type: el.type || null,
+      name: el.name || null,
+      placeholder: el.placeholder || null,
+      cls: (typeof el.className === "string")
+        ? el.className.slice(0, 80) : null,
+    };
+  }
+
+  function _largestVisibleEditable() {
+    const candidates = [];
+    for (const el of document.querySelectorAll(
+        'textarea, input, [contenteditable="true"], [contenteditable=""]')) {
+      if (_isEditable(el) && _isVisible(el)) candidates.push(el);
+    }
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => {
+      const ra = a.getBoundingClientRect();
+      const rb = b.getBoundingClientRect();
+      return (rb.width * rb.height) - (ra.width * ra.height);
+    });
+    return candidates[0];
+  }
+
+  function _strategyMatches() {
+    const out = [];
+    const seen = new Set();
+    for (const sel of COMPOSER_STRATEGIES) {
+      for (const el of document.querySelectorAll(sel)) {
+        if (seen.has(el)) continue;
+        if (_isEditable(el) && _isVisible(el)) {
+          out.push(el);
+          seen.add(el);
+        }
+      }
+    }
+    return out;
+  }
+
+  function findComposer() {
+    const active = document.activeElement;
+    const activeOk = _isEditable(active) && _isVisible(active);
+    const strategy = _strategyMatches();
+    const largest = _largestVisibleEditable();
+
+    // Priority 1: active element that matches a known strategy.
+    if (activeOk && strategy.includes(active)) {
+      return { el: active,
+               selector: "active-element (matches strategy)",
+               source: "active-matches-strategy",
+               active, chosen: active };
+    }
+
+    // Priority 2: active element that is the largest visible editable.
+    if (activeOk && largest && active === largest) {
+      return { el: active,
+               selector: "active-element (largest editable)",
+               source: "active-largest",
+               active, chosen: active };
+    }
+
+    // Priority 3: first visible strategy match.
+    if (strategy.length) {
+      return { el: strategy[0],
+               selector: "strategy: " +
+                         (strategy[0].getAttribute("data-testid")
+                          || strategy[0].placeholder
+                          || strategy[0].tagName.toLowerCase()),
+               source: "selector",
+               active, chosen: strategy[0] };
+    }
+
+    // Priority 4: largest visible editable, any selector.
+    if (largest) {
+      return { el: largest,
+               selector: "largest-editable",
+               source: "largest-editable",
+               active, chosen: largest };
+    }
+
+    return { el: null, selector: null, source: "none",
+             active, chosen: null };
   }
 
   function setComposerValue(el, text) {
@@ -595,12 +716,23 @@
 
   async function doType(text, opts) {
     const settleMs = Number(opts.settle_ms) || 300;
-    const { el, selector } = findComposer();
-    if (!el) return { success: false, reason: "no composer found on page" };
+    const found = findComposer();
+    const el = found.el;
+    if (!el) {
+      return { success: false,
+               reason: "no composer found on page",
+               composer_source: "none",
+               active_element_info: _describeEl(found.active) };
+    }
 
     const before = el.value ?? el.textContent ?? "";
     if (!setComposerValue(el, text)) {
-      return { success: false, reason: "could not set composer value" };
+      return { success: false,
+               reason: "could not set composer value",
+               composer_selector: found.selector,
+               composer_source: found.source,
+               composer_element_info: _describeEl(el),
+               active_element_info: _describeEl(found.active) };
     }
     await new Promise((r) => setTimeout(r, settleMs));
 
@@ -609,7 +741,10 @@
 
     return {
       success: react_accepted,
-      composer_selector: selector,
+      composer_selector: found.selector,
+      composer_source: found.source,
+      composer_element_info: _describeEl(el),
+      active_element_info: _describeEl(found.active),
       value_before: before,
       value_after: after,
       react_accepted,
@@ -621,15 +756,24 @@
 
   async function doEnter(opts) {
     const verifyMs = Number(opts.verify_ms) || 700;
-    const { el, selector } = findComposer();
-    if (!el) return { success: false, reason: "no composer found on page" };
+    const found = findComposer();
+    const el = found.el;
+    if (!el) {
+      return { success: false,
+               reason: "no composer found on page",
+               composer_source: "none",
+               active_element_info: _describeEl(found.active) };
+    }
 
     const before = el.value ?? el.textContent ?? "";
     if (!before) {
       return {
         success: false,
         reason: "composer is empty — nothing to submit",
-        composer_selector: selector,
+        composer_selector: found.selector,
+        composer_source: found.source,
+        composer_element_info: _describeEl(el),
+        active_element_info: _describeEl(found.active),
       };
     }
 
@@ -642,7 +786,10 @@
 
     return {
       success: composer_cleared,
-      composer_selector: selector,
+      composer_selector: found.selector,
+      composer_source: found.source,
+      composer_element_info: _describeEl(el),
+      active_element_info: _describeEl(found.active),
       value_before: before,
       value_after: after,
       submitted: true,

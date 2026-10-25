@@ -341,6 +341,18 @@ _IF_OPENER_RE = re.compile(
 _MODULE_CONST_RE = re.compile(
     r"^const\s+([A-Za-z_$][\w$]*)\s*=", re.MULTILINE)
 
+# Class C: function/class declarations at column 0 (no indent).
+# The name capture group is for fast duplicate-detection; the
+# full declaration text (header + body) is what actually gets
+# compared during dedup.
+_FUNC_DECL_RE = re.compile(
+    r"^((?:export\s+)?(?:async\s+)?function\s+"
+    r"([A-Za-z_$][\w$]*)\s*\()",
+    re.MULTILINE)
+_CLASS_DECL_RE = re.compile(
+    r"^((?:export\s+)?class\s+([A-Za-z_$][\w$]*)\b)",
+    re.MULTILINE)
+
 _DEDUP_WINDOW_CHARS = 1500
 
 
@@ -512,6 +524,25 @@ def _has_obvious_duplicates(content: str) -> bool:
         if key in seen_ifs:
             return True
         seen_ifs.add(key)
+    # Class C: function/class name duplicates at column 0
+    seen_funcs = set()
+    for m in _FUNC_DECL_RE.finditer(content):
+        if (content.rfind(chr(10), 0, m.start()) + 1
+                != m.start()):
+            continue
+        name = m.group(2)
+        if name in seen_funcs:
+            return True
+        seen_funcs.add(name)
+    seen_classes = set()
+    for m in _CLASS_DECL_RE.finditer(content):
+        if (content.rfind(chr(10), 0, m.start()) + 1
+                != m.start()):
+            continue
+        name = m.group(2)
+        if name in seen_classes:
+            return True
+        seen_classes.add(name)
     return False
 
 
@@ -666,6 +697,64 @@ def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
             removals.append((m.start(), end_char, "const " + name))
             continue
         seen_const[name] = (m.start(), end_char)
+
+    # ---- Class C: duplicate function/class declarations ----
+    # Two identical `function NAME(...) { body }` (or `class
+    # NAME { body }`) in the same enclosing scope within the
+    # window: remove the later one.  Body comparison includes
+    # the header line, so different parameter lists are not
+    # considered identical.  Column-0 only -- indented
+    # declarations are anonymous or nested, and their scope is
+    # meaningful even if the header text matches.
+    for _pat, _kind in (
+            (_FUNC_DECL_RE, "function"),
+            (_CLASS_DECL_RE, "class")):
+        _seen_decl = {}
+        for _m in _pat.finditer(content):
+            if (content.rfind(chr(10), 0, _m.start()) + 1
+                    != _m.start()):
+                continue
+            _name = _m.group(2)
+            _header_end = content.find(chr(10), _m.end())
+            if _header_end == -1:
+                _header_end = len(content)
+            _open = content.find("{", _m.end(), _header_end)
+            if _open == -1:
+                continue
+            _close = _find_matching_close_char(content, _open)
+            if _close == -1:
+                continue
+            _end = _close + 1
+            if _end < len(content) and content[_end] == chr(10):
+                _end += 1
+            _body = _norm_lines(content[_m.start():_close + 1])
+            if not _body:
+                continue
+            _key = (_kind, _name, _body)
+            if _key in _seen_decl:
+                _prev_start, _prev_end = _seen_decl[_key]
+                if (_m.start() - _prev_start
+                        > _DEDUP_WINDOW_CHARS):
+                    _seen_decl[_key] = (_m.start(), _end)
+                    continue
+                if (_enclosing_scope_depth(content, _prev_start)
+                        != _enclosing_scope_depth(
+                            content, _m.start())):
+                    _seen_decl[_key] = (_m.start(), _end)
+                    continue
+                # Same-string guard: identical functions inside two
+                # DIFFERENT embedded string literals of a .py file are
+                # author-written duplication (per-string), not a
+                # pipeline artifact.  Preserve both.
+                if is_python:
+                    if not _same_python_string(
+                            _prev_start, _m.start(), py_spans):
+                        _seen_decl[_key] = (_m.start(), _end)
+                        continue
+                removals.append((_m.start(), _end,
+                                 _kind + " " + _name))
+                continue
+            _seen_decl[_key] = (_m.start(), _end)
 
     if not removals:
         return content, 0

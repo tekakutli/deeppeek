@@ -162,6 +162,54 @@ def _trust_reason(rec: FileRecord) -> str:
     return ""
 
 
+def _compute_block_disposition(b, records):
+    """One-word summary of a block's fate.  Used in
+    `_debug.blocks` and (indirectly) by the warnings
+    summarizer."""
+    if getattr(b, "disposition", None):
+        return b.disposition
+    if b.classified_by == "preexisting":
+        return "preexisting"
+    if b.is_orphan:
+        if b.attributed_to:
+            rec = records.get(b.attributed_to)
+            if not rec or rec.state not in (
+                    "SINGLE_FULL", "FULL_PLUS_PATCH",
+                    "MULTI_FULL"):
+                return "orphan_attributed_skipped"
+            # Record was written, but check whether THIS block's
+            # own patch was the one applied.
+            _own_patch = next(
+                (p for p in rec.patches
+                 if p.get("idx") == b.idx),
+                None)
+            if (_own_patch is not None
+                    and _own_patch.get("applied_by")
+                    in ("deterministic", "llm")):
+                return "orphan_attributed_applied"
+            return "orphan_attributed_skipped"
+        if b.kind == "not_a_file":
+            return "orphan_not_code"
+        if b.kind == "recovered_meta":
+            return "orphan_meta"
+        if b.attributed_by == "empty":
+            return "orphan_empty"
+        return "orphan_unattributed"
+    if getattr(b, "paired_with", None) is not None:
+        return "paired"
+    if b.output_path is None:
+        return "unresolved"
+    rec = records.get(b.output_path)
+    if rec is None:
+        return "unmatched"
+    if rec.state in (
+            "SINGLE_FULL", "FULL_PLUS_PATCH", "MULTI_FULL"):
+        return "applied"
+    if rec.state == "PARTIAL_ONLY":
+        return "partial"
+    return "unapplied"
+
+
 def _orphan_first_line(block: Block) -> str:
     """First non-empty body line of an orphan block, truncated."""
     if not block.body:
@@ -200,6 +248,7 @@ def pass9_write(records: dict,
                 cross_validate: dict,
                 apply_to: Optional[Path] = None,
                 resolutions: Optional[list] = None,
+                cross_file_duplicates: Optional[list] = None,
                 verbose: bool = False) -> int:
     if apply_to is not None:
         files_dir = apply_to
@@ -269,6 +318,18 @@ def pass9_write(records: dict,
             warnings_lines.append(
                 f"[{path}] [PATCH_FAILED] idx={p['idx']} "
                 f"(first line: {first_line!r}): {reason}")
+
+        # Per-patch insertion-filter detail.
+        for p in rec.patches:
+            if not p.get("filtered_duplicate_lines"):
+                continue
+            status = p.get("applied_by", "?")
+            fallback = " (fallback: applied unfiltered)" \
+                if p.get("filter_fallback") else ""
+            warnings_lines.append(
+                f"[{path}] [FILTERED] idx={p['idx']} "
+                f"filtered duplicate block(s); final status: "
+                f"{status}{fallback}")
 
         if rec.is_deleted:
             warnings_lines.append(
@@ -485,7 +546,14 @@ def pass9_write(records: dict,
             "dedup_reason": rec.dedup_reason,
             "last_full_idx": rec.last_full_idx,
             "patches": [
-                {"idx": p["idx"], "applied_by": p.get("applied_by", "?")}
+                {
+                    "idx": p["idx"],
+                    "applied_by": p.get("applied_by", "?"),
+                    **({"filtered_duplicate_lines": True}
+                       if p.get("filtered_duplicate_lines") else {}),
+                    **({"filter_fallback": True}
+                       if p.get("filter_fallback") else {}),
+                }
                 for p in rec.patches
             ],
             "pairs": [
@@ -550,8 +618,7 @@ def pass9_write(records: dict,
 
     unattributed = [b for b in blocks
                     if b.is_orphan and not b.attributed_to
-                    and b.attributed_by not in ("empty", "no_candidates",
-                                                 "skipped_meta")]
+                    and b.attributed_by not in ("empty", "no_candidates", "skipped_meta", "not_a_file")]
     for b in unattributed:
         first_line = _orphan_first_line(b)
         warnings_lines.append(
@@ -631,6 +698,14 @@ def pass9_write(records: dict,
             warnings_lines.append(
                 "  (per-file listing suppressed in --apply-to mode; "
                 "the target tree owns its own files)")
+
+    if cross_file_duplicates:
+        for _d in cross_file_duplicates:
+            _files = ", ".join(_d["files"])
+            warnings_lines.append(
+                f"[CROSS_FILE_DUP] {_d['kind']} "
+                f"{_d['name']!r} ({_d['line_count']} lines) "
+                f"newly-added to: {_files}")
 
     if overwritten_files or overwritten_low:
         warnings_lines.append(
@@ -799,6 +874,7 @@ def pass9_write(records: dict,
         "skipped": skipped,
         "decisions": decisions,
         "deleted": all_deleted,
+        "cross_file_duplicates": cross_file_duplicates or [],
         "_debug": {
             "blocks": [
                 {
@@ -813,6 +889,7 @@ def pass9_write(records: dict,
                     "classified_by": b.classified_by,
                     "line_start": b.line_start,
                     "line_end": b.line_end,
+                    "disposition": _compute_block_disposition(b, records),
                 }
                 for b in blocks
             ],
@@ -958,6 +1035,10 @@ def pass9_write(records: dict,
              if unattributed else ""))
     print(f"  graph:    {len(xv)} import problem(s)"
           if xv else "  graph:    clean")
+    if cross_file_duplicates:
+        print(f"  cross-dup: {len(cross_file_duplicates)} "
+              f"newly-added function/class body(ies) in multiple "
+              f"files (see warnings.txt)")
     print(f"  deleted:  {reports_dir / 'deleted.txt'} "
           f"({len(all_deleted)} marked"
           + (f", {len(deleted_applied)} applied)" if apply_to is not None

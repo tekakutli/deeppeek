@@ -399,8 +399,15 @@ def run(cfg: RecoverConfig) -> int:
     print("[pass 8] verifying...")
     pass8_verify(records, blocks_by_idx=blocks_by_idx)
 
+    from .cross_file import find_cross_file_duplicates
+    cross_file_dups = find_cross_file_duplicates(
+        records, blocks_by_idx)
+    if cross_file_dups:
+        print(f"  {len(cross_file_dups)} cross-file duplicate(s) (see warnings.txt)")
+
     print("[pass 9] writing files...")
     rc = pass9_write(
+        cross_file_duplicates=cross_file_dups,
         records=records,
         blocks=blocks,
         deleted_files=deleted_files,

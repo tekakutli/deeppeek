@@ -564,6 +564,8 @@ def pass8_verify(records: dict[str, FileRecord],
                     # No-op at application time; content may have
                     # evolved since.  Do not re-check.
                     continue
+                if status == "skipped_weak_attribution":
+                    continue
                 if status == "deterministic":
                     # The deterministic patcher matched its anchor
                     # exactly and mutated the exact lines it named.

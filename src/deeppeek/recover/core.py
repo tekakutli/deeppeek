@@ -278,6 +278,11 @@ class Block:
     scope_hint: str = ""
     scope_name: str = ""
     paired_with: Optional[int] = None
+    # Set by classify/attribute stages as an early disposition
+    # hint ("orphan_prose", "orphan_not_code", ...).  Read by
+    # write.py's _compute_block_disposition; falls back to a
+    # derivation from the block's final state when unset.
+    disposition: Optional[str] = None
 
 
 @dataclass

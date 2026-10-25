@@ -15,6 +15,7 @@ import sys
 from typing import Optional
 
 from .core import Block, FileRecord, _basename
+from .prose_filter import filename_in_orphan_header
 
 
 def pass4_attribute_orphans(blocks: list[Block],
@@ -28,6 +29,18 @@ def pass4_attribute_orphans(blocks: list[Block],
             continue
         if b.kind == "recovered_meta":
             b.attributed_by = "skipped_meta"
+            continue
+        if b.kind == "not_a_file":
+            # Prose blocks arrive here with disposition already
+            # set ("orphan_prose", from classify.py).  Non-prose
+            # not-a-file (bash, json without a target) arrive
+            # with disposition unset.  Preserve the specific
+            # label; the fallback covers the non-prose case.
+            # attributed_by=not_a_file excludes both from
+            # write.py's unattributed warnings list.
+            b.attributed_by = "not_a_file"
+            if not b.disposition:
+                b.disposition = "orphan_not_code"
             continue
         if not b.body.strip():
             b.attributed_by = "empty"
@@ -66,6 +79,13 @@ def pass4_attribute_orphans(blocks: list[Block],
                 continue
 
         # (b) leading declaration anchor
+        # (a2) filename mentioned in the body's opening lines
+        body_matches = filename_in_orphan_header(
+            b.body, existing_paths)
+        if len(body_matches) == 1:
+            _assign(b, body_matches[0], "body_header", verbose)
+            continue
+
         anchor = _extract_anchor(b.body)
         if anchor:
             anchor_matches = []

@@ -31,6 +31,7 @@ from .core import (
     _narrow_context,
 )
 from .llm import LLMClient
+from .prose_filter import looks_like_prose_ui
 from .prose import parse_intent
 
 
@@ -78,6 +79,19 @@ def pass2_classify(blocks: list[Block], llm: Optional[LLMClient],
             b.intent = "full"
             continue
         _classify_one_heuristic(b)
+
+        # Pre-filter: prose/UI blocks never recover, and their
+        # presence wastes LLM escalation budget.  Detecting them
+        # here is cheaper than classifying-then-failing-attribution.
+        if b.is_orphan and looks_like_prose_ui(b.body):
+            b.is_code_file = False
+            b.kind = "not_a_file"
+            b.confidence = 0.95
+            b.disposition = "orphan_prose"
+            b.classified_by = "heuristic"
+            b.heuristic_kind = "not_a_file"
+            b.intent = "full"
+            continue
         b.classified_by = "heuristic"
         b.heuristic_kind = b.kind
 
