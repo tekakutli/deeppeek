@@ -117,6 +117,41 @@ def pass5_deduplicate(records: dict,
     detect_all(list(blocks_by_idx.values()), blocks_by_idx)
     global_pairs = build_pairs(blocks_by_idx)
 
+    # ---- global block ownership ----
+    # Each block idx belongs to at most one record.  Precedence:
+    #   (1) explicit pair (old_idx, new_idx)
+    #   (2) source_blocks of a record
+    #   (3) orphan attribution
+    # Prevents the same block from being applied as a patch in two
+    # different records (which would silently duplicate the edit).
+    block_owner = {}
+    for anchor, pair in global_pairs.items():
+        if pair["old_idx"] == -1:
+            b = blocks_by_idx[anchor]
+            if b.output_path:
+                block_owner[anchor] = b.output_path
+        else:
+            b_old = blocks_by_idx.get(pair["old_idx"])
+            b_new = blocks_by_idx.get(pair["new_idx"])
+            if b_old and b_old.output_path:
+                block_owner[pair["old_idx"]] = b_old.output_path
+            if b_new and b_new.output_path:
+                block_owner[pair["new_idx"]] = b_new.output_path
+    for _path, _rec in records.items():
+        for _idx in _rec.source_blocks:
+            if _idx not in block_owner:
+                block_owner[_idx] = _path
+    for _b in blocks_by_idx.values():
+        if not _b.is_orphan or not _b.attributed_to:
+            continue
+        if _b.idx not in block_owner:
+            block_owner[_b.idx] = _b.attributed_to
+        elif block_owner[_b.idx] != _b.attributed_to and verbose:
+            print(f"  [pass 5] block idx={_b.idx} claimed by "
+                  f"{block_owner[_b.idx]!r} (source), also "
+                  f"attributed to {_b.attributed_to!r}; ignoring "
+                  f"the attribution", file=sys.stderr)
+
     for path, rec in records.items():
         all_fulls = [i for i in rec.source_blocks
                      if blocks_by_idx[i].kind == "full"]
@@ -167,12 +202,14 @@ def pass5_deduplicate(records: dict,
 
         partials = [i for i in rec.source_blocks
                     if blocks_by_idx[i].kind == "partial"
-                    and i not in pair_idxs_for_this_file]
+                    and i not in pair_idxs_for_this_file
+                    and block_owner.get(i) == path]
         orphan_patches = [
             b.idx for b in blocks_by_idx.values()
             if b.is_orphan and b.attributed_to == path
             and b.kind != "full"
             and b.idx not in pair_idxs_for_this_file
+            and block_owner.get(b.idx) == path
         ]
         partials = sorted(partials + orphan_patches)
 

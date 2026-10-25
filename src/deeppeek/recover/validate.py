@@ -300,6 +300,43 @@ def _diff_lines_for_verify(body: str) -> tuple[list[str], list[str]]:
 def pass8_verify(records: dict[str, FileRecord],
                  blocks_by_idx: Optional[dict] = None) -> None:
     from .validate_output import validate_content
+    # ---- global patch-conflict detection ----
+    # A block applied to more than one record indicates a parser
+    # or attribution bug.  Demote every affected record to LOW
+    # so the fail-closed policy routes them to low_trust/ instead
+    # of silently duplicating the edit in the target tree.
+    patch_usage = {}
+    for _p, _r in records.items():
+        for _pp in _r.patches:
+            _i = _pp.get("idx")
+            if _i is None:
+                continue
+            patch_usage.setdefault(_i, []).append(_p)
+    for _p, _r in records.items():
+        if _r.content is None:
+            continue
+        _v = _r.verification
+        _conflicts = []
+        for _pp in _r.patches:
+            _i = _pp.get("idx")
+            if _i is None:
+                continue
+            _others = [op for op in patch_usage.get(_i, []) if op != _p]
+            if _others:
+                _conflicts.append({
+                    "patch_idx": _i,
+                    "other_records": _others,
+                })
+        if _conflicts:
+            _v["patch_conflict"] = _conflicts
+            _r.trust = "LOW"
+            _r.warnings.append(
+                "patch-conflict: %d block(s) claimed by another "
+                "record - likely a duplicated source block"
+                % len(_conflicts))
+            print(f"  [verify] {_p}: {len(_conflicts)} patch(es) "
+                  f"cross-claimed by another record; "
+                  f"demoting to LOW", file=sys.stderr)
     for path, rec in records.items():
         if rec.content is None:
             continue
@@ -344,10 +381,47 @@ def pass8_verify(records: dict[str, FileRecord],
         # the pg_panel_scrubs.py "duplicate top-level declaration"
         # fail-closed case in the real conversation.
         from .validate_output import _dedup_duplicate_blocks
-        deduped, n_removed = _dedup_duplicate_blocks(rec.content, path)
+        from .validate_output import _dedup_repeated_statements
+        from .validate_output import _LAST_DEDUP_DETAILS
+        import deeppeek.recover.validate_output as _vo
+
+        # Skip dedup entirely for pre-existing baselines that the
+        # conversation didn't touch.  Such records are never written
+        # (preexisting_unmodified), so deduping them is wasted work
+        # and produces a misleading count in the manifest.
+        _skip_dedup = (
+            rec.preexisting_base
+            and not rec.pairs
+            and not any(
+                p.get("applied_by") != "already-present"
+                for p in rec.patches
+            )
+        )
+
+        if _skip_dedup:
+            n_removed = 0
+            _dedup_details = []
+        else:
+            _vo._LAST_DEDUP_DETAILS = []
+            deduped, n_removed = _dedup_duplicate_blocks(
+                rec.content, path)
+            _dedup_details = list(_vo._LAST_DEDUP_DETAILS)
+            _patch_bodies = [p.get("body", "") for p in rec.patches]
+            _vo._LAST_DEDUP_DETAILS = []
+            deduped2, n_removed2 = _dedup_repeated_statements(
+                deduped, path,
+                base=base_for_check,
+                patch_bodies=_patch_bodies)
+            _dedup_details.extend(_vo._LAST_DEDUP_DETAILS)
+            if n_removed2 > 0:
+                deduped = deduped2
+                n_removed += n_removed2
+
         if n_removed > 0:
             rec.content = deduped
             rec.verification["deduped_blocks"] = n_removed
+            if _dedup_details:
+                rec.verification["deduped_detail"] = _dedup_details
             print(f"  [dedup] {path}: removed {n_removed} duplicate "
                   f"block(s)", file=sys.stderr)
 

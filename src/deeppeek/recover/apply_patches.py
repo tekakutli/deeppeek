@@ -861,6 +861,93 @@ _SCOPE_PATTERNS = [
 ]
 
 
+def _body_starts_with_comment(body):
+    """True iff the body's first non-blank line is a comment marker."""
+    if not body:
+        return False
+    for line in body.split(chr(10)):
+        s = line.strip()
+        if not s:
+            continue
+        return (s.startswith("/*")
+                or s.startswith("//")
+                or s.startswith("#"))
+    return False
+
+
+def _find_leading_comment_start(base, indent_pos):
+    """Walk backward from indent_pos over a leading comment region
+    (block comment, consecutive line comments, or decorators).  Blank
+    lines BETWEEN the scope and its leading comment are traversed; a
+    blank line ABOVE an already-identified comment ends the walk.
+
+    Returns indent_pos unchanged when no leading comment exists, so a
+    caller gating on this function does nothing in the no-comment case.
+    """
+    if indent_pos <= 0:
+        return indent_pos
+    pos = indent_pos
+    entered_comment = False
+    while pos > 0:
+        prev_nl = base.rfind(chr(10), 0, pos - 1)
+        line_start = prev_nl + 1
+        line = base[line_start:pos - 1]
+        stripped = line.strip()
+
+        if not stripped:
+            if entered_comment:
+                return pos
+            pos = line_start
+            continue
+
+        if stripped.startswith("//") or stripped.startswith("#"):
+            entered_comment = True
+            pos = line_start
+            continue
+
+        if stripped.startswith("@"):
+            opens = stripped.count("(")
+            closes = stripped.count(")")
+            if opens > closes:
+                depth = opens - closes
+                scan = line_start
+                while scan > 0 and depth > 0:
+                    prev_nl2 = base.rfind(chr(10), 0, scan - 1)
+                    scan2 = prev_nl2 + 1
+                    scan_line = base[scan2:scan - 1]
+                    depth += scan_line.count(")") - scan_line.count("(")
+                    scan = scan2
+                if depth == 0:
+                    pos = scan
+                    entered_comment = True
+                    continue
+                return pos
+            pos = line_start
+            entered_comment = True
+            continue
+
+        if stripped.endswith("*/"):
+            block_start = base.rfind("/*", 0, pos - 1)
+            if block_start < 0:
+                return pos
+            block_line_start = base.rfind(chr(10), 0, block_start) + 1
+            between = base[block_start:pos]
+            if between.count("/*") != 1:
+                return pos
+            pos = block_line_start
+            entered_comment = True
+            continue
+
+        # Non-comment, non-blank line reached.
+        if entered_comment:
+            return pos
+        return indent_pos
+
+    if entered_comment:
+        return pos
+    return indent_pos
+
+
 def _apply_scoped(base, scope_name, new_body):
     if not scope_name or not new_body.strip():
         return None
@@ -882,6 +969,19 @@ def _apply_scoped(base, scope_name, new_body):
         else:
             indent_pos = base.rfind("\n", 0, m_start) + 1
             base_indent = base[indent_pos:m_start]
+        # Consume the leading comment above the scope iff the
+        # new_body carries its own comment.  The semantic is:
+        #   new_body starts with a comment -> the user is
+        #     replacing the docstring too; the old one is
+        #     stale and must be removed.
+        #   new_body does NOT start with a comment -> the user
+        #     is replacing only the code; leave the old
+        #     comment in place.
+        if _body_starts_with_comment(new_body):
+            extended_start = _find_leading_comment_start(
+                base, indent_pos)
+            if extended_start < indent_pos:
+                indent_pos = extended_start
         while m_end > m_start and base[m_end - 1] == "\n":
             m_end -= 1
         reindented = _reindent_body(base_indent, new_body)

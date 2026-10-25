@@ -27,6 +27,11 @@ def _walk_block_tokens(tokens):
 
 def _parse_file_header(text: str) -> Optional[tuple[str, Optional[str]]]:
     s = text.strip()
+    # Markdown link: [text](url) -> text.  The link text may
+    # itself carry backticks, which the strip below removes.
+    link_m = re.match(r"^\[([^\]]+)\]\([^)]+\)\s*$", s)
+    if link_m:
+        s = link_m.group(1).strip()
     s = re.sub(r"[*`]", "", s)
 
     m = re.match(

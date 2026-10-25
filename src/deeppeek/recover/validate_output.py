@@ -35,6 +35,13 @@ from pathlib import Path
 from typing import Optional
 
 
+# Accumulator that _dedup_repeated_statements
+# and _dedup_duplicate_blocks populate so callers
+# can record audit trail in the manifest.  Reset by
+# the caller before each invocation.
+_LAST_DEDUP_DETAILS = []
+
+
 _JS_EXTS = frozenset({".js", ".mjs", ".jsx", ".ts", ".tsx"})
 
 
@@ -677,6 +684,11 @@ def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
             merged.append(r)
     removals = merged
 
+    global _LAST_DEDUP_DETAILS
+    _LAST_DEDUP_DETAILS = [
+        {"path": path, "kind": "block", "desc": desc}
+        for _rstart, _rend, desc in removals
+    ]
     removals.sort(key=lambda r: r[0], reverse=True)
     new_content = content
     for rstart, rend, desc in removals:
@@ -684,3 +696,104 @@ def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
               file=sys.stderr)
         new_content = new_content[:rstart] + new_content[rend:]
     return new_content, len(removals)
+
+
+def _dedup_repeated_statements(content, path, base=None,
+                                patch_bodies=None, window=15):
+    """Remove duplicate single-line statements under tight conditions:
+
+      1. Code file (not documentation, not CSS-in-py).
+      2. Line does NOT appear in `base` -- i.e. it is genuinely new,
+         added by the patches, not inherited from the pre-existing
+         file.  A legitimate duplicate (e.g. `resetView();` appearing
+         in both `setImage` and `clearImage`) is in `base` and is
+         therefore skipped.
+      3. Line appears in at least one `patch_bodies` entry.  A
+         user-authored duplication with no patch provenance is left
+         alone.
+      4. Exactly two occurrences in the result.
+      5. Both in the same enclosing scope (by innermost `{` position).
+      6. Within `window` lines of each other.
+
+    Removing one copy of a line that is byte-identical, at the same
+    indent, in the same scope, and that the patches added twice yields
+    the single-application result the patch text intended.
+    """
+    from pathlib import Path as _P
+    ext = _P(path).suffix.lower()
+    if ext not in frozenset({
+        ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".py",
+    }):
+        return content, 0
+
+    if not patch_bodies:
+        return content, 0
+
+    patch_line_set = set()
+    for pb in patch_bodies:
+        for line in pb.split(chr(10)):
+            s = line.strip()
+            if s and s.endswith(";"):
+                patch_line_set.add(s)
+
+    if not patch_line_set:
+        return content, 0
+
+    base_lines_set = set()
+    if base:
+        for line in base.split(chr(10)):
+            s = line.strip()
+            if s:
+                base_lines_set.add(s)
+
+    lines = content.split(chr(10))
+    line_starts = []
+    pos = 0
+    for line in lines:
+        line_starts.append(pos)
+        pos += len(line) + 1
+
+    candidates = {}
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s or not s.endswith(";"):
+            continue
+        if "{" in s or "}" in s:
+            continue
+        if s not in patch_line_set:
+            continue
+        if s in base_lines_set:
+            continue
+        indent = len(line) - len(line.lstrip())
+        try:
+            _, scope_open = _enclosing_scope_depth(content, line_starts[i])
+        except Exception:
+            continue
+        key = (indent, s)
+        candidates.setdefault(key, []).append((i, scope_open))
+
+    removals = []
+    for key, occs in candidates.items():
+        if len(occs) != 2:
+            continue
+        (i1, scope1), (i2, scope2) = occs
+        if scope1 != scope2:
+            continue
+        if i2 - i1 > window:
+            continue
+        removals.append((i2, lines[i2].strip()))
+
+    if not removals:
+        return content, 0
+
+    remove_set = {i for i, _ in removals}
+    out = [line for i, line in enumerate(lines) if i not in remove_set]
+    global _LAST_DEDUP_DETAILS
+    _LAST_DEDUP_DETAILS = [
+        {"path": path, "kind": "stmt", "line": text}
+        for _i, text in removals
+    ]
+    for _i, text in removals:
+        print(f"  [dedup-stmt] {path}: removed duplicate line "
+              f"{text!r}", file=sys.stderr)
+    return chr(10).join(out), len(removals)

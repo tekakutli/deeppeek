@@ -799,6 +799,24 @@ def pass9_write(records: dict,
         "skipped": skipped,
         "decisions": decisions,
         "deleted": all_deleted,
+        "_debug": {
+            "blocks": [
+                {
+                    "idx": b.idx,
+                    "header_path": b.header_path,
+                    "output_path": b.output_path,
+                    "attributed_to": b.attributed_to,
+                    "attributed_by": b.attributed_by,
+                    "is_orphan": b.is_orphan,
+                    "kind": b.kind,
+                    "paired_with": getattr(b, "paired_with", None),
+                    "classified_by": b.classified_by,
+                    "line_start": b.line_start,
+                    "line_end": b.line_end,
+                }
+                for b in blocks
+            ],
+        },
     }
     (reports_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
