@@ -17,6 +17,7 @@ dev = ["pytest>=7", "pytest-cov", "ruff", "mypy"]
 ast = [
     "tree-sitter>=0.21",
     "tree-sitter-javascript>=0.21",
+    "tree-sitter-python>=0.21",
 ]
 
 [project.scripts]

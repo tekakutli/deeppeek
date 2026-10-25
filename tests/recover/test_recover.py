@@ -1064,6 +1064,233 @@ def test_20():
 
     check_apply("20_ast_top_level", extra)
 
+
+def test_21():
+    """AST anchor: JS embedded in a Python string literal.
+
+    Requires tree-sitter + tree-sitter-javascript (the [ast] extra).
+    Skips silently if unavailable.  Asserts the JS block is inserted
+    inside the Python string, at the end of syncPanelFields, and that
+    the surrounding Python structure (docstring, assignment, closing
+    triple-quote) is preserved verbatim.
+    """
+    if not _ast_available():
+        return  # skip
+
+    def extra(target, run):
+        rec = run["manifest"].get("files", {}).get("helper.py", {})
+        assert rec, (
+            f"helper.py missing from manifest files; "
+            f"manifest files: {list(run['manifest'].get('files', {}))}"
+        )
+        assert rec.get("trust") == "HIGH", (
+            f"expected trust=HIGH, got {rec.get('trust')}; "
+            f"verification: {rec.get('verification')}, "
+            f"warnings: {rec.get('warnings')}"
+        )
+        content = (target / "helper.py").read_text()
+        assert "Fixture 21 helper" in content, (
+            f"Python docstring at top lost:\n{content}"
+        )
+        assert "PANEL_FIELDS_JS = r" in content, (
+            f"Python string assignment lost:\n{content}"
+        )
+        assert "if (e.inpaintFullCanvas" in content, (
+            f"new JS if-block missing:\n{content}"
+        )
+        assert "if (e.imageInfo)" in content, (
+            f"existing JS statement lost:\n{content}"
+        )
+        assert "if (e.inpaintPrompt) e.inpaintPrompt.disabled = busy;" in content, (
+            f"trailing JS statement lost:\n{content}"
+        )
+        # New if-block must be INSIDE the string literal.
+        q3 = '"' * 3
+        first_open = content.index(q3)
+        second_open = content.index(q3, first_open + 3)  # docstring close
+        third_open = content.index(q3, second_open + 3)   # string open
+        fourth_close = content.index(q3, third_open + 3)  # string close
+        new_pos = content.index("if (e.inpaintFullCanvas")
+        assert third_open < new_pos < fourth_close, (
+            f"new block placed OUTSIDE the string literal:\n{content}"
+        )
+        last_existing = content.index(
+            "if (e.inpaintPrompt) e.inpaintPrompt.disabled = busy;")
+        assert new_pos > last_existing, (
+            f"new block placed BEFORE the last JS statement:\n{content}"
+        )
+
+    check_apply("21_ast_embedded_js", extra)
+
+def test_24():
+    """Structural append: statement inside embedded JS.
+
+    Reproduces the pg_panel_fields.py failure with NO AST dependency.
+    The block is a bare `if (e.inpaintFullCanvas...)` guard; base
+    has a `syncPanelFields` function inside a Python string.  The
+    step-9 text fallback finds the last top-level function and
+    inserts before its close brace.
+    """
+    def extra(target, run):
+        rec = run["manifest"].get("files", {}).get("helper.py", {})
+        assert rec, "helper.py missing from manifest files"
+        assert rec.get("trust") == "HIGH", (
+            f"expected trust=HIGH, got {rec.get('trust')}; "
+            f"verification: {rec.get('verification')}, "
+            f"warnings: {rec.get('warnings')}"
+        )
+        content = (target / "helper.py").read_text()
+        assert "inpaintFullCanvas" in content, (
+            f"new block missing:\n{content}"
+        )
+        assert "e.imageInfo" in content, (
+            f"existing content lost:\n{content}"
+        )
+        assert "e.inpaintPrompt" in content, (
+            f"trailing statement lost:\n{content}"
+        )
+        close = content.rfind("}")
+        new_pos = content.index("if (e.inpaintFullCanvas")
+        assert new_pos < close, (
+            f"new block outside function body:\n{content}"
+        )
+
+    check_apply("24_structural_append_stmt", extra)
+
+
+def test_25():
+    """Structural append: declaration after existing pair.
+
+    Reproduces the pg_panel_scrubs.py failure with NO AST dependency.
+    The block is a `const X = ...; if (X) {...}` pair; base has
+    an existing `const Y = document.getElementById(...); if (Y)
+    {...}` block.  The RHS pattern matches (string literals
+    abstracted) and the block is inserted after the existing pair.
+    """
+    def extra(target, run):
+        rec = run["manifest"].get("files", {}).get("scrubs.py", {})
+        assert rec, "scrubs.py missing from manifest files"
+        assert rec.get("trust") == "HIGH", (
+            f"expected trust=HIGH, got {rec.get('trust')}; "
+            f"verification: {rec.get('verification')}, "
+            f"warnings: {rec.get('warnings')}"
+        )
+        content = (target / "scrubs.py").read_text()
+        assert "inpaintFullCanvasEl" in content, (
+            f"new block missing:\n{content}"
+        )
+        assert "inpaintPromptEl" in content, (
+            f"existing block lost:\n{content}"
+        )
+        # New block must be after the existing if-block closes.
+        existing_close = content.index("});\n}")
+        new_start = content.index("inpaintFullCanvasEl")
+        assert new_start > existing_close, (
+            f"new block inserted inside existing block:\n{content}"
+        )
+        assert "export { };" in content, (
+            f"trailing export lost:\n{content}"
+        )
+
+    check_apply("25_structural_append_decl", extra)
+
+
+def test_26():
+    """Unbalanced block must fail-closed.
+
+    The block is a 3-line fragment with one open brace and zero
+    close braces — exactly the pg_panel_fields.py shape.  Step-9
+    structural append refuses to append it; pass8_verify's
+    `validate_content` catches the resulting file anyway.  Target
+    file preserved; block lands in `low_trust/`.
+    """
+    def extra(target, run):
+        decisions = run["manifest"].get("decisions", {})
+        dec = decisions.get("broken.js", {})
+        assert dec, "broken.js missing from manifest decisions"
+        assert dec.get("written") is False, (
+            f"expected written=False (fail-closed), got "
+            f"{dec.get('written')}"
+        )
+        assert dec.get("trust") == "LOW", (
+            f"expected trust=LOW, got {dec.get('trust')}"
+        )
+        content = (target / "broken.js").read_text()
+        assert "export function handler" in content, (
+            f"base function gone:\n{content}"
+        )
+        assert "cond" not in content, (
+            f"broken block leaked to target:\n{content}"
+        )
+
+    check_apply("26_unbalanced_fails_closed", extra, skip_file_compare=True, min_trust="MEDIUM")
+
+
+def test_27():
+    """Deleted-function regression must fail-closed.
+
+    Base has two exported functions in an embedded JS string; a
+    scoped-replace attempts to empty the `deleteMe` block.  The
+    function-presence check in `validate_content` catches the
+    missing declaration and routes the file to `low_trust/`.
+    """
+    def extra(target, run):
+        decisions = run["manifest"].get("decisions", {})
+        dec = decisions.get("deleted.py", {})
+        assert dec, "deleted.py missing from manifest decisions"
+        assert dec.get("written") is False, (
+            f"expected written=False (fail-closed), got "
+            f"{dec.get('written')}"
+        )
+        content = (target / "deleted.py").read_text()
+        assert "keepMe" in content, (
+            f"base function gone:\n{content}"
+        )
+        assert "deleteMe" in content, (
+            f"base function gone:\n{content}"
+        )
+
+    check_apply("27_deleted_function_fails_closed", extra, skip_file_compare=True, min_trust="MEDIUM")
+
+
+def test_22():
+    """Fuzzy replace-pair: exact and normalized fail, superset
+    similarity succeeds.  Reproduces the pg_dispatch.py shape."""
+    def extra(target, run):
+        rec = run["manifest"].get("files", {}).get("target.js", {})
+        assert rec, "target.js missing from manifest files"
+        assert rec.get("trust") == "HIGH", (
+            f"expected trust=HIGH, got {rec.get('trust')}")
+        assert rec.get("verification", {}).get("pairs_applied", 0) == 1, (
+            f"expected 1 pair applied, got {rec}")
+        content = (target / "target.js").read_text()
+        assert "Skipped when the rect is hidden" in content
+        assert "board.inpaintEnabled && r" not in content
+        assert "!board.inpaintFullCanvas" in content
+
+    check_apply("22_fuzzy_replace_pair", extra)
+
+
+def test_23():
+    """Identifier-block anchor: const+if insertion after whole pair.
+    Reproduces the pg_panel_scrubs.py shape."""
+    def extra(target, run):
+        rec = run["manifest"].get("files", {}).get("scrubs.js", {})
+        assert rec, "scrubs.js missing from manifest files"
+        assert rec.get("trust") == "HIGH", (
+            f"expected trust=HIGH, got {rec.get('trust')}")
+        content = (target / "scrubs.js").read_text()
+        assert "inpaintFullCanvasEl" in content
+        assert "inpaintPromptEl" in content
+        existing_close = content.index("});\n}")
+        new_start = content.index("inpaintFullCanvasEl")
+        assert new_start > existing_close, (
+            f"new block inside existing if-block:\n{content}")
+        assert "export { };" in content
+
+    check_apply("23_identifier_block_anchor", extra)
+
+
 def main():
     tests = [
         ("01", test_01), ("02", test_02), ("03", test_03),
@@ -1071,8 +1298,8 @@ def main():
         ("07", test_07), ("08", test_08), ("09", test_09),
         ("10", test_10), ("11", test_11),
         ("12", test_12), ("13", test_13), ("14", test_14),
-        ("15", test_15), ("16", test_16), ("17", test_17), ("19", test_19), ("20", test_20),
-        ("18", test_18),
+        ("15", test_15), ("16", test_16), ("17", test_17), ("19", test_19), ("20", test_20), ("21", test_21),
+        ("18", test_18), ("22", test_22), ("23", test_23), ("24", test_24), ("25", test_25), ("26", test_26), ("27", test_27)
     ]
     failed = 0
     for name, fn in tests:

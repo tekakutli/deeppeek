@@ -397,7 +397,7 @@ def run(cfg: RecoverConfig) -> int:
         print("  clean")
 
     print("[pass 8] verifying...")
-    pass8_verify(records)
+    pass8_verify(records, blocks_by_idx=blocks_by_idx)
 
     print("[pass 9] writing files...")
     rc = pass9_write(

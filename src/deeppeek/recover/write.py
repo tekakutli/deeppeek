@@ -692,6 +692,13 @@ def pass9_write(records: dict,
             "warnings": rec.warnings,
         }
 
+    ast_info = None
+    try:
+        from .ast_anchor import ast_status
+        ast_info = ast_status()
+    except Exception:
+        pass
+
     manifest = {
         "dump": {
             "path": dump_display,
@@ -711,6 +718,7 @@ def pass9_write(records: dict,
                 "cached": llm.calls_cached if llm else 0,
                 "refused": llm.calls_refused if llm else 0,
             },
+            "ast": ast_info,
             "block_classification": {
                 "total": len(blocks),
                 "escalated_to_llm": escalated,

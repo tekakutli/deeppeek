@@ -297,11 +297,56 @@ def _diff_lines_for_verify(body: str) -> tuple[list[str], list[str]]:
     return adds, dels
 
 
-def pass8_verify(records: dict[str, FileRecord]) -> None:
+def pass8_verify(records: dict[str, FileRecord],
+                 blocks_by_idx: Optional[dict] = None) -> None:
+    from .validate_output import validate_content
     for path, rec in records.items():
         if rec.content is None:
             continue
         v = rec.verification
+
+        base_for_check = None
+        if blocks_by_idx is not None and rec.last_full_idx is not None:
+            base_block = blocks_by_idx.get(rec.last_full_idx)
+            if base_block is not None:
+                base_for_check = base_block.body
+
+        # Declarations that a deletion patch was explicitly told to
+        # remove must not trigger the presence regression check.
+        # Otherwise every correct deletion looks like a lost function.
+        allow_missing = set()
+        if base_for_check:
+            from .core import _is_deletion_instruction, _strip_diff_prefixes
+            for p in rec.patches:
+                if p.get("applied_by") != "deterministic":
+                    continue
+                body = p.get("body", "")
+                if not body:
+                    continue
+                if not _is_deletion_instruction(
+                        body, p.get("context_before", "")):
+                    continue
+                stripped = _strip_diff_prefixes(body)
+                for m in __import__("re").finditer(
+                        r"(?:const|let|var|function|class)\s+"
+                        r"([A-Za-z_$][\w$]*)",
+                        stripped):
+                    allow_missing.add(m.group(1))
+
+        structural_err = validate_content(
+            rec.content, path, base=base_for_check,
+            allow_missing=allow_missing)
+        if structural_err:
+            v["content_valid"] = f"FAIL: {structural_err}"
+            rec.trust = "LOW"
+            rec.sanity_rejected = True
+            rec.verification["sanity_reason"] = structural_err
+            rec.warnings.append(
+                f"content validation failed: {structural_err}")
+            print(f"  [verify] content validation FAIL in {path}: "
+                  f"{structural_err}", file=sys.stderr)
+            continue
+        v["content_valid"] = "ok"
 
         if path.endswith(".py"):
             try:
