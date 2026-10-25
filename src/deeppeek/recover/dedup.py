@@ -2,15 +2,35 @@
 recover.dedup — Pass 5 (pick one full-print winner per file) plus
 pair detection.
 
-Pair detection (new in 2026-11-01) runs first.  Any block that is
-half of a replace pair or the single half of a scoped replacement
-is *removed* from the normal trailing-patch path — it becomes a
-structured edit that `apply_patches` handles separately.
+Pair detection runs first.  Any block that is half of a replace pair
+or a scoped replace is *removed* from the normal trailing-patch path
+— it becomes a structured edit that `apply_patches` handles
+separately.
 
-Without this, a replace pair was being mangled: the OLD block was
-seen as a delete (matched the base exactly), the NEW block was
-dropped as an unclassifiable snippet (no anchor in base).  Result:
-half the transformation applied.
+SILENT-DROP POLICY (2026-11-01c)
+================================
+Any attributed partial block whose body shows a code signal becomes
+a patch candidate.  The code-signal check (`_has_code_signal`) is
+intentionally permissive: it accepts `=`, `;`, `{`, `}`, `=>`,
+`->`, `identifier(`, `: value`, HTML tags, and a small set of
+code keywords.  This is the general-purpose rule:
+
+    if a block was attributed to a file (by header or by orphan
+    attribution) and its body contains anything a programmer would
+    write as code, we attempt the patch.
+
+If the patch cannot apply, fail-closed catches it: the record goes
+to `low_trust/` and the target is preserved.  This is strictly
+better than the previous policy, which silently dropped legitimate
+code additions (blocks 41, 42, 44 in the pg_panel_fields /
+pg_panel_scrubs edits were dropped because they contained
+single-line bodies without an add-family verb in the prose).
+
+The code-signal check only excludes genuinely prose-y blocks
+(`[Inpaint] [Cancel]`, `Drag the rectangle to move it...`, bare
+sentences).  Those would have been mis-classified as `partial` by
+the heuristic classifier; the code-signal check filters them before
+they reach the patcher.
 """
 
 import re
@@ -25,10 +45,75 @@ from .core import (
 from .pairing import detect_all, build_pairs
 
 
-def pass5_deduplicate(records: dict[str, FileRecord],
-                      blocks_by_idx: dict[int, Block],
+_EXPORT_CONST_OBJECT_RE = re.compile(
+    r'^export\s+(?:const|let|var)\s+\w+\s*=\s*\{'
+)
+
+
+# ---------------------------------------------------------------------------
+# Code-signal detection
+# ---------------------------------------------------------------------------
+#
+# A "code signal" is anything that distinguishes code from prose:
+#
+#   * Assignment, statement terminator, or block braces anywhere on a line
+#   * Arrow function or type hint
+#   * An identifier followed by `(` (function/method call)
+#   * A key: value pattern (object literal entry)
+#   * An HTML/XML opening tag
+#
+# Line-start keyword detection covers the remaining common cases
+# (`def`, `class`, `function`, `const`, `let`, `var`, `import`,
+# `from`, `return`, `async`, `await`, `yield`, `try`, `except`,
+# `finally`, `throw`, `raise`, `export`, `package`).
+#
+# `if`, `for`, `while`, `else`, `elif`, `with` are deliberately NOT
+# in the keyword list — they are too common as prose words.  A line
+# starting with `if (` will still pass because of the `(` signal.
+
+_CODE_KEYWORDS = (
+    "def ", "class ", "function ", "const ", "let ", "var ",
+    "import ", "from ", "return ", "async ", "await ", "yield ",
+    "try ", "except ", "finally ", "throw ", "raise ",
+    "export ", "package ",
+)
+
+_CODE_PUNCT_LINE_RE = re.compile(
+    r'[=;]'                       # assignment or statement terminator
+    r'|[{}]'                      # block braces
+    r'|=>'                        # arrow function
+    r'|->\s'                      # type hint (Python/TS)
+    r'|\(\s*\)'                   # empty call
+    r'|[A-Za-z_$][\w$]*\s*\('     # identifier followed by (
+    r'|:\s+\S'                    # key: value pattern
+    r'|<\/?[A-Za-z]'              # HTML/XML tag
+)
+
+
+def _has_code_signal(body: str) -> bool:
+    """True iff `body` looks like code rather than prose.
+
+    Permissive by design.  False positives lead to failed patches
+    (caught by fail-closed), while false negatives lead to silent
+    drops (the class of failure this policy exists to eliminate).
+    """
+    if not body:
+        return False
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if any(stripped.startswith(kw) for kw in _CODE_KEYWORDS):
+            return True
+        if _CODE_PUNCT_LINE_RE.search(stripped):
+            return True
+    return False
+
+
+def pass5_deduplicate(records: dict,
+                      blocks_by_idx: dict,
                       verbose: bool) -> None:
-    # ---- new: detect replace / scoped pairs first ----
+    # ---- detect replace / scoped pairs first ----
     detect_all(list(blocks_by_idx.values()), blocks_by_idx)
     global_pairs = build_pairs(blocks_by_idx)
 
@@ -50,11 +135,10 @@ def pass5_deduplicate(records: dict[str, FileRecord],
             fulls = []
             rec.preexisting_base = False
 
-        # ---- new: pair-assigned blocks are excluded from patches ----
+        # ---- pair-assigned blocks are excluded from patches ----
         pair_idxs_for_this_file = set()
         for anchor, pair in global_pairs.items():
             if pair["old_idx"] == -1:
-                # Scoped: block anchor is both old and new
                 b = blocks_by_idx[anchor]
                 if b.output_path == path:
                     pair_idxs_for_this_file.add(anchor)
@@ -97,8 +181,6 @@ def pass5_deduplicate(records: dict[str, FileRecord],
                   file=sys.stderr)
 
         if not fulls:
-            # Pairs require a base to operate on.  If there's no full
-            # print, the pair cannot apply.
             if rec.pairs:
                 rec.state = "PARTIAL_ONLY"
                 if verbose:
@@ -143,24 +225,23 @@ def pass5_deduplicate(records: dict[str, FileRecord],
             if not body:
                 return False
 
+            # Structured patch types — always accepted.
             if _is_deletion_instruction(body, b.context_before):
                 return True
-
             if b.fence_lang.lower() == "diff":
                 return True
-
             if _looks_like_diff_body(body):
                 return True
-
             first_line = body.split("\n", 1)[0].strip()
-            if re.match(
-                r'^export\s+(?:const|let|var)\s+\w+\s*=\s*\{',
-                first_line,
-            ):
+            if _EXPORT_CONST_OBJECT_RE.match(first_line):
                 return True
             if body.startswith("@@ ") or "\n@@ " in body:
                 return True
-            return False
+
+            # Policy (2026-11-01c): any remaining attributed partial
+            # with a code signal is a patch candidate.  Silent drops
+            # are strictly worse than fail-closed rejections.
+            return _has_code_signal(body)
 
         trailing = [p for p in partials
                     if p > chosen_idx and _is_real_patch(p)]
@@ -181,15 +262,13 @@ def pass5_deduplicate(records: dict[str, FileRecord],
         else:
             rec.state = "MULTI_FULL"
 
-        # A file with only pairs (no trailing patches, one full
-        # print) still needs FULL_PLUS_PATCH so apply_patches runs.
         if rec.pairs and rec.state == "SINGLE_FULL":
             rec.state = "FULL_PLUS_PATCH"
 
 
 def _dedup_pick(path: str,
-                fulls: list[int],
-                blocks_by_idx: dict[int, Block]) -> tuple[int, str]:
+                fulls: list,
+                blocks_by_idx: dict) -> tuple:
     if len(fulls) == 1:
         return fulls[0], "single"
 
@@ -216,7 +295,7 @@ def _dedup_pick(path: str,
         for i in fulls
     }
 
-    qualifies: dict[int, float] = {}
+    qualifies = {}
     for j in fulls:
         bj = body_lines[j]
         if len(bj) < _SIM_MIN_LINES:

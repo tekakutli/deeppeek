@@ -130,6 +130,22 @@ intermediate markdown stays in memory. To keep it on disk too, add
 The files appear as chips in the input. Type your prompt and send —
 `pipe` attaches but does not submit.
 
+## Optional: AST anchoring
+
+The `recover` command's text heuristics can place most AI-generated
+edits.  For blocks with no unique text anchor (e.g. a bare `if`
+statement referencing local variables, or a top-level `const X = ...`
+declaration), the tool falls back to fail-closed by default.
+
+To enable structural anchoring — which uses tree-sitter to find the
+correct insertion point from the file's AST — install the `ast` extra:
+
+    pipx inject deeppeek 'deeppeek[ast]'
+
+This pulls in `tree-sitter` and `tree-sitter-javascript`.  Without it,
+`recover` works exactly as before: text-only heuristics plus
+fail-closed.
+
 ## Common flags
 
 `capture`:

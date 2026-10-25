@@ -20,6 +20,25 @@ Intent vocabulary (each maps to a different patcher):
     INSERT          single block, prose signals insertion
     FULL            single block, prose signals a full-file write
     UNKNOWN         no clear signal
+
+SCOPE-FROM-BODY EXTRACTION
+==========================
+When the prose says "replace/update/change the X" (or "add X to Y")
+but the block body carries a recognisable scope marker (an HTML
+`<details>` with a `<summary>`, a Python `def X`, a JS `function X`
+/ `export const X = {`), we can extract the scope name *from the
+body* rather than requiring the prose to name it.  This is
+`_extract_scope_from_body`, used by `pairing._detect_scoped` as a
+fallback.
+
+ADD VERBS
+=========
+"Add", "insert", "append", and "prepend" are treated as
+replace-adjacent verbs for scoped-replace purposes: an instruction
+like "add the full-canvas early-out to `drawInpaintContext`:" with
+a body that IS the full new function is a scoped-replace in
+disguise.  The `_ADD_VERBS` tuple carries these, and
+`is_add_instruction` is a per-context check.
 """
 
 import re
@@ -58,6 +77,20 @@ _REPLACE_WITH_PROSE = (
     "becomes",
     "new code:",
 )
+
+# Verbs that indicate the block *is* the new content for some scope,
+# even without a name in prose.  Used by the pairing fallback.
+#
+# The trailing space after each verb reduces false positives ("add"
+# vs "additional", "insert" vs "insertion").  "modify" and "edit"
+# are excluded from the trailing-space form because they commonly
+# appear as "modifying" / "edited" in prose.
+_REPLACE_VERBS = ("replace", "update", "change", "rewrite", "modify", "edit")
+
+# Add-family verbs.  Treated as replace-adjacent for scoped-apply
+# because a body that IS the full new scope is a scoped-replace,
+# regardless of whether the prose says "replace" or "add".
+_ADD_VERBS = ("add ", "insert ", "append ", "prepend ", "include ")
 
 # Scoped-replace prose — no OLD block follows; only the NEW block,
 # and the prose names the target as "<scope> for <name>".
@@ -121,9 +154,6 @@ def parse_intent(context_before: str) -> Intent:
         return Intent()
 
     text_lower = text.lower()
-    # Strip backticks only for the scoped-replace regex, which
-    # tolerates them imperfectly; leave the rest of `text` alone so
-    # multi-word phrases match cleanly.
     text_clean = text_lower.replace("`", "")
 
     for phrase in _REPLACE_WITH_PROSE:
@@ -161,20 +191,10 @@ def is_with_connective(context_before: str) -> bool:
     """True iff the prose preceding the block is a `with:`-style
     follow-on connective.
 
-    This is the single strongest signal for pair formation.  The
-    connective names the *second* half of a replace: the AI is
-    saying "the block above this line is the old version; the block
-    below is the new version, with: [this]".  Two adjacent code
-    blocks separated by "with:" *is* the replace-pair shape,
-    regardless of what verb the first block's prose used.  Requiring
-    the first block to say "Replace the block:" was why
-    "Replace the doc comment above X:" silently failed to form a
-    pair and its old block was dropped as a stray snippet.
-
     Only the last non-empty line is checked — that is the prose
-    directly above the code block.  A leading conjunction
-    ("And ", "Then ", "And then ") is stripped first, because
-    "And with:" reads the same as "with:".
+    directly above the code block.  A leading conjunction ("And ",
+    "Then ", "And then ") is stripped first, because "And with:"
+    reads the same as "with:".
     """
     text = (context_before or "").strip().lower()
     if not text:
@@ -195,3 +215,46 @@ def is_with_connective(context_before: str) -> bool:
         "with:", "with the following", "with this:",
         "to:", "becomes:", "new code:",
     ))
+
+
+def is_add_instruction(context_before: str) -> bool:
+    """True iff the prose contains an add-family verb."""
+    text = (context_before or "").lower()
+    return any(v in text for v in _ADD_VERBS)
+
+
+def _extract_scope_from_body(body: str) -> tuple:
+    """Return (name, kind) extracted from the block body, or ("", "")."""
+    if not body:
+        return "", ""
+    for pattern, kind in _SCOPE_FROM_BODY_PATTERNS:
+        m = pattern.search(body)
+        if m:
+            return m.group(1).strip(), kind
+    return "", ""
+
+
+# ---------------------------------------------------------------------------
+# Scope extraction from block body
+# ---------------------------------------------------------------------------
+
+_SCOPE_FROM_BODY_PATTERNS = [
+    # HTML <details> with <summary>
+    (re.compile(
+        r"<details\b[^>]*>\s*<summary>\s*([A-Za-z][\w \-]+?)\s*</summary>",
+        re.IGNORECASE | re.DOTALL),
+     "details"),
+    # Python def/class at top level
+    (re.compile(r"^(?:def|class)\s+([A-Za-z_]\w*)", re.MULTILINE),
+     "python"),
+    # JS function/class (with or without export)
+    (re.compile(
+        r"^(?:export\s+)?(?:async\s+)?(?:function|class)\s+([A-Za-z_]\w*)",
+        re.MULTILINE),
+     "javascript"),
+    # JS object literal (with or without export)
+    (re.compile(
+        r"^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_]\w*)\s*=\s*\{",
+        re.MULTILINE),
+     "javascript"),
+]

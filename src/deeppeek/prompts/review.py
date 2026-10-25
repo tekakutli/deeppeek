@@ -22,6 +22,52 @@ Hard requirement, checked BEFORE any destructive operation:
 we refuse — `git reset --hard` on a non-repo would be silent and
 useless, and we'd rather bail with a clear message.
 
+`--text STR` REPLACES THE COMPOSER CONTENT
+==========================================
+When `--text STR` is given, `STR` is typed into the DeepSeek
+composer — exactly that string, nothing else, no concatenation,
+no wrapping.  The templated default prompt is not used.  The rest
+of the pipeline is unchanged: reset runs, apply runs, status is
+captured, meta files are collected, and the pipe stage attaches
+them as file chips.  The composer receives the file chips AND the
+override text; the file chips are not part of the text field, so
+the "only text in the text field" claim still holds.
+
+Use cases for `--text`:
+
+  · "just send a one-liner about this aftermath" — pass a short
+    string and let the attachments speak for themselves.
+  · "use a completely different prompt template" — craft it
+    externally, pass it in.
+  · scripting: feed a prompt from a file via
+    `--text "$(cat prompt.md)"`.
+
+The override string is used verbatim.  It is NOT `str.format`-ed
+against the pipeline's kwargs — if you want the target path or
+the conversation filename in there, `pwd` in the shell you are
+running from (or use `--dry-run` to see them) and paste.  This
+keeps the semantics dead simple: what you pass is what gets typed.
+To suppress the attachments too (composer text only, no file
+chips), add `--no-pipe`.
+
+NON-ZERO EXIT FROM RECOVER IS NOT FATAL
+=======================================
+`deeppeek recover` uses non-zero exit codes to signal partial
+application:
+
+    1 — fail-closed: ≥1 file fell below --min-trust
+    2 — skipped/missing files, basename collisions, [DEL] misses
+    3 — validation error before recovery started
+    4 — import-graph problems (missing modules / missing exports)
+
+(`write.pass9_write` accumulates them via `max()`, so exit 4
+dominates exit 1 when both happen.)  Those partial outcomes are
+*precisely* what this command exists to review — aborting on them
+would defeat the purpose.  The real gate is whether `deeppeek/`
+exists after the apply (see `_stage_require_meta`).  The exit code
+is recorded and surfaced in the typed prompt so the model knows
+what it's looking at, but it does not abort the pipeline.
+
 Informational warning, before the reset: if `<cwd>/deeppeek/` does
 not exist, print a note that the user is about to nuke a tree that
 does not (yet) look like a deeppeek target.  This is *not* a
@@ -29,9 +75,9 @@ blocker — the reset+apply will recreate `deeppeek/` anyway — but it
 is the cheapest possible safety rail against running the script in
 the wrong directory.
 
-After the apply, `deeppeek/` is a hard requirement again.  If it
-does not exist post-apply, the apply silently failed; bail rather
-than review nothing.
+After the apply, `deeppeek/` is a hard requirement.  If it does not
+exist post-apply, the apply silently failed; bail rather than
+review nothing.
 
 `deeppeek/low_trust/` and `deeppeek/cache/` are NOT piped — those
 are per-file post-patch bodies and the LLM prompt cache, not the
@@ -60,9 +106,26 @@ _STATUS_PY_SCRIPT = _PROJECT_ROOT / "scripts" / "status.py"
 DEFAULT_CONVERSATION = Path("/tmp/conversation.md")
 
 
+# `deeppeek recover` exit codes, surfaced to the model as a
+# human-readable gloss on the number.
+_RECOVER_EXIT_GLOSS = {
+    0: "clean run — everything the tool attempted landed",
+    1: "fail-closed — ≥1 file fell below --min-trust, target preserved",
+    2: "partial — some files skipped, missing, or [DEL] targets not found",
+    3: "validation error before recovery started",
+    4: "import-graph problems (missing modules or exports)",
+}
+
+
 DEFAULT_PROMPT_TEMPLATE = """\
 I just ran `cd {target} && deeppeek recover {conversation} --apply-here`,
-on the clean original pre-applied state, and this is the aftermath.  Attached:
+on the clean original pre-applied state, and this is the aftermath.
+The recover run exited with code {recover_rc} ({recover_rc_gloss}).
+Exit codes are accumulated via `max()`, so a higher number can
+mask a lower one — read the reports for the full picture rather
+than assuming the run was all-or-nothing.
+
+Attached:
 
   1. `diff.txt` — a `git status`-style view of {target} after the
      apply (unstaged hunks + untracked files).  This is exactly what
@@ -215,7 +278,21 @@ def _stage_reset(cwd: Path) -> None:
         raise SystemExit(f"error: `git clean -fd` exited {rc}")
 
 
-def _stage_apply(cwd: Path, args: argparse.Namespace) -> None:
+def _stage_apply(cwd: Path, args: argparse.Namespace) -> int:
+    """Run `recover --apply-here` in `cwd` and return its exit code.
+
+    Non-zero exit is NOT an abort condition: `deeppeek recover` uses
+    non-zero exit codes to signal partial application (1 = fail-
+    closed, 2 = skipped/missing/collisions, 4 = import-graph
+    problems).  Those are the outcomes this command exists to
+    review.  A hard failure shows up as a missing `deeppeek/`
+    directory, which `_stage_require_meta` catches immediately
+    after this returns.
+
+    The returned code is threaded into the typed prompt so the
+    model knows the recovery outcome without having to reconstruct
+    it from the reports.
+    """
     print(f"[apply] recover {args.conversation} --apply-here in {cwd}",
           file=sys.stderr)
     prefix = _deeppeek_cmd()
@@ -224,12 +301,15 @@ def _stage_apply(cwd: Path, args: argparse.Namespace) -> None:
     ]
     rc, _, _ = _run_cmd(
         cmd, cwd=cwd,
-        timeout=args.recover_timeout, allow_failure=False,
+        timeout=args.recover_timeout, allow_failure=True,
     )
     if rc != 0:
-        raise SystemExit(
-            f"error: `deeppeek recover --apply-here` exited {rc}"
+        print(
+            f"  recover exited {rc} — continuing; the reports under "
+            f"deeppeek/ record the partial outcome",
+            file=sys.stderr,
         )
+    return rc
 
 
 # ---------------------------------------------------------------------------
@@ -341,15 +421,45 @@ def _stage_type(text: str, args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Prompt assembly — cwd, conversation, and meta dir templated in
+# Prompt assembly — cwd, conversation, meta dir, recover_rc templated in
 # ---------------------------------------------------------------------------
 
+def _recover_rc_gloss(rc: int) -> str:
+    if rc in _RECOVER_EXIT_GLOSS:
+        return _RECOVER_EXIT_GLOSS[rc]
+    # Unknown code — could be a user-supplied handler, a wrapper,
+    # or a signal.  Say so without guessing.
+    return "unrecognised exit code; read the reports directly"
+
+
 def _build_prompt(cwd: Path, meta_dir: Path,
-                  conversation: Path) -> str:
+                  conversation: Path, recover_rc: int) -> str:
     return DEFAULT_PROMPT_TEMPLATE.format(
         target=cwd.resolve(),
         meta_name=meta_dir.name or "deeppeek",
         conversation=str(conversation),
+        recover_rc=recover_rc,
+        recover_rc_gloss=_recover_rc_gloss(recover_rc),
+    )
+
+
+def _resolve_composer_text(args: argparse.Namespace,
+                           cwd: Path,
+                           meta_dir: Path,
+                           recover_rc: int) -> tuple[str, str]:
+    """Return (text, source_tag) for the composer.
+
+    When `--text STR` is given, STR is returned verbatim — no
+    formatting, no wrapping, no concatenation with the default
+    template.  Otherwise the templated default is built from the
+    pipeline's state.  `source_tag` is a short label used only in
+    the log line so the user can see which path was taken.
+    """
+    if args.text is not None:
+        return args.text, "--text override"
+    return (
+        _build_prompt(cwd, meta_dir, args.conversation, recover_rc),
+        "default template",
     )
 
 
@@ -361,17 +471,31 @@ def run(args: argparse.Namespace) -> int:
     cwd = Path.cwd()
     print(f"[review] cwd: {cwd}", file=sys.stderr)
 
+    # 0. Cheap upfront validation of --text so we don't nuke the
+    #    tree and *then* discover the override is empty.  `deeppeek
+    #    type` would reject empty text anyway; failing here gives a
+    #    clearer error and does not reset anything.
+    if args.text is not None and not args.text.strip():
+        print("error: --text is empty (or whitespace-only).  "
+              "Omit --text to use the default prompt.",
+              file=sys.stderr)
+        return 2
+
     # 1. Hard: must be a git work tree (reset depends on it).
     _stage_verify_git(cwd)
 
     # 2. Informational: warn if this tree has never been applied to.
     _stage_warn_if_no_meta(cwd)
 
-    # 3. Reset + apply (the deterministic prelude).
+    # 3. Reset + apply (the deterministic prelude).  Apply's exit
+    #    code is captured, NOT treated as fatal — partial outcomes
+    #    are the whole reason this command exists.
     _stage_reset(cwd)
-    _stage_apply(cwd, args)
+    recover_rc = _stage_apply(cwd, args)
 
-    # 4. Hard: deeppeek/ must exist after the apply.
+    # 4. Hard: deeppeek/ must exist after the apply.  This is the
+    #    real gate — if recovery ran, it wrote its reports, and
+    #    those are what we're about to review.
     meta_dir = _stage_require_meta(cwd)
     print(f"  metadata: {meta_dir}", file=sys.stderr)
 
@@ -388,16 +512,21 @@ def run(args: argparse.Namespace) -> int:
     for f in meta_files:
         print(f"    {f.name}", file=sys.stderr)
 
-    prompt = _build_prompt(cwd, meta_dir, args.conversation)
-    print(f"[build] prompt: {len(prompt):,} chars", file=sys.stderr)
+    composer_text, source_tag = _resolve_composer_text(
+        args, cwd, meta_dir, recover_rc,
+    )
+    print(f"[build] composer text: {len(composer_text):,} chars "
+          f"({source_tag})", file=sys.stderr)
 
     if args.dry_run:
         print("\n[dry-run] would pipe:", file=sys.stderr)
         print(f"  {status_path}", file=sys.stderr)
         for f in meta_files:
             print(f"  {f}", file=sys.stderr)
-        print("\n[dry-run] prompt below; not typed.", file=sys.stderr)
-        print(prompt)
+        print(f"\n[dry-run] recover exited {recover_rc}", file=sys.stderr)
+        print(f"[dry-run] composer text ({source_tag}) below; not typed.",
+              file=sys.stderr)
+        print(composer_text)
         return 0
 
     if not args.no_pipe:
@@ -408,7 +537,7 @@ def run(args: argparse.Namespace) -> int:
         if rc != 0:
             return rc
 
-    return _stage_type(prompt, args)
+    return _stage_type(composer_text, args)
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +557,20 @@ def register(sub: argparse._SubParsersAction) -> None:
              f"(default: {DEFAULT_CONVERSATION})",
     )
     p.add_argument(
+        "--text", default=None, metavar="STR",
+        help="Override the default templated prompt.  STR is typed "
+             "into the DeepSeek composer verbatim — exactly that "
+             "string, nothing else, no concatenation with the "
+             "default template.  The rest of the pipeline (reset, "
+             "apply, status capture, pipe) still runs and the "
+             "captured diff + meta files are still attached as "
+             "file chips.  Use --no-pipe to suppress the "
+             "attachments as well.  The string is NOT "
+             "str.format-ed; if you want the target path in there, "
+             "paste it (run --dry-run first to see what's "
+             "available).",
+    )
+    p.add_argument(
         "--workspace", type=Path, default=None,
         help="directory for the captured diff.txt.  Default: a fresh "
              "temp dir in /tmp.  Point this at a stable location to "
@@ -441,13 +584,16 @@ def register(sub: argparse._SubParsersAction) -> None:
     )
     p.add_argument(
         "--no-pipe", action="store_true",
-        help="skip the pipe step; only type the prompt (useful when "
-             "the attachments are already in the composer)",
+        help="skip the pipe step; only type the composer text "
+             "(useful when the attachments are already in the "
+             "composer, or when you want only --text in the "
+             "composer with no file chips at all)",
     )
     p.add_argument(
         "--dry-run", action="store_true",
         help="run the reset + apply, capture the status, print the "
-             "file list and the prompt, then stop — no pipe, no type",
+             "file list and the composer text, then stop — no "
+             "pipe, no type",
     )
     p.add_argument(
         "--recover-timeout", type=float, default=1800.0,

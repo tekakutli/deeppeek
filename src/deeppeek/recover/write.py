@@ -4,8 +4,18 @@ recover.write — Pass 9 (write files, manifest, warnings).
 New in 2026-11-01: `sanity_rejected` branch.  A file marked with
 `sanity_rejected = True` by `apply_patches` is treated exactly like
 a `LOW`-trust file: not written to the target tree, reported in
-`warnings.txt`, and preserved as-is.  This is the last line of
-defence against over-deletion.
+`warnings.txt`, and preserved as-is.
+
+New in 2026-11-01 (b): trust reason names the specific check
+(`patches_incomplete`, `pairs_incomplete`, `ast_parse_failed`).
+Unattributed orphans report their first content line.
+
+New in 2026-11-01 (c): `patch_failure_reasons` in `decisions[path]`.
+Each failed patch records its `idx`, `first_line`, and `reason`.
+`warnings.txt` gets a `[PATCH_FAILED]` line per failed patch.  The
+final summary prints one PATCH_FAILED / PAIR_FAILED line per failure
+so the user sees the diagnostics in the console without opening
+files.
 """
 
 import hashlib
@@ -26,8 +36,8 @@ from .llm import LLMClient
 from .validate import _py_imports, _is_likely_local
 
 
-def _scan_mentioned_files(dump_text: str) -> set[str]:
-    mentioned: set[str] = set()
+def _scan_mentioned_files(dump_text: str) -> set:
+    mentioned: set = set()
     for m in re.finditer(r'[A-Za-z0-9_./\-]+', dump_text):
         tok = m.group(0)
         if any(tok.endswith(ext) for ext in SOURCE_EXTENSIONS):
@@ -37,8 +47,8 @@ def _scan_mentioned_files(dump_text: str) -> set[str]:
     return mentioned
 
 
-def _aggregate_missing_imports(records: dict[str, FileRecord]) -> set[str]:
-    expected: set[str] = set()
+def _aggregate_missing_imports(records: dict) -> set:
+    expected: set = set()
     for path, rec in records.items():
         if not path.endswith(".py"):
             continue
@@ -56,8 +66,8 @@ def _aggregate_missing_imports(records: dict[str, FileRecord]) -> set[str]:
     return expected - recovered
 
 
-def _recovered_name_prefixes(records: dict[str, FileRecord]) -> set[str]:
-    prefixes: set[str] = set()
+def _recovered_name_prefixes(records: dict) -> set:
+    prefixes: set = set()
     for path, rec in records.items():
         if rec.content is None:
             continue
@@ -73,8 +83,8 @@ def _recovered_name_prefixes(records: dict[str, FileRecord]) -> set[str]:
     return prefixes
 
 
-def _recovered_extensions(records: dict[str, FileRecord]) -> set[str]:
-    exts: set[str] = set()
+def _recovered_extensions(records: dict) -> set:
+    exts: set = set()
     for path, rec in records.items():
         if rec.content is None:
             continue
@@ -85,10 +95,10 @@ def _recovered_extensions(records: dict[str, FileRecord]) -> set[str]:
 
 
 def _apply_deletions(apply_to: Path,
-                     all_deleted: list[str],
-                     warnings_lines: list[str]) -> tuple[list[str], list[str]]:
-    applied: list[str] = []
-    missing: list[str] = []
+                     all_deleted: list,
+                     warnings_lines: list) -> tuple:
+    applied: list = []
+    missing: list = []
     for name in all_deleted:
         base = os.path.basename(name)
         candidates = []
@@ -137,9 +147,47 @@ def _apply_deletions(apply_to: Path,
     return applied, missing
 
 
-def pass9_write(records: dict[str, FileRecord],
-                blocks: list[Block],
-                deleted_files: list[str],
+def _trust_reason(rec: FileRecord) -> str:
+    """Human-readable string listing which check(s) triggered LOW trust."""
+    reasons = []
+    if rec.verification.get("patches_incomplete"):
+        reasons.append("patches_incomplete")
+    if rec.verification.get("pairs_incomplete"):
+        reasons.append("pairs_incomplete")
+    ast_check = rec.verification.get("ast_parse", "")
+    if isinstance(ast_check, str) and ast_check.startswith("FAIL"):
+        reasons.append("ast_parse_failed")
+    if reasons:
+        return " [" + ", ".join(reasons) + "]"
+    return ""
+
+
+def _orphan_first_line(block: Block) -> str:
+    """First non-empty body line of an orphan block, truncated."""
+    if not block.body:
+        return "(empty)"
+    for ln in block.body.splitlines():
+        s = ln.strip()
+        if s:
+            if len(s) > 60:
+                s = s[:57] + "..."
+            return s
+    return "(empty)"
+
+
+def _patch_first_line(patch: dict, limit: int = 60) -> str:
+    """First non-empty line of a patch's body, truncated."""
+    body = patch.get("body", "") or ""
+    for ln in body.splitlines():
+        s = ln.strip()
+        if s:
+            return s[:limit]
+    return ""
+
+
+def pass9_write(records: dict,
+                blocks: list,
+                deleted_files: list,
                 out_dir: Path,
                 layout: str,
                 min_trust: str,
@@ -151,7 +199,7 @@ def pass9_write(records: dict[str, FileRecord],
                 llm_mode: str,
                 cross_validate: dict,
                 apply_to: Optional[Path] = None,
-                resolutions: Optional[list[dict]] = None,
+                resolutions: Optional[list] = None,
                 verbose: bool = False) -> int:
     if apply_to is not None:
         files_dir = apply_to
@@ -167,11 +215,11 @@ def pass9_write(records: dict[str, FileRecord],
     files_dir.mkdir(parents=True, exist_ok=True)
     aux_dir.mkdir(parents=True, exist_ok=True)
 
-    pre_existing_files: set[str] = (
+    pre_existing_files: set = (
         {p.name for p in files_dir.iterdir() if p.is_file()}
         if files_dir.exists() else set()
     )
-    pre_existing_low: set[str] = (
+    pre_existing_low: set = (
         {p.name for p in low_dir.iterdir() if p.is_file()}
         if low_dir.exists() else set()
     )
@@ -179,35 +227,59 @@ def pass9_write(records: dict[str, FileRecord],
     trust_rank = {"SKIP": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
     min_rank = trust_rank[min_trust]
 
-    warnings_lines: list[str] = []
-    written: dict[str, dict] = {}
-    skipped: list[dict] = []
+    warnings_lines: list = []
+    written: dict = {}
+    skipped: list = []
     written_count = 0
     exit_code = 0
-    written_out_names: dict[str, str] = {}
-    actually_written: set[str] = set()
-    actually_written_low: set[str] = set()
+    written_out_names: dict = {}
+    actually_written: set = set()
+    actually_written_low: set = set()
     preexisting_skipped_count = 0
 
     for path, rec in sorted(records.items()):
         if layout == "flat":
             out_name = os.path.basename(path)
-        else:  # "header"
+        else:
             out_name = path
 
         for w in rec.warnings:
             warnings_lines.append(f"[{path}] [WARN] {w}")
+
+        # Per-pair failure detail: name which pair(s) failed and why.
+        for r in rec.verification.get("pair_records", []):
+            if r.get("applied_by") != "failed":
+                continue
+            pair = r.get("pair", {})
+            oi = pair.get("old_idx")
+            ni = pair.get("new_idx")
+            scope = pair.get("scope_hint", "replace")
+            reason = r.get("reason", "unknown")
+            kind = "scoped" if oi == -1 else "replace"
+            warnings_lines.append(
+                f"[{path}] [PAIR_FAILED] {kind} pair "
+                f"(old={oi}, new={ni}, scope={scope}): {reason}")
+
+        # Per-patch failure detail.
+        for p in rec.patches:
+            if p.get("applied_by") != "failed":
+                continue
+            first_line = _patch_first_line(p, limit=70)
+            reason = p.get("failure_reason", "unknown")
+            warnings_lines.append(
+                f"[{path}] [PATCH_FAILED] idx={p['idx']} "
+                f"(first line: {first_line!r}): {reason}")
 
         if rec.is_deleted:
             warnings_lines.append(
                 f"[{path}] [INFO] file deleted by conversation")
             continue
 
-        # NEW: sanity-rejected files go to the same skip path as
-        # LOW-trust files — never written, base preserved.
         if getattr(rec, "sanity_rejected", False):
-            reason = ("sanity gate rejected write (over-deletion, "
-                      "empty result, or unrelated content)")
+            reason = rec.verification.get(
+                "sanity_reason",
+                "sanity gate rejected write (over-deletion, empty result, "
+                "or unrelated content)")
             warnings_lines.append(
                 f"[{path}] [SANITY] {reason}; target file preserved")
             skipped.append({
@@ -260,13 +332,21 @@ def pass9_write(records: dict[str, FileRecord],
             exit_code = max(exit_code, 2)
             continue
 
+        # "No conversation changes" means: no patch and no pair was
+        # attempted with any effect.  A "failed" patch is an attempt
+        # that could not land — it is NOT a no-op.  Treating it as
+        # "preexisting unmodified" would silently hide the failure
+        # before the trust check could route it to low_trust/.
+        #
+        # "already-present" patches ARE no-ops: the content is
+        # already in the file, so the target needs no write.
         preexisting_unmodified = (
             rec.preexisting_base
+            and not rec.pairs
             and not any(
-                p.get("applied_by") in ("deterministic", "llm")
+                p.get("applied_by") != "already-present"
                 for p in rec.patches
             )
-            and not rec.pairs
         )
         if preexisting_unmodified:
             reason = ("pre-existing file with no conversation "
@@ -310,9 +390,10 @@ def pass9_write(records: dict[str, FileRecord],
         written_out_names[out_name] = path
 
         if trust_rank.get(rec.trust, 0) < min_rank:
-            reason = f"trust={rec.trust} below --min-trust {min_trust}"
+            why = _trust_reason(rec)
+            reason = f"trust={rec.trust}{why} below --min-trust {min_trust}"
             warnings_lines.append(
-                f"[{path}] [{rec.trust}] {reason}")
+                f"[{path}] [{rec.trust}]{why} {reason}")
             skipped.append({
                 "path": path,
                 "trust": rec.trust,
@@ -339,7 +420,7 @@ def pass9_write(records: dict[str, FileRecord],
             if verbose:
                 dest = ("deeppeek/low_trust/" if apply_to is not None
                         else "files_low_trust/")
-                print(f"  SKIPPED {path} ({rec.trust}): {reason} "
+                print(f"  SKIPPED {path} ({rec.trust}){why}: {reason} "
                       f"-> {dest}", file=sys.stderr)
                 for w in rec.warnings[:3]:
                     print(f"    warning: {w}", file=sys.stderr)
@@ -393,8 +474,8 @@ def pass9_write(records: dict[str, FileRecord],
     deleted_from_records = {p for p, r in records.items() if r.is_deleted}
     all_deleted = sorted(set(deleted_files) | deleted_from_records)
 
-    deleted_applied: list[str] = []
-    deleted_missing: list[str] = []
+    deleted_applied: list = []
+    deleted_missing: list = []
     if apply_to is not None:
         deleted_applied, deleted_missing = _apply_deletions(
             apply_to, all_deleted, warnings_lines)
@@ -439,10 +520,12 @@ def pass9_write(records: dict[str, FileRecord],
                     and b.attributed_by not in ("empty", "no_candidates",
                                                  "skipped_meta")]
     for b in unattributed:
+        first_line = _orphan_first_line(b)
         warnings_lines.append(
             f"[orphan] idx={b.idx} (lines {b.line_start}..{b.line_end}) "
             f"could not be attributed to any file "
-            f"(lang={b.fence_lang}, {b.body_line_count} lines)")
+            f"(lang={b.fence_lang}, {b.body_line_count} line(s), "
+            f"first: {first_line!r})")
 
     mentioned = _scan_mentioned_files(dump_text)
 
@@ -555,14 +638,47 @@ def pass9_write(records: dict[str, FileRecord],
 
     decisions = {}
     for path, rec in records.items():
+        patch_idxs = [p["idx"] for p in rec.patches]
+        source_idxs = list(rec.source_blocks)
+        for pidx in patch_idxs:
+            if pidx not in source_idxs:
+                source_idxs.append(pidx)
+
+        pair_records = rec.verification.get("pair_records", [])
+        pair_failures = []
+        for r in pair_records:
+            if r.get("applied_by") == "failed":
+                pair = r.get("pair", {})
+                pair_failures.append({
+                    "old_idx": pair.get("old_idx"),
+                    "new_idx": pair.get("new_idx"),
+                    "scope_hint": pair.get("scope_hint"),
+                    "reason": r.get("reason", "unknown"),
+                })
+        sanity_reason = (
+            rec.verification.get("sanity_reason")
+            if getattr(rec, "sanity_rejected", False) else None
+        )
+
+        patch_failure_reasons = [
+            {
+                "idx": p["idx"],
+                "first_line": _patch_first_line(p, limit=70),
+                "reason": p.get("failure_reason", "unknown"),
+            }
+            for p in rec.patches
+            if p.get("applied_by") == "failed"
+        ]
+
         decisions[path] = {
             "state": rec.state,
-            "source_block_idxs": rec.source_blocks,
+            "source_block_idxs": source_idxs,
             "chosen_full_idx": rec.chosen_full_idx,
             "chosen_by": rec.dedup_reason,
             "trust": rec.trust,
             "preexisting_base": rec.preexisting_base,
             "sanity_rejected": getattr(rec, "sanity_rejected", False),
+            "sanity_reason": sanity_reason,
             "written": path in written,
             "patch_count": len(rec.patches),
             "pair_count": len(rec.pairs),
@@ -570,6 +686,9 @@ def pass9_write(records: dict[str, FileRecord],
                 p["idx"] for p in rec.patches
                 if p.get("applied_by") == "failed"
             ],
+            "patch_failure_reasons": patch_failure_reasons,
+            "pair_failures": pair_failures,
+            "verification": rec.verification,
             "warnings": rec.warnings,
         }
 
@@ -617,7 +736,7 @@ def pass9_write(records: dict[str, FileRecord],
     (reports_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
     if skipped:
-        by_reason: dict[str, list[str]] = {
+        by_reason: dict = {
             "no_full":     [],
             "low_trust":   [],
             "sanity":      [],
@@ -630,7 +749,7 @@ def pass9_write(records: dict[str, FileRecord],
             r = s.get("reason", "")
             if "no full print" in r:
                 by_reason["no_full"].append(s["path"])
-            elif "sanity gate rejected" in r:
+            elif "sanity gate rejected" in r or "truncation" in r:
                 by_reason["sanity"].append(s["path"])
             elif "trust=" in r:
                 by_reason["low_trust"].append(s["path"])
@@ -670,6 +789,45 @@ def pass9_write(records: dict[str, FileRecord],
         print(f"\nWrote {written_count} files to {files_dir}/")
     print(f"  skipped:  {len(skipped)}"
           + ("  (see warnings.txt)" if skipped else ""))
+
+    fail_closed_count = sum(
+        1 for rec in records.values()
+        if rec.trust == "LOW"
+        and not rec.is_deleted
+        and not getattr(rec, "sanity_rejected", False)
+        and rec.content is not None
+    )
+    if fail_closed_count:
+        print(f"  FAIL-CLOSED: {fail_closed_count} file(s) with "
+              f"incomplete application — target preserved, content in "
+              f"{'deeppeek/low_trust/' if apply_to else 'files_low_trust/'}",
+              file=sys.stderr)
+        print(f"    (use --min-trust LOW to force-write them)",
+              file=sys.stderr)
+        # Per-failure detail in the summary.
+        for fpath, frec in sorted(records.items()):
+            if frec.trust != "LOW":
+                continue
+            if frec.is_deleted or getattr(frec, "sanity_rejected", False):
+                continue
+            if frec.content is None:
+                continue
+            for pf in frec.patches:
+                if pf.get("applied_by") != "failed":
+                    continue
+                first_line = _patch_first_line(pf, limit=60)
+                reason = pf.get("failure_reason", "unknown")
+                print(f"    PATCH_FAILED {fpath} idx={pf['idx']}: "
+                      f"{first_line!r} — {reason}",
+                      file=sys.stderr)
+            for r in frec.verification.get("pair_records", []):
+                if r.get("applied_by") != "failed":
+                    continue
+                pair = r.get("pair", {})
+                oi = pair.get("old_idx")
+                reason = r.get("reason", "unknown")
+                print(f"    PAIR_FAILED {fpath} (old={oi}): {reason}",
+                      file=sys.stderr)
 
     if preexisting_skipped_count:
         print(f"  preexisting: {preexisting_skipped_count} file(s) left "
