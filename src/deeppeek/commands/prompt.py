@@ -26,6 +26,7 @@ def register(sub: argparse._SubParsersAction) -> None:
 
     from ..prompts import (
         evolve, new, last_thought, heredoc, reprint_markdown, review,
+        refine_deeppeek,
     )
     evolve.register(psub)
     new.register(psub)
@@ -33,6 +34,7 @@ def register(sub: argparse._SubParsersAction) -> None:
     heredoc.register(psub)
     reprint_markdown.register(psub)
     review.register(psub)
+    refine_deeppeek.register(psub)
 
     p.set_defaults(func=run)
 

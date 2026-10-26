@@ -41,7 +41,82 @@
     return "assistant";
   }
 
-  async function extractViaIndexedDB(sessionId) {
+  // -----------------------------------------------------------------
+  // Active-path reconstruction
+  // -----------------------------------------------------------------
+  //
+  // DeepSeek stores the conversation as a message TREE: each message
+  // has a `parent_id`, and `chat_session.current_message_id` points
+  // at the leaf the UI is currently rendering.  When the user edits
+  // an earlier prompt (or regenerates a response), DeepSeek forks:
+  // the old branch stays in IndexedDB but is no longer on the active
+  // path and is not visible in the UI.  Sorting ALL messages by
+  // `message_id` therefore resurrects every discarded fork.
+  //
+  // Reconstruct the active path by walking backward from
+  // current_message_id via parent_id, then reverse to get
+  // root-to-leaf order.  The resulting list is ALREADY in correct
+  // temporal order — the parent chain is the ground truth.
+  //
+  // Fallbacks:
+  //   · current_message_id missing/dangling → pick the latest leaf
+  //     (a message id never used as a parent) by inserted_at.
+  //   · the tree has no message_id/parent_id structure at all →
+  //     return null so the caller keeps its old all-messages
+  //     behaviour.
+  function _activePathMessages(chatSession, allMessages) {
+    if (!Array.isArray(allMessages) || allMessages.length === 0) {
+      return null;
+    }
+    const byId = new Map();
+    const usedAsParent = new Set();
+    for (const m of allMessages) {
+      if (!m || typeof m !== "object" || m.message_id == null) continue;
+      byId.set(m.message_id, m);
+      if (m.parent_id != null) usedAsParent.add(m.parent_id);
+    }
+    if (byId.size === 0) return null;
+
+    let leafId = null;
+    if (chatSession && chatSession.current_message_id != null
+        && byId.has(chatSession.current_message_id)) {
+      leafId = chatSession.current_message_id;
+    } else {
+      // Fallback: latest leaf by inserted_at.
+      let best = null;
+      for (const [id, m] of byId) {
+        if (usedAsParent.has(id)) continue;
+        const ts = typeof m.inserted_at === "number" ? m.inserted_at : 0;
+        if (best === null || ts > best.ts) best = { id, ts };
+      }
+      if (best) leafId = best.id;
+    }
+    if (leafId == null) return null;
+
+    const path = [];
+    const seen = new Set();
+    let cur = leafId;
+    let reachedRoot = false;
+    while (cur != null) {
+      if (seen.has(cur)) break;          // cycle guard
+      const m = byId.get(cur);
+      if (!m) break;                     // parent missing from IDB
+      seen.add(cur);
+      path.push(m);
+      if (m.parent_id == null) { reachedRoot = true; break; }
+      cur = m.parent_id;
+    }
+    if (path.length === 0) return null;
+    path.reverse();
+    if (!reachedRoot) {
+      // Chain is broken; the partial path is still far better than
+      // all-messages, but the caller may want to know.
+      path._incomplete = true;
+    }
+    return path;
+  }
+
+  async function extractViaIndexedDB(sessionId, includeForked) {
     const LOG = (...a) => console.log("[deeppeek:idb]", ...a);
     if (!sessionId) { LOG("no session id in URL"); return null; }
 
@@ -77,10 +152,38 @@
           }
           if (!match) { LOG("session not in IDB"); resolve(null); return; }
           const raw = (match.data && match.data.chat_messages) || [];
-          const allHaveMsgId = raw.every((m) => m && typeof m.message_id === "number");
-          const sorted = allHaveMsgId
-            ? [...raw].sort((a, b) => a.message_id - b.message_id)
-            : raw;
+          const chatSession = match.data && match.data.chat_session;
+          let activePath = null;
+          if (includeForked) {
+            LOG(`--include-forked: skipping active-path filter; `
+                + `using all ${raw.length} message(s)`);
+          } else {
+            activePath = _activePathMessages(chatSession, raw);
+          }
+          let sorted;
+          if (activePath) {
+            // The parent chain already gives root-to-leaf order.
+            // Do NOT re-sort by message_id: relying on message_id
+            // monotonicity along the parent chain is safe today
+            // but is not part of DeepSeek's protocol.
+            sorted = activePath;
+            if (activePath._incomplete) {
+              LOG(`active path: ${activePath.length}/${raw.length} `
+                  + `message(s); parent chain BROKEN before root `
+                  + `(partial path used)`);
+            } else {
+              LOG(`active path: ${activePath.length}/${raw.length} `
+                  + `message(s) (forked branches excluded)`);
+            }
+          } else {
+            const allHaveMsgId = raw.every(
+              (m) => m && typeof m.message_id === "number");
+            sorted = allHaveMsgId
+              ? [...raw].sort((a, b) => a.message_id - b.message_id)
+              : raw;
+            LOG(`active path unavailable; using all ${raw.length} `
+                + `message(s) sorted by message_id`);
+          }
           const normalized = [];
           for (const m of sorted) {
             if (!m || typeof m !== "object") continue;
@@ -275,14 +378,15 @@
   // Part 4 — orchestration (extract)
   // ==================================================================
 
-  async function doExtraction() {
+  async function doExtraction(args) {
+    const includeForked = !!(args && args.include_forked);
     const sessionId = getSessionIdFromURL();
     let messages = null;
     let source = null;
 
     if (sessionId) {
       try {
-        messages = await extractViaIndexedDB(sessionId);
+        messages = await extractViaIndexedDB(sessionId, includeForked);
         if (messages && messages.length) source = "indexeddb";
       } catch (e) { console.log("[deeppeek] idb threw:", e); }
     }
@@ -483,8 +587,12 @@
   // Part 6 — exports
   // ==================================================================
 
-  window.__dsx_extract = async function () {
-    return JSON.stringify(await doExtraction());
+  window.__dsx_extract = async function (argsJson) {
+    let args = {};
+    if (typeof argsJson === "string" && argsJson.length > 0) {
+      try { args = JSON.parse(argsJson); } catch (_) {}
+    }
+    return JSON.stringify(await doExtraction(args));
   };
 
   // Object-taking entry point, kept for direct console debugging:

@@ -102,6 +102,19 @@ def add_capture_side_args(p: argparse.ArgumentParser) -> None:
              "would leave no turns).  Mutually exclusive with "
              "--until.",
     )
+    p.add_argument(
+        "--include-forked", action="store_true",
+        help="include forked conversation branches in the captured "
+             "messages.  DeepSeek stores the conversation as a "
+             "message tree; editing an earlier prompt (or "
+             "regenerating a reply) forks it.  By default only the "
+             "active path — the messages the UI is actually "
+             "rendering — is captured.  Pass this to also include "
+             "every hidden branch that lives in IndexedDB.  Useful "
+             "for auditing or recovering discarded work; harmful "
+             "for normal capture, since forked messages look like "
+             "context that never appeared on screen.",
+    )
     p.add_argument("--no-thinking", action="store_true")
     p.add_argument("--no-hints", action="store_true")
     p.add_argument("--latex", action="store_true")
@@ -137,6 +150,7 @@ def capture_config_from_args(args: argparse.Namespace) -> CaptureConfig:
         last_regex=args.last_regex,
         until_user_turn=args.until,
         until_regex=args.until_regex,
+        include_forked=args.include_forked,
     )
 
 

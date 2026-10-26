@@ -49,6 +49,7 @@ class CaptureConfig:
     last_regex: Optional[str] = None
     until_user_turn: Optional[int] = None
     until_regex: Optional[str] = None
+    include_forked: bool = False
 
 
 @dataclass
@@ -95,7 +96,10 @@ def _print_prompt_index(messages, label: str) -> None:
 
 
 def capture_payload(cfg: CaptureConfig) -> Conversation:
-    server = ExportServer(port=cfg.port, watch_mode=cfg.watch)
+    server = ExportServer(
+        port=cfg.port, watch_mode=cfg.watch,
+        include_forked=cfg.include_forked,
+    )
     server.start()
     print(f"Listening on http://127.0.0.1:{cfg.port}", file=sys.stderr)
     print("Open Zen to chat.deepseek.com and click the DEEPPEEK toolbar button.",

@@ -171,6 +171,13 @@ fail-closed.
                         Requires --last or --last-regex; errors if
                         the first match is the slice start itself.
                         Mutually exclusive with --until.
+    --include-forked    also capture forked branches that live in
+                        IndexedDB but are NOT on the active path.
+                        DeepSeek forks the conversation when you
+                        edit an earlier prompt or regenerate a
+                        reply; the discarded branches stay stored
+                        but are hidden from the UI.  Default: only
+                        the active path (what you actually see).
     -o PATH|auto        write the markdown; "auto" = timestamped default.
                         Recovery runs by default, with or without -o.
                         When PATH is given, the recovered directory

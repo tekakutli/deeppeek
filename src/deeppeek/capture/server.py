@@ -16,9 +16,11 @@ class ExportServer:
       /status   plain JSON for debugging.
     """
 
-    def __init__(self, port: int = 8765, watch_mode: bool = False):
+    def __init__(self, port: int = 8765, watch_mode: bool = False,
+                 include_forked: bool = False):
         self.port = port
         self.watch_mode = watch_mode
+        self.include_forked = include_forked
         self.result_queue: "queue.Queue[dict]" = queue.Queue()
         self.armed = watch_mode
         self.sse_clients: list["queue.Queue[dict]"] = []
@@ -34,6 +36,13 @@ class ExportServer:
         with self._lock:
             self.sse_clients.append(q)
             armed_now = self.armed
+        # Always send config (include_forked).  Arm is conditional
+        # on watch_mode.  Config goes FIRST so by the time the
+        # extension fires on arm, the flag is already current.
+        q.put_nowait({
+            "event": "config",
+            "data": {"include_forked": self.include_forked},
+        })
         if armed_now:
             q.put_nowait({"event": "arm"})
         return q

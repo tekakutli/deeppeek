@@ -51,7 +51,10 @@
         return null;
       }
       try {
-        const jsonString = await window.wrappedJSObject.__dsx_extract();
+        const argsJson = JSON.stringify({
+          include_forked: !!msg.include_forked,
+        });
+        const jsonString = await window.wrappedJSObject.__dsx_extract(argsJson);
         return JSON.parse(jsonString);
       } catch (e) {
         console.error("DSX: extraction threw:", e);

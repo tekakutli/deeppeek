@@ -5,6 +5,7 @@ const DSX_URL = "http://127.0.0.1:8765";
 
 let armed = false;
 let firing = false;
+let includeForked = false;
 let eventSource = null;
 let wasConnected = false;
 let watchdogTimer = null;
@@ -47,6 +48,12 @@ function attachHandlers(es) {
   es.addEventListener("config", (e) => {
     let data = {};
     try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+
+    if ("include_forked" in data) {
+      includeForked = !!data.include_forked;
+      console.log(`DSX: config include_forked=${includeForked}`);
+    }
+
     if (!("watchdog" in data)) return;
     const enabled = data.watchdog !== false;
     browser.storage.local.set({ watchdog: enabled }).then(() => {
@@ -276,7 +283,10 @@ async function handleExtract() {
   }
   let payload;
   try {
-    payload = await browser.tabs.sendMessage(tab.id, { type: "DSX_EXTRACT" });
+    payload = await browser.tabs.sendMessage(tab.id, {
+      type: "DSX_EXTRACT",
+      include_forked: includeForked,
+    });
   } catch (e) {
     console.error("DSX: content script is not loaded in this tab. Reload the tab (F5) and try again.");
     return false;

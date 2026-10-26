@@ -1,0 +1,340 @@
+"""
+patch_scope — scope boundary detection and scoped-replace.
+
+A "scope" is a `function foo()`, `def foo():`, `class Foo {`,
+`export const foo = {`, `<details><summary>Foo</summary>`, or a
+plain assignment `foo.bar = {`.  Every one of these shapes is found
+by a pattern in `_SCOPE_PATTERNS`, which the rest of the pipeline
+consults to decide "does the body target an existing named scope?".
+
+The scoped-replace heuristic (`_apply_scoped`) is the most
+load-bearing path in the whole pipeline: it is what lets a single
+conversation block declare "here is the whole new `foo()`" and have
+that block replace `foo()` without duplicating anything.
+
+Separately, `_try_ellipsis_splice` handles the "prefix + `...` +
+suffix" abbreviation shape.  It lives here rather than in
+patch_heuristics because it is *scope-bound* — the splice target is
+always a scope, never a bare statement.
+
+The `_scope_in_base` predicate is exported for the dispatch layer's
+pre-check (patch_dispatch), which routes scope-declaring bodies to
+this module *before* they can fall through to the insert heuristics.
+
+Imports from patch_text; imports from prose (for
+`_extract_scope_from_body`).
+
+No cyclic risk: patch_heuristics does not import this module, only
+patch_dispatch (which imports both) and patch_diag (which imports
+this for `_find_scope_in_base` and `_SCOPE_PATTERNS`).
+"""
+
+import re
+
+from .prose import _extract_scope_from_body
+from .patch_text import (
+    _has_ellipsis_marker, _split_at_ellipsis,
+    _find_matching_brace, _reindent_body, _insert_lines_in_inner,
+    _body_starts_with_comment, _find_leading_comment_start,
+)
+
+
+# ===========================================================================
+#  Scope patterns
+# ===========================================================================
+
+_SCOPE_PATTERNS = [
+    lambda name: re.compile(
+        r"<details\b[^>]*>\s*<summary>\s*" + re.escape(name) +
+        r"\s*</summary>.*?</details>",
+        re.DOTALL | re.IGNORECASE),
+    lambda name: re.compile(
+        r"(?:^|\n)(?:def|class)\s+" + re.escape(name) +
+        r"\b.*?(?=\n(?:def|class|@)|\Z)",
+        re.DOTALL),
+    lambda name: re.compile(
+        r"(?:^|\n)(?:export\s+)?(?:async\s+)?"
+        r"(?:function|class)\s+" + re.escape(name) + r"\b.*?"
+        r"(?:\n\}|\Z)",
+        re.DOTALL),
+    lambda name: re.compile(
+        r"(?:^|\n)(?:export\s+)?(?:const|let|var)\s+" + re.escape(name) +
+        r"\s*=\s*\{.*?\n\};?",
+        re.DOTALL),
+    # Plain (possibly dotted) assignment: `_els = {`, `board.x = {`.
+    lambda name: re.compile(
+        r"(?:^|\n)[ \t]*" + re.escape(name) + r"\s*=\s*\{.*?\n[ \t]*\};?",
+        re.DOTALL),
+]
+
+
+# ===========================================================================
+#  Scope detection
+# ===========================================================================
+
+def _scope_in_base(base, scope_name, scope_kind):
+    """True iff `scope_name` exists in `base` as an extractable scope
+    of the given kind.
+
+    Conservative: if extraction doesn't find it, we don't claim it
+    exists.
+    """
+    if not base or not scope_name:
+        return False
+    if scope_kind == "details":
+        return bool(re.search(
+            r"<details\b[^>]*>\s*<summary>\s*"
+            + re.escape(scope_name) + r"\s*</summary>",
+            base, re.IGNORECASE | re.DOTALL))
+    esc = re.escape(scope_name)
+    if scope_kind == "python":
+        return bool(re.search(
+            rf"^(?:async\s+)?(?:def|class)\s+{esc}\b",
+            base, re.MULTILINE))
+    # javascript (default)
+    if re.search(rf"^(?:export\s+)?(?:async\s+)?"
+                 rf"(?:function|class)\s+{esc}\b", base, re.MULTILINE):
+        return True
+    if re.search(rf"^(?:export\s+)?(?:const|let|var)\s+{esc}\s*=\s*\{{",
+                 base, re.MULTILINE):
+        return True
+    return False
+
+
+def _find_scope_in_base(base, scope_name):
+    for make_pattern in _SCOPE_PATTERNS:
+        try:
+            pattern = make_pattern(scope_name)
+        except re.error:
+            continue
+        m = pattern.search(base)
+        if not m:
+            continue
+        matched = base[m.start():m.end()]
+        if matched.lstrip().startswith("<details"):
+            return None
+        brace_open = base.find("{", m.start(), m.end())
+        if brace_open == -1:
+            continue
+        brace_close = _find_matching_brace(base, brace_open)
+        if brace_close == -1:
+            continue
+        return (m.start(), brace_open + 1, brace_close, brace_close + 1)
+    return None
+
+
+def _matches_scope_declaration(line, scope_name):
+    if not line:
+        return False
+    stripped = line.strip()
+    if not stripped:
+        return False
+    esc = re.escape(scope_name)
+    if re.match(r'^(?:async\s+)?def\s+' + esc + r'\s*\(', stripped):
+        return True
+    if re.match(r'^class\s+' + esc + r'\b', stripped):
+        return True
+    if re.match(r'^(?:export\s+)?(?:async\s+)?function\s+' + esc +
+                r'\s*\(', stripped):
+        return True
+    if re.match(r'^(?:export\s+)?(?:const|let|var)\s+' + esc +
+                r'\s*=', stripped):
+        return True
+    if re.match(r'^(?:export\s+)?(?:async\s+)?class\s+' + esc +
+                r'\b', stripped):
+        return True
+    if re.match(r'^' + esc + r'\s*=', stripped):
+        return True
+    return False
+
+
+_SCOPE_CLOSE_RE = re.compile(r'^\s*(?:\}|\};|\};?\s*\}\s*;?|</details>)\s*$',
+                             re.IGNORECASE)
+
+
+def _looks_like_scope_close(line):
+    return bool(_SCOPE_CLOSE_RE.match(line))
+
+
+# ===========================================================================
+#  Ellipsis splice
+# ===========================================================================
+
+def _try_ellipsis_splice(base, body, context_before=""):
+    if not _has_ellipsis_marker(body):
+        return None
+    scope_name, _kind = _extract_scope_from_body(body)
+    if not scope_name:
+        return None
+    scope_info = _find_scope_in_base(base, scope_name)
+    if scope_info is None:
+        return None
+    decl_start, body_open, body_close, scope_end = scope_info
+
+    prefix_lines, suffix_lines = _split_at_ellipsis(body)
+    if not prefix_lines:
+        return None
+    if not _matches_scope_declaration(prefix_lines[0], scope_name):
+        return None
+
+    inner_prefix = prefix_lines[1:]
+    if suffix_lines and _looks_like_scope_close(suffix_lines[-1]):
+        inner_suffix = suffix_lines[:-1]
+    else:
+        inner_suffix = suffix_lines
+
+    base_scope_inner = base[body_open:body_close]
+    base_stripped_set = {
+        ln.strip() for ln in base_scope_inner.splitlines() if ln.strip()
+    }
+
+    new_prefix = [ln for ln in inner_prefix
+                  if ln.strip() and ln.strip() not in base_stripped_set]
+    new_suffix = [ln for ln in inner_suffix
+                  if ln.strip() and ln.strip() not in base_stripped_set]
+
+    if not new_prefix and not new_suffix:
+        # All body lines are already in base — this is a no-op, not a
+        # failure.  Return base unchanged; the caller detects it via
+        # `result == content` and marks the patch `already-present`.
+        return base
+
+    prefix_anchor = None
+    for ln in inner_prefix:
+        if ln.strip() and ln.strip() in base_stripped_set:
+            prefix_anchor = ln.strip()
+            break
+
+    suffix_anchor = None
+    for ln in reversed(inner_suffix):
+        if ln.strip() and ln.strip() in base_stripped_set:
+            suffix_anchor = ln.strip()
+            break
+
+    result_inner = base_scope_inner
+    if new_prefix:
+        result_inner = _insert_lines_in_inner(
+            result_inner, new_prefix,
+            before_anchor=prefix_anchor, default_position="top")
+    if new_suffix:
+        result_inner = _insert_lines_in_inner(
+            result_inner, new_suffix,
+            after_anchor=suffix_anchor, default_position="bottom")
+
+    return base[:body_open] + result_inner + base[body_close:]
+
+
+# ===========================================================================
+#  Scoped replace
+# ===========================================================================
+
+def _new_body_is_complete_for_scope(base_scope_text, new_body):
+    """True iff `new_body` looks like a complete replacement of
+    `base_scope_text`.
+
+    The heuristic: if `base_scope_text` ends with a "closer"
+    (`</details>` or `}`), `new_body` must end with the same closer.
+    A prefix that omits the closer is a partial-splice candidate, not
+    a full replacement.
+    """
+    base_stripped = base_scope_text.rstrip()
+    new_stripped = new_body.rstrip()
+    if not new_stripped:
+        return False
+    if base_stripped.endswith("</details>"):
+        return new_stripped.endswith("</details>")
+    if base_stripped.endswith("}"):
+        return (new_stripped.endswith("}")
+                or new_stripped.endswith("};"))
+    return True
+
+
+def _try_scoped_partial_splice(base_scope_text, new_body):
+    """Splice `new_body`'s additions into `base_scope_text` line-wise.
+
+    Uses `difflib.SequenceMatcher` to compute the line-level diff.
+    Inserts and small replaces from `new_body` are applied; deletions
+    from `base_scope_text` are skipped (a partial body shouldn't be
+    silently removing content — that would be a full replace).
+
+    Returns the spliced scope text, or None when the diff adds
+    nothing (meaning the "new" body is a strict subset of the old —
+    a truncation, not an extension)."""
+    import difflib
+    base_lines = base_scope_text.split("\n")
+    new_lines = new_body.split("\n")
+    sm = difflib.SequenceMatcher(None, base_lines, new_lines)
+    result = list(base_lines)
+    added_lines = 0
+    for tag, i1, i2, j1, j2 in reversed(sm.get_opcodes()):
+        if tag == 'equal':
+            continue
+        if tag == 'insert':
+            added_lines += (j2 - j1)
+            result[i1:i1] = new_lines[j1:j2]
+        elif tag == 'replace':
+            if (i2 - i1) <= (j2 - j1) * 2:
+                added_lines += (j2 - j1)
+                result[i1:i2] = new_lines[j1:j2]
+        # 'delete' — skipped deliberately
+    if added_lines == 0:
+        return None
+    result_text = "\n".join(result)
+    if result_text == base_scope_text:
+        return None
+    return result_text
+
+
+def _apply_scoped(base, scope_name, new_body):
+    if not scope_name or not new_body.strip():
+        return None
+    if _has_ellipsis_marker(new_body):
+        return _try_ellipsis_splice(base, new_body)
+    for make_pattern in _SCOPE_PATTERNS:
+        try:
+            pattern = make_pattern(scope_name)
+        except re.error:
+            continue
+        m = pattern.search(base)
+        if not m:
+            continue
+        m_start = m.start()
+        m_end = m.end()
+        base_scope_text = base[m_start:m_end]
+
+        # Partial splice: when the new body is a *prefix* of the
+        # base scope (missing the closer), splice the prefix in
+        # rather than truncating the base.
+        if not _new_body_is_complete_for_scope(
+                base_scope_text, new_body):
+            spliced = _try_scoped_partial_splice(
+                base_scope_text, new_body)
+            if spliced is not None:
+                if m_start < len(base) and base[m_start] == "\n":
+                    indent_pos = m_start + 1
+                    base_indent = ""
+                else:
+                    indent_pos = base.rfind("\n", 0, m_start) + 1
+                    base_indent = base[indent_pos:m_start]
+                reindented = _reindent_body(base_indent, spliced)
+                return base[:indent_pos] + reindented + base[m_end:]
+
+        # Full replacement (original logic).
+        if m_start < len(base) and base[m_start] == "\n":
+            indent_pos = m_start + 1
+            base_indent = ""
+        else:
+            indent_pos = base.rfind("\n", 0, m_start) + 1
+            base_indent = base[indent_pos:m_start]
+        # Consume the leading comment above the scope iff the
+        # new_body carries its own comment.
+        if _body_starts_with_comment(new_body):
+            extended_start = _find_leading_comment_start(
+                base, indent_pos)
+            if extended_start < indent_pos:
+                indent_pos = extended_start
+        while m_end > m_start and base[m_end - 1] == "\n":
+            m_end -= 1
+        reindented = _reindent_body(base_indent, new_body)
+        return base[:indent_pos] + reindented + base[m_end:]
+    return None
