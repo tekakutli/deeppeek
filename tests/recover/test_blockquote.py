@@ -2,7 +2,7 @@
 
 deeppeek's own formatter (formatter.py) wraps AI thought content in
 markdown blockquotes.  A blockquoted fence is therefore part of the
-AI's reasoning, not its final answer.  Three behaviours matter:
+AI's reasoning, not its final answer.  Four behaviours matter:
 
   1. Unattributed blockquoted fences must NOT be reported as orphan
      warnings.  They are thinking-fragment noise (the AI exploring
@@ -29,6 +29,16 @@ AI's reasoning, not its final answer.  Three behaviours matter:
      matching the previous behaviour.  This is the case where the
      AI is explicitly saying "Update file X with this code".
 
+  4. The two gates in `pass5_deduplicate` that enforce the
+     blockquote policy — the `orphan_patches` construction and
+     `_is_real_patch` — MUST share the same predicate.  A prior
+     version had an inline `_STRONG_BQ_ATTR` check in one gate and
+     a predicate call in the other; a tightening of the predicate
+     silently diverged from the inline check, producing two
+     contradictory policies within the same function.  The
+     consistency tests at the bottom of this file guard against
+     that class of regression.
+
 The motivating case for the blockquote handling: conversation2.md,
 where every assistant message was a thought-process blockquote.  The
 previous behaviour extracted four thinking fragments (blocks 26, 28,
@@ -46,7 +56,11 @@ if str(_SRC) not in sys.path:
 from deeppeek.recover.core import Block, FileRecord
 from deeppeek.recover.extract import pass1_extract
 from deeppeek.recover.attribute import pass4_attribute_orphans
-from deeppeek.recover.dedup import pass5_deduplicate
+from deeppeek.recover.dedup import (
+    pass5_deduplicate,
+    _has_strong_blockquote_attribution,
+    _STRONG_BQ_ATTR,
+)
 from deeppeek.recover.write import _compute_block_disposition
 
 
@@ -372,6 +386,73 @@ def test_via_llm_not_set_without_llm_patch():
         f"verification={rec.verification}")
 
 
+# ---------------------------------------------------------------------------
+# Blockquote-policy consistency (single source of truth)
+# ---------------------------------------------------------------------------
+#
+# The two gates in `pass5_deduplicate` that enforce the blockquote
+# policy are the `orphan_patches` construction and `_is_real_patch`.
+# Both MUST call `_has_strong_blockquote_attribution`; neither may
+# inline the check.  A prior version had an inline check in one gate
+# and a predicate call in the other; when the predicate was tightened
+# to always-return-False, the two gates silently disagreed, and
+# `test_blockquoted_prose_attr_still_patched` was the only thing that
+# noticed.  These tests lock in the single-source-of-truth contract.
+
+def test_blockquote_policy_is_single_source_of_truth():
+    """`_has_strong_blockquote_attribution` must agree with
+    membership in `_STRONG_BQ_ATTR`.  If a future change tightens
+    the predicate without updating the set (or vice versa), this
+    fails immediately rather than only after the drift surfaces as
+    a contradictory policy between the two gates.
+    """
+    for attr in ("prose", "prose_nearest", "body_header",
+                 "anchor", "subset", "blockquote_skip",
+                 None, "unattributed"):
+        b = Block(
+            idx=0, header_path=None, modifier=None, fence_lang="js",
+            body="x();\n", body_line_count=1,
+            context_before="", line_start=0, line_end=1,
+            is_orphan=True, is_code_file=True, kind="partial",
+            in_blockquote=True, attributed_by=attr,
+        )
+        predicate_says_strong = _has_strong_blockquote_attribution(b)
+        set_says_strong = attr in _STRONG_BQ_ATTR
+        assert predicate_says_strong == set_says_strong, (
+            f"_has_strong_blockquote_attribution disagrees with "
+            f"_STRONG_BQ_ATTR for attribution={attr!r}: "
+            f"predicate={predicate_says_strong}, "
+            f"set={set_says_strong}.  A future tightening of one "
+            f"without the other will re-create the two-gate drift "
+            f"bug.")
+
+
+def test_prose_attribution_is_strong():
+    """Lock the positive case: exact `prose` attribution overrides
+    the blockquote convention."""
+    b = Block(
+        idx=0, header_path=None, modifier=None, fence_lang="js",
+        body="x();\n", body_line_count=1,
+        context_before="", line_start=0, line_end=1,
+        is_orphan=True, is_code_file=True, kind="partial",
+        in_blockquote=True, attributed_by="prose",
+    )
+    assert _has_strong_blockquote_attribution(b) is True
+
+
+def test_prose_nearest_is_not_strong():
+    """Lock the negative case: `prose_nearest` (multi-file guess)
+    does NOT override the blockquote convention."""
+    b = Block(
+        idx=0, header_path=None, modifier=None, fence_lang="js",
+        body="x();\n", body_line_count=1,
+        context_before="", line_start=0, line_end=1,
+        is_orphan=True, is_code_file=True, kind="partial",
+        in_blockquote=True, attributed_by="prose_nearest",
+    )
+    assert _has_strong_blockquote_attribution(b) is False
+
+
 def main():
     tests = [
         ("extract top-level not blockquoted",
@@ -398,6 +479,12 @@ def main():
          test_disposition_blockquote_skip),
         ("via_llm not set without llm patch",
          test_via_llm_not_set_without_llm_patch),
+        ("blockquote policy is single source of truth",
+         test_blockquote_policy_is_single_source_of_truth),
+        ("prose attribution is strong",
+         test_prose_attribution_is_strong),
+        ("prose_nearest is not strong",
+         test_prose_nearest_is_not_strong),
     ]
     failed = 0
     for name, fn in tests:

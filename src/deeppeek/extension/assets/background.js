@@ -229,6 +229,113 @@ function attachHandlers(es) {
     } catch (_) {}
   });
 
+  // ---- extract-attachments (deeppeek prompt attachments) ----
+  es.addEventListener("extract-attachments", async (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+    const batchId = data.batch_id;
+    const opts = data.opts || {};
+
+    console.log(
+      `DSX: extract-attachments received (batch=${batchId}, ` +
+      `mode=${opts.mode})`);
+
+    let result = { success: false, ok: false,
+                   reason: "no active deepseek tab" };
+    try {
+      const [tab] = await browser.tabs.query({
+        active: true, currentWindow: true,
+      });
+      if (tab && tab.url &&
+          tab.url.startsWith("https://chat.deepseek.com/")) {
+        const resp = await browser.tabs.sendMessage(tab.id, {
+          type: "DSX_EXTRACT_ATTACHMENTS",
+          opts,
+        });
+        result = resp || {
+          success: false, ok: false,
+          reason: "no response from content script",
+        };
+      }
+    } catch (err) {
+      result = {
+        success: false, ok: false,
+        reason: `sendMessage threw: ${err.message}`,
+      };
+    }
+
+    console.log(`DSX: extract-attachments result:`, {
+      ok: result.ok,
+      n_files: (result.files || []).length,
+      n_errors: (result.files || []).filter(f => f.error).length,
+    });
+
+    try {
+      await fetch(`${DSX_URL}/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          __ack: "extract-attachments",
+          batch_id: batchId,
+          result,
+        }),
+      });
+    } catch (_) {}
+  });
+
+  // ---- retry-last (deeppeek prompt retry) ----
+  es.addEventListener("retry-last", async (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+    const batchId = data.batch_id;
+    const opts = data.opts || {};
+
+    console.log(`DSX: retry-last received (batch=${batchId})`);
+
+    let result = { success: false,
+                   reason: "no active deepseek tab" };
+    try {
+      const [tab] = await browser.tabs.query({
+        active: true, currentWindow: true,
+      });
+      if (tab && tab.url &&
+          tab.url.startsWith("https://chat.deepseek.com/")) {
+        const resp = await browser.tabs.sendMessage(tab.id, {
+          type: "DSX_RETRY_LAST",
+          opts,
+        });
+        result = resp || {
+          success: false,
+          reason: "no response from content script",
+        };
+      }
+    } catch (err) {
+      result = {
+        success: false,
+        reason: `sendMessage threw: ${err.message}`,
+      };
+    }
+
+    console.log(`DSX: retry-last result:`, {
+      ok: result.success,
+      message_id: result.message_id,
+      files_attached: result.files_attached,
+      text_length: result.text_length,
+    });
+
+    try {
+      await fetch(`${DSX_URL}/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          __ack: "retry-last",
+          batch_id: batchId,
+          result,
+        }),
+      });
+    } catch (_) {}
+  });
+
   es.onopen = () => {
     console.log("DSX: SSE connected");
     wasConnected = true;

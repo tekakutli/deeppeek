@@ -225,7 +225,7 @@
         if (type === "FILE" && Array.isArray(f.files)) {
           for (const file of f.files) {
             if (!file || typeof file !== "object") continue;
-            const name = file.file_name || file.name || "attachment";
+            const name = file.file_name || file.fileName || file.name || "attachment";
             const size = typeof file.file_size === "number"
               ? ` (${(file.file_size / 1024).toFixed(1)} KB)`
               : "";
@@ -514,7 +514,7 @@
     return { success: true, method: "file-input", dispatched: files.length };
   }
 
-  async function attachOnce(files) {
+  async function attachOnce(files, skipPreviewWait) {
     const previewsBefore = blobCount();
     let result = await attachViaDrop(files);
     if (!result.success) {
@@ -527,12 +527,19 @@
       };
     }
 
-    if (result.success) {
+    if (result.success && !skipPreviewWait) {
       await new Promise((r) => setTimeout(r, 800));
       const previewsAfter = blobCount();
       result.previews_before = previewsBefore;
       result.previews_after = previewsAfter;
       result.previews_added = previewsAfter - previewsBefore;
+    } else if (result.success) {
+      // Fast path: trust the drop, skip the 800ms preview count.
+      // Used by retry, where the user visually verifies chips.
+      result.previews_before = previewsBefore;
+      result.previews_after = previewsBefore;
+      result.previews_added = 0;
+      result.skipped_preview_wait = true;
     }
 
     return result;
@@ -540,6 +547,7 @@
 
   async function doAttach(filesPayload, opts) {
     const delayMs = Math.max(0, Number(opts && opts.delay_ms) || 0);
+    const skipPreviewWait = !!(opts && opts.skip_preview_wait);
 
     let files;
     try {
@@ -551,7 +559,7 @@
     }
 
     if (delayMs === 0) {
-      const result = await attachOnce(files);
+      const result = await attachOnce(files, skipPreviewWait);
       return { ...result, mode: "batch", total: files.length };
     }
 
@@ -824,7 +832,8 @@
   }
 
   async function doType(text, opts) {
-    const settleMs = Number(opts.settle_ms) || 300;
+    const skipVerify = !!(opts && opts.skip_verify);
+    const settleMs = skipVerify ? 0 : (Number(opts.settle_ms) || 300);
     const found = findComposer();
     const el = found.el;
     if (!el) {
@@ -842,6 +851,21 @@
                composer_source: found.source,
                composer_element_info: _describeEl(el),
                active_element_info: _describeEl(found.active) };
+    }
+    if (skipVerify) {
+      // Trust execCommand('insertText').  Verification via a
+      // 300ms settle + read is wasted when the caller (retry)
+      // has the user visually inspecting the composer.  If the
+      // text didn't take, the user sees it and reruns.
+      return { success: true,
+               composer_selector: found.selector,
+               composer_source: found.source,
+               composer_element_info: _describeEl(el),
+               active_element_info: _describeEl(found.active),
+               value_before: before,
+               value_after: text,
+               react_accepted: true,
+               skipped_verification: true };
     }
     await new Promise((r) => setTimeout(r, settleMs));
 
@@ -1038,4 +1062,818 @@
     console.log('[deeppeek:clear] result:', result);
     return JSON.stringify(result);
   };
+  // ==================================================================
+  // Part 10 — attachment extraction (deeppeek prompt attachments)
+  // ==================================================================
+  //
+  // Two discovery paths, one fetch path:
+  //
+  //   composer draft / edit-mode  →  fiber walk → memoizedProps.fileList
+  //                                   (camelCase: fileName, signedPath)
+  //
+  //   sent message attachment     →  IndexedDB history-message
+  //                                   (snake_case: file_name, signed_path)
+  //
+  // Both normalize to one record and feed the same fetcher.
+  //
+  // SignedPath is a RELATIVE URL.  The real endpoint is:
+  //
+  //     https://files.deepseeksvc.com/api + signedPath + "&ty=r"
+  //
+  // The `state` token authenticates; `file_id` is decorative (POC 9:
+  // corrupting it still returns the same bytes).  `ty=r` is required
+  // by CORS policy.  `credentials: 'omit'` is correct — the token
+  // carries auth on its own.
+  //
+  // Tokens do NOT expire within the conversation's lifetime (POC 7:
+  // message 1's attachment still fetches correctly at the end of a
+  // 353-message conversation).
+  //
+  // Every fetched byte count is checked against metadata.file_size.
+  // Mismatch = SPA shell served instead of file (this was the
+  // silent failure mode that produced 8.5KB HTML files in earlier
+  // POCs).  Mismatched fetches are reported with the first 48 bytes
+  // so the user can see what came back.
+
+  const DSX_FILE_BASE = "https://files.deepseeksvc.com/api";
+
+  function _resolveFileUrl(signedPath) {
+    if (!signedPath) return null;
+    let url = signedPath.startsWith("/")
+      ? DSX_FILE_BASE + signedPath
+      : signedPath;
+    if (!url.includes("ty=")) {
+      url += (url.includes("?") ? "&" : "?") + "ty=r";
+    }
+    return url;
+  }
+
+  function _guessMimeFromName(name) {
+    const lower = (name || "").toLowerCase();
+    const map = {
+      ".md": "text/markdown", ".txt": "text/plain",
+      ".json": "application/json", ".py": "text/x-python",
+      ".js": "text/javascript", ".mjs": "text/javascript",
+      ".ts": "text/typescript", ".html": "text/html",
+      ".css": "text/css", ".yml": "text/yaml",
+      ".yaml": "text/yaml", ".toml": "text/toml",
+      ".xml": "text/xml", ".csv": "text/csv", ".sh": "text/x-sh",
+      ".png": "image/png", ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg", ".gif": "image/gif",
+      ".webp": "image/webp", ".svg": "image/svg+xml",
+      ".pdf": "application/pdf", ".zip": "application/zip",
+    };
+    for (const ext in map) if (lower.endsWith(ext)) return map[ext];
+    return "application/octet-stream";
+  }
+
+  // Shared byte fetcher: validates signed_path, resolves URL,
+  // fetches, and verifies byte length against metadata.  Every
+  // downstream consumer (download, base64) reuses this so URL
+  // resolution, size check, and error formatting exist exactly
+  // once.
+  async function _fetchBytes(signedPath, expectedSize) {
+    const url = _resolveFileUrl(signedPath);
+    if (!url) {
+      return { buf: null, bytes_received: null,
+               error: "no signedPath on file record" };
+    }
+    try {
+      const resp = await fetch(url, { credentials: "omit" });
+      if (!resp.ok) {
+        return { buf: null, bytes_received: null,
+                 error: `HTTP ${resp.status} ${resp.statusText}` };
+      }
+      const buf = await resp.arrayBuffer();
+      if (expectedSize && buf.byteLength !== expectedSize) {
+        const head = new Uint8Array(buf.slice(0, 48));
+        const asText = new TextDecoder("utf-8", { fatal: false })
+          .decode(head);
+        const hex = Array.from(head.slice(0, 8))
+          .map(b => b.toString(16).padStart(2, "0")).join(" ");
+        return {
+          buf: null,
+          bytes_received: buf.byteLength,
+          error: `size mismatch: expected ${expectedSize}, got ` +
+                 `${buf.byteLength} (first bytes: ${hex} | ` +
+                 `${JSON.stringify(asText.slice(0, 32))})`,
+        };
+      }
+      return { buf, bytes_received: buf.byteLength, error: null };
+    } catch (e) {
+      return { buf: null, bytes_received: null,
+               error: `fetch threw: ${e.message}` };
+    }
+  }
+
+  // Consumer: trigger browser download (used by prompt attachments).
+  async function _fetchAndDownload(signedPath, expectedSize,
+                                    listOnly, downloadName) {
+    if (listOnly) {
+      return { downloaded: false, bytes_received: null, error: null };
+    }
+    const r = await _fetchBytes(signedPath, expectedSize);
+    if (r.error) {
+      return { downloaded: false,
+               bytes_received: r.bytes_received,
+               error: r.error };
+    }
+    // Route through <a download> + Blob URL so files land wherever
+    // the browser's download directory points.
+    const blob = new Blob([r.buf]);
+    const objUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objUrl;
+    a.download = downloadName || "attachment";
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      try { a.remove(); } catch (_) {}
+      try { URL.revokeObjectURL(objUrl); } catch (_) {}
+    }, 1500);
+    return { downloaded: true,
+             bytes_received: r.bytes_received, error: null };
+  }
+
+  // Consumer: base64-encode for composer re-attachment
+  // (used by prompt retry).
+  async function _fetchAndEncode(signedPath, expectedSize) {
+    const r = await _fetchBytes(signedPath, expectedSize);
+    if (r.error) {
+      return { base64: null, bytes_received: r.bytes_received,
+               error: r.error };
+    }
+    const bytes = new Uint8Array(r.buf);
+    let binary = "";
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      binary += String.fromCharCode.apply(
+        null, bytes.subarray(i, i + CHUNK));
+    }
+    return { base64: btoa(binary),
+             bytes_received: r.bytes_received, error: null };
+  }
+
+  function _normalizeFileRecord(rawFile, msg, msgIdx, source) {
+    const name = rawFile.file_name || rawFile.fileName || "(unnamed)";
+    const size = rawFile.file_size || rawFile.fileSize || 0;
+    const sp = rawFile.signed_path || rawFile.signedPath || null;
+    return {
+      message_id: (msg && msg.message_id != null)
+                    ? msg.message_id : null,
+      message_index: msgIdx,
+      source,
+      file_name: name,
+      file_size: size,
+      status: rawFile.status || "UNKNOWN",
+      signed_path: sp,
+      mime: _guessMimeFromName(name),
+      base64: null,
+      bytes_received: null,
+      error: null,
+    };
+  }
+
+  async function _collectIndexedDBMessages(includeForked) {
+    const sessionId = getSessionIdFromURL();
+    if (!sessionId) return null;
+    const db = await new Promise((res, rej) => {
+      const req = indexedDB.open("deepseek-chat");
+      req.onsuccess = () => res(req.result);
+      req.onerror = () => rej(req.error);
+    });
+    try {
+      const all = await new Promise((res, rej) => {
+        const tx = db.transaction("history-message", "readonly");
+        const req = tx.objectStore("history-message").getAll();
+        req.onsuccess = () => res(req.result);
+        req.onerror = () => rej(req.error);
+      });
+      let match = null;
+      for (const rec of all) {
+        const sess = rec && rec.data && rec.data.chat_session;
+        if (sess && sess.id &&
+            String(sess.id).toLowerCase() === sessionId.toLowerCase()) {
+          match = rec; break;
+        }
+      }
+      if (!match) return null;
+      const raw = (match.data && match.data.chat_messages) || [];
+      return includeForked
+        ? raw
+        : (_activePathMessages(match.data.chat_session, raw) || raw);
+    } finally {
+      db.close();
+    }
+  }
+
+  function _fragFiles(frag) {
+    if (!frag || String(frag.type).toUpperCase() !== "FILE") return [];
+    return Array.isArray(frag.files) ? frag.files : [];
+  }
+
+  function _hasFiles(msg) {
+    const frags = msg.fragments || msg.content_blocks || [];
+    return frags.some(f => _fragFiles(f).length > 0);
+  }
+
+  async function _extractFocus() {
+    const chip = document.querySelector(".ds-animated-size-item");
+    if (!chip) {
+      return { success: true, mode: "focus", files: [],
+               reason: "no attachment chip in composer" };
+    }
+    let fiber = chip[Object.keys(chip)
+      .find(k => k.startsWith("__reactFiber"))];
+    let fileList = null;
+    while (fiber && !fileList) {
+      if (fiber.memoizedProps && fiber.memoizedProps.fileList) {
+        fileList = fiber.memoizedProps.fileList;
+        break;
+      }
+      fiber = fiber.return;
+    }
+
+    // Composer identity: messageId in the textarea's fiber chain.
+    //   -2   → new draft (not associated with a sent message)
+    //   +N   → editing sent message N
+    let composerMessageId = null;
+    const ta = document.querySelector("textarea");
+    if (ta) {
+      let tf = ta[Object.keys(ta)
+        .find(k => k.startsWith("__reactFiber"))];
+      let d = 0;
+      while (tf && d < 30) {
+        if (tf.memoizedProps &&
+            tf.memoizedProps.messageId !== undefined) {
+          composerMessageId = tf.memoizedProps.messageId;
+          break;
+        }
+        tf = tf.return; d++;
+      }
+    }
+
+    const files = (fileList || []).map(f =>
+      _normalizeFileRecord(f, { message_id: composerMessageId },
+                            -1, "composer"));
+    return {
+      success: true, mode: "focus",
+      composer_message_id: composerMessageId,
+      files,
+    };
+  }
+
+  async function _extractByPromptRegex(pattern, flags, includeForked,
+                                        allMatches) {
+    const messages = await _collectIndexedDBMessages(includeForked);
+    if (!messages) {
+      return { success: false, ok: false,
+               reason: "session not found in IndexedDB" };
+    }
+    let re;
+    try { re = new RegExp(pattern, flags); }
+    catch (e) {
+      return { success: false, ok: false,
+               reason: `invalid regex: ${e.message}` };
+    }
+
+    // Backward scan: most recent matching prompt with attachments
+    // wins.  Same semantics as capture --last-regex.
+    const matches = [];
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (normalizeRoleFromIDB(m.role) !== "user") continue;
+      const _promptText = extractMessageBody(m).content || "";
+      if (!re.test(_promptText)) continue;
+      if (!_hasFiles(m)) continue;
+      matches.push({ msg: m, idx: i });
+      if (!allMatches) break;
+    }
+
+    if (matches.length === 0) {
+      return { success: true, mode: "prompt-regex",
+               files: [], matched_message_ids: [],
+               reason: "no user prompt matching regex had attachments" };
+    }
+
+    const files = [];
+    for (const { msg, idx } of matches) {
+      const frags = msg.fragments || msg.content_blocks || [];
+      for (const frag of frags) {
+        for (const f of _fragFiles(frag)) {
+          files.push(_normalizeFileRecord(
+            f, msg, idx, "prompt-regex"));
+        }
+      }
+    }
+    return {
+      success: true, mode: "prompt-regex",
+      matched_message_ids: matches.map(x => x.msg.message_id),
+      files,
+    };
+  }
+
+  async function _extractByMessageId(id, includeForked) {
+    const messages = await _collectIndexedDBMessages(includeForked);
+    if (!messages) {
+      return { success: false, ok: false,
+               reason: "session not found in IndexedDB" };
+    }
+    const files = [];
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      if (m.message_id !== id) continue;
+      const frags = m.fragments || m.content_blocks || [];
+      for (const frag of frags) {
+        for (const f of _fragFiles(frag)) {
+          files.push(_normalizeFileRecord(f, m, i, "message-id"));
+        }
+      }
+    }
+    return { success: true, mode: "message-id",
+             matched_message_ids: [id], files };
+  }
+
+  async function _extractLastN(n, includeForked) {
+    const messages = await _collectIndexedDBMessages(includeForked);
+    if (!messages) {
+      return { success: false, ok: false,
+               reason: "session not found in IndexedDB" };
+    }
+    const picks = [];
+    for (let i = messages.length - 1; i >= 0 && picks.length < n; i--) {
+      if (_hasFiles(messages[i])) {
+        picks.push({ msg: messages[i], idx: i });
+      }
+    }
+    picks.reverse();  // oldest first in the batch
+    const files = [];
+    for (const { msg, idx } of picks) {
+      const frags = msg.fragments || msg.content_blocks || [];
+      for (const frag of frags) {
+        for (const f of _fragFiles(frag)) {
+          files.push(_normalizeFileRecord(f, msg, idx, "last-N"));
+        }
+      }
+    }
+    return {
+      success: true, mode: "last-N",
+      matched_message_ids: picks.map(p => p.msg.message_id),
+      files,
+    };
+  }
+
+  async function _extractAll(includeForked) {
+    const messages = await _collectIndexedDBMessages(includeForked);
+    if (!messages) {
+      return { success: false, ok: false,
+               reason: "session not found in IndexedDB" };
+    }
+    const files = [];
+    const ids = new Set();
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      const frags = m.fragments || m.content_blocks || [];
+      let any = false;
+      for (const frag of frags) {
+        for (const f of _fragFiles(frag)) {
+          files.push(_normalizeFileRecord(f, m, i, "all"));
+          any = true;
+        }
+      }
+      if (any) ids.add(m.message_id);
+    }
+    return {
+      success: true, mode: "all",
+      matched_message_ids: Array.from(ids),
+      files,
+    };
+  }
+
+  async function doExtractAttachments(args) {
+    const mode = args.mode || "focus";
+    const listOnly = !!args.list_only;
+    const includeForked = !!args.include_forked;
+
+    let result;
+    if (mode === "focus") {
+      result = await _extractFocus();
+    } else if (mode === "prompt-regex") {
+      result = await _extractByPromptRegex(
+        args.pattern, args.flags || "i", includeForked,
+        !!args.all_matches);
+    } else if (mode === "message-id") {
+      result = await _extractByMessageId(
+        Number(args.message_id), includeForked);
+    } else if (mode === "last-N") {
+      result = await _extractLastN(
+        Number(args.last), includeForked);
+    } else if (mode === "all") {
+      result = await _extractAll(includeForked);
+    } else {
+      return { success: false, ok: false,
+               reason: `unknown mode: ${mode}` };
+    }
+
+    if (!result.success) return result;
+
+    // Sequential fetch (POC 9: 14–433ms per file; parallel risks
+    // throttling and would confuse per-file diagnostics).
+    for (const f of result.files) {
+      if (!f.signed_path) {
+        f.error = "no signed_path on file record";
+        continue;
+      }
+      const fetched = await _fetchAndDownload(
+        f.signed_path, f.file_size, listOnly, f.file_name);
+      f.downloaded = fetched.downloaded;
+      f.bytes_received = fetched.bytes_received;
+      if (fetched.error) f.error = fetched.error;
+      // Give Firefox a beat between downloads so it
+      // registers each one individually instead of
+      // coalescing them into a "Save As" prompt storm.
+      if (!listOnly && fetched.downloaded) {
+        await new Promise(r => setTimeout(r, 200));
+      }
+    }
+
+    result.ok = true;
+    result.title = getChatTitle();
+    result.url = window.location.href;
+    return result;
+  }
+
+  window.__dsx_extract_attachments_json = async function (argsJson) {
+    let args = {};
+    try {
+      if (typeof argsJson === "string" && argsJson.length > 0) {
+        args = JSON.parse(argsJson);
+      }
+    } catch (e) {
+      return JSON.stringify({
+        success: false, ok: false,
+        reason: `arg parse failed: ${e.message}`,
+      });
+    }
+    try {
+      const result = await doExtractAttachments(args);
+      console.log(
+        `[deeppeek:attachments] mode=${args.mode || "focus"} ` +
+        `${(result.files || []).length} file(s) ` +
+        `(${(result.files || []).filter(f => !f.error).length} ok)`);
+      return JSON.stringify(result);
+    } catch (e) {
+      console.error("[deeppeek:attachments] threw:", e);
+      return JSON.stringify({
+        success: false, ok: false,
+        reason: `extract threw: ${e.message}`,
+      });
+    }
+  };
+
+
+  // ==================================================================
+  // Part 11 — retry-last (deeppeek prompt retry)
+  // ==================================================================
+  //
+  // Recreates the setup of the most recent user prompt that had
+  // attachments: re-attaches those files to the composer, and
+  // retypes the prompt's original text.
+  //
+  // All work happens in the page world — no base64 crosses the
+  // CLI boundary.  Reuses doClear (Part 9) to reset the composer,
+  // doAttach (Part 5) to place the files, doType (Part 7) to fill
+  // the textarea, and _fetchAndEncode (Part 10) to reconstruct
+  // File objects from the stored signed_path URLs.
+  //
+  // Message selection: the last user message in the conversation
+  // with at least one FILE fragment.  If none, returns an error.
+
+  async function _findLastUserPrompt(includeForked) {
+    const messages = await _collectIndexedDBMessages(includeForked);
+    if (!messages) return null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (normalizeRoleFromIDB(m.role) !== "user") continue;
+      return { msg: m, idx: i, total: messages.length };
+    }
+    return null;
+  }
+
+
+  // Extract only the prompt text (TEXT/REQUEST fragments), skipping
+  // FILE fragments (their `[file: ...]` lines are capture-time
+  // display artifacts, not prompt text) and THINK/REASON fragments
+  // (reasoning, not the user's question).  Used by doRetryLast so
+  // retry types the actual prompt, not the file-placeholder prefix
+  // that extractMessageBody produces for the capture pipeline.
+  function _extractPromptTextOnly(msg) {
+    const isStr = (v) => typeof v === "string" && v.trim().length > 0;
+    const frags = msg.fragments || msg.content_blocks || [];
+    const parts = [];
+    for (const f of frags) {
+      if (!f || typeof f !== "object") continue;
+      const type = String(f.type || f.kind || "").toUpperCase();
+      if (type === "FILE") continue;
+      if (/THINK|REASON/.test(type)) continue;
+      const t = isStr(f.content) ? f.content
+              : isStr(f.text) ? f.text
+              : isStr(f.value) ? f.value : "";
+      if (t) parts.push(t);
+    }
+    if (parts.length) return parts.join("");
+    if (isStr(msg.content)) return msg.content;
+    return "";
+  }
+
+  // Find a message that is currently held in React state but NOT in
+  // IndexedDB.  This catches failed submissions: the client
+  // optimistically renders the message and uploads its files
+  // (status: SUCCESS on each file record) before the send POST
+  // completes.  If the POST fails or the message otherwise fails to
+  // persist, the rendered message stays in fiber state but is never
+  // written to history-message.  On reload, it is gone.
+  //
+  // The composer's own useState / useReducer hook (typically
+  // hook[13]) holds the optimistic pending message until it either
+  // persists or rolls back.  We scan every hook and every props
+  // object for message-shaped objects whose message_id is missing
+  // or absent from IndexedDB.
+  //
+  // Returns the first matching message object, or null.  The
+  // pending message often has no message_id; the caller uses a
+  // "(pending)" label in that case.
+  async function _findPendingMessage() {
+    // Collect known persisted message_ids so we can distinguish
+    // "pending" (not in IDB) from "already persisted".
+    const idbMessages = await _collectIndexedDBMessages(true);
+    const idbIds = new Set();
+    if (idbMessages) {
+      for (const m of idbMessages) {
+        if (m && m.message_id != null) idbIds.add(m.message_id);
+      }
+    }
+
+    // Locate the React container.  __reactContainer$ is what React
+    // attaches to the root DOM node; walking up from body suffices.
+    let rootFiber = null;
+    const tryContainer = (el) => {
+      for (const k of Object.keys(el)) {
+        if (k.startsWith("__reactContainer$")) return el[k];
+      }
+      return null;
+    };
+    rootFiber = tryContainer(document.body);
+    if (!rootFiber) {
+      for (const el of document.body.querySelectorAll("*")) {
+        rootFiber = tryContainer(el);
+        if (rootFiber) break;
+      }
+    }
+    if (!rootFiber) return null;
+
+    const seen = new WeakSet();
+    const seenFibers = new Set();
+    const stack = [rootFiber];
+    const candidates = [];
+    let nodes = 0;
+
+    function looksLikeMessage(v) {
+      if (!v || typeof v !== "object" || Array.isArray(v)) return false;
+      return (Array.isArray(v.fragments)
+           || Array.isArray(v.content_blocks)
+           || Array.isArray(v.blocks)
+           || Array.isArray(v.parts));
+    }
+
+    function consider(v) {
+      if (!v || typeof v !== "object" || seen.has(v)) return;
+      seen.add(v);
+      if (!looksLikeMessage(v)) return;
+      const role = String(v.role || "").toLowerCase();
+      if (!["user", "human", "customer"].includes(role)) return;
+      const mid = v.message_id;
+      if (mid != null && idbIds.has(mid)) return;  // already persisted
+      const frags = v.fragments || v.content_blocks || [];
+      if (frags.length === 0) return;
+      candidates.push(v);
+    }
+
+    while (stack.length && nodes < 200000) {
+      const node = stack.pop();
+      nodes++;
+      if (!node || seenFibers.has(node)) continue;
+      seenFibers.add(node);
+
+      // Hooks: useReducer / useState state lives on the memoizedState
+      // linked list.  Each node.memoizedState is the first hook;
+      // .next chains the rest.
+      let state = node.memoizedState;
+      let hIdx = 0;
+      while (state && hIdx < 100) {
+        consider(state.memoizedState);
+        state = state.next;
+        hIdx++;
+      }
+
+      // Props: some React shapes pass the message as a prop.
+      const props = node.memoizedProps;
+      if (props && typeof props === "object") {
+        consider(props);
+        for (const k of Object.keys(props)) {
+          const v = props[k];
+          if (v && typeof v === "object" && !seen.has(v)) {
+            consider(v);
+            if (Array.isArray(v)) {
+              for (const item of v) {
+                if (item && typeof item === "object") consider(item);
+              }
+            }
+          }
+        }
+      }
+
+      if (node.child) stack.push(node.child);
+      if (node.sibling) stack.push(node.sibling);
+    }
+
+    if (candidates.length === 0) return null;
+    // Prefer a candidate whose prompt text is non-empty.
+    for (const c of candidates) {
+      if (_extractPromptTextOnly(c).trim().length > 0) return c;
+    }
+    return candidates[0];
+  }
+
+  async function doRetryLast(args) {
+    const includeForked = !!args.include_forked;
+
+    // Selection order: pending fiber state (failed submissions
+    // live here until reload) beats persisted IndexedDB history.
+    let msg = null;
+    let source = null;
+    let msgLabel = null;
+
+    let pending = null;
+    try {
+      pending = await _findPendingMessage();
+    } catch (_e) {
+      // Fiber walk failed for any reason — fall through to IDB.
+      pending = null;
+    }
+    if (pending) {
+      msg = pending;
+      source = "pending-fiber";
+      msgLabel = pending.message_id != null
+        ? pending.message_id
+        : "(pending)";
+    } else {
+      const found = await _findLastUserPrompt(includeForked);
+      if (!found) {
+        const _msgs = await _collectIndexedDBMessages(includeForked) || [];
+        let _users = 0;
+        const _roles = new Set();
+        for (const _m of _msgs) {
+          _roles.add(String(_m.role));
+          if (normalizeRoleFromIDB(_m.role) === "user") _users++;
+        }
+        return { success: false,
+                 reason: `no user message found in this conversation ` +
+                         `(${_users} user of ${_msgs.length} msg; ` +
+                         `roles seen: ` +
+                         `${Array.from(_roles).join(", ")})` };
+      }
+      msg = found.msg;
+      source = "indexeddb";
+      msgLabel = msg.message_id;
+    }
+
+    // Extract only the prompt text: skips FILE fragments (their
+    // "[file: ...]" lines are capture-time display artifacts,
+    // not prompt text) and THINK/REASON fragments (reasoning,
+    // not the user's question).
+    const text = _extractPromptTextOnly(msg).trim();
+
+    // Collect raw file records.
+    const frags = msg.fragments || msg.content_blocks || [];
+    const rawFiles = [];
+    for (const frag of frags) {
+      for (const f of _fragFiles(frag)) rawFiles.push(f);
+    }
+
+    // Fetch all files in PARALLEL.  Sequential fetches take
+    // ~400ms each on cold cache; parallelizing collapses that
+    // to ~400ms total regardless of N.  Order is preserved by
+    // mapping over rawFiles and awaiting Promise.all.
+    const fetchResults = await Promise.all(rawFiles.map(async (rf) => {
+      const name = rf.file_name || rf.fileName || "attachment";
+      const size = rf.file_size || rf.fileSize || 0;
+      const sp = rf.signed_path || rf.signedPath;
+      if (!sp) return { name, error: "no signed_path on file record" };
+      const r = await _fetchAndEncode(sp, size);
+      if (r.error) return { name, error: r.error };
+      return { name, base64: r.base64 };
+    }));
+
+    const errors = [];
+    const attachPayload = [];
+    for (const fr of fetchResults) {
+      if (fr.error) {
+        errors.push({ name: fr.name, error: fr.error });
+      } else {
+        attachPayload.push({
+          name: fr.name,
+          mime: _guessMimeFromName(fr.name),
+          base64: fr.base64,
+        });
+      }
+    }
+
+    // Reset composer before placing new state so retry starts
+    // from a clean slate (no stale chips, no stale text).
+    try {
+      await doClear({});
+    } catch (e) {
+      console.warn("[deeppeek:retry-last] clear threw:", e);
+    }
+
+    // Attach files (batch mode — single dragover/drop).
+    let attachResult = null;
+    if (attachPayload.length > 0) {
+      try {
+        attachResult = await doAttach(
+          attachPayload, { delay_ms: 0, skip_preview_wait: true });
+      } catch (e) {
+        return {
+          success: false,
+          reason: `attach threw: ${e.message}`,
+          message_id: msgLabel,
+          files_fetched: attachPayload.length,
+          file_count: rawFiles.length,
+          errors,
+        };
+      }
+    }
+
+    // Type original prompt text (only if there was any).
+    let typeResult = null;
+    if (text) {
+      try {
+        typeResult = await doType(text, { skip_verify: true });
+      } catch (e) {
+        return {
+          success: false,
+          reason: `type threw: ${e.message}`,
+          message_id: msgLabel,
+          attach_result: attachResult,
+          errors,
+        };
+      }
+    }
+
+    return {
+      success: true,
+      source,
+      message_id: msgLabel,
+      file_count: rawFiles.length,
+      files_fetched: attachPayload.length,
+      files_attached: (attachResult && attachResult.dispatched)
+                        || attachPayload.length,
+      attach_result: attachResult,
+      text_length: text.length,
+      type_result: typeResult,
+      errors: errors.length ? errors : undefined,
+    };
+  }
+
+  window.__dsx_retry_last_json = async function (argsJson) {
+    let args = {};
+    try {
+      if (typeof argsJson === "string" && argsJson.length > 0) {
+        args = JSON.parse(argsJson);
+      }
+    } catch (e) {
+      return JSON.stringify({
+        success: false,
+        reason: `arg parse failed: ${e.message}`,
+      });
+    }
+    try {
+      const result = await doRetryLast(args);
+      console.log(
+        `[deeppeek:retry-last] ${result.success ? "OK" : "FAIL"} ` +
+        `(msg=${result.message_id || "?"}, ` +
+        `${result.files_attached || 0}/${result.file_count || 0} ` +
+        `file(s), ${result.text_length || 0} chars)`);
+      return JSON.stringify(result);
+    } catch (e) {
+      console.error("[deeppeek:retry-last] threw:", e);
+      return JSON.stringify({
+        success: false,
+        reason: `retry-last threw: ${e.message}`,
+      });
+    }
+  };
+
 })();

@@ -8,7 +8,14 @@ Each prompt gets its own subcommand:
     deeppeek prompt heredoc [flags]            — install a standing heredoc-emission order
     deeppeek prompt reprint-markdown [flags]   — ask the AI to reprint all edited markdowns
     deeppeek prompt review [flags]             — reset, re-apply the conversation, and pipe the aftermath
+    deeppeek prompt refine_deeppeek [flags]    — like review, plus a dump of deeppeek itself
     deeppeek prompt delete [flags]             — remove all attached files and clear the composer textarea
+    deeppeek prompt attachments [flags]        — download files attached to messages
+                                                 (composer draft/edit, prompt regex, message id,
+                                                 last N, or all)
+    deeppeek prompt retry [flags]              — reset the composer with the last
+                                                 prompt-with-attachments (clears, re-attaches,
+                                                 retypes the text)
 
 Every prompt module under `deeppeek.prompts.*` provides:
 
@@ -27,7 +34,7 @@ def register(sub: argparse._SubParsersAction) -> None:
 
     from ..prompts import (
         evolve, new, last_thought, heredoc, reprint_markdown, review,
-        refine_deeppeek, delete,
+        refine_deeppeek, delete, attachments, retry,
     )
     evolve.register(psub)
     new.register(psub)
@@ -37,6 +44,8 @@ def register(sub: argparse._SubParsersAction) -> None:
     review.register(psub)
     refine_deeppeek.register(psub)
     delete.register(psub)
+    attachments.register(psub)
+    retry.register(psub)
 
     p.set_defaults(func=run)
 

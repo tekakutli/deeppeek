@@ -133,6 +133,38 @@
       }
     }
 
+    if (msg.type === "DSX_EXTRACT_ATTACHMENTS") {
+      if (!(await ensurePageWorldFn("__dsx_extract_attachments_json"))) {
+        return { success: false, ok: false,
+                 reason: "page-world attachment extractor unavailable" };
+      }
+      try {
+        const argsJson = JSON.stringify(msg.opts || {});
+        const resultJson = await window.wrappedJSObject
+          .__dsx_extract_attachments_json(argsJson);
+        return JSON.parse(resultJson);
+      } catch (e) {
+        return { success: false, ok: false,
+                 reason: `extract-attachments threw: ${e.message}` };
+      }
+    }
+
+    if (msg.type === "DSX_RETRY_LAST") {
+      if (!(await ensurePageWorldFn("__dsx_retry_last_json"))) {
+        return { success: false,
+                 reason: "page-world retry-last unavailable" };
+      }
+      try {
+        const argsJson = JSON.stringify(msg.opts || {});
+        const resultJson = await window.wrappedJSObject
+          .__dsx_retry_last_json(argsJson);
+        return JSON.parse(resultJson);
+      } catch (e) {
+        return { success: false,
+                 reason: `retry-last threw: ${e.message}` };
+      }
+    }
+
     return null;
   });
 

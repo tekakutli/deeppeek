@@ -110,44 +110,69 @@ def _has_code_signal(body: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Blockquote policy — the single source of truth
+# ---------------------------------------------------------------------------
+#
+# A blockquote wraps the AI's reasoning (deeppeek's own formatter
+# wraps thoughts in `> `; the GUI does the same).  By convention such
+# content is speculative.  The one signal strong enough to override
+# that convention is **exact prose attribution** — the prose
+# immediately above the fence names exactly ONE target file
+# (`attributed_by == "prose"`).  That is the AI's explicit
+# "Update file X with this code" instruction.
+#
+# Every other attribution strength is rejected:
+#
+#   · `prose_nearest` — the prose named MULTIPLE files and the
+#     pipeline guessed the closest.  Thinking code routinely
+#     straddles several files; the guess is unreliable.  This is
+#     the pg_inpaint.py counterexample: a prose_nearest blockquoted
+#     block was applied AFTER a correct scoped-replace pair had
+#     already fixed the file, nesting `buildContextMaskB64` inside
+#     itself.  Balanced-brace clean, silently wrong.  The
+#     pg_state.py counterexample from an earlier revision is the
+#     same shape: "the AI's prose named `pg_state.py` among other
+#     files", i.e., multi-file guess, not exact single-file
+#     attribution.
+#
+#   · `body_header`, `anchor`, `subset` — incidental matches
+#     against the thinking's working notes.  The AI is not
+#     signalling "commit this"; it happens to mention a filename, or
+#     an anchor line, or a snippet.  The pipeline previously applied
+#     these and produced two warnings per block for no benefit.
+#
+# Do not inline the check at any call site.  Every consumer of the
+# blockquote policy calls `_has_strong_blockquote_attribution`,
+# which reads `_STRONG_BQ_ATTR`.  To make the policy more or less
+# permissive, edit `_STRONG_BQ_ATTR` — the predicate and every gate
+# that uses it pick up the change together.  A prior version had an
+# inline `_STRONG_BQ_ATTR` check in one gate (`orphan_patches`)
+# and a predicate call in the other (`_is_real_patch`); a
+# tightening of the predicate silently diverged from the inline
+# check, producing two contradictory policies within the same
+# function — that drift is the bug this comment exists to prevent.
+
+_STRONG_BQ_ATTR = frozenset({"prose"})
+
+
 def _has_strong_blockquote_attribution(b: Block) -> bool:
-    """Return False: blockquoted content is NEVER a committed edit.
+    """True iff the block's attribution is strong enough to override
+    the blockquote-is-thinking convention.
 
-    A blockquote is the AI's reasoning wrapper. Both deeppeek's own
-    formatter (`formatter.py`) and the browser GUI wrap thought
-    process in `> `. If the AI wants to write an edit, it writes it
-    outside the blockquote.
+    Only `attributed_by == "prose"` qualifies — the surrounding prose
+    names EXACTLY ONE target file, which is the AI's explicit
+    "Update file X with this code" instruction.  Every other
+    attribution strength is rejected; see the module-level
+    blockquote policy comment for the full reasoning and the
+    counterexamples that motivated the current boundary.
 
-    Prior versions allowed exact-prose attribution to override this,
-    on the theory "the AI named the target file in prose, so this
-    must be the code for that file." That theory is wrong, and the
-    pg_state.py corruption in this conversation is the counterexample:
-
-      · The AI's prose named `pg_state.py` among other files it was
-        analyzing.
-      · The blockquoted fragment contained code from a DIFFERENT
-        file (`pg_panel_fields.py`'s `syncPanelFields` guard).
-      · Pass 4 attributed the fragment to `pg_state.py` because that
-        was the only file in the surrounding ~1000 chars of prose.
-      · Pass 6 applied it, inserting an `if (...)` statement directly
-        inside an object literal. Braces balanced, so validation
-        passed.
-
-    A filename mention in prose is *weak* evidence about which file a
-    specific code fragment belongs to. It can only name ONE file at a
-    time, and AI reasoning often discusses several files. The
-    blockquote format is *strong* evidence about intent. When they
-    disagree, the structural signal wins.
-
-    Users who want their code committed should write it in a file
-    section (`### \`path/to/file\``) or in non-blockquoted prose. Both
-    produce headers or prose attribution that work correctly. The
-    only content this rule eliminates is a small number of legitimate
-    blockquoted edits — the cost of which is one lost patch per run,
-    versus one silently-corrupted file per run under the previous
-    policy.
+    This predicate and `_STRONG_BQ_ATTR` are the SINGLE source of
+    truth for the policy.  Every call site in `pass5_deduplicate` —
+    the `orphan_patches` construction and `_is_real_patch` — must
+    go through this predicate.  Callers must not inline the check.
     """
-    return False
+    return b.attributed_by in _STRONG_BQ_ATTR
 
 
 def pass5_deduplicate(records: dict,
@@ -244,40 +269,22 @@ def pass5_deduplicate(records: dict,
                     if blocks_by_idx[i].kind == "partial"
                     and i not in pair_idxs_for_this_file
                     and block_owner.get(i) == path]
-        # Orphan blocks inside a blockquote come from AI
-        # thinking.  Apply them only when prose attribution (the
-        # AI naming the file in prose) succeeded -- that is the
-        # strongest signal that the AI intended to commit the
-        # code.  Weaker attributions (body_header, anchor,
-        # subset) on blockquoted blocks are almost always
-        # incidental matches against the thinking's working
-        # notes: the pipeline previously applied them, they
-        # failed all insertion heuristics, and generated two
-        # warnings per block for no benefit.
-        # Only EXACT prose attribution — one filename in the
-        # surrounding prose — is strong enough to justify applying a
-        # blockquoted (thought-process) orphan.
-        #
-        # `prose_nearest` means the prose mentioned MULTIPLE files and
-        # the pipeline guessed.  Thought process routinely references
-        # several files at once; the guess is unreliable.  The
-        # regression that motivated this tightening: a prose_nearest
-        # blockquoted block was applied to pg_inpaint.py AFTER a
-        # correct scoped-replace pair had already fixed the file,
-        # nesting buildContextMaskB64 inside itself.
-        #
-        # `body_header`, `anchor`, and `subset` remain excluded, as
-        # before — those are incidental matches against the
-        # thinking's working notes.
-        _STRONG_BQ_ATTR = frozenset({"prose"})
+        # Orphan blocks inside a blockquote come from AI thinking.
+        # Apply them only when attribution is strong enough to
+        # override the blockquote-is-thinking convention — see
+        # `_has_strong_blockquote_attribution`'s docstring and the
+        # module-level blockquote policy comment.  Both this gate
+        # and `_is_real_patch` below must share the SAME predicate;
+        # inlining the check here was the source of the two-gate
+        # drift bug this comment guards against.
         orphan_patches = [
             b.idx for b in blocks_by_idx.values()
             if b.is_orphan and b.attributed_to == path
             and b.kind != "full"
             and b.idx not in pair_idxs_for_this_file
             and block_owner.get(b.idx) == path
-            and not (b.in_blockquote
-                     and b.attributed_by not in _STRONG_BQ_ATTR)
+            and (not b.in_blockquote
+                 or _has_strong_blockquote_attribution(b))
         ]
         partials = sorted(partials + orphan_patches)
 
@@ -327,13 +334,13 @@ def pass5_deduplicate(records: dict,
             ):
                 return True
 
-            # NEW: blockquoted content is thought-process unless
-            # explicitly signalled otherwise.  The rationale is in
-            # Block.in_blockquote's docstring, but that docstring
-            # only covers *orphan* blockquoted blocks.  Header-
-            # attributed blockquoted blocks are the leak: a File
-            # heading inside a blockquote mints a block that looks
-            # exactly like a real patch but is exploratory.
+            # Blockquoted content is thought-process unless
+            # `_has_strong_blockquote_attribution` says otherwise.
+            # The rationale is in that predicate's docstring and the
+            # module-level blockquote policy comment.  This gate and
+            # the `orphan_patches` construction above must share the
+            # SAME predicate — see the policy comment for the
+            # two-gate drift bug this contract prevents.
             if b.in_blockquote and not _has_strong_blockquote_attribution(b):
                 return False
 
