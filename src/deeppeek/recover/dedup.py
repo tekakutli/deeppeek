@@ -110,6 +110,31 @@ def _has_code_signal(body: str) -> bool:
     return False
 
 
+def _has_strong_blockquote_attribution(b: Block) -> bool:
+    """True iff a blockquoted block carries enough evidence to be
+    treated as a committed patch rather than thought-process
+    reasoning.
+
+    The only signal strong enough is an EXACT-prose attribution:
+    the AI named exactly one target file in the surrounding
+    prose, above the fence, with no ambiguity.  That is what
+    `attributed_by == "prose"` records.
+
+    Header-attributed blockquoted content is skipped.  Verb
+    heuristics ("add this", "replace with", ...) were tried and
+    rejected: thought-process prose uses those words constantly,
+    so they never separate "the assistant committed this code"
+    from "the assistant reasoned about this code".
+
+    A legitimate answer that arrives blockquoted and is silently
+    skipped is a lost patch.  A legitimate answer that arrives
+    blockquoted and is applied when it should not be is a
+    corruption.  A lost patch is visible in the manifest; a
+    corruption is not.  The gate errs on the side of visible.
+    """
+    return b.attributed_by == "prose"
+
+
 def pass5_deduplicate(records: dict,
                       blocks_by_idx: dict,
                       verbose: bool) -> None:
@@ -286,6 +311,17 @@ def pass5_deduplicate(records: dict,
                 or "reprint-context anchor" in b.override_reason
             ):
                 return True
+
+            # NEW: blockquoted content is thought-process unless
+            # explicitly signalled otherwise.  The rationale is in
+            # Block.in_blockquote's docstring, but that docstring
+            # only covers *orphan* blockquoted blocks.  Header-
+            # attributed blockquoted blocks are the leak: a File
+            # heading inside a blockquote mints a block that looks
+            # exactly like a real patch but is exploratory.
+            if b.in_blockquote and not _has_strong_blockquote_attribution(b):
+                return False
+
             body = b.body.strip()
             if not body:
                 return False

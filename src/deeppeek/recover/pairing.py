@@ -111,6 +111,18 @@ def _detect_replace_pairs(blocks: list, blocks_by_idx: dict) -> None:
         b = blocks[i]
         next_block = blocks[i + 1]
 
+        # Thought-process code (blockquoted by deeppeek's formatter
+        # or by the source GUI) is exploratory reasoning, not the
+        # assistant's committed answer.  Pairing such fragments --
+        # either with each other or with a real patch -- produces
+        # false pairs whose old_body references a base state that
+        # was never committed.  They fail closed (correct safety),
+        # but they add noise to the manifest and dilute the real
+        # failures.  Skip blockquoted blocks from pair detection
+        # entirely.
+        if b.in_blockquote or next_block.in_blockquote:
+            continue
+
         if getattr(b, "paired_with", None) is not None:
             continue
         if getattr(next_block, "paired_with", None) is not None:

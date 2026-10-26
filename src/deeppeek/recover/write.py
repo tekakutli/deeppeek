@@ -381,9 +381,26 @@ def pass9_write(records: dict,
             scope = pair.get("scope_hint", "replace")
             reason = r.get("reason", "unknown")
             kind = "scoped" if oi == -1 else "replace"
-            warnings_lines.append(
-                f"[{path}] [PAIR_FAILED] {kind} pair "
-                f"(old={oi}, new={ni}, scope={scope}): {reason}")
+
+            if "ellipsis" in reason.lower():
+                warnings_lines.append(
+                    f"[{path}] [PAIR_ELIDED] {kind} pair "
+                    f"(old={oi}, new={ni}): {reason}")
+            elif ("not found in base" in reason
+                  or "state drift" in reason):
+                warnings_lines.append(
+                    f"[{path}] [STATE_DRIFT] {kind} pair "
+                    f"(old={oi}, new={ni}): {reason}")
+                warnings_lines.append(
+                    f"[{path}] [STATE_DRIFT] this usually means "
+                    f"the base is missing a prerequisite change "
+                    f"from an earlier conversation; verify the "
+                    f"base state and reapply the prerequisite "
+                    f"before retrying.")
+            else:
+                warnings_lines.append(
+                    f"[{path}] [PAIR_FAILED] {kind} pair "
+                    f"(old={oi}, new={ni}, scope={scope}): {reason}")
 
         # Per-patch failure detail.
         for p in rec.patches:
@@ -859,14 +876,19 @@ def pass9_write(records: dict,
 
         pair_records = rec.verification.get("pair_records", [])
         pair_failures = []
+        state_drift_count = 0
         for r in pair_records:
             if r.get("applied_by") == "failed":
                 pair = r.get("pair", {})
+                reason = r.get("reason", "unknown")
+                if ("not found in base" in reason
+                        or "state drift" in reason):
+                    state_drift_count += 1
                 pair_failures.append({
                     "old_idx": pair.get("old_idx"),
                     "new_idx": pair.get("new_idx"),
                     "scope_hint": pair.get("scope_hint"),
-                    "reason": r.get("reason", "unknown"),
+                    "reason": reason,
                 })
         sanity_reason = (
             rec.verification.get("sanity_reason")
@@ -901,6 +923,7 @@ def pass9_write(records: dict,
             ],
             "patch_failure_reasons": patch_failure_reasons,
             "pair_failures": pair_failures,
+            "state_drift_count": state_drift_count,
             "verification": rec.verification,
             "warnings": rec.warnings,
         }
@@ -1071,6 +1094,31 @@ def pass9_write(records: dict,
                 reason = r.get("reason", "unknown")
                 print(f"    PAIR_FAILED {fpath} (old={oi}): {reason}",
                       file=sys.stderr)
+
+    # Cross-file hint: if the same file has ONLY state-drift
+    # failures across all its pairs, the base for that file is
+    # very likely stale -- the previous conversation's changes
+    # never landed there.
+    stale_files = []
+    for fpath, frec in records.items():
+        pf = frec.verification.get("pair_records") or []
+        failed = [r for r in pf if r.get("applied_by") == "failed"]
+        if not failed:
+            continue
+        if all(("not found in base" in r.get("reason", "")
+                or "state drift" in r.get("reason", ""))
+               for r in failed):
+            if not frec.patches or all(
+                p.get("applied_by") in ("failed", "already-present")
+                for p in frec.patches
+            ):
+                stale_files.append(fpath)
+    if stale_files:
+        print(f"  [hint] {len(stale_files)} file(s) look like "
+              f"their base predates this conversation "
+              f"({", ".join(sorted(stale_files))}); consider "
+              f"applying the previous conversation first.",
+              file=sys.stderr)
 
     if preexisting_skipped_count:
         print(f"  preexisting: {preexisting_skipped_count} file(s) left "

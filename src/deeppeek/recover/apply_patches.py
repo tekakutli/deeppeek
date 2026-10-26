@@ -902,6 +902,43 @@ def _diagnose_scoped_failure(base, scope_name, new_body=""):
     return f"scope {scope_name!r} not found in base"
 
 
+def _find_closest_window(base, old_body, threshold=0.4):
+    """Return (line_no, similarity, first_line_of_window) for
+    the closest match to old_body in base, or None.
+
+    Used by the replace-failure diagnostic to turn
+    "not found" into actionable context.  Similarity is
+    token-Jaccard; the search is over every window of
+    len(old_body) lines, so it can point at a region that
+    IS the drift the user is looking for.
+    """
+    def _toks(s):
+        return set(re.findall(r"[A-Za-z_$][\w$]*|[0-9]+|\S", s))
+
+    base_lines = base.split("\n")
+    old_lines = old_body.split("\n")
+    n = len(old_lines)
+    if n == 0 or len(base_lines) < n:
+        return None
+
+    old_toks = _toks(old_body)
+    if not old_toks:
+        return None
+
+    best = None
+    for i in range(len(base_lines) - n + 1):
+        window = "\n".join(base_lines[i:i + n])
+        window_toks = _toks(window)
+        if not window_toks:
+            continue
+        sim = len(old_toks & window_toks) / len(old_toks | window_toks)
+        if sim >= threshold and (best is None or sim > best[1]):
+            snippet = window.strip().split("\n")[0][:60]
+            best = (i + 1, sim, snippet)
+
+    return best
+
+
 def _diagnose_replace_failure(base, old_body, new_body=""):
     if not old_body or not old_body.strip():
         return "old_body is empty"
@@ -927,10 +964,25 @@ def _diagnose_replace_failure(base, old_body, new_body=""):
         if count_norm > 1:
             return (f"old_body (whitespace-normalized) appears "
                     f"{count_norm} times (ambiguous)")
+        if _has_ellipsis_marker(old_body):
+            return ("old_body contains an ellipsis marker; "
+                    "the AI abbreviated the change and it "
+                    "cannot be matched literally.  Use a "
+                    "scoped-replace or a narrower pair.")
         first_line = old_body.strip().split("\n")[0]
         if first_line and first_line not in base:
+            closest = _find_closest_window(base, old_body)
+            if closest is not None:
+                line_no, sim, snippet = closest
+                return (f"old_body's first line "
+                        f"({first_line[:60]!r}) not found in base; "
+                        f"closest match at line {line_no} "
+                        f"(token similarity {sim:.2f}): "
+                        f"{snippet!r} - base may be a pre-patch state")
             return (f"old_body's first line "
-                    f"({first_line[:60]!r}) not found in base")
+                    f"({first_line[:60]!r}) not found in base; "
+                    f"no similar region either - base is likely a "
+                    f"state that predates this edit")
         first_count = base.count(first_line)
         lines = old_body.strip().split("\n")
         second_hint = ""
@@ -1382,6 +1434,13 @@ def _try_object_literal_splice_for_pair(base, old_body, new_body):
 
 def _try_replace_pair(base, old, new):
     if not old.strip():
+        return None
+
+    # Ellipsis in old_body: cannot match literally.  Let the
+    # caller's other heuristics handle the new_body side
+    # (_try_ellipsis_splice) when applicable; otherwise
+    # fail-closed.
+    if _has_ellipsis_marker(old):
         return None
 
     # Drift: new is present, old is gone → already applied.  Return

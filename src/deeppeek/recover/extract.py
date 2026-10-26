@@ -75,6 +75,52 @@ def _parse_file_header(text: str) -> Optional[tuple[str, Optional[str]]]:
     return None
 
 
+import re as _re
+
+
+_DUMP_WRAPPER_RE = _re.compile(
+    r"\[file name\]:\s*(\S+)\s*\n"
+    r"(?:.*?\n)*?"
+    r"\[file content begin\]\s*\n"
+    r"(.*?)"
+    r"\n\[file content end\]",
+    _re.DOTALL,
+)
+
+
+def _find_dump_wrapper_spans(text):
+    """Return [(start_char, end_char)] spans of dump wrappers."""
+    spans = []
+    for m in _DUMP_WRAPPER_RE.finditer(text):
+        filename = m.group(1) or ""
+        body = m.group(2) or ""
+        looks_dump = (
+            "dump" in filename.lower()
+            or "SCANNED DIRECTORY" in body
+        )
+        if not looks_dump:
+            continue
+        spans.append((m.start(), m.end()))
+    return spans
+
+
+def _char_spans_to_line_spans(text, char_spans):
+    line_spans = []
+    for start, end in char_spans:
+        start_line = text.count("\n", 0, start)
+        end_line = text.count("\n", 0, end)
+        line_spans.append((start_line, end_line))
+    return line_spans
+
+
+def _block_in_any_span(block_line_start, block_line_end, line_spans):
+    for span_start, span_end in line_spans:
+        if (block_line_start >= span_start
+                and block_line_start <= span_end):
+            return True
+    return False
+
+
 def pass1_extract(dump_text: str) -> tuple[list[Block], list[str]]:
     md = MarkdownIt()
     tokens = md.parse(dump_text)
@@ -148,7 +194,12 @@ def pass1_extract(dump_text: str) -> tuple[list[Block], list[str]]:
             body = tok.content
             if body.endswith("\n"):
                 body = body[:-1]
-            ctx = "\n".join(current_context_lines[-6:])
+            # Fix D: 15-line context so `FILE i/N:` markers
+            # written by dump.py output (which are three lines
+            # above the fence) are visible to RECOVERED_META_RE.
+            # The extra lines are cheap; the false-negative they
+            # prevent is a silent corruption.
+            ctx = "\n".join(current_context_lines[-15:])
             blocks.append(_make_block(
                 current_header, lang, body, m[0], m[1], ctx,
                 bq=(blockquote_depth > 0),
@@ -158,6 +209,21 @@ def pass1_extract(dump_text: str) -> tuple[list[Block], list[str]]:
             continue
 
         i += 1
+
+    # Fix C: dump-wrapper spans are marked as recovered_meta.
+    # Their inner blocks were already extracted by the markdown
+    # parser as ordinary fences; we are re-tagging, not
+    # re-parsing.
+    wrapper_char_spans = _find_dump_wrapper_spans(dump_text)
+    wrapper_line_spans = _char_spans_to_line_spans(
+        dump_text, wrapper_char_spans)
+    if wrapper_line_spans:
+        for b in blocks:
+            if _block_in_any_span(b.line_start, b.line_end,
+                                   wrapper_line_spans):
+                b.kind = "recovered_meta"
+                b.is_code_file = False
+                b.override_reason = "dump wrapper"
 
     deleted = _del_marker_names(dump_text)
     return blocks, sorted(deleted)

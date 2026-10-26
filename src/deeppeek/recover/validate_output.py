@@ -270,6 +270,40 @@ def _looks_like_html(text: str) -> bool:
             or "<button" in text)
 
 
+def _looks_like_css(text: str) -> bool:
+    """True iff text contains CSS-specific structure that would
+    be meaningless or misleading inside a JS body.
+
+    Two patterns cover the observed failure shape and are
+    deliberately narrow enough to miss no valid JS:
+
+      1. A CSS ID selector at line start followed by `{`.
+         In JS, `#word {` can only appear inside a class body
+         as part of `#word() {` (a private method) or as
+         `#word = ...` (a private field).  CSS `#maskPromptRow
+         textarea {` -- hash-word followed by space and another
+         word and `{` -- has no JS interpretation.
+
+      2. Two or more `prop: value;` declarations on one line.
+         JS object literals use `,` between entries; `;`
+         after every value is CSS-only.
+    """
+    if not text:
+        return False
+    if re.search(
+        r"^[ \t]*#[A-Za-z][\w-]*(?:\s+[\w-]+)+\s*\{",
+        text, re.MULTILINE,
+    ):
+        return True
+    if re.search(
+        r"^[ \t]*[\w-]+\s*:\s*[^;{}\n]+;\s*"
+        r"[\w-]+\s*:\s*[^;{}\n]+;",
+        text, re.MULTILINE,
+    ):
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -302,6 +336,13 @@ def validate_content(content: str, path: str,
             return (f"{path}: python SyntaxError at line {e.lineno}: "
                     f"{e.msg}")
 
+        base_js_texts = []
+        if base:
+            for _off, _b in _iter_triple_quoted(base):
+                if _looks_like_js(_b):
+                    base_js_texts.append(_b)
+        base_js_css = any(_looks_like_css(b) for b in base_js_texts)
+
         for offset, block in _iter_triple_quoted(content):
             lineno = _line_of(content, offset)
             label = f"{path} (embedded at line {lineno})"
@@ -313,6 +354,17 @@ def validate_content(content: str, path: str,
                 err = _js_structural_check(block, label)
                 if err:
                     return err
+                # Cross-language guard: CSS appearing in JS that
+                # did not have CSS in base is a strong signal that
+                # a block from a different language was applied
+                # here.  Reject rather than write corrupted JS.
+                if (base_js_texts
+                        and not base_js_css
+                        and _looks_like_css(block)):
+                    return (f"{label}: CSS structure appeared "
+                            f"inside embedded JS that had none in "
+                            f"base -- cross-language contamination, "
+                            f"rejecting")
 
         if base:
             return _function_presence_check(
