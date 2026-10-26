@@ -64,10 +64,19 @@ def slice_messages(
                     if m.role == "user"]
 
     # ------------------------------------------------------------------
-    # Turn-anchored slice: --last-regex (last matching user turn to
-    # end) or --last N (last N user turns to end).  Both paths
-    # produce (start, start_user_turn) and then fall into the
-    # shared exclusive tail-trim.
+    # Turn-anchored slice: --last-regex (last matching user turn
+    # to end) or --last N (last N user turns to end).
+    #
+    # --last-regex is the mirror of --until-regex: it scans
+    # BACKWARD from the conversation end and takes the very first
+    # match it encounters -- i.e. the very last matching user turn
+    # overall.  --until-regex scans FORWARD from the slice start
+    # and takes the very first match after it.  Both are "first
+    # match" scans in opposite directions; the symmetry is
+    # deliberate.
+    #
+    # Both paths produce (start, start_user_turn) and then fall
+    # into the shared exclusive tail-trim.
     # ------------------------------------------------------------------
     if in_turn_slice:
         if last_regex is not None:
@@ -79,12 +88,20 @@ def slice_messages(
                     file=sys.stderr)
                 raise SystemExit(3)
 
-            match_idx = None
-            for i, m in enumerate(messages):
-                if m.role == "user" and pat.search(m.content or ""):
-                    match_idx = i
+            # Scan BACKWARD from the conversation end and take the
+            # FIRST user turn that matches.  "The very last
+            # occurrence" is "the very first one, starting in
+            # reverse" -- the mirror of --until-regex, which scans
+            # forward from the slice start and takes the very next
+            # match.
+            match_turn = None
+            for turn in range(len(user_indices) - 1, -1, -1):
+                m = messages[user_indices[turn]]
+                if pat.search(m.content or ""):
+                    match_turn = turn
+                    break
 
-            if match_idx is None:
+            if match_turn is None:
                 print(
                     f"warning: --last-regex {last_regex!r} matched "
                     f"no user prompt; returning whole conversation",
@@ -92,8 +109,8 @@ def slice_messages(
                 start = 0
                 start_user_turn = 0
             else:
-                start = match_idx
-                start_user_turn = user_indices.index(match_idx)
+                start_user_turn = match_turn
+                start = user_indices[match_turn]
             end = last
         else:  # last_user_turns is not None
             if last_user_turns <= 0:
@@ -148,32 +165,32 @@ def slice_messages(
                     f"{e}", file=sys.stderr)
                 raise SystemExit(3)
 
-            match_idx = None
-            for i, m in enumerate(messages):
-                if m.role == "user" and upat.search(m.content or ""):
-                    match_idx = i
+            # Scan forward from the slice start and take the FIRST
+            # matching user turn.  "The very next regex match after
+            # --last": we do NOT scan the whole conversation and
+            # pick the last match -- we stop at the first hit.
+            matched_turn = None
+            for turn in range(start_user_turn, len(user_indices)):
+                m = messages[user_indices[turn]]
+                if upat.search(m.content or ""):
+                    matched_turn = turn
+                    break
 
-            if match_idx is None:
+            if matched_turn is None:
                 print(
                     f"warning: --until-regex {until_regex!r} "
-                    f"matched no user prompt; no trim applied",
+                    f"matched no user prompt at or after the slice "
+                    f"start (user turn {start_user_turn}); no trim "
+                    f"applied",
                     file=sys.stderr)
                 # end stays `last`
+            elif matched_turn == start_user_turn:
+                raise SystemExit(
+                    f"error: --until-regex {until_regex!r} "
+                    f"matched the start of the slice (user turn "
+                    f"{start_user_turn}); excluding it would leave "
+                    f"no turns")
             else:
-                matched_turn = user_indices.index(match_idx)
-                if matched_turn < start_user_turn:
-                    raise SystemExit(
-                        f"error: --until-regex {until_regex!r} "
-                        f"matched only before the start of the "
-                        f"slice (matched user turn "
-                        f"{matched_turn}, slice starts at user "
-                        f"turn {start_user_turn})")
-                if matched_turn == start_user_turn:
-                    raise SystemExit(
-                        f"error: --until-regex {until_regex!r} "
-                        f"matched the start of the slice (user "
-                        f"turn {start_user_turn}); excluding it "
-                        f"would leave no turns")
                 end_user_turn = matched_turn - 1
                 end = user_indices[end_user_turn]
                 if (end + 1 <= last

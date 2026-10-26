@@ -75,7 +75,11 @@ def add_capture_side_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--last-regex", default=None, metavar="PATTERN",
         help="anchor at the LAST user prompt whose content matches "
-             "PATTERN (Python regex), slice to end.  Overrides --last.",
+             "PATTERN (Python regex), slice to end.  The very "
+             "last matching turn overall — implemented as a "
+             "BACKWARD scan from the conversation end (first hit "
+             "wins).  Mirror of --until-regex's forward scan.  "
+             "Overrides --last.",
     )
     p.add_argument(
         "--until", type=int, default=None, metavar="K",
@@ -89,11 +93,14 @@ def add_capture_side_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--until-regex", default=None, metavar="PATTERN",
         help="end the --last/--last-regex slice JUST BEFORE the "
-             "LAST user prompt matching PATTERN: keeps user turns "
-             "[start, match-1], exclusive of the matched turn.  "
-             "Requires --last N or --last-regex.  Errors if the "
-             "last match is at or before the slice's start user-"
-             "turn index.  Mutually exclusive with --until.",
+             "FIRST user prompt at or after the slice start "
+             "whose content matches PATTERN.  Scans forward from "
+             "the slice start and takes the very next match — "
+             "NOT the last match in the conversation.  Requires "
+             "--last N or --last-regex.  Errors if the first "
+             "match is the slice start itself (excluding it "
+             "would leave no turns).  Mutually exclusive with "
+             "--until.",
     )
     p.add_argument("--no-thinking", action="store_true")
     p.add_argument("--no-hints", action="store_true")

@@ -151,7 +151,11 @@ fail-closed.
 `capture`:
 
     --last N            last N user turns (each turn = prompt + reply)
-    --last-regex PAT    last prompt matching a regex, to end of conversation
+    --last-regex PAT    last prompt matching a regex, to end of
+                        conversation.  The very last matching turn —
+                        i.e. the first match when scanning BACKWARD
+                        from the conversation end.  Mirror of
+                        --until-regex's forward scan.
     --until K           end the --last/--last-regex slice JUST BEFORE
                         user turn K (0-indexed from conversation
                         start). Requires --last or --last-regex; K
@@ -160,10 +164,13 @@ fail-closed.
                         --until 5 keeps turns (total-10)..4 (exclusive
                         of turn 5).
     --until-regex PAT    end the --last/--last-regex slice JUST BEFORE
-                        the LAST user prompt matching PATTERN.
+                        the FIRST user prompt at or after the slice
+                        start matching PATTERN.  Scans forward from
+                        the slice start; the very next match wins —
+                        NOT the last match in the conversation.
                         Requires --last or --last-regex; errors if
-                        the last match is at or before the slice
-                        start.  Mutually exclusive with --until.
+                        the first match is the slice start itself.
+                        Mutually exclusive with --until.
     -o PATH|auto        write the markdown; "auto" = timestamped default.
                         Recovery runs by default, with or without -o.
                         When PATH is given, the recovered directory

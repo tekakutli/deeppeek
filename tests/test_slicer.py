@@ -1,15 +1,24 @@
 """Tests for slice_messages with the --until / --until-regex flags.
 
+--last-regex PATTERN anchors at the LAST user prompt matching
+PATTERN.  It is the mirror of --until-regex: it scans BACKWARD
+from the conversation end and takes the very first match
+encountered (the very last matching turn overall).
+
 --until K trims the tail of a --last / --last-regex slice so it
 ends JUST BEFORE user turn K (0-indexed, exclusive of K).  Keeps
 user turns [start_user_turn, K-1].
 
---until-regex PATTERN is the pattern-based mirror: it ends just
-before the LAST user turn matching PATTERN.  Exclusive of the
-matched turn.
+--until-regex PATTERN ends the slice JUST BEFORE the FIRST user
+prompt at or after the slice start matching PATTERN.  The scan is
+forward-only from the slice start ("the very next match"); it does
+NOT pick the last match anywhere in the conversation.  If the first
+match is the slice start turn itself, that would exclude the whole
+slice and is an error.  If there is no match at or after the slice
+start, no trim is applied (warning, but not an error).
 
-Both require a turn-anchored start (--last N or --last-regex) and
-are mutually exclusive with each other.
+Both flags require a turn-anchored start (--last N or
+--last-regex) and are mutually exclusive with each other.
 """
 import sys
 from pathlib import Path
@@ -112,24 +121,44 @@ def test_until_regex_invalid_errors():
     assert "not a valid regex" in err.getvalue()
 
 
-def test_until_regex_before_start_errors():
-    msgs = _mk_messages(10)
-    try:
-        slice_messages(msgs, last_user_turns=3, until_regex="q2")
-        assert False, "expected SystemExit"
-    except SystemExit as e:
-        assert "matched only before the start" in str(e)
-
-
 def test_until_regex_at_start_errors():
-    """--until-regex matching the slice's start turn: excluding it
-    leaves no turns, error."""
-    msgs = _mk_messages(10)
+    """The FIRST match in the forward scan is the slice start itself:
+    excluding it leaves no turns, error."""
+    msgs = _mk_messages(10)  # last 3 -> start_user_turn = 7
     try:
         slice_messages(msgs, last_user_turns=3, until_regex="q7")
         assert False, "expected SystemExit"
     except SystemExit as e:
         assert "matched the start" in str(e)
+
+
+def test_until_regex_at_start_with_later_match_still_errors():
+    """First match is the slice start, but a LATER turn also matches.
+    New semantics: the very next match is the start itself, so this
+    still errors — we do NOT skip to the later match."""
+    msgs = _mk_messages(10)  # last 5 -> start_user_turn = 5
+    # "q" matches every user turn; the first one in the slice is
+    # turn 5 (the start).
+    try:
+        slice_messages(msgs, last_user_turns=5, until_regex="q")
+        assert False, "expected SystemExit"
+    except SystemExit as e:
+        assert "matched the start" in str(e)
+
+
+def test_until_regex_before_start_no_trim():
+    """A pattern that matches only before the slice start is simply
+    NOT FOUND by the forward scan.  No trim; whole slice returned.
+
+    (Old behavior errored with 'matched only before the start'.
+    Under 'very next after --last' semantics, that case is
+    indistinguishable from 'no match at all in the slice'.)
+    """
+    msgs = _mk_messages(10)  # last 3 -> start_user_turn = 7
+    a = slice_messages(msgs, last_user_turns=3)
+    b = slice_messages(msgs, last_user_turns=3, until_regex="q2")
+    assert len(a) == len(b) == 6
+    assert [m.content for m in a] == [m.content for m in b]
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +169,33 @@ def test_last_only_backward_compat():
     msgs = _mk_messages(10)
     sliced = slice_messages(msgs, last_user_turns=3)
     assert len(sliced) == 6
+
+
+def test_last_regex_picks_very_last_match():
+    """When PATTERN matches multiple user turns, --last-regex anchors
+    at the VERY LAST one — the first hit when scanning BACKWARD from
+    the conversation end.  Mirror of --until-regex's forward scan.
+
+    Setup: 10 turns, every user prompt contains 'q'.  --last-regex
+    'q' must anchor at turn 9 (the very last one), so the slice is
+    turn 9 plus its reply.
+    """
+    msgs = _mk_messages(10)
+    sliced = slice_messages(msgs, last_regex="q")
+    assert len(sliced) == 2
+    assert sliced[0].content == "q9"
+    assert sliced[1].content == "a9"
+
+
+def test_last_regex_picks_last_of_scattered_matches():
+    """Non-contiguous matches: pattern 'q1|q4|q7' on 10 turns.  The
+    backward scan from the end hits turn 7 first; that becomes the
+    anchor.  Turns 8,9 are after it in the slice."""
+    msgs = _mk_messages(10)
+    sliced = slice_messages(msgs, last_regex="q1|q4|q7")
+    assert sliced[0].content == "q7"
+    assert sliced[-1].content == "a9"
+    assert len(sliced) == 6  # turns 7,8,9
 
 
 def test_last_regex_only_backward_compat():
@@ -234,12 +290,12 @@ def test_until_regex_with_last_regex_works():
 
 
 # ---------------------------------------------------------------------------
-# --until-regex (pattern-based) — EXCLUSIVE of matched turn
+# --until-regex (pattern-based) — first-forward-match semantics
 # ---------------------------------------------------------------------------
 
 def test_until_regex_one_turn():
-    """--last 3 --until-regex 'q8' on 10 turns: keeps turn 7 only
-    (turn 8 excluded)."""
+    """--last 3 --until-regex 'q8' on 10 turns: start=7, first match
+    in the slice is turn 8; keeps turn 7 only (turn 8 excluded)."""
     msgs = _mk_messages(10)
     sliced = slice_messages(msgs, last_user_turns=3, until_regex="q8")
     assert len(sliced) == 2
@@ -265,14 +321,23 @@ def test_until_regex_no_match_noop():
     assert len(a) == len(b) == 6
 
 
-def test_until_regex_last_match_wins():
-    """PATTERN 'q' matches every user turn; last match is turn 9.
-    --last 5 → start=5, keeps turns 5,6,7,8 (exclusive of 9)."""
+def test_until_regex_first_match_wins():
+    """The FIRST match at or after the slice start wins — NOT the
+    last one.  (Under the old 'last match' behaviour this test
+    would trim at turn 9, leaving turns 5,6,7,8.  Under the new
+    'very next after --last' behaviour, the first match is turn 6,
+    leaving turns 5 only.)
+
+    Setup: last 5 on 10 turns → slice is turns 5,6,7,8,9.  Pattern
+    'q6|q9' matches turn 6 (first) and turn 9 (last).  The forward
+    scan hits turn 6 first and stops there.
+    """
     msgs = _mk_messages(10)
-    sliced = slice_messages(msgs, last_user_turns=5, until_regex="q")
-    assert len(sliced) == 8
+    sliced = slice_messages(msgs, last_user_turns=5,
+                           until_regex="q6|q9")
+    assert len(sliced) == 2
     assert sliced[0].content == "q5"
-    assert sliced[-1].content == "a8"
+    assert sliced[1].content == "a5"
 
 
 def test_until_regex_partial_match():
@@ -285,10 +350,28 @@ def test_until_regex_partial_match():
 
 
 def test_until_regex_ignores_assistant_messages():
-    """Pattern 'a5' matches no user turn → no trim."""
+    """Pattern 'a5' matches no user turn -> no trim."""
     msgs = _mk_messages(10)
     sliced = slice_messages(msgs, last_user_turns=10, until_regex="a5")
     assert len(sliced) == 20
+
+
+def test_until_regex_skips_matches_before_slice_start():
+    """A pattern that matches BOTH before the slice start AND inside
+    the slice: the scan starts at the slice start, so the
+    before-slice match is ignored and the first inside-slice match
+    is used.
+
+    Setup: last 3 on 10 turns → slice is turns 7,8,9.  Pattern
+    'q2|q8' matches turn 2 (before slice) and turn 8 (inside).
+    Forward scan from turn 7 hits turn 8 first → keeps turns 7.
+    """
+    msgs = _mk_messages(10)
+    sliced = slice_messages(msgs, last_user_turns=3,
+                           until_regex="q2|q8")
+    assert len(sliced) == 2
+    assert sliced[0].content == "q7"
+    assert sliced[1].content == "a7"
 
 
 def main():
@@ -302,11 +385,17 @@ def main():
         ("until at start errors", test_until_at_start_errors),
         ("until negative errors", test_until_negative_errors),
         ("until-regex invalid errors", test_until_regex_invalid_errors),
-        ("until-regex before start errors",
-         test_until_regex_before_start_errors),
         ("until-regex at start errors",
          test_until_regex_at_start_errors),
+        ("until-regex at start with later match still errors",
+         test_until_regex_at_start_with_later_match_still_errors),
+        ("until-regex before start no trim",
+         test_until_regex_before_start_no_trim),
         ("last only backward compat", test_last_only_backward_compat),
+        ("last-regex picks very last match",
+         test_last_regex_picks_very_last_match),
+        ("last-regex picks last of scattered matches",
+         test_last_regex_picks_last_of_scattered_matches),
         ("last-regex only backward compat",
          test_last_regex_only_backward_compat),
         ("last until one turn", test_last_until_one_turn),
@@ -326,12 +415,14 @@ def main():
         ("until-regex two turns", test_until_regex_two_turns),
         ("until-regex no match noop",
          test_until_regex_no_match_noop),
-        ("until-regex last match wins",
-         test_until_regex_last_match_wins),
+        ("until-regex first match wins",
+         test_until_regex_first_match_wins),
         ("until-regex partial match",
          test_until_regex_partial_match),
         ("until-regex ignores assistant messages",
          test_until_regex_ignores_assistant_messages),
+        ("until-regex skips matches before slice start",
+         test_until_regex_skips_matches_before_slice_start),
     ]
     failed = 0
     for name, fn in tests:
