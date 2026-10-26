@@ -10,20 +10,31 @@ AI's reasoning, not its final answer.  Three behaviours matter:
      warnings.txt with blocks the user can't act on.
 
   2. Blockquoted fences with weak attribution (body_header, anchor,
-     subset) must NOT be applied as patches.  Only prose attribution
-     (the AI naming the target file in surrounding prose) is strong
-     enough to justify applying a blockquoted fence.
+     subset, prose_nearest) must NOT be applied as patches.  Only
+     EXACT prose attribution — the AI naming exactly one target file
+     in surrounding prose — is strong enough to justify applying a
+     blockquoted fence.
 
-  3. Blockquoted fences with prose attribution ARE applied, matching
-     the previous behaviour.  This is the case where the AI is
-     explicitly saying "Update file X with this code".
+     `prose_nearest` was previously accepted alongside `prose`; the
+     distinction matters when the prose names MULTIPLE files and the
+     tool guesses the closest mention.  Thought-process code that
+     straddles several files is exactly what should not be applied
+     on a guess.  The specific failure that motivated the tightening:
+     a prose_nearest blockquoted block was applied to pg_inpaint.py
+     AFTER a correct scoped-replace pair had already fixed the file,
+     nesting `buildContextMaskB64` inside itself.  Balanced-brace
+     clean, syntactically valid JavaScript, silently wrong.
 
-The motivating case: conversation2.md, where every assistant message
-was a thought-process blockquote.  The previous behaviour extracted
-four thinking fragments (blocks 26, 28, 30, 32) as unattributable
-orphans and produced two warnings for a fifth (block 25) that failed
-after being tried.  The fix eliminates all six warnings without
-changing which files land on disk.
+  3. Blockquoted fences with exact-prose attribution ARE applied,
+     matching the previous behaviour.  This is the case where the
+     AI is explicitly saying "Update file X with this code".
+
+The motivating case for the blockquote handling: conversation2.md,
+where every assistant message was a thought-process blockquote.  The
+previous behaviour extracted four thinking fragments (blocks 26, 28,
+30, 32) as unattributable orphans and produced two warnings for a
+fifth (block 25) that failed after being tried.  The fix eliminates
+all six warnings without changing which files land on disk.
 """
 import sys
 from pathlib import Path
@@ -266,6 +277,50 @@ def test_blockquoted_prose_attr_still_patched():
         f"bq.idx={bq.idx}, patches={rec.patches}")
 
 
+def test_blockquoted_prose_nearest_not_patched():
+    """A blockquoted orphan with `prose_nearest` attribution must NOT
+    be applied.
+
+    `prose_nearest` means the prose named MULTIPLE files and the tool
+    guessed the closest one.  Thought-process code routinely straddles
+    several files; the guess is unreliable — especially for a
+    blockquoted block, which is already speculative by convention.
+
+    The specific regression: a prose_nearest blockquoted block was
+    applied to pg_inpaint.py *after* a correct scoped-replace pair
+    had already fixed the file, nesting `buildContextMaskB64` inside
+    itself.  The nesting was balanced-brace clean — syntactically
+    valid JavaScript, silently wrong."""
+    base = Block(
+        idx=0, header_path="a.js", modifier=None, fence_lang="js",
+        body="existing();\n", body_line_count=1,
+        context_before="", line_start=0, line_end=1,
+        is_orphan=False, is_code_file=True, kind="full",
+        canonical_path="a.js", output_path="a.js",
+        classified_by="preexisting",
+    )
+    bq = Block(
+        idx=1, header_path=None, modifier=None, fence_lang="js",
+        body="// a.js fragment\nnewFunc();\n", body_line_count=2,
+        # Ambiguous prose — mentions two files.
+        context_before="Update `a.js` and `b.js` with:",
+        line_start=0, line_end=2, is_orphan=True,
+        is_code_file=True, kind="partial",
+        in_blockquote=True,
+        attributed_to="a.js", attributed_by="prose_nearest",
+        output_path="a.js",
+    )
+    rec = FileRecord(path="a.js", state="SINGLE_FULL")
+    rec.source_blocks = [0]
+    rec.preexisting_base = True
+    rec.chosen_full_idx = 0
+    rec.last_full_idx = 0
+    pass5_deduplicate({"a.js": rec}, {0: base, 1: bq}, verbose=False)
+    assert not any(p["idx"] == bq.idx for p in rec.patches), (
+        f"prose_nearest blockquoted should be skipped; "
+        f"bq.idx={bq.idx}, patches={rec.patches}")
+
+
 # ---------------------------------------------------------------------------
 # write.py: blockquote_skip disposition
 # ---------------------------------------------------------------------------
@@ -337,6 +392,8 @@ def main():
          test_blockquoted_weak_attr_not_patched),
         ("blockquoted prose attr still patched",
          test_blockquoted_prose_attr_still_patched),
+        ("blockquoted prose_nearest not patched",
+         test_blockquoted_prose_nearest_not_patched),
         ("disposition blockquote_skip",
          test_disposition_blockquote_skip),
         ("via_llm not set without llm patch",

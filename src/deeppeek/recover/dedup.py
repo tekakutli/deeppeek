@@ -214,7 +214,22 @@ def pass5_deduplicate(records: dict,
         # notes: the pipeline previously applied them, they
         # failed all insertion heuristics, and generated two
         # warnings per block for no benefit.
-        _STRONG_BQ_ATTR = frozenset({"prose", "prose_nearest"})
+        # Only EXACT prose attribution — one filename in the
+        # surrounding prose — is strong enough to justify applying a
+        # blockquoted (thought-process) orphan.
+        #
+        # `prose_nearest` means the prose mentioned MULTIPLE files and
+        # the pipeline guessed.  Thought process routinely references
+        # several files at once; the guess is unreliable.  The
+        # regression that motivated this tightening: a prose_nearest
+        # blockquoted block was applied to pg_inpaint.py AFTER a
+        # correct scoped-replace pair had already fixed the file,
+        # nesting buildContextMaskB64 inside itself.
+        #
+        # `body_header`, `anchor`, and `subset` remain excluded, as
+        # before — those are incidental matches against the
+        # thinking's working notes.
+        _STRONG_BQ_ATTR = frozenset({"prose"})
         orphan_patches = [
             b.idx for b in blocks_by_idx.values()
             if b.is_orphan and b.attributed_to == path

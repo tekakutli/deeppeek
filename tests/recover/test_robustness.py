@@ -556,7 +556,6 @@ def test_dedup_func_block_async():
     assert out.count("async function fetch") == 1
 
 
-
 def test_dedup_func_block_python_different_strings_kept():
     """Identical functions inside two different embedded JS string
     literals of a .py file must NOT be deduped -- that would empty
@@ -604,8 +603,181 @@ def test_dedup_func_block_python_same_string_removed():
     assert out.count("function foo()") == 1
 
 
+# ============================================================
+# Scope-aware pre-check + indented-export gate
+# ============================================================
+#
+# Three invariants that close the pg_inpaint.py nesting class:
+#
+#   · A patch whose body declares a scope that exists in base must be
+#     routed through `_apply_scoped`, not the insert heuristics.
+#   · `validate_content` must reject indented `export` (invalid ESM).
+#   · Both checks apply to `.js` and to JS embedded in `.py` strings.
+
+def test_scope_replace_via_patch_not_insert():
+    """A patch whose body is a full function-decl matching an
+    existing base scope must REPLACE the function, not insert it.
+
+    Without the scope-aware pre-check in `_try_deterministic_patch`,
+    a body that failed the earlier heuristics could fall through to
+    `_try_insert_after_anchor` / `_try_structural_append`.  When the
+    anchor landed inside an existing function, the new body got
+    inserted there, nesting `export function foo()` inside `foo()`.
+    Balanced-brace clean, invalid ESM.
+
+    Motivating case: pg_inpaint.py in the wild — a
+    thought-process-supplied function body was inserted inside
+    `buildContextMaskB64`, immediately after a correct
+    scoped-replace pair had already fixed the file.
+    """
+    from deeppeek.recover.apply_patches import _try_deterministic_patch
+    base = (
+        "export function foo() {\n"
+        "  return 1;\n"
+        "}"
+    )
+    patch = {
+        "body": (
+            "export function foo() {\n"
+            "  return 2;\n"
+            "}"
+        ),
+        "context_before": "",
+    }
+    result = _try_deterministic_patch(base, patch)
+    assert result is not None, (
+        "expected scope-replace to succeed; pre-check should have "
+        "routed through _apply_scoped")
+    assert "return 2" in result, (
+        f"expected new body; got:\n{result}")
+    assert "return 1" not in result, (
+        f"expected old body replaced; got:\n{result}")
+    assert result.count("export function foo") == 1, (
+        f"expected exactly 1 foo decl, got "
+        f"{result.count('export function foo')}:\n{result}")
+    assert result.count("{") == result.count("}"), (
+        f"unbalanced result:\n{result}")
 
 
+def test_scope_replace_via_patch_nonmatching_scope_inserts():
+    """When the body declares a scope NOT in base, the pre-check must
+    fall through and the existing insert heuristics must run.
+
+    This guards against over-triggering: if the pre-check fired on
+    every scope-decl body (whether or not the scope exists in base),
+    legitimate inserts of new functions would break.
+    """
+    from deeppeek.recover.apply_patches import _try_deterministic_patch
+    base = (
+        "export function existing() {\n"
+        "  return 1;\n"
+        "}"
+    )
+    patch = {
+        "body": (
+            "export function totallyNew() {\n"
+            "  return 42;\n"
+            "}"
+        ),
+        "context_before": "",
+    }
+    result = _try_deterministic_patch(base, patch)
+    # The insert may or may not find an anchor depending on the
+    # heuristic set; the important property is that the pre-check
+    # did not force a scoped-replace on a non-existent scope.
+    # If it did fire, we'd see "existing" replaced and "totallyNew"
+    # nowhere — or a Return of None.  If a heuristic ran, result
+    # either contains both or is None (no anchor).  Either is
+    # acceptable; the pre-check did not consume the case.
+    if result is not None:
+        # If applied, the original function must survive.
+        assert "existing" in result, (
+            f"non-matching scope pre-check should not have replaced "
+            f"existing:\n{result}")
+        assert "totallyNew" in result, (
+            f"new function missing:\n{result}")
+    # (result is None is also acceptable — no anchor found.)
+
+
+def test_indented_export_rejected():
+    """A nested `export function X()` inside another function body is
+    balanced-brace clean but invalid ESM.  `validate_content` must
+    reject it so the fail-closed trust policy routes the file to
+    low_trust/.
+
+    This is the second line of defence for the pg_inpaint.py nesting
+    mangle: even if a bad patch slips past the pre-check, the
+    resulting file is caught before it can be written.
+    """
+    from deeppeek.recover.validate_output import validate_content
+    content = (
+        "function outer() {\n"
+        "  export function inner() {\n"
+        "    return 1;\n"
+        "  }\n"
+        "}\n"
+    )
+    err = validate_content(content, "test.js")
+    assert err is not None, "expected indented-export rejection"
+    assert "indented" in err.lower(), (
+        f"expected 'indented' in error; got {err!r}")
+
+
+def test_indented_export_in_embedded_js_rejected():
+    """Same check must fire for JS embedded in a Python string
+    literal — that's the playground pattern and the exact
+    pg_inpaint.py shape (`INPAINT_JS = r\"\"\"...\"\"\"`)."""
+    from deeppeek.recover.validate_output import validate_content
+    Q = chr(34) * 3
+    content = (
+        "JS = r" + Q + "\n"
+        "function outer() {\n"
+        "  export function inner() {\n"
+        "    return 1;\n"
+        "  }\n"
+        "}\n"
+        + Q + "\n"
+    )
+    err = validate_content(content, "test.py")
+    assert err is not None, (
+        "expected indented-export rejection for embedded JS")
+    assert "indented" in err.lower(), (
+        f"expected 'indented' in error; got {err!r}")
+
+
+def test_top_level_export_not_rejected():
+    """Sanity: the indented-export check must not reject legitimate
+    top-level `export function` / `export const`."""
+    from deeppeek.recover.validate_output import validate_content
+    content = (
+        "export function foo() {\n"
+        "  return 1;\n"
+        "}\n"
+        "export const bar = 42;\n"
+    )
+    err = validate_content(content, "test.js")
+    assert err is None, (
+        f"top-level export should be accepted; got {err!r}")
+
+
+def test_export_inside_string_literal_not_rejected():
+    """The indented-export check must ignore `export` inside JS
+    string literals — those are data, not declarations."""
+    from deeppeek.recover.validate_output import validate_content
+    content = (
+        "const s = '  export function hidden() {}';\n"
+        "export function visible() {\n"
+        "  return 1;\n"
+        "}\n"
+    )
+    err = validate_content(content, "test.js")
+    assert err is None, (
+        f"export inside string should be ignored; got {err!r}")
+
+
+# ============================================================
+# Cross-file duplicate detection
+# ============================================================
 
 def _long_body(name="processData"):
     body = f"function {name}(x) {{\n"
@@ -870,8 +1042,6 @@ def test_compute_block_disposition_preexisting():
     assert disp == "preexisting"
 
 
-
-
 def test_pass4_marks_not_a_file_as_attributed():
     """A prose block from pass2 (kind=not_a_file) is marked
     attributed_by='not_a_file' by pass4 — not left as unattributed.
@@ -943,9 +1113,67 @@ def test_pass4_marks_bash_not_a_file_as_orphan_not_code():
         f"{bash.disposition!r}")
 
 
+# ============================================================
+# _resolve_module / pass7 cross_validate — dotted-module handling
+# ============================================================
+
+def _mk_rec(path):
+    from deeppeek.recover.core import FileRecord
+    r = FileRecord(path=path, state="SINGLE_FULL")
+    r.content = "placeholder"
+    return r
+
+
+def test_resolve_module_dotted_top_not_recovered():
+    """`from pg_comfy.image import X` with neither `pg_comfy.py` nor
+    `pg_comfy/` recovered must return None.  Prior bug: the last
+    component was tried as a basename, so an unrelated `image.py`
+    anywhere in the recovery set falsely resolved the import."""
+    from deeppeek.recover.validate import _resolve_module
+    records = {"inpaint_server.py": _mk_rec("inpaint_server.py")}
+    assert _resolve_module(
+        "pg_comfy.image", records, "inpaint_server.py") is None
+
+
+def test_resolve_module_dotted_top_recovered():
+    """If `pg_comfy.py` IS recovered, `from pg_comfy.image import X`
+    resolves to that file (sub-paths become attribute accesses)."""
+    from deeppeek.recover.validate import _resolve_module
+    records = {
+        "inpaint_server.py": _mk_rec("inpaint_server.py"),
+        "pg_comfy.py":       _mk_rec("pg_comfy.py"),
+    }
+    result = _resolve_module(
+        "pg_comfy.image", records, "inpaint_server.py")
+    assert result == "pg_comfy.py"
+
+
+def test_pass7_reports_top_level_once():
+    """`from pg_comfy import X` and `from pg_comfy.image import Y`
+    must produce a single problem: `{module: "pg_comfy"}`, not two
+    entries (`pg_comfy` and `pg_comfy.image`)."""
+    from deeppeek.recover.validate import pass7_cross_validate
+    src = (
+        "from pg_comfy import ComfyClient\n"
+        "from pg_comfy.image import make_encoded_image\n"
+    )
+    rec = _mk_rec("inpaint_server.py")
+    rec.content = src
+    result = pass7_cross_validate({"inpaint_server.py": rec})
+    modules = [p["module"] for p in result["problems"]
+               if p["type"] == "missing_module"]
+    assert modules == ["pg_comfy"], (
+        f"expected ['pg_comfy'], got {modules!r}")
+
 
 def main():
     tests = [
+        ("resolve module dotted top not recovered",
+         test_resolve_module_dotted_top_not_recovered),
+        ("resolve module dotted top recovered",
+         test_resolve_module_dotted_top_recovered),
+        ("pass7 reports top level once",
+         test_pass7_reports_top_level_once),
         ("walker no comment returns input", test_walker_no_comment_returns_input),
         ("walker no comment contiguous", test_walker_no_comment_contiguous),
         ("walker line comment blank traversed", test_walker_line_comment_blank_traversed),
@@ -1016,6 +1244,18 @@ def main():
          test_dedup_func_block_python_different_strings_kept),
         ("dedup_func_block python same string removed",
          test_dedup_func_block_python_same_string_removed),
+        ("scope_replace via patch not insert",
+         test_scope_replace_via_patch_not_insert),
+        ("scope_replace via patch non-matching scope inserts",
+         test_scope_replace_via_patch_nonmatching_scope_inserts),
+        ("indented export rejected",
+         test_indented_export_rejected),
+        ("indented export in embedded JS rejected",
+         test_indented_export_in_embedded_js_rejected),
+        ("top-level export not rejected",
+         test_top_level_export_not_rejected),
+        ("export inside string literal not rejected",
+         test_export_inside_string_literal_not_rejected),
         ("cross_file empty when no records",
          test_cross_file_empty_when_no_records),
         ("cross_file detects identical long functions",

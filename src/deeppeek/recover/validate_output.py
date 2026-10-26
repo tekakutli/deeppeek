@@ -43,6 +43,17 @@ _LAST_DEDUP_DETAILS = []
 
 
 _JS_EXTS = frozenset({".js", ".mjs", ".jsx", ".ts", ".tsx"})
+# `export` is only legal at module top-level in ESM.  An indented
+# `export function X()` or `export const X = ...` is invalid syntax
+# and — in the recovery pipeline — is a smoking gun for a nested
+# declaration inserted by a mis-firing anchor heuristic.  The
+# specific corruption: an ellipsis or context-insert heuristic
+# placed `export function buildContextMaskB64() {}` inside the
+# existing `buildContextMaskB64()` body.
+_INDENTED_EXPORT_RE = re.compile(
+    r"^[ \t]+export\s+(?:function|class|const|let|var|default)\b",
+    re.MULTILINE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +178,17 @@ def _js_structural_check(text: str, label: str) -> Optional[str]:
         return f"{label}: unbalanced brackets ({brackets:+d})"
     if unclosed:
         return f"{label}: unclosed string literal"
+
+    # NEW: indented `export` is invalid ESM — `export` must be at
+    # module top-level.  This catches the nested-declaration
+    # corruption where a scope decl was inserted inside another
+    # function body.
+    _ie = _INDENTED_EXPORT_RE.search(text)
+    if _ie:
+        _line_no = text.count("\n", 0, _ie.start()) + 1
+        return (f"{label}: line {_line_no}: indented `export` "
+                f"(invalid ESM — export must be top-level)")
+
     # Column-0 declarations only.  JS `const` is block-scoped, so
     # `const res = ...` inside `uploadImageFile` and another
     # `const res = ...` inside `fetchStatus` are distinct bindings,

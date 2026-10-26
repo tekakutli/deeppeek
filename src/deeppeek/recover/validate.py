@@ -89,9 +89,27 @@ def pass7_cross_validate(records: dict[str, FileRecord]) -> dict:
             target = _resolve_module(module, records, path)
             if target is None:
                 if _is_likely_local(module, records):
-                    display = module.lstrip(".")
-                    if not display:
+                    clean = module.lstrip(".")
+                    if not clean:
                         continue
+                    # Report the TOP-LEVEL only when the top-level
+                    # is itself missing; report the full sub-path
+                    # when the top-level IS recovered but the
+                    # specific submodule is not.  This keeps the
+                    # problem list consistent with
+                    # `write._aggregate_missing_imports` (which
+                    # reports `pg_comfy.py`, not `image.py`, when
+                    # `from pg_comfy.image import X` fails to
+                    # resolve and `pg_comfy.py` is not recovered).
+                    top = clean.split(".", 1)[0]
+                    top_recovered = any(
+                        r.content is not None
+                        and (_basename(p) == top + ".py"
+                             or Path(p).as_posix()
+                                == top + "/__init__.py")
+                        for p, r in records.items()
+                    )
+                    display = clean if top_recovered else top
                     key = (path, display)
                     if key in seen_missing_modules:
                         continue
@@ -212,14 +230,55 @@ def _resolve_module(module: str, records: dict[str, FileRecord],
                 return full
         return None
 
+    # Bare (possibly dotted) module name.  Resolve the TOP-LEVEL
+    # component first: that is the level at which deeppeek can
+    # decide "recovered / not recovered".
+    #
+    #   · `pg_comfy.py` is recovered  → `pg_comfy.image` resolves
+    #     (whether `image` is a real submodule, a package submodule,
+    #     or an attribute on a single-file module).
+    #   · `pg_comfy/__init__.py` is recovered  → the package exists;
+    #     a dotted submodule is missing unless its own file is
+    #     recovered.
+    #   · Neither is recovered  → return None.
+    #
+    # Prior logic reduced every dotted import to its LAST
+    # component and searched for that basename anywhere in the
+    # recovery set.  That produced spurious `missing_module`
+    # entries for `from pg_comfy.image import X` whenever an
+    # unrelated `image.py` happened to exist elsewhere, and -- once
+    # `write._aggregate_missing_imports` was fixed -- left the two
+    # artefacts (MISSING_FILES.txt and manifest.run.cross_validate)
+    # disagreeing about what is actually missing.
+    parts    = module.split(".")
+    top_name = parts[0]
+    top_file = top_name + ".py"
+    top_pkg  = top_name + "/__init__.py"
+    sub_file = "/".join(parts) + ".py" if len(parts) > 1 else None
+
+    # Single-file module takes priority: if `pg_comfy.py` is
+    # recovered, every dotted path below it is an attribute
+    # access at runtime, not a distinct file.
     for path, rec in records.items():
         if rec.content is None:
             continue
-        if _basename(path) == module + ".py":
+        if _basename(path) == top_file:
             return path
-        last = module.rsplit(".", 1)[-1]
-        if last != module and _basename(path) == last + ".py":
-            return path
+
+    # Package form: only a specific sub-path resolves.
+    for path, rec in records.items():
+        if rec.content is None:
+            continue
+        if Path(path).as_posix() == top_pkg:
+            if sub_file is None:
+                return path
+            for sub_path, sub_rec in records.items():
+                if sub_rec.content is None:
+                    continue
+                if Path(sub_path).as_posix() == sub_file:
+                    return sub_path
+            return None
+
     return None
 
 

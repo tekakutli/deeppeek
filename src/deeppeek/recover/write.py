@@ -48,6 +48,35 @@ def _scan_mentioned_files(dump_text: str) -> set:
 
 
 def _aggregate_missing_imports(records: dict) -> set:
+    """Return basenames of local modules that are imported by a
+    recovered file but not themselves recovered.
+
+    Dotted paths (``from pg_comfy.image import X``) are resolved
+    against the **top-level** module first, because that is the
+    level at which deeppeek can decide "recovered / not recovered":
+
+      · ``pg_comfy.py`` is recovered  → ``pg_comfy.image`` resolves
+        (whether the sub is a real file, an ``__init__.py`` package,
+        or an attribute) — do not report a missing file.
+      · ``pg_comfy/__init__.py`` is recovered  → the package exists;
+        check for the submodule file specifically.
+      · Neither is recovered  → report ``pg_comfy.py`` (once), not
+        ``image.py``.
+
+    Prior logic reduced every import to its last dotted component
+    and produced spurious ``image.py`` entries (from
+    ``pg_comfy.image``), which pointed the user at the wrong path.
+    """
+    recovered_files = {
+        _basename(p) for p, r in records.items()
+        if r.content is not None
+    }
+    recovered_paths = {
+        p.replace("\\", "/").lstrip("./")
+        for p, r in records.items()
+        if r.content is not None
+    }
+
     expected: set = set()
     for path, rec in records.items():
         if not path.endswith(".py"):
@@ -55,15 +84,38 @@ def _aggregate_missing_imports(records: dict) -> set:
         if rec.content is None:
             continue
         for module, _name in _py_imports(rec.content):
-            if _is_likely_local(module, records):
-                clean = module.lstrip(".")
-                if not clean:
-                    continue
-                last = clean.rsplit(".", 1)[-1]
-                expected.add(_basename(last + ".py"))
-    recovered = {_basename(p) for p, r in records.items()
-                 if r.content is not None}
-    return expected - recovered
+            if not _is_likely_local(module, records):
+                continue
+            clean = module.lstrip(".")
+            if not clean:
+                continue
+            parts = clean.split(".")
+
+            top_name = parts[0]
+            top_file = top_name + ".py"
+            top_pkg  = top_name + "/__init__.py"
+
+            if top_file in recovered_paths:
+                # Single-file top-level module is recovered.
+                # Whatever the sub-path means (attribute, class,
+                # function) the ``file`` is present; the sub-path
+                # is not a missing file.
+                continue
+            if top_pkg in recovered_paths:
+                # Recovered as a package.  A submodule is only
+                # missing if it is a real multi-level path AND
+                # no file at that path is recovered.
+                if len(parts) > 1:
+                    sub_file = "/".join(parts) + ".py"
+                    if sub_file in recovered_paths:
+                        continue
+                    expected.add(os.path.basename(sub_file))
+                continue
+            # Top-level not recovered: report the top-level file
+            # once, not its last component.
+            expected.add(top_file)
+
+    return expected - recovered_files
 
 
 def _recovered_name_prefixes(records: dict) -> set:

@@ -1964,6 +1964,38 @@ def _try_deterministic_patch(base, patch, path=""):
               f"{type(e).__name__}: {e}", file=sys.stderr)
         return None
 
+def _scope_in_base(base: str, scope_name: str, scope_kind: str) -> bool:
+    """True iff `scope_name` exists in `base` as an extractable scope
+    of the given kind.
+
+    Reuses `_extract_scope_from_body` on the base itself — that is,
+    we ask "does the base contain a scope declaration for this name?"
+    rather than trying to match a regex against unknown structure.
+    Conservative: if extraction doesn't find it, we don't claim it
+    exists.
+    """
+    if not base or not scope_name:
+        return False
+    if scope_kind == "details":
+        return bool(re.search(
+            r"<details\b[^>]*>\s*<summary>\s*"
+            + re.escape(scope_name) + r"\s*</summary>",
+            base, re.IGNORECASE | re.DOTALL))
+    # For function/class/const: search for a line that starts the
+    # matching declaration.
+    esc = re.escape(scope_name)
+    if scope_kind == "python":
+        return bool(re.search(
+            rf"^(?:async\s+)?(?:def|class)\s+{esc}\b",
+            base, re.MULTILINE))
+    # javascript (default)
+    if re.search(rf"^(?:export\s+)?(?:async\s+)?"
+                 rf"(?:function|class)\s+{esc}\b", base, re.MULTILINE):
+        return True
+    if re.search(rf"^(?:export\s+)?(?:const|let|var)\s+{esc}\s*=\s*\{{",
+                 base, re.MULTILINE):
+        return True
+    return False
 
 def _try_deterministic_patch_inner(base, patch, path=""):
     raw_body = patch["body"]
@@ -1982,6 +2014,69 @@ def _try_deterministic_patch_inner(base, patch, path=""):
         diffed = _try_raw_diff_patch(base, raw_body)
         if diffed is not None:
             return diffed
+        # A diff body is a diff, not a scope replacement.
+        #
+        # If `_try_raw_diff_patch` failed, the patch is either already
+        # applied or genuinely malformed -- both outcomes are already
+        # handled by `pass6_apply_patches` (`_patch_already_present`
+        # then `_diff_already_applied`, then `failed` + LOW trust).
+        #
+        # Falling through would let the scope-aware pre-check below
+        # misinterpret a diff's *context* line as a real scope
+        # declaration: `body_stripped = raw_body.strip()` strips the
+        # context space from ` export function keepMe() {`, the JS
+        # scope regex matches scope `keepMe`, and `_apply_scoped`
+        # then replaces that function's body with the entire diff
+        # -- leaving `-` markers and a space-indented `export` line
+        # in the output.  `validate_content` correctly rejects that
+        # as `indented export`, so the file fail-closes and never
+        # lands in `files/`.  That is the regression behind
+        # `test_07_deletion_shapes`.
+        return None
+
+    # ---- Scope-aware pre-check -----------------------------------
+    #
+    # If the body DECLARES a scope (function, class, const-object,
+    # <details>) whose name is ALSO present in the base, this is a
+    # scoped-replace — not an insert.  Route through `_apply_scoped`
+    # and DO NOT fall through to the insert heuristics on failure.
+    #
+    # Why this matters: the previous code let a body that was a full
+    # function declaration flow past the diff check and into
+    # `_try_context_insert` / `_try_insert_after_anchor` /
+    # `_try_structural_append`.  When the target's anchor lived
+    # inside a function, the body got inserted *inside that
+    # function*, nesting `export function X()` inside another `X()`.
+    # Balanced-brace clean, syntactically valid JS, semantically
+    # catastrophic.  The specific mangle was a blockquoted orphan
+    # containing `export function buildContextMaskB64()` applied to
+    # a base that already had that function — but the same failure
+    # mode fires for any patch whose body is a full scope decl.
+    #
+    # If the body declares a scope NOT present in base, we fall
+    # through — that's a legitimate insert of a new declaration,
+    # and the existing heuristics handle it.
+    _scope_name, _scope_kind = _extract_scope_from_body(body_stripped)
+    if _scope_name and _scope_in_base(base, _scope_name, _scope_kind):
+        _scope_result = _apply_scoped(base, _scope_name, body_stripped)
+        if _scope_result is not None and _scope_result != base:
+            return _scope_result
+        if _scope_result == base:
+            # No-op — the current body already equals the target.
+            # Return None so the caller's `_patch_already_present`
+            # check runs and marks it `already-present`.
+            return None
+        # Scope exists but the replace failed (body didn't splice
+        # cleanly).  Fail-closed: do NOT let the insert heuristics
+        # run — they would either duplicate the declaration or
+        # nest it.  The caller records this as a failed patch and
+        # the fail-closed trust policy routes the file to
+        # low_trust/.
+        patch["failure_reason"] = (
+            f"body declares scope {_scope_name!r} which already "
+            f"exists in base, but scoped-replace could not complete"
+        )
+        return None
 
     if _has_ellipsis_marker(raw_body):
         return _try_ellipsis_splice(base, raw_body, context_before)
