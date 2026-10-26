@@ -49,8 +49,27 @@ from .prose import (
 )
 
 
-_EXPORT_CONST_OBJECT_RE = re.compile(
-    r'^export\s+(?:const|let|var)\s+\w+\s*=\s*\{'
+# Object-literal assignments: `export const X = {`, `const X = {`,
+# `let X = {`, `var X = {`, `X = {`, `a.b.c = {`.  These bodies are
+# handled by `_try_object_literal_splice` in apply_patches.py, which
+# preserves the base's leading prefix (const / let / var /
+# export const).  They must NOT be routed through `_apply_scoped`
+# (scoped-replace strips the base prefix) or through replace-pairs
+# whose old side has a prefix the new side omits (raw replace also
+# strips it).
+#
+# Superset of the previous _EXPORT_CONST_OBJECT_RE: it additionally
+# matches `const X = {`, `let X = {`, `var X = {`, `X = {`, and
+# `a.b.c = {`.  Every case the old pattern matched is still matched
+# here, so callers that used to see True still see True.
+_OBJECT_LITERAL_ASSIGNMENT_RE = re.compile(
+    r'^(?P<prefix>'
+    r'(?:export\s+)?'
+    r'(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*='
+    r'|'
+    r'[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*='
+    r')'
+    r'\s*\{'
 )
 
 
@@ -168,6 +187,12 @@ def _detect_scoped(blocks: list) -> None:
         # Case 2: prose says "replace … with:" AND body carries a
         # scope marker.  The name comes from the body.
         if is_scoped_replace_by_body(b.context_before, b.body):
+            if _looks_like_patchable(b):
+                # Object-literal assignments route to
+                # `_try_object_literal_splice` (preserves base prefix),
+                # not `_apply_scoped` (strips it).  See
+                # _looks_like_patchable.
+                continue
             name, kind = _extract_scope_from_body(b.body)
             b.scope_hint = kind
             b.scope_name = name
@@ -222,8 +247,12 @@ def _looks_like_patchable(b: Block) -> bool:
         return True
     if _looks_like_diff_body(body):
         return True
-    first_line = body.split("\n", 1)[0].strip()
-    if _EXPORT_CONST_OBJECT_RE.match(first_line):
+    # Object-literal assignments (const/let/var, export-prefixed,
+    # plain, dotted) are handled by `_try_object_literal_splice`,
+    # which preserves the base's leading prefix.  Treat them as
+    # patchable so `_detect_scoped` does not route them through
+    # `_apply_scoped` (which strips the prefix).
+    if _OBJECT_LITERAL_ASSIGNMENT_RE.match(body):
         return True
     if body.startswith("@@ ") or "\n@@ " in body:
         return True

@@ -551,6 +551,17 @@ def pass8_verify(records: dict[str, FileRecord],
 
             rec.trust = "LOW"
             rec.sanity_rejected = True
+            # Fix 5: attribute the sanity failure to a specific patch.
+            if rec.patches:
+                try:
+                    _sanity_blocks = blocks_by_idx
+                except NameError:
+                    _sanity_blocks = None
+                if _sanity_blocks is not None:
+                    from .apply_patches import attribute_sanity_failure
+                    _culprit = attribute_sanity_failure(rec, _sanity_blocks)
+                    if _culprit is not None:
+                        rec.verification['sanity_caused_by'] = _culprit
             rec.verification["sanity_reason"] = structural_err
             rec.warnings.append(
                 f"content validation failed: {structural_err}")

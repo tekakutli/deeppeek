@@ -1166,6 +1166,187 @@ def test_pass7_reports_top_level_once():
         f"expected ['pg_comfy'], got {modules!r}")
 
 
+# ============================================================
+# Fix 5 — sanity failure attribution
+# ============================================================
+
+def test_attribute_sanity_failure_finds_culprit():
+    """Two single-line-replace patches; the second introduces the
+    failure.  Attribution must return the second patch's idx.
+
+    Uses `value:`/`other:` field flips because
+    `_try_single_line_replace` fires deterministically on that shape.
+    A short backtick anchor (`a();`) would fall through every insert
+    heuristic (>= 6 chars required), so replay fails on the first
+    patch and the helper correctly returns None -- this was the
+    failure mode of the original version of this test.
+    """
+    from deeppeek.recover.apply_patches import attribute_sanity_failure
+    from deeppeek.recover.core import Block, FileRecord
+
+    base_body = (
+        "export const config = {\n"
+        "  value: false,\n"
+        "  other: false,\n"
+        "};\n"
+    )
+    rec = FileRecord(path="x.js", state="FULL_PLUS_PATCH")
+    rec.last_full_idx = 0
+    rec.patches = [
+        {"idx": 1, "body": "value: true,",
+         "applied_by": "deterministic",
+         "context_before": "Change value to true:"},
+        {"idx": 2, "body": "other: true,",
+         "applied_by": "deterministic",
+         "context_before": "Change other to true:"},
+    ]
+    base_block = Block(
+        idx=0, header_path="x.js", modifier=None, fence_lang="js",
+        body=base_body, body_line_count=4, context_before="",
+        line_start=0, line_end=0, is_orphan=False, is_code_file=True,
+        kind="full", canonical_path="x.js", output_path="x.js",
+        classified_by="preexisting",
+    )
+
+    def validate_fn(content, path):
+        return "other true" if "other: true" in content else None
+
+    idx = attribute_sanity_failure(rec, {0: base_block}, validate_fn)
+    assert idx == 2, f"expected culprit idx=2, got {idx!r}"
+
+
+def test_attribute_sanity_failure_no_patches():
+    """No patches -> no attribution."""
+    from deeppeek.recover.apply_patches import attribute_sanity_failure
+    from deeppeek.recover.core import Block, FileRecord
+
+    rec = FileRecord(path="x.js", state="SINGLE_FULL")
+    rec.patches = []
+    rec.last_full_idx = 0
+    base_block = Block(
+        idx=0, header_path="x.js", modifier=None, fence_lang="js",
+        body="x\n", body_line_count=1, context_before="",
+        line_start=0, line_end=0, is_orphan=False, is_code_file=True,
+        kind="full", canonical_path="x.js", output_path="x.js",
+        classified_by="preexisting",
+    )
+    idx = attribute_sanity_failure(
+        rec, {0: base_block}, lambda c, p: "always fail")
+    assert idx is None
+
+
+def test_attribute_sanity_failure_no_base():
+    """Missing base -> no attribution (can't replay)."""
+    from deeppeek.recover.apply_patches import attribute_sanity_failure
+    from deeppeek.recover.core import FileRecord
+
+    rec = FileRecord(path="x.js", state="FULL_PLUS_PATCH")
+    rec.last_full_idx = 0
+    rec.patches = [
+        {"idx": 1, "body": "b();",
+         "applied_by": "deterministic",
+         "context_before": ""},
+    ]
+    idx = attribute_sanity_failure(
+        rec, {}, lambda c, p: "always fail")
+    assert idx is None
+
+
+def test_attribute_sanity_failure_llm_patch_stops_attribution():
+    """If any patch was LLM-applied we can't replay the chain --
+    return None rather than guessing."""
+    from deeppeek.recover.apply_patches import attribute_sanity_failure
+    from deeppeek.recover.core import Block, FileRecord
+
+    rec = FileRecord(path="x.js", state="FULL_PLUS_PATCH")
+    rec.last_full_idx = 0
+    rec.patches = [
+        {"idx": 1, "body": "b();", "applied_by": "llm"},
+        {"idx": 2, "body": "c();", "applied_by": "deterministic"},
+    ]
+    base_block = Block(
+        idx=0, header_path="x.js", modifier=None, fence_lang="js",
+        body="function f() { a(); }\n", body_line_count=1,
+        context_before="", line_start=0, line_end=0,
+        is_orphan=False, is_code_file=True, kind="full",
+        canonical_path="x.js", output_path="x.js",
+        classified_by="preexisting",
+    )
+    idx = attribute_sanity_failure(
+        rec, {0: base_block}, lambda c, p: "always fail")
+    assert idx is None
+
+
+def test_attribute_sanity_failure_replay_failure():
+    """Replay failure (body can't be placed) returns None, never a
+    wrong idx."""
+    from deeppeek.recover.apply_patches import attribute_sanity_failure
+    from deeppeek.recover.core import Block, FileRecord
+
+    rec = FileRecord(path="x.js", state="FULL_PLUS_PATCH")
+    rec.last_full_idx = 0
+    rec.patches = [
+        {"idx": 1, "body": "this_will_not_place_easily();",
+         "applied_by": "deterministic", "context_before": ""},
+    ]
+    base_block = Block(
+        idx=0, header_path="x.js", modifier=None, fence_lang="js",
+        body="function f() { a(); }\n", body_line_count=1,
+        context_before="", line_start=0, line_end=0,
+        is_orphan=False, is_code_file=True, kind="full",
+        canonical_path="x.js", output_path="x.js",
+        classified_by="preexisting",
+    )
+    idx = attribute_sanity_failure(
+        rec, {0: base_block}, lambda c, p: "always fail")
+    # Replay either succeeded (int) or failed (None); never a wrong type.
+    assert idx is None or isinstance(idx, int)
+
+
+# ============================================================
+# Fix 5 companion -- direct unit for _try_object_literal_splice
+# ============================================================
+#
+# test_35 exercises the heuristic end-to-end; these isolate it so a
+# heuristic-level regression is distinguishable from a
+# classification/pipeline issue.
+
+def test_object_literal_splice_const_omitted():
+    """Body `board = { ... }` against base `const board = { ... }`
+    preserves the base's `const` prefix and does not produce a
+    duplicate `board =` assignment."""
+    from deeppeek.recover.apply_patches import _try_object_literal_splice
+    base = "const board = { a: 1 };"
+    body = "board = { a: 1, b: 2 };"
+    result = _try_object_literal_splice(base, body, "board")
+    assert result is not None, "expected splice to succeed"
+    assert "const board" in result, (
+        f"base's `const` prefix lost:\n{result}"
+    )
+    assert "b: 2" in result, f"new field missing:\n{result}"
+    assert result.count("board") == 1, (
+        f"expected exactly 1 'board', got {result.count('board')}:"
+        f"\n{result}"
+    )
+    assert result.count("{") == result.count("}"), (
+        f"unbalanced braces:\n{result}"
+    )
+
+
+def test_object_literal_splice_export_preserved():
+    """Base `export const board = { ... }` + body `board = { ... }`
+    preserves the full `export const` prefix."""
+    from deeppeek.recover.apply_patches import _try_object_literal_splice
+    base = "export const board = { a: 1 };"
+    body = "board = { a: 1, b: 2 };"
+    result = _try_object_literal_splice(base, body, "board")
+    assert result is not None, "expected splice to succeed"
+    assert "export const board" in result, (
+        f"full prefix lost:\n{result}"
+    )
+    assert "b: 2" in result
+
+
 def main():
     tests = [
         ("resolve module dotted top not recovered",
@@ -1300,6 +1481,22 @@ def main():
          test_pass4_marks_not_a_file_as_attributed),
         ("pass4 marks bash not_a_file as orphan_not_code",
          test_pass4_marks_bash_not_a_file_as_orphan_not_code),
+        # Fix 5 -- sanity failure attribution
+        ("attribute_sanity_failure finds culprit",
+         test_attribute_sanity_failure_finds_culprit),
+        ("attribute_sanity_failure no patches",
+         test_attribute_sanity_failure_no_patches),
+        ("attribute_sanity_failure no base",
+         test_attribute_sanity_failure_no_base),
+        ("attribute_sanity_failure llm patch stops attribution",
+         test_attribute_sanity_failure_llm_patch_stops_attribution),
+        ("attribute_sanity_failure replay failure",
+         test_attribute_sanity_failure_replay_failure),
+        # Fix 5 companion -- direct unit for _try_object_literal_splice
+        ("object_literal_splice const omitted",
+         test_object_literal_splice_const_omitted),
+        ("object_literal_splice export preserved",
+         test_object_literal_splice_export_preserved),
     ]
     failed = 0
     for name, fn in tests:

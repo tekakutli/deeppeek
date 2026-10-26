@@ -371,4 +371,13 @@ _SCOPE_FROM_BODY_PATTERNS = [
         r"^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_]\w*)\s*=\s*\{",
         re.MULTILINE),
      "javascript"),
+    # Plain identifier assignment, optionally dotted.  Matches
+    # `_els = {`, `board.inpaintContext = {`, `foo.bar.baz = {`.
+    # This is the shape `apply_patches._try_object_literal_splice`
+    # handles; adding it here makes `_try_ellipsis_splice` and the
+    # pair-detection machinery see the same objects as scopes.
+    (re.compile(
+        r"^([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*=\s*\{",
+        re.MULTILINE),
+     "javascript"),
 ]

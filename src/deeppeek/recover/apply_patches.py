@@ -6,19 +6,27 @@ INSERTION HEURISTICS (in `_try_deterministic_patch`, in order)
 ==============================================================
   1. Deletion (explicit `_is_deletion_instruction`).
   2. Raw diff (`_try_raw_diff_patch`).
-  3. Ellipsis-splice (`_try_ellipsis_splice`).
-  4. Object-literal splice (`export const X = { ... }`).
-  5. Context-insert (`_try_context_insert`).
-  6. Object-entry-insert (`_try_object_entry_insert`).
-  7. Insert-after-anchor (`_try_insert_after_anchor`).
-  8. AST anchor (`ast_anchor.try_ast_anchor`).
+  3. Single-line replace (`_try_single_line_replace`).
+  4. Scoped replace (`_apply_scoped` — for a body that declares a
+     scope which already exists in base).
+  5. Ellipsis-splice (`_try_ellipsis_splice`), with a strip-and-
+     recurse fallthrough when the scope-splice cannot fire.
+  6. Object-literal splice (`_OBJECT_LITERAL_ASSIGNMENT_RE`, for
+     `export const X = {`, `const X = {`, `let X = {`, `var X = {`,
+     `X = {`, and `X.y = {`).
+  7. Context-insert (`_try_context_insert`).
+  8. Object-entry-insert (`_try_object_entry_insert`).
+  9. Insert-after-anchor (`_try_insert_after_anchor`).
+ 10. AST anchor (`ast_anchor.try_ast_anchor`).
+ 11. Structural append (`_try_structural_append`, text-only fallback
+     when AST is unavailable).
 
-Step 8 requires the `[ast]` extra (`tree-sitter` +
-`tree-sitter-javascript` + `tree-sitter-python`).  Without it the
-step silently returns None and the tool behaves exactly as before.
+Steps 10 and 11 require the `[ast]` extra for step 10.  Without it,
+step 10 silently returns None; step 11 still runs as the text-only
+fallback.
 
-PAIR / PARTIAL / DRIFT ROBUSTNESS (2026-11-04)
-==============================================
+PAIR / PARTIAL / DRIFT ROBUSTNESS
+=================================
   · Pair detection requires the old side to NOT be classified "new"
     by its own prose.  A "with:"-block cannot also be the old side
     of another pair.  This prevents the "new CSS was paired with
@@ -62,8 +70,14 @@ from .llm import LLMClient
 from .prose import _extract_scope_from_body
 
 
-_EXPORT_CONST_OBJECT_RE = re.compile(
-    r'^(export\s+(?:const|let)\s+(\w+)\s*=\s*)\{'
+_OBJECT_LITERAL_ASSIGNMENT_RE = re.compile(
+    r'^(?P<prefix>'
+    r'(?:export\s+)?'
+    r'(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*='
+    r'|'
+    r'[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*='
+    r')'
+    r'\s*\{'
 )
 
 
@@ -128,6 +142,49 @@ def _split_at_ellipsis(body):
     return prefix, suffix
 
 
+def _strip_ellipsis_lines(body):
+    """Remove `...` marker lines from a body, keeping blank lines."""
+    out = []
+    for ln in body.split("\n"):
+        if _is_ellipsis_line(ln):
+            continue
+        out.append(ln)
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Empty-block detection (used by ellipsis fallthrough)
+# ---------------------------------------------------------------------------
+#
+# Stripping `...` lines from a body is safe only when the result is a
+# complete block.  If the `...` was the *entire* content of a `{ }`
+# (e.g. `set: (v) => { ... }` — a legitimate "logic elided" marker),
+# stripping produces `set: (v) => { }`, which is a semantically empty
+# block we do NOT want to insert.  Detecting that case lets the
+# fallthrough refuse instead of silently producing wrong code.
+
+_EMPTY_BLOCK_RE = re.compile(r'\{([^{}]*)\}')
+
+
+def _count_empty_blocks(text):
+    if not text:
+        return 0
+    count = 0
+    for m in _EMPTY_BLOCK_RE.finditer(text):
+        if not m.group(1).strip():
+            count += 1
+    return count
+
+
+def _would_introduce_empty_block(original_body, stripped_body):
+    """True iff stripping `...` introduced one or more new empty `{ }`
+    blocks.  Refusing in that case avoids inserting semantically-empty
+    code that was produced by the strip itself."""
+    return _count_empty_blocks(stripped_body) > _count_empty_blocks(
+        original_body
+    )
+
+
 # ---------------------------------------------------------------------------
 # Scope detection helpers
 # ---------------------------------------------------------------------------
@@ -173,6 +230,9 @@ def _matches_scope_declaration(line, scope_name):
         return True
     if re.match(r'^(?:export\s+)?(?:async\s+)?class\s+' + esc +
                 r'\b', stripped):
+        return True
+    # Plain (possibly dotted) assignment: `_els = {`, `board.x = {`.
+    if re.match(r'^' + esc + r'\s*=', stripped):
         return True
     return False
 
@@ -276,10 +336,9 @@ def _try_ellipsis_splice(base, body, context_before=""):
                   if ln.strip() and ln.strip() not in base_stripped_set]
 
     if not new_prefix and not new_suffix:
-        # All body lines are already in base — this is a
-        # no-op, not a failure.  Return base unchanged; the
-        # caller detects it via result == current and marks
-        # the pair as already-present.
+        # All body lines are already in base — this is a no-op, not a
+        # failure.  Return base unchanged; the caller detects it via
+        # `result == content` and marks the patch `already-present`.
         return base
 
     prefix_anchor = None
@@ -305,6 +364,108 @@ def _try_ellipsis_splice(base, body, context_before=""):
             after_anchor=suffix_anchor, default_position="bottom")
 
     return base[:body_open] + result_inner + base[body_close:]
+
+
+# ---------------------------------------------------------------------------
+# Single-line replace
+# ---------------------------------------------------------------------------
+#
+# A body that is exactly one non-blank line and matches a line already
+# in base by identifier + token-similarity, when the prose is not an
+# add-instruction, is a *substitution* of that line, not an insertion.
+# This is the shape of "Change the default value of `inpaintEnabled` to
+# `true`" or "Update `meta.label`".  Without this branch, single-line
+# bodies fall through every insert-shaped heuristic and fail.
+
+_ONE_LINE_MIN_SIM = 0.35
+_ONE_LINE_MIN_GAP = 0.20
+
+_IDENT_KEYWORDS = frozenset({
+    "const", "let", "var", "function", "class", "def", "import",
+    "export", "return", "if", "for", "while", "async", "await",
+    "else", "elif", "try", "catch", "finally", "throw", "raise",
+    "new", "delete", "typeof", "instanceof", "in", "of",
+})
+
+
+def _first_identifier(text):
+    for m in re.finditer(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*", text):
+        tok = m.group(0)
+        if tok not in _IDENT_KEYWORDS:
+            return tok
+    return None
+
+
+def _line_token_jaccard(a, b):
+    at = set(re.findall(r"[A-Za-z_$][\w$]*|[0-9]+|\S", a))
+    bt = set(re.findall(r"[A-Za-z_$][\w$]*|[0-9]+|\S", b))
+    if not at or not bt:
+        return 0.0
+    return len(at & bt) / len(at | bt)
+
+
+def _try_single_line_replace(base, raw_body, context_before=""):
+    """Replace exactly one base line with a one-line body.
+
+    Fires only when:
+      · the body has exactly one non-blank line;
+      · the line is not a block opener/closer;
+      · the prose does not signal an addition;
+      · the line has an identifier that matches a base line's
+        identifier;
+      · the token-Jaccard similarity to that base line is
+        unambiguous (best - second-best ≥ _ONE_LINE_MIN_GAP).
+    """
+    lines = [ln for ln in raw_body.split("\n") if ln.strip()]
+    if len(lines) != 1:
+        return None
+    new_line = lines[0].rstrip()
+    stripped = new_line.strip()
+    if stripped.endswith("{") or stripped.startswith("}"):
+        return None
+    # Object-literal assignments get a dedicated branch
+    # (`_try_object_literal_splice`) that preserves the base's
+    # `const`/`let`/`var`/`export` prefix.  Single-line replace would
+    # strip that prefix; route these to the object-literal branch.
+    if _OBJECT_LITERAL_ASSIGNMENT_RE.match(stripped):
+        return None
+
+    lower = (context_before or "").lower()
+    if any(v in lower for v in ("add ", "insert ", "append ", "prepend ")):
+        return None
+
+    new_ident = _first_identifier(stripped)
+    if not new_ident:
+        return None
+
+    base_lines = base.split("\n")
+    candidates = []
+    for i, bl in enumerate(base_lines):
+        if not bl.strip():
+            continue
+        cand_ident = _first_identifier(bl.strip())
+        if cand_ident != new_ident:
+            continue
+        sim = _line_token_jaccard(bl.strip(), stripped)
+        if sim >= _ONE_LINE_MIN_SIM:
+            candidates.append((sim, i))
+
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    best_sim, best_idx = candidates[0]
+
+    if len(candidates) > 1 and (best_sim - candidates[1][0]) < _ONE_LINE_MIN_GAP:
+        return None
+
+    old_line = base_lines[best_idx]
+    old_indent = old_line[:len(old_line) - len(old_line.lstrip())]
+    replacement = old_indent + stripped
+
+    result_lines = list(base_lines)
+    result_lines[best_idx] = replacement
+    result = "\n".join(result_lines)
+    return result if result != base else None
 
 
 # ---------------------------------------------------------------------------
@@ -458,10 +619,15 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
             result = _try_deterministic_patch(
                 content, patch_to_apply, path)
             if result is not None:
-                record_inserted |= _collect_inserted_lines(
-                    content, result)
-                content = result
-                patch["applied_by"] = "deterministic"
+                if result == content:
+                    # Deterministic path produced no change — the
+                    # patch's intent is already satisfied.
+                    patch["applied_by"] = "already-present"
+                else:
+                    record_inserted |= _collect_inserted_lines(
+                        content, result)
+                    content = result
+                    patch["applied_by"] = "deterministic"
                 continue
 
             # Filtered body failed; fall back to unfiltered so
@@ -471,17 +637,20 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                 result = _try_deterministic_patch(
                     content, patch, path)
                 if result is not None:
-                    record_inserted |= _collect_inserted_lines(
-                        content, result)
-                    content = result
-                    patch["applied_by"] = "deterministic"
-                    patch["filter_fallback"] = True
-                    print(
-                        f"  [insert-filter] {path} "
-                        f"idx={patch['idx']}: filtered body "
-                        f"failed, applied unfiltered",
-                        file=sys.stderr,
-                    )
+                    if result == content:
+                        patch["applied_by"] = "already-present"
+                    else:
+                        record_inserted |= _collect_inserted_lines(
+                            content, result)
+                        content = result
+                        patch["applied_by"] = "deterministic"
+                        patch["filter_fallback"] = True
+                        print(
+                            f"  [insert-filter] {path} "
+                            f"idx={patch['idx']}: filtered body "
+                            f"failed, applied unfiltered",
+                            file=sys.stderr,
+                        )
                     continue
 
             if _patch_already_present(patch_to_apply["body"], content):
@@ -872,9 +1041,10 @@ def _diagnose_patch_failure_inner(patch, content, base):
     if _looks_like_diff_body(stripped):
         return ("looks like a diff but could not be applied to base "
                 "(context mismatch or already applied elsewhere)")
-    if _EXPORT_CONST_OBJECT_RE.match(stripped):
-        return ("looks like an `export const X = { ... }` splice but "
-                "no matching base declaration was found for the variable")
+    if _OBJECT_LITERAL_ASSIGNMENT_RE.match(stripped):
+        return ("looks like an object-literal assignment splice but "
+                "no matching base declaration was found for the "
+                "variable")
 
     count_full = content.count(stripped)
     if count_full > 1:
@@ -1188,6 +1358,10 @@ _SCOPE_PATTERNS = [
     lambda name: re.compile(
         r"(?:^|\n)(?:export\s+)?(?:const|let|var)\s+" + re.escape(name) +
         r"\s*=\s*\{.*?\n\};?",
+        re.DOTALL),
+    # Plain (possibly dotted) assignment: `_els = {`, `board.x = {`.
+    lambda name: re.compile(
+        r"(?:^|\n)[ \t]*" + re.escape(name) + r"\s*=\s*\{.*?\n[ \t]*\};?",
         re.DOTALL),
 ]
 
@@ -1964,6 +2138,7 @@ def _try_deterministic_patch(base, patch, path=""):
               f"{type(e).__name__}: {e}", file=sys.stderr)
         return None
 
+
 def _scope_in_base(base: str, scope_name: str, scope_kind: str) -> bool:
     """True iff `scope_name` exists in `base` as an extractable scope
     of the given kind.
@@ -1996,6 +2171,7 @@ def _scope_in_base(base: str, scope_name: str, scope_kind: str) -> bool:
                  base, re.MULTILINE):
         return True
     return False
+
 
 def _try_deterministic_patch_inner(base, patch, path=""):
     raw_body = patch["body"]
@@ -2034,6 +2210,19 @@ def _try_deterministic_patch_inner(base, patch, path=""):
         # `test_07_deletion_shapes`.
         return None
 
+    # ---- Single-line replace -------------------------------------
+    #
+    # A body that is exactly one non-blank line, that matches a
+    # base line by identifier + token similarity, and that is not
+    # introduced by an add-instruction in the prose, is a
+    # substitution of that base line.  This is the shape of
+    # "Change the default value of `inpaintEnabled` to true" or
+    # "Update `meta.label`".  Without this branch, single-line
+    # bodies fall through every insert-shaped heuristic and fail.
+    single_line = _try_single_line_replace(base, raw_body, context_before)
+    if single_line is not None:
+        return single_line
+
     # ---- Scope-aware pre-check -----------------------------------
     #
     # If the body DECLARES a scope (function, class, const-object,
@@ -2056,16 +2245,25 @@ def _try_deterministic_patch_inner(base, patch, path=""):
     # If the body declares a scope NOT present in base, we fall
     # through — that's a legitimate insert of a new declaration,
     # and the existing heuristics handle it.
-    _scope_name, _scope_kind = _extract_scope_from_body(body_stripped)
+    # Object-literal assignments LOOK like scopes to
+    # `_extract_scope_from_body`, but `_apply_scoped` would strip the
+    # base's `const`/`let`/`var`/`export` prefix.  The dedicated
+    # `_try_object_literal_splice` branch preserves that prefix.
+    _body_is_obj_lit = bool(
+        _OBJECT_LITERAL_ASSIGNMENT_RE.match(body_stripped))
+    if _body_is_obj_lit:
+        _scope_name, _scope_kind = None, None
+    else:
+        _scope_name, _scope_kind = _extract_scope_from_body(body_stripped)
     if _scope_name and _scope_in_base(base, _scope_name, _scope_kind):
         _scope_result = _apply_scoped(base, _scope_name, body_stripped)
-        if _scope_result is not None and _scope_result != base:
+        if _scope_result is not None:
+            # `_apply_scoped` returns `base` when the splice has no
+            # new lines to place (i.e. the body's intent is already
+            # satisfied).  Returning `base` here lets the caller
+            # mark the patch `already-present` via the `result ==
+            # content` check, instead of treating it as a failure.
             return _scope_result
-        if _scope_result == base:
-            # No-op — the current body already equals the target.
-            # Return None so the caller's `_patch_already_present`
-            # check runs and marks it `already-present`.
-            return None
         # Scope exists but the replace failed (body didn't splice
         # cleanly).  Fail-closed: do NOT let the insert heuristics
         # run — they would either duplicate the declaration or
@@ -2078,13 +2276,47 @@ def _try_deterministic_patch_inner(base, patch, path=""):
         )
         return None
 
+    # ---- Ellipsis handling --------------------------------------
+    #
+    # Try the scope-aware splice first.  If it does not fire (no
+    # scope, or scope not in base, or splice produced no change),
+    # fall through with the `...` marker lines stripped so the
+    # remaining heuristics can still place the surrounding content.
+    #
+    # Guard against inserting truncated code: when stripping `...`
+    # would leave a `{ }` block empty that wasn't empty before
+    # (because the `...` WAS its content), refuse — the `...` was
+    # semantic, not structural.
     if _has_ellipsis_marker(raw_body):
-        return _try_ellipsis_splice(base, raw_body, context_before)
+        result = _try_ellipsis_splice(base, raw_body, context_before)
+        if result is not None:
+            return result
+        stripped_body = _strip_ellipsis_lines(raw_body)
+        if not stripped_body.strip():
+            return None
+        if _would_introduce_empty_block(raw_body, stripped_body):
+            return None
+        fallback_patch = {**patch, "body": stripped_body}
+        return _try_deterministic_patch_inner(base, fallback_patch, path)
 
-    m = _EXPORT_CONST_OBJECT_RE.match(body_stripped)
+    # ---- Object-literal splice ----------------------------------
+    #
+    # Any of these shapes: `export const X = {`, `const X = {`,
+    # `let X = {`, `var X = {`, `X = {`, `a.b.c = {`.  The body
+    # names the variable; `_try_object_literal_splice` replaces
+    # the object literal in place, preserving the base's leading
+    # prefix (so `export const X =` stays `export const X =` even
+    # when the body said only `X =`).
+    m = _OBJECT_LITERAL_ASSIGNMENT_RE.match(body_stripped)
     if m:
-        varname = m.group(2)
-        return _try_object_literal_splice(base, body_stripped, varname)
+        id_m = re.search(
+            r'([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*=\s*$',
+            m.group("prefix").rstrip(),
+        )
+        if id_m:
+            return _try_object_literal_splice(
+                base, body_stripped, id_m.group(1))
+        return None
 
     inserted = _try_context_insert(base, raw_body)
     if inserted is not None:
@@ -2098,7 +2330,7 @@ def _try_deterministic_patch_inner(base, patch, path=""):
     if inserted is not None:
         return inserted
 
-    # --- AST anchor (step 8) ---
+    # --- AST anchor (step 10) ---
     if path:
         try:
             from .ast_anchor import try_ast_anchor
@@ -2122,7 +2354,7 @@ def _try_deterministic_patch_inner(base, patch, path=""):
                 if result != base:
                     return result
 
-    # --- Structural append (step 9) ---
+    # --- Structural append (step 11) ---
     # Text-only fallback for a block with no anchor and no matching
     # AST path.  Handles the two shapes left over after steps 4-6:
     # a bare `if (...)` guard that belongs inside the last top-level
@@ -2141,47 +2373,142 @@ def _try_deterministic_patch_inner(base, patch, path=""):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Fix 5 — sanity failure attribution (deferred)
+# ---------------------------------------------------------------------------
+#
+# When pass8_verify rejects a record's content, the user has no way to
+# tell *which* patch caused the failure.  This helper replays the
+# deterministic patches one at a time on top of the base content and
+# returns the idx of the first patch whose application causes
+# validation to fail.
+#
+# Replay is conservative: if ANY patch was applied by an LLM, or has
+# no replayable body, or cannot be replayed deterministically, the
+# function returns None.  A wrong attribution is worse than no
+# attribution — this field is diagnostic only; it never changes trust
+# or writing behaviour.
+
+def attribute_sanity_failure(rec, blocks_by_idx, validate_fn=None):
+    """Return the idx of the first patch whose application causes
+    validation to fail, or None if attribution isn't possible.
+
+    `validate_fn(content, path)` must return the failure reason
+    string (same shape as `validate_content`) or None for a passing
+    result.  Defaults to `validate_content` from `validate_output`.
+
+    Returns None when:
+      - rec.patches is empty;
+      - rec.last_full_idx is unset or not in blocks_by_idx;
+      - a patch was applied by LLM (no faithful replay);
+      - a patch cannot be replayed deterministically;
+      - the base itself already fails validation (nothing to blame).
+    """
+    if validate_fn is None:
+        from .validate_output import validate_content as validate_fn
+
+    if not rec.patches:
+        return None
+    base_block = (blocks_by_idx.get(rec.last_full_idx)
+                  if rec.last_full_idx is not None else None)
+    if base_block is None:
+        return None
+    base_content = base_block.body
+    if base_content is None:
+        return None
+
+    current = base_content
+    for patch_dict in rec.patches:
+        applied_by = patch_dict.get("applied_by")
+        if applied_by == "already-present":
+            continue
+        if applied_by != "deterministic":
+            # LLM-applied or failed patch: replay would diverge.
+            return None
+        result = _try_deterministic_patch(current, patch_dict, rec.path)
+        if result is None:
+            return None
+        if result == current:
+            continue
+        current = result
+        if validate_fn(current, rec.path) is not None:
+            return patch_dict["idx"]
+    return None
+
+
 def _try_object_literal_splice(base, body_stripped, varname):
-    assign_re = re.compile(
-        r'^(export\s+(?:const|let)\s+' + re.escape(varname) +
-        r'\s*=\s*)\{', re.MULTILINE)
-    base_m = assign_re.search(base)
+    """Replace an object literal in place, preserving the base's
+    leading prefix.
+
+    Handles these base shapes:
+      · `export const X = { ... }`
+      · `const X = { ... }`
+      · `let X = { ... }`
+      · `var X = { ... }`
+      · `X = { ... }` (assignment)
+      · `a.b.c = { ... }` (dotted assignment)
+      · `X: { ... }` (object-literal entry)
+
+    The body must be one of the same shapes (plus `X = { ... }`
+    assignment, which is the common case for a body that is not a
+    declaration).  The result keeps the base's prefix (`export const`
+    / `const` / `let` / `var`), so a body that wrote only `X = { ... }`
+    against a base that had `export const X = { ... }` produces
+    `export const X = { new_content };`, not `X = { new_content };`.
+    """
+    if not varname:
+        return None
+    name = re.escape(varname)
+    base_re = re.compile(
+        r'^([ \t]*(?:(?:export\s+)?(?:const|let|var)\s+)?'
+        + name + r'\s*[=:])\s*\{',
+        re.MULTILINE,
+    )
+    base_m = base_re.search(base)
     if not base_m:
         return None
-    body_m = re.match(
-        r'^(export\s+(?:const|let)\s+' + re.escape(varname) +
-        r'\s*=\s*)\{', body_stripped)
+
+    prefix_from_base = base_m.group(1)  # e.g. `  export const X =`
+    file_prefix = base[:base_m.start()]
+
+    body_m = _OBJECT_LITERAL_ASSIGNMENT_RE.match(body_stripped)
+    if not body_m:
+        return None
     patch_open = body_stripped.index("{", body_m.start())
     patch_is_py = _looks_like_python_fragment(body_stripped)
     patch_close = _find_matching_brace(
         body_stripped, patch_open, is_python=patch_is_py)
     if patch_close < 0:
         return None
-    base_open = base.index("{", base_m.start())
+    body_obj = body_stripped[patch_open:patch_close + 1]
+
+    base_open = base_m.end() - 1
     base_is_py = _looks_like_python_fragment(base[base_m.start():])
     base_close = _find_matching_brace(
         base, base_open, is_python=base_is_py)
     if base_close < 0:
         return None
-    base_head = base[:base_m.start()]
-    base_tail = base[base_close + 1:]
-    body_trimmed = body_stripped.rstrip()
-    if body_trimmed.endswith(";"):
-        body_trimmed = body_trimmed[:-1].rstrip()
-        body_had_semi = True
-    else:
-        body_had_semi = False
-    tail_lstripped = base_tail.lstrip()
-    if tail_lstripped.startswith(";"):
-        base_tail = tail_lstripped[1:]
+
+    file_tail = base[base_close + 1:]
+    ft_lstripped = file_tail.lstrip()
+    if ft_lstripped.startswith(";"):
+        file_tail = ft_lstripped[1:]
         base_had_semi = True
     else:
         base_had_semi = False
-    sep = ";" if (body_had_semi or base_had_semi) else ""
-    result = base_head + body_trimmed + sep + base_tail
-    if result == base:
-        return None
-    return result
+
+    body_had_semi = body_stripped.rstrip().endswith(";")
+    sep = ";" if (base_had_semi or body_had_semi) else ""
+
+    result = (
+        file_prefix
+        + prefix_from_base
+        + " "
+        + body_obj
+        + sep
+        + file_tail
+    )
+    return result if result != base else None
 
 
 def _find_matching_brace(text, open_idx, is_python=False):
@@ -2347,9 +2674,9 @@ def _manual_apply_unified(base, diff_text):
 #                its close brace, re-indented to the function body's
 #                indentation.
 #
-# No tree-sitter required.  This runs as step 9 in
-# `_try_deterministic_patch`, after AST (step 8).  When AST is
-# available and finds a precise anchor, step 8 wins and this is
+# No tree-sitter required.  This runs as step 11 in
+# `_try_deterministic_patch`, after AST (step 10).  When AST is
+# available and finds a precise anchor, step 10 wins and this is
 # never called.  When AST is unavailable (or returns None for a
 # block with no text anchor), this fires as the text-only fallback.
 #

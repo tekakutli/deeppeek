@@ -1523,6 +1523,133 @@ def test_33():
                 skip_file_compare=True, min_trust="MEDIUM")
 
 
+def test_34():
+    """Single-line field replace.
+
+    The body is one line (`value: true,`); the prose is not an
+    add-instruction; the base has `value: false,`.  `_try_single_line_replace`
+    must flip the line in place.  Trust HIGH, target written.
+    """
+
+    def extra(target, run):
+        rec = run["manifest"].get("files", {}).get("config.js", {})
+        assert rec, (
+            f"config.js missing from manifest files; "
+            f"manifest files: {list(run['manifest'].get('files', {}))}"
+        )
+        assert rec.get("trust") == "HIGH", (
+            f"expected trust=HIGH, got {rec.get('trust')}; "
+            f"verification: {rec.get('verification')}"
+        )
+        content = (target / "config.js").read_text()
+        assert "value: true" in content, (
+            f"new value missing:\n{content}"
+        )
+        assert "value: false" not in content, (
+            f"old value still present:\n{content}"
+        )
+        assert "imageHash: null" in content, (
+            f"sibling field lost:\n{content}"
+        )
+        assert "running: false" in content, (
+            f"sibling field lost:\n{content}"
+        )
+        assert content.count("value:") == 1, (
+            f"expected exactly 1 'value:' entry, "
+            f"got {content.count('value:')}:\n{content}"
+        )
+
+    check_apply("34_single_line_field_replace", extra)
+
+
+def test_35():
+    """Object-literal replace preserves base prefix, no duplicate.
+
+    Base: `const board = { a: 1 };`
+    Body: `board = { a: 1, b: 2 };`
+
+    The body omits the `const` keyword.  The patcher must preserve
+    the base's `const` prefix and must not append a second `board =`
+    assignment.
+    """
+
+    def extra(target, run):
+        rec = run["manifest"].get("files", {}).get("board.js", {})
+        assert rec, (
+            f"board.js missing from manifest files; "
+            f"manifest files: {list(run['manifest'].get('files', {}))}"
+        )
+        assert rec.get("trust") == "HIGH", (
+            f"expected trust=HIGH, got {rec.get('trust')}; "
+            f"verification: {rec.get('verification')}"
+        )
+        content = (target / "board.js").read_text()
+        assert "b: 2" in content, (
+            f"new field b: 2 missing:\n{content}"
+        )
+        assert "a: 1" in content, (
+            f"existing field a: 1 lost:\n{content}"
+        )
+        assert content.count("board") == 1, (
+            f"expected exactly 1 'board' (no duplicate assignment), "
+            f"got {content.count('board')}:\n{content}"
+        )
+        assert content.count("const board") == 1, (
+            f"expected exactly 1 'const board', "
+            f"got {content.count('const board')}:\n{content}"
+        )
+        assert content.count("{") == content.count("}"), (
+            f"unbalanced braces:\n{content}"
+        )
+
+    check_apply("35_object_literal_replace", extra)
+
+
+def test_36():
+    """Ellipsis without scope -- fallthrough path fires.
+
+    Body has `...` but no function/class/const-object header.
+    `_try_ellipsis_splice` returns None; the fallthrough strips the
+    `...` line and the resulting 2-line snippet inserts via
+    context-insert.  Without this path, the body would fail closed
+    because the `...` is not in base and no insert heuristic would
+    fire.
+    """
+
+    def extra(target, run):
+        rec = run["manifest"].get("files", {}).get("view.js", {})
+        assert rec, (
+            f"view.js missing from manifest files; "
+            f"manifest files: {list(run['manifest'].get('files', {}))}"
+        )
+        assert rec.get("trust") == "HIGH", (
+            f"expected trust=HIGH, got {rec.get('trust')}; "
+            f"verification: {rec.get('verification')}"
+        )
+        content = (target / "view.js").read_text()
+        assert "if (board.inpaintFullCanvas) return;" in content, (
+            f"new early-out missing:\n{content}"
+        )
+        assert "if (!board.imageEl) return;" in content, (
+            f"existing guard lost:\n{content}"
+        )
+        assert "ctx.fillRect(0, 0, 100, 100);" in content, (
+            f"function body lost:\n{content}"
+        )
+        new_pos = content.index("if (board.inpaintFullCanvas) return;")
+        old_pos = content.index("if (!board.imageEl) return;")
+        assert new_pos < old_pos, (
+            f"new guard should precede existing guard "
+            f"({new_pos} vs {old_pos}):\n{content}"
+        )
+        for ln in content.splitlines():
+            assert ln.strip() != "...", (
+                f"raw ellipsis leaked into content:\n{content}"
+            )
+
+    check_apply("36_ellipsis_without_scope", extra)
+
+
 def main():
     tests = [
         ("01", test_01), ("02", test_02), ("03", test_03),
@@ -1531,7 +1658,8 @@ def main():
         ("10", test_10), ("11", test_11),
         ("12", test_12), ("13", test_13), ("14", test_14),
         ("15", test_15), ("16", test_16), ("17", test_17), ("19", test_19), ("20", test_20), ("21", test_21),
-        ("18", test_18), ("22", test_22), ("23", test_23), ("24", test_24), ("25", test_25), ("26", test_26), ("27", test_27), ("28", test_28), ("29", test_29), ("30", test_30), ("31", test_31), ("32", test_32), ("33", test_33)]
+        ("18", test_18), ("22", test_22), ("23", test_23), ("24", test_24), ("25", test_25), ("26", test_26), ("27", test_27), ("28", test_28), ("29", test_29), ("30", test_30), ("31", test_31), ("32", test_32), ("33", test_33),
+        ("34", test_34), ("35", test_35), ("36", test_36)]
     failed = 0
     for name, fn in tests:
         try:
