@@ -77,7 +77,7 @@ DEFAULT_TREE_ONLY  = False            # only emit the directory tree, no file co
 # also listed in DEFAULT_TREE_EXCLUDE_DIRS below.
 DEFAULT_EXCLUDE_DIRS = [
     ".git", "__pycache__", ".venv", "venv", "node_modules",
-    "lib", "bin",
+    "lib", "bin", "deeppeek",
     "kritomatic_xremap", "other_scripts", "playgrounds",
     "data/comfy_panel",
     # e.g. "src/vendor" to skip only ./src/vendor
@@ -89,7 +89,7 @@ DEFAULT_EXCLUDE_DIRS = [
 # rendering — it never changes which files are dumped. An empty list means
 # every directory is shown in the tree.
 DEFAULT_TREE_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modules",
-                             "lib", "bin",
+                             "lib", "bin", "deeppeek",
                              "target", "release",
                              "data/comfy_panel", "other_scripts/room/leader_optimizer",
 ]

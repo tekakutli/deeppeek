@@ -13,6 +13,7 @@ from .commands import (
     enter as enter_cmd,
     prompt as prompt_cmd,
     test as test_cmd,
+    scripts as scripts_cmd,
 )
 
 
@@ -34,6 +35,9 @@ def _build_root_parser() -> argparse.ArgumentParser:
     extension_cmd.register(sub)
     diagnose_cmd.register(sub)
     test_cmd.register(sub)
+    # `scripts` registers for --help listing only; the real dispatch
+    # bypasses argparse (see main() below).
+    scripts_cmd.register(sub)
     return p
 
 
@@ -47,10 +51,36 @@ _DISPATCH = {
     "extension": extension_cmd.run,
     "diagnose": diagnose_cmd.run,
     "test": test_cmd.run,
+    # Unreachable in normal operation — main() intercepts `scripts`
+    # before parse_args.  Entry present only so a future refactor
+    # that forgets the intercept fails with a clear message rather
+    # than a KeyError.
+    "scripts": scripts_cmd.run,
 }
 
 
 def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+
+    # ------------------------------------------------------------------
+    # `scripts` is dispatched before argparse: everything after the
+    # subcommand name (including flags like --merge, -a, --help) must
+    # reach the target script verbatim, which argparse would otherwise
+    # consume or reject.  See commands/scripts.py.
+    #
+    # We tolerate a leading `-v` / `--verbose` (matching the global
+    # flag's position), so `deeppeek -v scripts dumps dumps_evolve`
+    # also works.  Anything after the script name is the script's own
+    # concern.
+    # ------------------------------------------------------------------
+    verbose = False
+    i = 0
+    while i < len(argv) and argv[i] in ("-v", "--verbose"):
+        verbose = True
+        i += 1
+    if i < len(argv) and argv[i] == "scripts":
+        return scripts_cmd.dispatch(argv[i + 1:], verbose=verbose)
+
     args = _build_root_parser().parse_args(argv)
     try:
         return _DISPATCH[args.command](args)
