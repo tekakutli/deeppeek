@@ -434,8 +434,17 @@ def _stage_generate(args: argparse.Namespace
             "capture", "-o", str(conversation_path),
             "--last", str(args.last),
             "--watch",
+            # Recovery runs in step 2 below against the actual
+            # --target.  Without --no-recover, capture would ALSO
+            # run recovery (into ./deeppeek_recovered/), doing the
+            # work twice and polluting the cwd.
+            "--no-recover",
             "--timeout", str(args.capture_timeout),
         ]
+        if args.until is not None:
+            cmd.extend(["--until", str(args.until)])
+        if args.until_regex is not None:
+            cmd.extend(["--until-regex", args.until_regex])
         print("  conversation: capturing via deeppeek", file=sys.stderr)
         _run_cmd(cmd, timeout=args.capture_timeout + 10,
                  allow_failure=False)
@@ -761,6 +770,17 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--last", type=int, default=3, metavar="N",
         help="passed to `deeppeek capture --last N` (default: 3)",
+    )
+    p.add_argument(
+        "--until", type=int, default=None, metavar="K",
+        help="passed to `deeppeek capture --until K`; requires "
+             "--last (trims the tail of the --last slice)",
+    )
+    p.add_argument(
+        "--until-regex", default=None, metavar="PATTERN",
+        help="passed to `deeppeek capture --until-regex PATTERN`; "
+             "requires --last or --last-regex (trims the tail of "
+             "the slice at the last matching user prompt)",
     )
 
     p.add_argument(

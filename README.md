@@ -152,6 +152,18 @@ fail-closed.
 
     --last N            last N user turns (each turn = prompt + reply)
     --last-regex PAT    last prompt matching a regex, to end of conversation
+    --until K           end the --last/--last-regex slice JUST BEFORE
+                        user turn K (0-indexed from conversation
+                        start). Requires --last or --last-regex; K
+                        must be strictly greater than the slice's
+                        start user-turn index.  e.g. --last 10
+                        --until 5 keeps turns (total-10)..4 (exclusive
+                        of turn 5).
+    --until-regex PAT    end the --last/--last-regex slice JUST BEFORE
+                        the LAST user prompt matching PATTERN.
+                        Requires --last or --last-regex; errors if
+                        the last match is at or before the slice
+                        start.  Mutually exclusive with --until.
     -o PATH|auto        write the markdown; "auto" = timestamped default.
                         Recovery runs by default, with or without -o.
                         When PATH is given, the recovered directory

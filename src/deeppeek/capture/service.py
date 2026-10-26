@@ -10,9 +10,9 @@ Two entry points for callers:
                                 cfg.output (auto-naming if None),
                                 return the written Path.
 
-Also exports `default_output_path(title, as_json)` — the timestamped
+Also exports default_output_path(title, as_json) — the timestamped
 filename generator — so the CLI can produce the same name for
-`capture -o auto`.
+capture -o auto.
 """
 import json
 import re
@@ -47,6 +47,8 @@ class CaptureConfig:
     timeout: Optional[float] = None
     last_user_turns: Optional[int] = None
     last_regex: Optional[str] = None
+    until_user_turn: Optional[int] = None
+    until_regex: Optional[str] = None
 
 
 @dataclass
@@ -67,9 +69,9 @@ def _safe_title(title: Optional[str], maxlen: int = 30) -> str:
 def default_output_path(title: Optional[str], as_json: bool) -> Path:
     """Produce a timestamped default output filename.
 
-    Used by `capture -o auto` and by `capture_to_markdown` when
-    `cfg.output is None`.  Example: `DeepSeek_2026-10-21_15-42-03.md`
-    or `DeepSeek_<sanitized-title>_2026-10-21_15-42-03.md` if the
+    Used by capture -o auto and by capture_to_markdown when
+    cfg.output is None.  Example: DeepSeek_2026-10-21_15-42-03.md
+    or DeepSeek_<sanitized-title>_2026-10-21_15-42-03.md if the
     conversation had a title.
     """
     stamp = datetime.now().strftime("%Y-%m-%d_%H_%M_%S")
@@ -122,11 +124,15 @@ def render_conversation(conversation: Conversation,
         context=cfg.context,
         last_user_turns=cfg.last_user_turns,
         last_regex=cfg.last_regex,
+        until_user_turn=cfg.until_user_turn,
+        until_regex=cfg.until_regex,
     )
 
     sliced_flag = (
         cfg.last_user_turns is not None
         or cfg.last_regex is not None
+        or cfg.until_user_turn is not None
+        or cfg.until_regex is not None
         or cfg.start_prompt is not None
         or cfg.end_prompt is not None
         or cfg.start_index is not None

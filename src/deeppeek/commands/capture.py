@@ -1,4 +1,4 @@
-"""`deeppeek capture` — capture a DeepSeek conversation.
+"""deeppeek capture — capture a DeepSeek conversation.
 
 Modes:
 
@@ -18,12 +18,12 @@ opt-out, and it requires -o so the capture isn't discarded.
 
 When a file is written (via -o), recovery reads it back from disk so
 that manifest.dump.path records the real path rather than
-"<in-memory>".  When -o is absent, recovery runs on the in-memory
-text and the manifest records "<in-memory>".
+<in-memory>.  When -o is absent, recovery runs on the in-memory
+text and the manifest records <in-memory>.
 
-The recovered directory defaults to `./deeppeek_recovered/`.  When
-`-o PATH` is given, it is created next to PATH instead — so
-`-o /tmp/conv.md` writes `/tmp/deeppeek_recovered/`, not into the
+The recovered directory defaults to ./deeppeek_recovered/.  When
+-o PATH is given, it is created next to PATH instead — so
+-o /tmp/conv.md writes /tmp/deeppeek_recovered/, not into the
 current directory.
 
 Output layout is derived, not user-set:
@@ -47,14 +47,14 @@ from ..recover.pipeline import RecoverConfig, run as recover_run
 
 
 # ---------------------------------------------------------------------------
-# Shared capture-side args (used by `capture` AND `conversation`)
+# Shared capture-side args (used by capture AND conversation)
 # ---------------------------------------------------------------------------
 
 def add_capture_side_args(p: argparse.ArgumentParser) -> None:
-    """Add the capture-side arguments shared by `capture` and `conversation`.
+    """Add the capture-side arguments shared by capture and conversation.
 
-    `-o` is NOT included: `capture` needs to accept the magic string
-    "auto", so it defines `-o` itself.  `conversation` uses a plain
+    -o is NOT included: capture needs to accept the magic string
+    auto, so it defines -o itself.  conversation uses a plain
     Path default.  Everything else (slicer, LLM-free capture options)
     is identical between the two commands.
     """
@@ -77,6 +77,24 @@ def add_capture_side_args(p: argparse.ArgumentParser) -> None:
         help="anchor at the LAST user prompt whose content matches "
              "PATTERN (Python regex), slice to end.  Overrides --last.",
     )
+    p.add_argument(
+        "--until", type=int, default=None, metavar="K",
+        help="end the --last/--last-regex slice JUST BEFORE user "
+             "turn K (0-indexed from conversation start): keeps "
+             "user turns [start, K-1], exclusive of turn K.  "
+             "Requires --last N or --last-regex.  K must be "
+             "strictly greater than the slice's start user-turn "
+             "index.  Mutually exclusive with --until-regex.",
+    )
+    p.add_argument(
+        "--until-regex", default=None, metavar="PATTERN",
+        help="end the --last/--last-regex slice JUST BEFORE the "
+             "LAST user prompt matching PATTERN: keeps user turns "
+             "[start, match-1], exclusive of the matched turn.  "
+             "Requires --last N or --last-regex.  Errors if the "
+             "last match is at or before the slice's start user-"
+             "turn index.  Mutually exclusive with --until.",
+    )
     p.add_argument("--no-thinking", action="store_true")
     p.add_argument("--no-hints", action="store_true")
     p.add_argument("--latex", action="store_true")
@@ -88,9 +106,9 @@ def add_capture_side_args(p: argparse.ArgumentParser) -> None:
 def capture_config_from_args(args: argparse.Namespace) -> CaptureConfig:
     """Build a CaptureConfig from the shared capture-side args.
 
-    `output` is always None: both callers write the returned text to
+    output is always None: both callers write the returned text to
     disk themselves (capture to decide auto vs path, conversation to
-    apply its conversation.md default).  `capture_conversation` does
+    apply its conversation.md default).  capture_conversation does
     not write, so this field is unused on this code path.
     """
     return CaptureConfig(
@@ -110,6 +128,8 @@ def capture_config_from_args(args: argparse.Namespace) -> CaptureConfig:
         timeout=args.timeout,
         last_user_turns=args.last,
         last_regex=args.last_regex,
+        until_user_turn=args.until,
+        until_regex=args.until_regex,
     )
 
 
@@ -230,10 +250,10 @@ def run(args: argparse.Namespace) -> int:
         out_dir = args.recover_to
     elif resolved_output is not None:
         # Put the recovered directory next to the -o output, so
-        # `-o /tmp/conv.md` writes to `/tmp/deeppeek_recovered/`
-        # rather than littering the cwd.  `-o auto` and a bare
+        # -o /tmp/conv.md writes to /tmp/deeppeek_recovered/
+        # rather than littering the cwd.  -o auto and a bare
         # filename both resolve to Path("."), so they land in the
-        # cwd — matching the no-`-o` default below.
+        # cwd — matching the no--o default below.
         out_dir = resolved_output.parent / "deeppeek_recovered"
     else:
         out_dir = Path("./deeppeek_recovered")
