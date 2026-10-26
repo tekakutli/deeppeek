@@ -204,12 +204,25 @@ def pass5_deduplicate(records: dict,
                     if blocks_by_idx[i].kind == "partial"
                     and i not in pair_idxs_for_this_file
                     and block_owner.get(i) == path]
+        # Orphan blocks inside a blockquote come from AI
+        # thinking.  Apply them only when prose attribution (the
+        # AI naming the file in prose) succeeded -- that is the
+        # strongest signal that the AI intended to commit the
+        # code.  Weaker attributions (body_header, anchor,
+        # subset) on blockquoted blocks are almost always
+        # incidental matches against the thinking's working
+        # notes: the pipeline previously applied them, they
+        # failed all insertion heuristics, and generated two
+        # warnings per block for no benefit.
+        _STRONG_BQ_ATTR = frozenset({"prose", "prose_nearest"})
         orphan_patches = [
             b.idx for b in blocks_by_idx.values()
             if b.is_orphan and b.attributed_to == path
             and b.kind != "full"
             and b.idx not in pair_idxs_for_this_file
             and block_owner.get(b.idx) == path
+            and not (b.in_blockquote
+                     and b.attributed_by not in _STRONG_BQ_ATTR)
         ]
         partials = sorted(partials + orphan_patches)
 

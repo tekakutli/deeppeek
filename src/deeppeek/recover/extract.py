@@ -83,7 +83,7 @@ def pass1_extract(dump_text: str) -> tuple[list[Block], list[str]]:
     current_header: Optional[tuple[str, Optional[str]]] = None
     current_context_lines: list[str] = []
 
-    def _make_block(header, lang, body, line_start, line_end, ctx):
+    def _make_block(header, lang, body, line_start, line_end, ctx, bq):
         return Block(
             idx=len(blocks),
             header_path=header[0] if header else None,
@@ -95,12 +95,29 @@ def pass1_extract(dump_text: str) -> tuple[list[Block], list[str]]:
             line_start=line_start,
             line_end=line_end,
             is_orphan=header is None,
+            in_blockquote=bq,
         )
 
     all_tokens = list(_walk_block_tokens(tokens))
+    blockquote_depth = 0
     i = 0
     while i < len(all_tokens):
         tok = all_tokens[i]
+
+        # Track blockquote nesting.  The token stream is flat:
+        # blockquote_open precedes the blockquoted content's
+        # tokens (including fences), blockquote_close follows
+        # them.  Fences at depth > 0 are parts of the AI's
+        # reasoning (deeppeek's formatter wraps thinking in
+        # `> ` quotes).
+        if tok.type == "blockquote_open":
+            blockquote_depth += 1
+            i += 1
+            continue
+        if tok.type == "blockquote_close":
+            blockquote_depth = max(0, blockquote_depth - 1)
+            i += 1
+            continue
 
         if tok.type == "heading_open":
             if (i + 1 < len(all_tokens)
@@ -134,6 +151,7 @@ def pass1_extract(dump_text: str) -> tuple[list[Block], list[str]]:
             ctx = "\n".join(current_context_lines[-6:])
             blocks.append(_make_block(
                 current_header, lang, body, m[0], m[1], ctx,
+                bq=(blockquote_depth > 0),
             ))
             current_context_lines = []
             i += 1

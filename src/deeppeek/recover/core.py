@@ -283,6 +283,15 @@ class Block:
     # write.py's _compute_block_disposition; falls back to a
     # derivation from the block's final state when unset.
     disposition: Optional[str] = None
+    # True iff this fence appeared inside a markdown blockquote.
+    # deeppeek's own formatter (formatter.py) wraps AI thought
+    # content in blockquotes, so a blockquoted fence is (per that
+    # contract) part of the AI's reasoning, not its answer.  Such
+    # blocks are still recoverable when prose attribution names
+    # the target file -- the AI frequently commits code it
+    # discussed in thinking -- but unattributed blockquoted blocks
+    # are skipped silently instead of reported as orphan noise.
+    in_blockquote: bool = False
 
 
 @dataclass

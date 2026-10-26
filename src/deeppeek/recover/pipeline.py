@@ -10,62 +10,60 @@ an in-place apply against an existing directory: recovered files go
 directly into apply_to, files marked [DEL] are deleted from it, and
 all reports are written into `apply_to/deeppeek/`.
 
-REPORTS DIRECTORY (--apply-to only)
-===================================
-`apply_to/deeppeek/` is a VISIBLE directory created on every run:
+ROBUSTNESS: PER-PASS EXCEPTION BOUNDARIES
+=========================================
+Every pass from 2.5 onward runs inside `_run_pass`, which catches
+exceptions, logs them with a traceback to stderr, records them in
+`run_errors`, and returns a safe default.  The consequence:
 
-    deeppeek/
-    ├── warnings.txt
-    ├── manifest.json
-    ├── deleted.txt
-    ├── MISSING_FILES.txt
-    ├── low_trust/          (--min-trust filtered files)
-    └── cache/llm/          (LLM prompt cache — preserved across runs)
+  · A crash in ANY pass does not abort the pipeline.
+  · `pass9_write` ALWAYS runs when `records` is non-empty.
+  · The manifest ALWAYS gets written, with the crashed pass named
+    in `run.errors` and `warnings.txt`.
+  · Files that were successfully recovered before the crash still
+    land on disk (or in `low_trust/`).
 
-The directory is wiped at the start of every `--apply-to` run so
-reports from a previous invocation never linger.  The one exception
-is `cache/` — the LLM cache is expensive to rebuild and useless to
-drop.  The wipe is in `_wipe_deeppeek_dir` below.
+`pass1_extract` (parsing) and `pass3_group` (grouping) are NOT
+wrapped — a crash there means the input is truly unusable, and the
+right answer is to abort with a clear error, not to write an empty
+manifest.  These two passes are also the simplest in the pipeline;
+their absence of exception handling is a deliberate trade-off, not
+an oversight.
 
-(An older version of this tool used `.deeppeek/`, a hidden dir.  Any
-leftover `.deeppeek/` from a previous install is excluded from the
-pre-existing scan and the DEL-marker scan, but is not auto-deleted;
-clean it up manually if you care.)
+`pass9_write` itself is wrapped in a top-level try/except that
+catches a crash and prints a message, so a bug in the writer never
+produces a silent no-op.
 
-LAYOUT (derived, not user-set)
-==============================
-The effective output layout is derived:
+CRASH REPORTING
+===============
+A crashed pass reports:
 
-    --apply-to set   → "header"   (preserve the target tree)
-    neither          → "flat"     (basenames only)
+    [!] pass 2.5 (resolve) raised: <one-line error>
+    <traceback>
+    [!] continuing with a safe default; downstream passes will see
+        the pre-pass state
 
-PRE-EXISTING BASELINES + PATH RESOLUTION (--apply-to only)
-==========================================================
-When `--apply-to DIR` is set:
+The safe defaults per pass:
 
-  1. `_load_preexisting_blocks` scans DIR and creates one synthetic
-     full-print block per source file, with canonical_path and
-     output_path both = the real relative path from DIR.
+    pass 2.5   → [] (no resolutions)
+    pass 4     → (no-op; orphans stay unattributed)
+    pass 5     → (no-op; records keep whatever state pass 3 gave them)
+    pass 6     → records keep base content (no patches applied)
+    pass 7     → {"exports": {}, "imports": {}, "problems": []}
+    pass 8     → (no-op; no per-file verification)
+    pass 8.5   → (no-op; no symbol demotions)
 
-  2. `resolve_paths` (in `recover.resolve`) then walks the
-     conversation blocks and tries to match each `header_path`
-     against the pre-existing file index.
-
-  3. `pass3_group` groups records by `output_path`, so a
-     conversation block and its matching pre-existing baseline end
-     up in the same FileRecord.
-
-  4. Pass 9 writes to `apply_to / output_path`, i.e. to the real
-     subdirectory.  And the pre-existing-baseline skip ensures files
-     the conversation didn't touch are left alone.
+These defaults are conservative: a crashed pass cannot accidentally
+make the result WORSE than "do nothing for that pass".
 """
 import hashlib
 import shutil
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .core import (
     Block,
@@ -105,6 +103,65 @@ class RecoverConfig:
     llm_verbose: bool = False
 
 
+# ---------------------------------------------------------------------------
+# Per-pass exception boundary
+# ---------------------------------------------------------------------------
+
+def _run_pass(pass_name: str,
+              pass_fn: Callable,
+              default,
+              errors: list,
+              *args,
+              **kwargs):
+    """Run `pass_fn(*args, **kwargs)`.  If it raises, log a traceback
+    to stderr, record the error in `errors`, and return `default`.
+
+    The whole point of this wrapper: a pass that crashes on one
+    pathological input must not stop the pipeline from writing the
+    files it has already decided on.  See the module docstring.
+    """
+    try:
+        return pass_fn(*args, **kwargs)
+    except Exception as e:
+        msg = f"pass {pass_name} raised: {type(e).__name__}: {e}"
+        print(f"  [!] {msg}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        print(f"  [!] continuing with a safe default; downstream "
+              f"passes will see the pre-pass state", file=sys.stderr)
+        errors.append({
+            "pass": pass_name,
+            "error": f"{type(e).__name__}: {e}",
+            "traceback": traceback.format_exc(),
+        })
+        return default
+
+
+def _run_pass_no_return(pass_name: str,
+                        pass_fn: Callable,
+                        errors: list,
+                        *args,
+                        **kwargs) -> None:
+    """Same as `_run_pass` but for no-op passes (mutate in place).
+    Records the crash and returns None; no default needed."""
+    try:
+        pass_fn(*args, **kwargs)
+    except Exception as e:
+        msg = f"pass {pass_name} raised: {type(e).__name__}: {e}"
+        print(f"  [!] {msg}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        print(f"  [!] continuing with a safe default; downstream "
+              f"passes will see the pre-pass state", file=sys.stderr)
+        errors.append({
+            "pass": pass_name,
+            "error": f"{type(e).__name__}: {e}",
+            "traceback": traceback.format_exc(),
+        })
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def _resolve_dump(cfg: RecoverConfig) -> tuple[str, str, int]:
     if cfg.dump_text is not None:
         text = cfg.dump_text
@@ -125,7 +182,8 @@ def _validate_apply_to(cfg: RecoverConfig) -> Optional[int]:
     if not cfg.apply_to.exists():
         print(f"error: --apply-to directory does not exist: {cfg.apply_to}",
               file=sys.stderr)
-        print("  (create it first, or omit --apply-to to use ./deeppeek_recovered/)",
+        print("  (create it first, or omit --apply-to to use "
+              "./deeppeek_recovered/)",
               file=sys.stderr)
         return 3
     if not cfg.apply_to.is_dir():
@@ -136,27 +194,7 @@ def _validate_apply_to(cfg: RecoverConfig) -> Optional[int]:
 
 
 def _wipe_deeppeek_dir(aux_base: Path) -> None:
-    """Empty the reports directory, preserving `cache/`.
-
-    Called at the start of every `--apply-to` run.  The intent is
-    that `deeppeek/` always reflects the MOST RECENT run — no stale
-    manifest, no yesterday's warnings.txt, no low_trust file for a
-    record that no longer applies.
-
-    The `cache/` subdirectory is deliberately preserved: the LLM
-    prompt cache is meant to be reused across runs (identical prompts
-    produce identical responses, and re-requesting them costs real
-    time).  Deleting it every run would defeat its purpose.
-
-    If the user wants a full wipe including cache, they can pass
-    `--cache-dir` to move the cache elsewhere, or delete
-    `deeppeek/cache/` manually.  Making that the default would be
-    surprising for the (larger) audience that expects the cache to
-    persist.
-
-    Failures to unlink individual files are best-effort: a stale
-    file we can't remove does not block the current run.
-    """
+    """Empty the reports directory, preserving `cache/`."""
     if not aux_base.exists():
         return
     for child in aux_base.iterdir():
@@ -178,11 +216,6 @@ def _wipe_deeppeek_dir(aux_base: Path) -> None:
 _PREEXISTING_EXCLUDE_DIRS = {
     "node_modules", "__pycache__", "dist", "build", "target",
     "venv", ".venv", ".tox", ".nox", ".git",
-    # NEW (2026-10-31): our own reports directory is never a
-    # source of pre-existing baselines.  Its JSON files (manifest,
-    # LLM cache) would otherwise be treated as user source files.
-    # ".deeppeek" is kept in the set for backward compatibility with
-    # previous installs that used the hidden dir.
     "deeppeek",
     ".deeppeek",
 }
@@ -192,15 +225,7 @@ _PREEXISTING_MAX_FILE_SIZE = 1_048_576  # 1 MiB
 def _load_preexisting_blocks(apply_to: Path) -> list[Block]:
     """Scan `apply_to` and return one synthetic 'full print' block per
     source-like file, ready to be prepended to the conversation's
-    blocks.
-
-    Each block carries its real relative path in both canonical_path
-    and output_path — this is the identity used for grouping and the
-    target used for writing.
-
-    Directories named in `_PREEXISTING_EXCLUDE_DIRS` (including our
-    own `deeppeek/` reports dir) are skipped at every depth.
-    """
+    blocks."""
     blocks: list[Block] = []
     if not apply_to.is_dir():
         return blocks
@@ -301,8 +326,8 @@ def run(cfg: RecoverConfig) -> int:
         print("[startup] LLM mode: off (0 calls will be made)",
               file=sys.stderr)
     else:
-        print(f"[startup] LLM mode: {cfg.llm_mode} (model={cfg.llm_model})",
-              file=sys.stderr)
+        print(f"[startup] LLM mode: {cfg.llm_mode} "
+              f"(model={cfg.llm_model})", file=sys.stderr)
 
     if cfg.apply_to is not None:
         print(f"[startup] apply mode: {cfg.apply_to} "
@@ -313,7 +338,9 @@ def run(cfg: RecoverConfig) -> int:
         print(f"[startup] layout: {layout}", file=sys.stderr)
 
     t_start = time.monotonic()
+    run_errors: list = []
 
+    # ---- pass 1 (NOT wrapped: parsing failure is fatal) ----
     print("[pass 1] extracting blocks (markdown AST)...")
     blocks, deleted_files = pass1_extract(dump_text)
     n_orphans = sum(1 for b in blocks if b.is_orphan)
@@ -329,10 +356,13 @@ def run(cfg: RecoverConfig) -> int:
             for i, b in enumerate(blocks):
                 b.idx = i
 
+    # ---- pass 2 (wrapped) ----
     print(f"[pass 2] classifying blocks (mode={cfg.llm_mode}, "
           f"escalate_below={cfg.escalate_below})...")
-    pass2_classify(blocks, llm, cfg.llm_mode, cfg.escalate_below,
-                   cfg.llm_verbose)
+    _run_pass_no_return(
+        "2 (classify)", pass2_classify, run_errors,
+        blocks, llm, cfg.llm_mode, cfg.escalate_below, cfg.llm_verbose,
+    )
     n_full = sum(1 for b in blocks if b.kind == "full")
     n_partial = sum(1 for b in blocks if b.kind == "partial")
     n_other = sum(1 for b in blocks if b.kind == "not_a_file")
@@ -343,14 +373,19 @@ def run(cfg: RecoverConfig) -> int:
           f"other: {n_other}  recovered-meta: {n_meta}"
           + (f"  preexisting: {n_pre_full}" if n_pre_full else ""))
 
+    # ---- pass 2.5 (wrapped) ----
     print("[pass 2.5] resolving output paths...")
-    resolutions = resolve_paths(blocks, cfg.apply_to, cfg.trace)
+    resolutions = _run_pass(
+        "2.5 (resolve)", resolve_paths, [],
+        run_errors, blocks, cfg.apply_to, cfg.trace,
+    )
     n_resolved = sum(1 for r in resolutions
                      if not r["reason"].startswith("unresolved"))
     n_unresolved = sum(1 for r in resolutions
                        if r["reason"].startswith("unresolved"))
     print(f"  {n_resolved} resolved, {n_unresolved} unresolved")
 
+    # ---- pass 3 (NOT wrapped: grouping failure is fatal) ----
     print("[pass 3] grouping by file...")
     records = pass3_group(blocks, deleted_files)
     n_pre_rec = sum(1 for r in records.values() if r.preexisting_base)
@@ -358,16 +393,24 @@ def run(cfg: RecoverConfig) -> int:
           + (f" ({n_pre_rec} preexisting baselines picked up later)"
              if n_pre_rec else ""))
 
+    # ---- pass 4 (wrapped) ----
     if n_orphans:
         print(f"[pass 4] attributing {n_orphans} orphan fence(s)...")
         blocks_by_idx_all = {b.idx: b for b in blocks}
-        pass4_attribute_orphans(blocks, blocks_by_idx_all, records, cfg.trace)
+        _run_pass_no_return(
+            "4 (attribute)", pass4_attribute_orphans, run_errors,
+            blocks, blocks_by_idx_all, records, cfg.trace,
+        )
         attributed = sum(1 for b in blocks if b.is_orphan and b.attributed_to)
         print(f"  {attributed}/{n_orphans} orphans attributed")
 
+    # ---- pass 5 (wrapped) ----
     print("[pass 5] deduplicating multi-print files...")
     blocks_by_idx = {b.idx: b for b in blocks}
-    pass5_deduplicate(records, blocks_by_idx, cfg.trace)
+    _run_pass_no_return(
+        "5 (deduplicate)", pass5_deduplicate, run_errors,
+        records, blocks_by_idx, cfg.trace,
+    )
     state_counts = {}
     pre_base_count = 0
     for r in records.values():
@@ -379,17 +422,49 @@ def run(cfg: RecoverConfig) -> int:
     if pre_base_count:
         print(f"  preexisting_baseline: {pre_base_count}")
 
+    # ---- pass 6 (wrapped) ----
     print("[pass 6] applying patches...")
-    pass6_apply_patches(records, blocks_by_idx, llm)
+    _p6_errors_before = len(run_errors)
+    _run_pass_no_return(
+        "6 (apply)", pass6_apply_patches, run_errors,
+        records, blocks_by_idx, llm,
+    )
+    if len(run_errors) > _p6_errors_before:
+        # Defense-in-depth.  pass6 has per-patch and per-pair crash
+        # isolation, so reaching here means something catastrophic
+        # (e.g. a crash in the filter/dedup scaffolding before any
+        # patch attempt).  Fail-closed: any record that was supposed
+        # to be patched but did not get its trust updated is
+        # demoted to LOW so write.py routes it to low_trust/ and the
+        # target tree is preserved.
+        _fc_count = 0
+        for _fc_path, _fc_rec in records.items():
+            if _fc_rec.state in ("SINGLE_FULL", "MULTI_FULL",
+                                 "FULL_PLUS_PATCH"):
+                if _fc_rec.trust == "SKIP":
+                    _fc_rec.trust = "LOW"
+                    _fc_rec.warnings.append(
+                        "pass 6 crashed; record fail-closed defensively")
+                    _fc_count += 1
+        if _fc_count:
+            print(f"  [!] pass 6 crashed; {_fc_count} record(s) "
+                  f"fail-closed defensively so the target is "
+                  f"preserved", file=sys.stderr)
 
+    # ---- pass 7 (wrapped) ----
     print("[pass 7] cross-validating imports...")
-    cross_validate = pass7_cross_validate(records)
+    cross_validate = _run_pass(
+        "7 (cross-validate)", pass7_cross_validate,
+        {"exports": {}, "imports": {}, "problems": []},
+        run_errors, records,
+    )
     xv = cross_validate.get("problems", [])
     if xv:
         print(f"  {len(xv)} import problem(s):")
         for p in xv[:10]:
             if p["type"] == "missing_module":
-                print(f"    [{p['from']}] imports '{p['module']}' — not recovered")
+                print(f"    [{p['from']}] imports '{p['module']}' — "
+                      f"not recovered")
             elif p["type"] == "missing_export":
                 print(f"    [{p['from']}] imports '{p['name']}' from "
                       f"'{p['target']}' — not exported")
@@ -398,38 +473,69 @@ def run(cfg: RecoverConfig) -> int:
     else:
         print("  clean")
 
+    # ---- pass 8 (wrapped) ----
     print("[pass 8] verifying...")
-    pass8_verify(records, blocks_by_idx=blocks_by_idx)
-
-    print("[pass 8.5] checking symbol resolution...")
-    pass8_5_check_symbols(records, blocks_by_idx=blocks_by_idx)
-
-    from .cross_file import find_cross_file_duplicates
-    cross_file_dups = find_cross_file_duplicates(
-        records, blocks_by_idx)
-    if cross_file_dups:
-        print(f"  {len(cross_file_dups)} cross-file duplicate(s) (see warnings.txt)")
-
-    print("[pass 9] writing files...")
-    rc = pass9_write(
-        cross_file_duplicates=cross_file_dups,
-        records=records,
-        blocks=blocks,
-        deleted_files=deleted_files,
-        out_dir=cfg.out_dir,
-        apply_to=cfg.apply_to,
-        layout=layout,
-        min_trust=cfg.min_trust,
-        dump_display=dump_display,
-        dump_size=dump_size,
-        dump_sha=dump_sha,
-        dump_text=dump_text,
-        llm=llm,
-        llm_mode=cfg.llm_mode,
-        cross_validate=cross_validate,
-        resolutions=resolutions,
-        verbose=cfg.trace,
+    _run_pass_no_return(
+        "8 (verify)", pass8_verify, run_errors,
+        records, blocks_by_idx=blocks_by_idx,
     )
 
+    # ---- pass 8.5 (wrapped) ----
+    print("[pass 8.5] checking symbol resolution...")
+    _run_pass_no_return(
+        "8.5 (symbols)", pass8_5_check_symbols, run_errors,
+        records, blocks_by_idx=blocks_by_idx,
+    )
+
+    # ---- cross-file duplicate detection (wrapped) ----
+    from .cross_file import find_cross_file_duplicates
+    cross_file_dups = _run_pass(
+        "8.6 (cross-file)", find_cross_file_duplicates, [],
+        run_errors, records, blocks_by_idx,
+    ) or []
+    if cross_file_dups:
+        print(f"  {len(cross_file_dups)} cross-file duplicate(s) "
+              f"(see warnings.txt)")
+
+    # ---- pass 9 (wrapped with defense-in-depth) ----
+    print("[pass 9] writing files...")
+    try:
+        rc = pass9_write(
+            cross_file_duplicates=cross_file_dups,
+            records=records,
+            blocks=blocks,
+            deleted_files=deleted_files,
+            out_dir=cfg.out_dir,
+            apply_to=cfg.apply_to,
+            layout=layout,
+            min_trust=cfg.min_trust,
+            dump_display=dump_display,
+            dump_size=dump_size,
+            dump_sha=dump_sha,
+            dump_text=dump_text,
+            llm=llm,
+            llm_mode=cfg.llm_mode,
+            cross_validate=cross_validate,
+            resolutions=resolutions,
+            verbose=cfg.trace,
+            run_errors=run_errors,
+        )
+    except Exception as e:
+        print(f"  [!] pass 9 (write) raised: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        if cfg.apply_to is not None:
+            print(f"  [!] target tree untouched.  Reports may be "
+                  f"incomplete in {cfg.apply_to / 'deeppeek'}/",
+                  file=sys.stderr)
+        else:
+            print(f"  [!] files may be partially written to "
+                  f"{cfg.out_dir}/", file=sys.stderr)
+        return 1
+
     print(f"  total time: {time.monotonic() - t_start:.1f}s")
+    if run_errors:
+        print(f"  [!] {len(run_errors)} pass(es) crashed — see "
+              f"warnings.txt for the traceback",
+              file=sys.stderr)
     return rc

@@ -1,37 +1,32 @@
 """
 recover.pairing — pair adjacent code blocks into replace / scope edits.
 
-After classify has assigned kinds and intents, this pass walks the
-blocks in order and produces two kinds of pair:
+PAIR DETECTION
+==============
+Two blocks are paired as (old, new) when:
 
-  · **Replace pairs**: two adjacent blocks where the second's
-    prose is a `with:`-style connective.
+    1. They are adjacent, in the same file, and both `partial`/`full`.
+    2. The *old* side is NOT already classified as "new" by prose
+       (a "with:"-block cannot also be an "old"-block).
+    3. The *new* side is classified "new" by prose, OR the old side
+       is classified "old" and the two bodies share enough lines to
+       look like versions of each other.
+    4. The new side is not itself a scoped-replace candidate (body
+       carries a scope marker AND prose introduces a scoped replace).
 
-  · **Scoped pairs**: a single block whose prose says "Replace the
-    X:" OR "Add X to Y:" OR contains any other replace/add verb,
-    AND whose body carries a recognisable scope marker — an HTML
-    `<details>` with a `<summary>`, a Python `def`, a JS `function`,
-    a JS object literal.
+SCOPED DETECTION
+================
+A single block becomes a scoped-replace (`paired_with = -1`) when:
 
-A pair is *not* treated as a regular patch.  Both halves are
-removed from the "trailing patch" path in dedup.
+    1. Its prose names the scope (`_SCOPED_REPLACE_RE` matches), OR
+    2. Its prose says "replace … with:" AND its body carries a scope
+       marker (name extracted from body via
+       `_extract_scope_from_body`), OR
+    3. Its body carries a scope marker AND its prose has a
+       replace/add verb.
 
-## Replace pairs are shape-driven
-
-The primary signal for replace pairs is the SECOND block's prose:
-a connective ("with:", "to:", "becomes:", "new code:", "with the
-following").  That connective alone is enough.
-
-## Scoped pairs fire on add verbs too
-
-The add-family verbs ("add", "insert", "append", "prepend",
-"include") often introduce a *full new version* of a scope rather
-than a surgical insertion.  "Add the full-canvas early-out to
-`drawInpaintContext`:" followed by a body that is the whole new
-function is a scoped-replace in disguise.  The pairing pass treats
-it as such: find the named scope in the baseline and replace it.
-If the body IS an incremental insertion (no scope marker inside),
-that falls through to `_try_context_insert` in `apply_patches`.
+Case 2 is the fix for "Replace the entire Inpainting `<details>` … with:"
+when the scope name is only in the body.
 """
 
 import re
@@ -43,7 +38,9 @@ from .core import (
 )
 from .prose import (
     parse_intent,
-    is_with_connective,
+    is_new_block_prose,
+    is_old_block_prose,
+    is_scoped_replace_by_body,
     _extract_scope_from_body,
     _REPLACE_VERBS,
     _ADD_VERBS,
@@ -57,44 +54,96 @@ _EXPORT_CONST_OBJECT_RE = re.compile(
 )
 
 
-def detect_all(blocks: list,
-               blocks_by_idx: dict) -> None:
-    """Populate `block.paired_with` on both halves of every pair."""
-    _detect_replace_pairs(blocks, blocks_by_idx)
-    _detect_scoped(blocks)
+# ---------------------------------------------------------------------------
+# Body-version similarity — used to safely pair (old, neutral)
+# ---------------------------------------------------------------------------
+
+def _bodies_look_like_versions(a: str, b: str) -> bool:
+    """True if two bodies plausibly represent old and new versions of
+    the same scope.
+
+    Two independent signals:
+      · similar size (within 3×)
+      · at least one shared "meaningful" line (≥10 chars).
+
+    Both are deliberately loose.  False positives are caught by the
+    patcher (the pair will simply fail to apply); false negatives
+    leave the pair unpaired, which is safer than pairing unrelated
+    blocks."""
+    if not a or not b:
+        return False
+    a_lines = [ln.strip() for ln in a.splitlines() if ln.strip()]
+    b_lines = [ln.strip() for ln in b.splitlines() if ln.strip()]
+    if not a_lines or not b_lines:
+        return False
+    if (len(a_lines) / len(b_lines) > 3.0
+            or len(b_lines) / len(a_lines) > 3.0):
+        return False
+    common = {ln for ln in (set(a_lines) & set(b_lines)) if len(ln) >= 10}
+    return bool(common)
 
 
-def _detect_replace_pairs(blocks: list,
-                          blocks_by_idx: dict) -> None:
-    for b in blocks:
+# ---------------------------------------------------------------------------
+# Replace-pair detection
+# ---------------------------------------------------------------------------
+
+def _detect_replace_pairs(blocks: list, blocks_by_idx: dict) -> None:
+    for i in range(len(blocks) - 1):
+        b = blocks[i]
+        next_block = blocks[i + 1]
+
         if getattr(b, "paired_with", None) is not None:
+            continue
+        if getattr(next_block, "paired_with", None) is not None:
             continue
         if b.kind not in ("partial", "full"):
             continue
-
-        next_block = blocks_by_idx.get(b.idx + 1)
-        if next_block is None:
-            continue
         if next_block.kind not in ("partial", "full"):
+            continue
+        if b.classified_by == "preexisting":
+            continue
+        if next_block.classified_by == "preexisting":
             continue
         if next_block.header_path != b.header_path:
             continue
 
-        # Primary signal: the second block's prose is a connective.
-        if is_with_connective(next_block.context_before):
+        b_new = is_new_block_prose(b.context_before)
+        b_old = is_old_block_prose(b.context_before)
+        next_new = is_new_block_prose(next_block.context_before)
+        next_old = is_old_block_prose(next_block.context_before)
+
+        # A block whose own prose is "new" is the new side of the pair
+        # above it.  It cannot also be the old side of the pair below.
+        if b_new:
+            continue
+
+        # The next block declared itself "old" — it can't be a new side.
+        if next_old:
+            continue
+
+        # Primary signal: next is explicitly new.
+        if next_new:
+            # Defer to scoped-replace if the next block's prose names
+            # a scope AND its body carries a scope marker.  Otherwise
+            # this is a straightforward pair.
+            if is_scoped_replace_by_body(
+                    next_block.context_before, next_block.body):
+                continue
             b.paired_with = next_block.idx
             next_block.paired_with = b.idx
             continue
 
-        # Fallback: the first block's prose is a recognised
-        # replace-verb AND the second block's prose signals a new
-        # version.
-        if parse_intent(b.context_before).action == REPLACE_PAIR:
-            second_intent = parse_intent(next_block.context_before)
-            if second_intent.action in (REPLACE_PAIR, "insert", "full"):
-                b.paired_with = next_block.idx
-                next_block.paired_with = b.idx
+        # Fallback: b is explicitly old, next is neutral, and the
+        # two bodies look like versions of each other.
+        if b_old and _bodies_look_like_versions(b.body, next_block.body):
+            b.paired_with = next_block.idx
+            next_block.paired_with = b.idx
+            continue
 
+
+# ---------------------------------------------------------------------------
+# Scoped detection
+# ---------------------------------------------------------------------------
 
 def _detect_scoped(blocks: list) -> None:
     for b in blocks:
@@ -104,31 +153,39 @@ def _detect_scoped(blocks: list) -> None:
             continue
         if b.kind not in ("partial", "full"):
             continue
+        if b.classified_by == "preexisting":
+            continue
+
         intent = parse_intent(b.context_before)
 
-        # Explicit scoped replace: prose names the scope.
+        # Case 1: prose names the scope with "for"/"named".
         if intent.action == REPLACE_SCOPED and intent.scope_name:
             b.scope_hint = intent.scope_hint
             b.scope_name = intent.scope_name
             b.paired_with = -1
             continue
 
-        # If the prose matches a REPLACE_PAIR *without* a "with:"
-        # connective, it's an old-half preamble.  Leave it for
-        # `_detect_replace_pairs`.
+        # Case 2: prose says "replace … with:" AND body carries a
+        # scope marker.  The name comes from the body.
+        if is_scoped_replace_by_body(b.context_before, b.body):
+            name, kind = _extract_scope_from_body(b.body)
+            b.scope_hint = kind
+            b.scope_name = name
+            b.paired_with = -1
+            continue
+
+        # Old-side pair halves must be left alone for
+        # _detect_replace_pairs.
         if (intent.action == REPLACE_PAIR
                 and intent.scope_hint != "with"):
             continue
 
-        # Fallback: the block has a replace OR add verb in prose
-        # AND its body carries a scope marker AND the existing
-        # patch machinery would not handle it.  Treat as scoped
-        # replace.  "add" is included here because a body that IS
-        # the full new scope is a scoped-replace regardless of the
-        # verb the prose used.
+        # Case 3: prose has a replace/add verb AND body carries a
+        # scope marker AND the block would not be handled by the
+        # patch machinery as-is.
         ctx_lower = b.context_before.lower()
         has_verb = (
-            intent.action == REPLACE_PAIR  # "with:" prose without pairing
+            intent.action == REPLACE_PAIR
             or any(v in ctx_lower for v in _REPLACE_VERBS)
             or any(v in ctx_lower for v in _ADD_VERBS)
         )
@@ -144,13 +201,12 @@ def _detect_scoped(blocks: list) -> None:
         b.paired_with = -1
 
 
-def _looks_like_patchable(b: Block) -> bool:
-    """True if the existing patch machinery would handle this block.
+# ---------------------------------------------------------------------------
+# Patchability pre-check (used to prevent scoped detection from
+# swallowing blocks the deterministic patcher would handle)
+# ---------------------------------------------------------------------------
 
-    Prevents the scoped-replace fallback from stealing blocks that a
-    deterministic patcher would process correctly (object literals,
-    diffs, deletions).
-    """
+def _looks_like_patchable(b: Block) -> bool:
     body = b.body.strip()
     if not body:
         return False
@@ -174,19 +230,23 @@ def _looks_like_patchable(b: Block) -> bool:
     return False
 
 
-def build_pairs(blocks_by_idx: dict) -> dict:
-    """
-    Return {anchor_idx: pair_dict} for every pair.
+# ---------------------------------------------------------------------------
+# Public entry points
+# ---------------------------------------------------------------------------
 
-    Regular pairs: anchor_idx is the OLD block's idx.
-    Scoped pairs:  anchor_idx is the NEW block's idx, `old_idx` = -1.
-    """
+def detect_all(blocks: list, blocks_by_idx: dict) -> None:
+    """Populate `block.paired_with` on both halves of every pair."""
+    _detect_replace_pairs(blocks, blocks_by_idx)
+    _detect_scoped(blocks)
+
+
+def build_pairs(blocks_by_idx: dict) -> dict:
+    """Return {anchor_idx: pair_dict} for every pair."""
     pairs: dict = {}
     for b in blocks_by_idx.values():
         paired = getattr(b, "paired_with", None)
         if paired is None:
             continue
-
         if paired == -1:
             pairs[b.idx] = {
                 "old_idx": -1,
@@ -196,14 +256,11 @@ def build_pairs(blocks_by_idx: dict) -> dict:
                 "new_body": b.body,
             }
             continue
-
         if paired < b.idx:
             continue
-
         other = blocks_by_idx.get(paired)
         if other is None:
             continue
-
         pairs[b.idx] = {
             "old_idx": b.idx,
             "new_idx": paired,

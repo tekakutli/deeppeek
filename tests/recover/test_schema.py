@@ -68,6 +68,7 @@ def test_block_schema():
         "scope_name": "",
         "paired_with": None,
         "disposition": None,
+        "in_blockquote": False,
     })
 
 

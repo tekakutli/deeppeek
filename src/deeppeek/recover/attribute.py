@@ -116,7 +116,14 @@ def pass4_attribute_orphans(blocks: list[Block],
             _assign(b, subset_matches[0], "subset", verbose)
             continue
 
-        b.attributed_by = "unattributed"
+        # Unattributed blockquoted blocks are AI-thinking noise:
+        # skip silently rather than emitting an orphan warning for
+        # every fragment the AI explored but did not commit to.
+        # See Block.in_blockquote's docstring.
+        if b.in_blockquote:
+            b.attributed_by = "blockquote_skip"
+        else:
+            b.attributed_by = "unattributed"
 
 
 def _assign(b: Block, path: str, method: str, verbose: bool,

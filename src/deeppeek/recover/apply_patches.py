@@ -17,6 +17,27 @@ Step 8 requires the `[ast]` extra (`tree-sitter` +
 `tree-sitter-javascript` + `tree-sitter-python`).  Without it the
 step silently returns None and the tool behaves exactly as before.
 
+PAIR / PARTIAL / DRIFT ROBUSTNESS (2026-11-04)
+==============================================
+  · Pair detection requires the old side to NOT be classified "new"
+    by its own prose.  A "with:"-block cannot also be the old side
+    of another pair.  This prevents the "new CSS was paired with
+    the next block's new <details>" mis-pairing.
+
+  · Replace-pair matching is drift-aware.  If `new` is present but
+    `old` is not, the pair is a no-op (already applied), not a
+    failure.  If both are present, the pair is ambiguous and fails
+    closed.  The exact-match branch runs AFTER the drift check so
+    an already-applied pair cannot produce a duplicate.
+
+  · Scoped replaces whose new body is a *prefix* of the base scope
+    splice the prefix into the base rather than truncating it.
+    Prefix-shaped bodies (no closer) trigger `_try_scoped_partial_splice`.
+
+  · Fuzzy line matching accepts token-equivalent lines (same tokens,
+    different whitespace) at 0.95.  This is a common drift signature
+    that previously scored 0.0 and killed whole blocks.
+
 FAIL-CLOSED
 ===========
 Any failed patch or failed pair sets `rec.trust = "LOW"`.  Under
@@ -491,8 +512,13 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                     continue
 
             patch["applied_by"] = "failed"
-            patch["failure_reason"] = _diagnose_patch_failure(
-                patch, content, base)
+            try:
+                patch["failure_reason"] = _diagnose_patch_failure(
+                    patch, content, base)
+            except Exception as _diag_exc:
+                patch["failure_reason"] = (
+                    f"diagnostic raised {type(_diag_exc).__name__}: "
+                    f"{_diag_exc}; patch could not be applied")
             rec.warnings.append(
                 f"patch idx={patch['idx']} could not be applied "
                 f"({patch['failure_reason']})")
@@ -572,8 +598,21 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                       f"trust", file=sys.stderr)
             else:
                 rec.trust = trust_cap
-                if all_ok and not all_deterministic and rec.patches:
+                # Report `via_llm` only when an LLM actually
+                # applied a patch.  Previously this checked
+                # `not all_deterministic`, which was also True
+                # when a patch failed deterministic heuristics
+                # but was demoted to skipped_weak_attribution (no
+                # LLM involved) -- producing a spurious
+                # `via_llm: true` in the manifest.  The correct
+                # signal is: count the patches whose applied_by
+                # is literally "llm".
+                llm_count = sum(
+                    1 for p in rec.patches
+                    if p.get("applied_by") == "llm")
+                if llm_count:
                     rec.verification["via_llm"] = True
+                    rec.verification["llm_patch_count"] = llm_count
 
         rec.content = content
 
@@ -619,32 +658,49 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
 # ---------------------------------------------------------------------------
 
 def _apply_pairs(base, pairs):
+    """Apply each pair.  Each pair is independently crash-isolated:
+    a raise inside one pair is recorded as that pair's failure and
+    the loop continues with the next pair.  The base is left
+    unchanged for the failed pair, so the caller's sanity gate sees
+    the previous state rather than a corrupted intermediate.
+    """
     records = []
     current = base
     for pair in pairs:
-        if pair["old_idx"] == -1:
-            result = _apply_scoped(
-                current, pair["scope_name"], pair["new_body"])
-            if result is None:
-                reason = _diagnose_scoped_failure(
-                    current, pair["scope_name"], pair.get("new_body", ""))
-                records.append({"applied_by": "failed",
-                                "pair": pair, "reason": reason})
+        try:
+            if pair["old_idx"] == -1:
+                result = _apply_scoped(
+                    current, pair["scope_name"], pair["new_body"])
+                if result is None:
+                    reason = _diagnose_scoped_failure(
+                        current, pair["scope_name"],
+                        pair.get("new_body", ""))
+                    records.append({"applied_by": "failed",
+                                    "pair": pair, "reason": reason})
+                    continue
+            else:
+                result = _try_replace_pair(
+                    current, pair["old_body"], pair["new_body"])
+                if result is None:
+                    reason = _diagnose_replace_failure(
+                        current, pair["old_body"],
+                        pair.get("new_body", ""))
+                    records.append({"applied_by": "failed",
+                                    "pair": pair, "reason": reason})
+                    continue
+            if result == current:
+                records.append({"applied_by": "already-present",
+                                "pair": pair})
                 continue
-        else:
-            result = _try_replace_pair(
-                current, pair["old_body"], pair["new_body"])
-            if result is None:
-                reason = _diagnose_replace_failure(
-                    current, pair["old_body"])
-                records.append({"applied_by": "failed",
-                                "pair": pair, "reason": reason})
-                continue
-        if result == current:
-            records.append({"applied_by": "already-present", "pair": pair})
-            continue
-        current = result
-        records.append({"applied_by": "deterministic", "pair": pair})
+            current = result
+            records.append({"applied_by": "deterministic", "pair": pair})
+        except Exception as _pair_exc:
+            records.append({
+                "applied_by": "failed",
+                "pair": pair,
+                "reason": (f"pair raised {type(_pair_exc).__name__}: "
+                           f"{_pair_exc}"),
+            })
     return current, records
 
 
@@ -677,9 +733,18 @@ def _diagnose_scoped_failure(base, scope_name, new_body=""):
     return f"scope {scope_name!r} not found in base"
 
 
-def _diagnose_replace_failure(base, old_body):
+def _diagnose_replace_failure(base, old_body, new_body=""):
     if not old_body or not old_body.strip():
         return "old_body is empty"
+
+    old_present = bool(old_body in base)
+    new_present = bool(new_body and new_body.strip() and new_body in base)
+
+    if old_present and new_present:
+        return ("both old and new bodies present in base — ambiguous "
+                "(partial prior application, or old appears as a "
+                "comment/example elsewhere); fail-closed")
+
     count = base.count(old_body)
     if count == 0:
         def _norm(s):
@@ -717,8 +782,9 @@ def _diagnose_replace_failure(base, old_body):
     if count > 1:
         return f"old_body appears {count} times (ambiguous)"
 
-    # Report the best fuzzy similarity so the user can tell "0.4 =
-    # wrong block" from "0.7 = almost matched, tweak old_body".
+    # count == 1 with only old present: exact match should have fired.
+    # Report best fuzzy similarity so the user can tell "0.4 = wrong
+    # block" from "0.7 = almost matched, tweak old_body".
     try:
         base_lines = base.splitlines()
         old_lines = old_body.splitlines()
@@ -754,6 +820,25 @@ def _diagnose_replace_failure(base, old_body):
 
 
 def _diagnose_patch_failure(patch, content, base):
+    """Explain why a patch could not be applied.
+
+    Returns a human-readable string suitable for warnings.txt and
+    the manifest's ``patch_failure_reasons``.  This function is on
+    the cold-failure path: if it raises, the whole pass would die.
+    The wrapper below catches any exception and falls back to a
+    generic message so a single weird block can never take out
+    the pass.
+
+    Never raises.
+    """
+    try:
+        return _diagnose_patch_failure_inner(patch, content, base)
+    except Exception as e:
+        return (f"diagnostic raised {type(e).__name__}: {e}; "
+                f"patch could not be applied")
+
+
+def _diagnose_patch_failure_inner(patch, content, base):
     body = patch.get("body", "") or ""
     stripped = body.strip()
     if not stripped:
@@ -771,21 +856,30 @@ def _diagnose_patch_failure(patch, content, base):
 
     ctx = patch.get("context_before", "") or ""
 
+    # Order matches `_try_deterministic_patch_inner`: a block whose
+    # prose carries a deletion signal is tried as a deletion FIRST,
+    # even when the block itself looks like an `export const X = {`
+    # splice.  `export const X = { ... }` is a common target for
+    # "Delete the X block:" prose (state objects, feature flags,
+    # config constants).  Reporting the splice variant when the
+    # pipeline actually tried deletion is misleading — the user
+    # needs to know what was attempted, so they can reason about
+    # why it failed.
+    if _is_deletion_instruction(stripped, ctx):
+        return ("looks like a deletion but the target block is not "
+                "present verbatim in base (deletion may already be "
+                "applied, or the block has shifted)")
     if _looks_like_diff_body(stripped):
         return ("looks like a diff but could not be applied to base "
                 "(context mismatch or already applied elsewhere)")
     if _EXPORT_CONST_OBJECT_RE.match(stripped):
         return ("looks like an `export const X = { ... }` splice but "
                 "no matching base declaration was found for the variable")
-    if _is_deletion_instruction(stripped, ctx):
-        return ("looks like a deletion but the target block is not "
-                "present verbatim in base (deletion may already be "
-                "applied, or the block has shifted)")
 
     count_full = content.count(stripped)
     if count_full > 1:
         return (f"body appears {count_full} times in the current file "
-                f"(ambiguous — no unique anchor)")
+                f"(ambiguous - no unique anchor)")
     if count_full == 1:
         return ("body already appears verbatim in the current file "
                 "(already-applied but not detected as a no-op; the "
@@ -845,10 +939,11 @@ def _try_fuzzy_replace(base, old_body, new_body, threshold=0.75):
     Fires only when byte-exact and whitespace-normalized matching
     both fail.  Accepts a base window as a candidate only if, for
     every line pair, the base line is a strict token superset of the
-    old_body line AND the length ratio is at most 2x.  That rejects
-    value substitutions (base shorter or different values) while
-    accepting drift where the base has extra tokens the AI's
-    old_body omitted (the pg_dispatch.py shape).
+    old_body line (or token-equivalent, meaning whitespace-only
+    drift) AND the length ratio is at most 2x.  That rejects value
+    substitutions while accepting drift where the base has extra
+    tokens the AI's old_body omitted (the pg_dispatch.py shape) OR
+    where whitespace drifted (the pg_inpaint.py shape).
     """
     import re as _re
     from collections import Counter
@@ -863,22 +958,34 @@ def _try_fuzzy_replace(base, old_body, new_body, threshold=0.75):
             r'''[A-Za-z_$][\w$]*|[0-9]+|"[^"]*"|'[^']*'|[^\s\w]''',
             s))
 
-    def _is_superset(a, b):
-        a_tok = _tokens(a)
-        b_tok = _tokens(b)
-        return not (a_tok - b_tok) and b_tok != a_tok
-
     def _line_sim(a, b):
+        """Return similarity 0.0–1.0 between two stripped line strings.
+
+        Arguments are (old_line, base_line) as passed in by the
+        caller.  Cases:
+          · 1.0   exact match
+          · 0.95  token-equivalent (same tokens, different whitespace)
+          · 0.9   base is a token-superset of old, size ratio ≤ 2
+          · 0.0   otherwise
+        """
         if a == b:
             return 1.0
         if not a or not b:
             return 0.0
-        la, lb = len(a), len(b)
-        if lb < la or lb > la * 2:
-            return 0.0
-        if not _is_superset(a, b):
-            return 0.0
-        return 0.9
+        a_tok = _tokens(a)   # old
+        b_tok = _tokens(b)   # base
+        if a_tok == b_tok:
+            # Same tokens, different formatting.  Common state-drift
+            # signature — should match at high confidence.
+            return 0.95
+        if not (a_tok - b_tok):
+            # Base is a token-superset of old (has everything old has,
+            # plus extra tokens).  Bounded by character-length ratio.
+            la, lb = len(a), len(b)
+            if lb < la or lb > la * 2:
+                return 0.0
+            return 0.9
+        return 0.0
 
     scored = []
     for i in range(len(base_lines) - n + 1):
@@ -988,13 +1095,64 @@ def _find_identifier_block_end_line(base, ident):
     return end_idx
 
 
+def _pair_already_applied(base, old, new):
+    """True if `new` is present in base but `old` is not.
+
+    This is the state-drift signature: someone (a previous
+    `--apply-to` run, a manual edit) already applied this exact
+    replacement.  Applying again would duplicate.  Caller marks the
+    pair as `already-present` — a no-op, not a failure.
+
+    If `new` is empty (deletion-as-pair) or `old` is present,
+    returns False.  The both-present case is handled separately by
+    `_pair_ambiguous`.
+    """
+    if not new or not new.strip():
+        return False
+    if new not in base:
+        return False
+    if old and old in base:
+        return False
+    return True
+
+
+def _pair_ambiguous(base, old, new):
+    """True if both `old` and `new` bodies are present in base.
+
+    This is genuinely ambiguous — could mean a partial prior
+    application left the old block behind, or old appears as a
+    comment / code example while new is the live code, or some
+    other non-idempotent state.  Fail-closed so the record lands
+    in low_trust/ and the user decides.
+    """
+    if not old or not old.strip():
+        return False
+    if not new or not new.strip():
+        return False
+    return old in base and new in base
+
+
 def _try_replace_pair(base, old, new):
     if not old.strip():
         return None
+
+    # Drift: new is present, old is gone → already applied.  Return
+    # base unchanged; caller records the pair as `already-present`.
+    if _pair_already_applied(base, old, new):
+        return base
+
+    # Both present: ambiguous.  Fail-closed — do NOT run the exact
+    # replace (which would produce two copies of `new`).
+    if _pair_ambiguous(base, old, new):
+        return None
+
+    # Exact match (old must be unique).
     if old in base and base.count(old) == 1:
         result = base.replace(old, new, 1)
         if result != base:
             return result
+
+    # Whitespace-normalized (trailing-whitespace drift on base lines).
     def _norm(s):
         return "\n".join(ln.rstrip() for ln in s.splitlines())
     base_norm = _norm(base)
@@ -1004,7 +1162,13 @@ def _try_replace_pair(base, old, new):
         result = base_norm[:pos] + new + base_norm[pos + len(old_norm):]
         if result != base_norm:
             return result
-    return _try_fuzzy_replace(base, old, new)
+
+    # Fuzzy line-level match (token-equivalent lines, superset lines).
+    fuzzy = _try_fuzzy_replace(base, old, new)
+    if fuzzy is not None:
+        return fuzzy
+
+    return None
 
 
 _SCOPE_PATTERNS = [
@@ -1115,6 +1279,64 @@ def _find_leading_comment_start(base, indent_pos):
     return indent_pos
 
 
+def _new_body_is_complete_for_scope(base_scope_text, new_body):
+    """True iff `new_body` looks like a complete replacement of
+    `base_scope_text`.
+
+    The heuristic: if `base_scope_text` ends with a "closer"
+    (`</details>` or `}`), `new_body` must end with the same closer.
+    A prefix that omits the closer is a partial-splice candidate, not
+    a full replacement.  If the base doesn't end with a known closer
+    (unusual), default to complete — the user gets the old behaviour.
+    """
+    base_stripped = base_scope_text.rstrip()
+    new_stripped = new_body.rstrip()
+    if not new_stripped:
+        return False
+    if base_stripped.endswith("</details>"):
+        return new_stripped.endswith("</details>")
+    if base_stripped.endswith("}"):
+        return (new_stripped.endswith("}")
+                or new_stripped.endswith("};"))
+    return True
+
+
+def _try_scoped_partial_splice(base_scope_text, new_body):
+    """Splice `new_body`'s additions into `base_scope_text` line-wise.
+
+    Uses `difflib.SequenceMatcher` to compute the line-level diff.
+    Inserts and small replaces from `new_body` are applied; deletions
+    from `base_scope_text` are skipped (a partial body shouldn't be
+    silently removing content — that would be a full replace).
+
+    Returns the spliced scope text, or None when the diff adds
+    nothing (meaning the "new" body is a strict subset of the old —
+    a truncation, not an extension)."""
+    import difflib
+    base_lines = base_scope_text.split("\n")
+    new_lines = new_body.split("\n")
+    sm = difflib.SequenceMatcher(None, base_lines, new_lines)
+    result = list(base_lines)
+    added_lines = 0
+    for tag, i1, i2, j1, j2 in reversed(sm.get_opcodes()):
+        if tag == 'equal':
+            continue
+        if tag == 'insert':
+            added_lines += (j2 - j1)
+            result[i1:i1] = new_lines[j1:j2]
+        elif tag == 'replace':
+            if (i2 - i1) <= (j2 - j1) * 2:
+                added_lines += (j2 - j1)
+                result[i1:i2] = new_lines[j1:j2]
+        # 'delete' — skipped deliberately
+    if added_lines == 0:
+        return None
+    result_text = "\n".join(result)
+    if result_text == base_scope_text:
+        return None
+    return result_text
+
+
 def _apply_scoped(base, scope_name, new_body):
     if not scope_name or not new_body.strip():
         return None
@@ -1130,6 +1352,28 @@ def _apply_scoped(base, scope_name, new_body):
             continue
         m_start = m.start()
         m_end = m.end()
+        base_scope_text = base[m_start:m_end]
+
+        # Partial splice: when the new body is a *prefix* of the
+        # base scope (missing the closer), splice the prefix in
+        # rather than truncating the base.  Common shape:
+        #   "Add the early-out to foo().  The rest is unchanged."
+        # where the AI emits only the new header + a few lines.
+        if not _new_body_is_complete_for_scope(
+                base_scope_text, new_body):
+            spliced = _try_scoped_partial_splice(
+                base_scope_text, new_body)
+            if spliced is not None:
+                if m_start < len(base) and base[m_start] == "\n":
+                    indent_pos = m_start + 1
+                    base_indent = ""
+                else:
+                    indent_pos = base.rfind("\n", 0, m_start) + 1
+                    base_indent = base[indent_pos:m_start]
+                reindented = _reindent_body(base_indent, spliced)
+                return base[:indent_pos] + reindented + base[m_end:]
+
+        # Full replacement (original logic).
         if m_start < len(base) and base[m_start] == "\n":
             indent_pos = m_start + 1
             base_indent = ""
@@ -1705,7 +1949,20 @@ def _patch_already_present(body, base):
 
 
 def _try_deterministic_patch(base, patch, path=""):
-    return _try_deterministic_patch_inner(base, patch, path)
+    """Crash-isolated entry point.
+
+    A crash inside any of the inner heuristics (context-insert,
+    structural-append, AST, fuzzy, etc.) is caught here and turned
+    into a `None` result, which the caller records as a failed
+    patch.  Without this wrapper, one bad block shape can take
+    down the entire pass for every file in the conversation.
+    """
+    try:
+        return _try_deterministic_patch_inner(base, patch, path)
+    except Exception as e:
+        print(f"  [patch] deterministic attempt raised: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        return None
 
 
 def _try_deterministic_patch_inner(base, patch, path=""):
@@ -2083,16 +2340,6 @@ def _try_structural_append(base: str, body: str,
 
     body_lang = _infer_body_lang(body)
     if body_lang is None:
-        return None
-
-    # Reject unbalanced blocks before appending.
-    from .validate_output import _js_balance
-    _b, _p, _k, _u = _js_balance(body)
-    if _b != 0 or _p != 0 or _k != 0 or _u:
-        print(f"  [structural] {path}: refusing to append "
-              f"structurally-unbalanced block "
-              f"(braces={_b:+d} parens={_p:+d} "
-              f"brackets={_k:+d})", file=sys.stderr)
         return None
 
     # Reject unbalanced blocks before appending.  Appending an

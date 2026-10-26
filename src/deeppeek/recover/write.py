@@ -194,6 +194,8 @@ def _compute_block_disposition(b, records):
             return "orphan_meta"
         if b.attributed_by == "empty":
             return "orphan_empty"
+        if b.attributed_by == "blockquote_skip":
+            return "blockquote_skip"
         return "orphan_unattributed"
     if getattr(b, "paired_with", None) is not None:
         return "paired"
@@ -249,7 +251,8 @@ def pass9_write(records: dict,
                 apply_to: Optional[Path] = None,
                 resolutions: Optional[list] = None,
                 cross_file_duplicates: Optional[list] = None,
-                verbose: bool = False) -> int:
+                verbose: bool = False,
+                run_errors: Optional[list] = None) -> int:
     if apply_to is not None:
         files_dir = apply_to
         aux_dir = apply_to / "deeppeek"
@@ -260,6 +263,21 @@ def pass9_write(records: dict,
         low_dir = out_dir / "files_low_trust"
         aux_dir = out_dir / "llm_audit"
         reports_dir = out_dir
+
+    # Defensive: an empty `records` after pass 3 means the pipeline
+    # failed before grouping.  Emit a loud diagnostic so the manifest
+    # (which will have empty `decisions`) is not mistaken for "the
+    # conversation had no code blocks".
+    if not records:
+        print("  [!] pipeline produced zero file records — the "
+              "conversation may have had no parseable code blocks, "
+              "OR an upstream pass silently discarded them.  Check "
+              "the block list and warnings.txt.",
+              file=sys.stderr)
+
+    # Surface any pass crashes at the top of warnings.txt so the
+    # manifest is self-explanatory without external logs.
+    _run_errors = run_errors or []
 
     files_dir.mkdir(parents=True, exist_ok=True)
     aux_dir.mkdir(parents=True, exist_ok=True)
@@ -277,6 +295,12 @@ def pass9_write(records: dict,
     min_rank = trust_rank[min_trust]
 
     warnings_lines: list = []
+    for _err in _run_errors:
+        warnings_lines.append(
+            f"[PASS_FAILED] {_err['pass']}: {_err['error']}")
+        # The full traceback follows as a single indented block.
+        for _line in (_err.get("traceback") or "").splitlines():
+            warnings_lines.append(f"  {_line}")
     written: dict = {}
     skipped: list = []
     written_count = 0
@@ -618,7 +642,10 @@ def pass9_write(records: dict,
 
     unattributed = [b for b in blocks
                     if b.is_orphan and not b.attributed_to
-                    and b.attributed_by not in ("empty", "no_candidates", "skipped_meta", "not_a_file")]
+                    and b.attributed_by not in (
+                        "empty", "no_candidates", "skipped_meta",
+                        "not_a_file", "blockquote_skip",
+                    )]
     for b in unattributed:
         first_line = _orphan_first_line(b)
         warnings_lines.append(
@@ -853,6 +880,7 @@ def pass9_write(records: dict,
                 "refused": llm.calls_refused if llm else 0,
             },
             "ast": ast_info,
+            "errors": _run_errors,
             "block_classification": {
                 "total": len(blocks),
                 "escalated_to_llm": escalated,
@@ -884,6 +912,7 @@ def pass9_write(records: dict,
                     "attributed_to": b.attributed_to,
                     "attributed_by": b.attributed_by,
                     "is_orphan": b.is_orphan,
+                    "in_blockquote": b.in_blockquote,
                     "kind": b.kind,
                     "paired_with": getattr(b, "paired_with", None),
                     "classified_by": b.classified_by,

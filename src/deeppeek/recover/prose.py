@@ -3,42 +3,35 @@ recover.prose — intent parsing of the prose around code blocks.
 
 The `context_before` on each Block is the text between the previous
 code block (or section heading) and this one.  That prose is where
-the author tells us *what to do*:
+the author tells us *what to do*.
 
-    "Replace the block:"              → replace, old shown next
-    "with:"                           → the second half of a pair
-    "Replace the entire X for Y:"     → scoped replace, only new shown
-    "Delete this:"                    → delete
-    "Add this after X:"               → insert
-    "Here is the full file:"          → full replacement
+PAIR ROLES
+==========
+For replace-pair detection, each block's prose is classified into
+one of three roles:
 
-Intent vocabulary (each maps to a different patcher):
+    OLD      "Find:", "Current:", "Old code:", "Before:", "Existing:",
+             "Replace the block:", "Look for:", …
 
-    REPLACE_PAIR    old + new blocks, side by side
-    REPLACE_SCOPED  single block, prose names the target scope
-    DELETE          single block, prose signals deletion
-    INSERT          single block, prose signals insertion
-    FULL            single block, prose signals a full-file write
-    UNKNOWN         no clear signal
+    NEW      "with:", "to:", "becomes:", "Replace with:",
+             "And replace with:", "New version:", "Updated:",
+             "Use this:", "Changed to:", …
 
-SCOPE-FROM-BODY EXTRACTION
-==========================
-When the prose says "replace/update/change the X" (or "add X to Y")
-but the block body carries a recognisable scope marker (an HTML
-`<details>` with a `<summary>`, a Python `def X`, a JS `function X`
-/ `export const X = {`), we can extract the scope name *from the
-body* rather than requiring the prose to name it.  This is
-`_extract_scope_from_body`, used by `pairing._detect_scoped` as a
-fallback.
+    NEUTRAL  anything else.
 
-ADD VERBS
-=========
-"Add", "insert", "append", and "prepend" are treated as
-replace-adjacent verbs for scoped-replace purposes: an instruction
-like "add the full-canvas early-out to `drawInpaintContext`:" with
-a body that IS the full new function is a scoped-replace in
-disguise.  The `_ADD_VERBS` tuple carries these, and
-`is_add_instruction` is a per-context check.
+Only an OLD (or NEUTRAL) block may be the *old* side of a pair.
+A NEW block cannot be the old side of another pair — it is
+itself the new side of the pair above it.  This is the invariant
+that prevents the "new CSS was paired with next block's new
+<details>" bug.
+
+PARTIAL REPLACEMENTS
+====================
+When prose says "rest unchanged", "otherwise unchanged", "identical
+to the original", "only the top", "start of", "prefix of", etc., the
+block that follows is understood to be a *prefix* of the new body —
+a scoped-replace should splice, not replace.  `is_partial_replacement`
+reports this to the patcher.
 """
 
 import re
@@ -53,8 +46,10 @@ FULL = "full"
 UNKNOWN = "unknown"
 
 
-# Words that appear in a "replace" instruction.  Order matters:
-# longer, more specific phrases first.
+# ---------------------------------------------------------------------------
+# Prose phrase lists
+# ---------------------------------------------------------------------------
+
 _REPLACE_PROSE = (
     "replace the block:",
     "replace the block with",
@@ -68,6 +63,94 @@ _REPLACE_PROSE = (
     "swap:",
 )
 
+# Last non-empty line ending in (or starting with) one of these marks
+# the block as the NEW side of a pair.
+_NEW_BLOCK_PROSE_PATTERNS = (
+    "with:",
+    "with the following:",
+    "with the following",
+    "with this:",
+    "to:",
+    "becomes:",
+    "becoming:",
+    "new code:",
+    "replacement:",
+    "replace with:",
+    "replaced with:",
+    "and replace with:",
+    "and with:",
+    "then with:",
+    "and then with:",
+    "new version:",
+    "updated version:",
+    "updated:",
+    "use this:",
+    "try this:",
+    "should be:",
+    "should become:",
+    "should look like:",
+    "changed to:",
+    "here is the new version:",
+    "here's the new version:",
+    "here is the replacement:",
+    "here's the replacement:",
+)
+
+# Last non-empty line ending in (or starting with) one of these marks
+# the block as the OLD side of a pair.
+_OLD_BLOCK_PROSE_PATTERNS = (
+    "find:",
+    "current:",
+    "current version:",
+    "existing:",
+    "existing version:",
+    "old:",
+    "old code:",
+    "old version:",
+    "before:",
+    "here is the current:",
+    "here's the current:",
+    "here is the old:",
+    "here's the old:",
+    "replace the block:",
+    "replace this:",
+    "look for:",
+)
+
+# Prose signalling "rest is unchanged" — a scoped-replace with one of
+# these phrases should splice the given prefix into the base, not
+# replace it entirely.
+_PARTIAL_REPLACE_PROSE_PATTERNS = (
+    "rest is unchanged",
+    "rest unchanged",
+    "rest of the function is unchanged",
+    "rest of the function unchanged",
+    "rest of the file is unchanged",
+    "rest of the file unchanged",
+    "rest of the method is unchanged",
+    "rest remains unchanged",
+    "rest stays",
+    "rest of it is unchanged",
+    "otherwise unchanged",
+    "unchanged except",
+    "identical to the version",
+    "identical to the original",
+    "same as before",
+    "no other changes",
+    "no other change",
+    "only the top",
+    "only the beginning",
+    "only the start",
+    "just the top",
+    "just the beginning",
+    "just the start",
+    "top of the function",
+    "top of the method",
+    "start of the function",
+    "beginning of the function",
+    "prefix of the",
+)
+
 _REPLACE_WITH_PROSE = (
     "with:",
     "with the following",
@@ -78,27 +161,9 @@ _REPLACE_WITH_PROSE = (
     "new code:",
 )
 
-# Verbs that indicate the block *is* the new content for some scope,
-# even without a name in prose.  Used by the pairing fallback.
-#
-# The trailing space after each verb reduces false positives ("add"
-# vs "additional", "insert" vs "insertion").  "modify" and "edit"
-# are excluded from the trailing-space form because they commonly
-# appear as "modifying" / "edited" in prose.
 _REPLACE_VERBS = ("replace", "update", "change", "rewrite", "modify", "edit")
-
-# Add-family verbs.  Treated as replace-adjacent for scoped-apply
-# because a body that IS the full new scope is a scoped-replace,
-# regardless of whether the prose says "replace" or "add".
 _ADD_VERBS = ("add ", "insert ", "append ", "prepend ", "include ")
 
-# Scoped-replace prose — no OLD block follows; only the NEW block,
-# and the prose names the target as "<scope> for <name>".
-#
-# Examples matched:
-#   "Replace the entire `<details>` for Inpainting with:"
-#   "Replace the whole function parse_config with:"
-#   "Replace the block named Foo with:"
 _SCOPED_REPLACE_RE = re.compile(
     r"replace\s+(?:the\s+)?(?:entire\s+|whole\s+)?"
     r"(?:`?[<]?[\w\-]+[>]?`?\s+)?"
@@ -147,6 +212,95 @@ class Intent:
     scope_name: str = ""
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _last_nonempty_line(prose: str) -> str:
+    if not prose:
+        return ""
+    for line in reversed(prose.splitlines()):
+        stripped = line.strip().lower()
+        if stripped:
+            return stripped
+    return ""
+
+
+def _strip_leading_conjunction(line: str) -> str:
+    for prefix in ("and then ", "and ", "then "):
+        if line.startswith(prefix):
+            return line[len(prefix):]
+    return line
+
+
+# ---------------------------------------------------------------------------
+# Pair-role classification
+# ---------------------------------------------------------------------------
+
+def is_new_block_prose(prose: str) -> bool:
+    """True if the last non-empty prose line signals "this block is
+    the new version of the one above"."""
+    last = _strip_leading_conjunction(_last_nonempty_line(prose))
+    if not last:
+        return False
+    return any(last.endswith(p) or last.startswith(p)
+               for p in _NEW_BLOCK_PROSE_PATTERNS)
+
+
+def is_old_block_prose(prose: str) -> bool:
+    """True if the last non-empty prose line signals "this block is
+    the old version, to be replaced"."""
+    last = _strip_leading_conjunction(_last_nonempty_line(prose))
+    if not last:
+        return False
+    return any(last.endswith(p) or last.startswith(p)
+               for p in _OLD_BLOCK_PROSE_PATTERNS)
+
+
+def is_with_connective(prose: str) -> bool:
+    """Backward-compat alias for is_new_block_prose."""
+    return is_new_block_prose(prose)
+
+
+def is_partial_replacement(prose: str) -> bool:
+    """True if the prose signals this block is a *prefix* of the new
+    body ("rest is unchanged", "start of", …)."""
+    if not prose:
+        return False
+    lower = prose.lower()
+    return any(p in lower for p in _PARTIAL_REPLACE_PROSE_PATTERNS)
+
+
+def is_scoped_replace_by_body(prose: str, body: str) -> bool:
+    """True if the prose introduces a scoped replace AND the body
+    carries a scope marker (so we know which scope to target).
+
+    This catches "Replace the entire Inpainting `<details>` with:" —
+    where the scope name comes from the body's
+    `<summary>Inpainting</summary>`, not from "for X" prose."""
+    if not prose or not body:
+        return False
+    prose_lower = prose.lower()
+    if "replace" not in prose_lower:
+        return False
+    last = _last_nonempty_line(prose_lower)
+    if not (last.endswith("with:") or last.endswith("with.")
+            or "with:" in last[-40:]):
+        return False
+    name, _kind = _extract_scope_from_body(body)
+    return bool(name)
+
+
+def is_add_instruction(prose: str) -> bool:
+    """True iff the prose contains an add-family verb."""
+    lower = (prose or "").lower()
+    return any(v in lower for v in _ADD_VERBS)
+
+
+# ---------------------------------------------------------------------------
+# Intent parsing
+# ---------------------------------------------------------------------------
+
 def parse_intent(context_before: str) -> Intent:
     """Return the structured intent of the prose preceding a block."""
     text = (context_before or "").strip()
@@ -187,41 +341,9 @@ def parse_intent(context_before: str) -> Intent:
     return Intent()
 
 
-def is_with_connective(context_before: str) -> bool:
-    """True iff the prose preceding the block is a `with:`-style
-    follow-on connective.
-
-    Only the last non-empty line is checked — that is the prose
-    directly above the code block.  A leading conjunction ("And ",
-    "Then ", "And then ") is stripped first, because "And with:"
-    reads the same as "with:".
-    """
-    text = (context_before or "").strip().lower()
-    if not text:
-        return False
-    last_line = ""
-    for line in reversed(text.splitlines()):
-        stripped = line.strip()
-        if stripped:
-            last_line = stripped
-            break
-    if not last_line:
-        return False
-    for prefix in ("and then ", "and ", "then "):
-        if last_line.startswith(prefix):
-            last_line = last_line[len(prefix):]
-            break
-    return any(last_line.startswith(p) for p in (
-        "with:", "with the following", "with this:",
-        "to:", "becomes:", "new code:",
-    ))
-
-
-def is_add_instruction(context_before: str) -> bool:
-    """True iff the prose contains an add-family verb."""
-    text = (context_before or "").lower()
-    return any(v in text for v in _ADD_VERBS)
-
+# ---------------------------------------------------------------------------
+# Scope extraction from body
+# ---------------------------------------------------------------------------
 
 def _extract_scope_from_body(body: str) -> tuple:
     """Return (name, kind) extracted from the block body, or ("", "")."""
@@ -234,25 +356,17 @@ def _extract_scope_from_body(body: str) -> tuple:
     return "", ""
 
 
-# ---------------------------------------------------------------------------
-# Scope extraction from block body
-# ---------------------------------------------------------------------------
-
 _SCOPE_FROM_BODY_PATTERNS = [
-    # HTML <details> with <summary>
     (re.compile(
         r"<details\b[^>]*>\s*<summary>\s*([A-Za-z][\w \-]+?)\s*</summary>",
         re.IGNORECASE | re.DOTALL),
      "details"),
-    # Python def/class at top level
     (re.compile(r"^(?:def|class)\s+([A-Za-z_]\w*)", re.MULTILINE),
      "python"),
-    # JS function/class (with or without export)
     (re.compile(
         r"^(?:export\s+)?(?:async\s+)?(?:function|class)\s+([A-Za-z_]\w*)",
         re.MULTILINE),
      "javascript"),
-    # JS object literal (with or without export)
     (re.compile(
         r"^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_]\w*)\s*=\s*\{",
         re.MULTILINE),
