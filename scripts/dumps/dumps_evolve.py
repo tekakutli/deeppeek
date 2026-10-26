@@ -1,53 +1,52 @@
 #!/usr/bin/env python3
 """
-dumps_evolve.py — delta dump for iterative LLM review.
+dumps_evolve.py — two-file delta dump for iterative LLM review.
 
 Modes:
 
   dumps_evolve.py
-      Compare current working tree against a reference, and write:
-        baseline.md   files UNCHANGED since reference
-        delta.md      files CHANGED or ADDED in the working tree
-      Reference = latest.md if it exists, otherwise git HEAD.
+      Compare current working tree against latest.md (if present) else
+      git HEAD. Writes:
+        project_dump_<name>_baseline.md  — unchanged files + directory tree
+        project_dump_<name>_delta.md     — git-style patch (a/ b/ prefixes,
+                                           git-apply compatible) for added /
+                                           modified / deleted files
 
   dumps_evolve.py --latest FILE
-      Adopt FILE as latest.md (validated + moved into place), then run as
-      above. Use this to bootstrap from an external dump.
+      Adopt FILE as latest.md (validated + moved into place), then as above.
 
   dumps_evolve.py DELTA LATEST
-      Merge two dumps into a new latest.md. LATEST is the base; DELTA
-      overrides on path collision.
-
-      Prefer (baseline.md, delta.md): reconstructs the current state exactly.
-      (delta.md, latest.md) also works, but files DELETED in cwd will linger
-      from latest.md, since delta carries no "deleted" record.
+      Apply DELTA patch to LATEST full dump → new latest.md.
 
 Typical workflow:
 
-  1.  dumps_evolve.py                         # diff cwd vs HEAD
-  2.  review baseline.md / delta.md (paste to LLM, etc.)
-  3.  dumps_evolve.py baseline.md delta.md    # -> latest.md (snapshot of cwd)
+  1.  dumps_evolve.py                              # diff cwd vs HEAD
+  2.  review baseline.md / delta.md
+  3.  dumps_evolve.py project_dump_*_delta.md \
+                     project_dump_*_baseline.md    # apply patch → latest.md
+      (or: git apply project_dump_*_delta.md  in a checkout of the baseline)
   4.  edit code ...
-  5.  dumps_evolve.py                         # diff cwd vs latest.md
-  6.  repeat from 3
+  5.  dumps_evolve.py                              # diff cwd vs latest.md
+  6.  repeat
 
-Configuration (top of file):
-  OVERRIDES   dump.py module variables to override (same keys as dumps_compare)
+Config (top of file):
+  OVERRIDES   dump.py module variables to override (same keys as
+              dumps_compare.py)
   DUMP_ARGS   extra CLI args for dump.py (default ["-r"])
 """
 
 import argparse
+import difflib
 import importlib.util
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-BASELINE_PATH = Path("baseline.md")
-DELTA_PATH    = Path("delta.md")
-LATEST_PATH   = Path("latest.md")
-DEFAULT_REF   = "HEAD"
+LATEST_PATH  = Path("latest.md")
+DEFAULT_REF  = "HEAD"
 
 SCRIPT_DIR     = Path(__file__).resolve().parent
 DUMP_SCRIPT    = SCRIPT_DIR / "dump.py"
@@ -62,6 +61,7 @@ OVERRIDES = {
 DUMP_ARGS = ["-r"]
 # ---------------------------------------------------------------------------
 
+HEADER = "=" * 70
 _cache = {}
 
 
@@ -84,10 +84,10 @@ def load_compare(): return _load("evolve_compare", COMPARE_SCRIPT)
 def load_diff():    return _load("evolve_diff",    DIFF_SCRIPT)
 
 
-# --- Dumping ---------------------------------------------------------------
+# --- dump.py config helpers ------------------------------------------------
 
-def _parse_dump_args():
-    """Extract (recursive_override, affix_override) from DUMP_ARGS."""
+def _dump_args_parsed():
+    """Return (recursive_override, affix_override) parsed from DUMP_ARGS."""
     recursive, affix = None, None
     args = list(DUMP_ARGS)
     i = 0
@@ -103,8 +103,33 @@ def _parse_dump_args():
     return recursive, affix
 
 
+def _scanned_dir(cwd):
+    """Absolute scanned directory = cwd / DEFAULT_DIR (DEFAULT_DIR after
+    OVERRIDES). For the common DEFAULT_DIR='.' this is just cwd."""
+    dm = load_dump()
+    default_dir = OVERRIDES.get("DEFAULT_DIR") \
+                  or getattr(dm, "DEFAULT_DIR", ".") or "."
+    return (Path(cwd) / default_dir).resolve()
+
+
+def _own_output_names(cwd):
+    """Filenames of our own outputs to skip during scans."""
+    baseline_path, delta_path = output_paths_for(cwd)
+    return {LATEST_PATH.name, baseline_path.name, delta_path.name}
+
+
+def _is_own_output(name, cwd):
+    return name in _own_output_names(cwd)
+
+
+# --- Dumping ---------------------------------------------------------------
+
 def dump_dir(scan_root):
-    """Run dump.py's filters over `scan_root`; return [(rel_path, content)]."""
+    """Run dump.py's filters over `scan_root`; return [(rel_path, content)].
+
+    `rel_path` is relative to the scanned directory (scan_root / DEFAULT_DIR),
+    matching what `dump.py` emits in its FILE blocks.
+    """
     dm = load_dump()
     saved = {}
     for k, v in OVERRIDES.items():
@@ -112,35 +137,40 @@ def dump_dir(scan_root):
         setattr(dm, k, v)
     try:
         scan_root = Path(scan_root)
-        root = scan_root / (getattr(dm, "DEFAULT_DIR", ".") or ".")
-        recursive_ovr, affix_ovr = _parse_dump_args()
+        default_dir = getattr(dm, "DEFAULT_DIR", ".") or "."
+        root = (scan_root / default_dir).resolve()
 
+        recursive_ovr, affix_ovr = _dump_args_parsed()
         exts = [dm.normalize_ext(x) for x in getattr(dm, "DEFAULT_EXTENSIONS", [])]
         exts = [e for e in exts if e]
         affix = affix_ovr if affix_ovr is not None \
                 else getattr(dm, "DEFAULT_AFFIX", None)
         if affix == "":
             affix = None
-        excl_dirs = [d for d in getattr(dm, "DEFAULT_EXCLUDE_DIRS", []) if d]
-        incl_dirs = {d for d in getattr(dm, "DEFAULT_INCLUDE_DIRS", []) if d}
-        incl_sub  = [s for s in getattr(dm, "DEFAULT_INCLUDE_FILE_SUBSTRINGS", []) if s]
-        excl_sub  = [s for s in getattr(dm, "DEFAULT_EXCLUDE_FILE_SUBSTRINGS", []) if s]
+        exclude_dirs = [d for d in getattr(dm, "DEFAULT_EXCLUDE_DIRS", []) if d]
+        include_dirs = {d for d in getattr(dm, "DEFAULT_INCLUDE_DIRS", []) if d}
+        incl_sub = [s for s in getattr(dm, "DEFAULT_INCLUDE_FILE_SUBSTRINGS", []) if s]
+        excl_sub = [s for s in getattr(dm, "DEFAULT_EXCLUDE_FILE_SUBSTRINGS", []) if s]
         recursive = recursive_ovr if recursive_ovr is not None \
                     else getattr(dm, "DEFAULT_RECURSIVE", False)
 
-        paths = dm.find_files(root, exts, affix, excl_dirs, incl_dirs,
+        paths = dm.find_files(root, exts, affix, exclude_dirs, include_dirs,
                               incl_sub, excl_sub, recursive)
+
+        own = _own_output_names(scan_root)
         result = []
         for p in paths:
+            if Path(p).name in own:
+                continue
             try:
-                rel = os.path.relpath(str(p), str(scan_root))
+                rel = Path(p).resolve().relative_to(root)
             except ValueError:
-                rel = str(p)
+                rel = Path(str(p))
             try:
                 content = Path(p).read_text(encoding="utf-8", errors="replace")
             except OSError as e:
                 content = f"# ERROR READING FILE: {e}\n"
-            result.append((rel, content))
+            result.append((str(rel), content))
         return result
     finally:
         for k, v in saved.items():
@@ -151,7 +181,8 @@ def dump_dir(scan_root):
 
 def dump_git(ref, cwd):
     """Dump the tree at git `ref`, as if scanned from `cwd`'s relative
-    position inside the repo. Uses `git archive` — never checks anything out.
+    position inside the enclosing repo. Uses `git archive` — never checks
+    anything out.
     """
     compare = load_compare()
     cwd = Path(cwd).resolve()
@@ -171,74 +202,240 @@ def dump_git(ref, cwd):
         return dump_dir(wt_cwd)
 
 
-# --- Parsing / writing (delegated to dumps_diff) ---------------------------
+# --- Parsing / naming ------------------------------------------------------
 
-def parse_file(path):
-    _, files = load_diff().parse_dump(
-        Path(path).read_text(encoding="utf-8"))
+def parse_dump_file(path):
+    """Parse a full-dump file into [(path, content)]."""
+    _, files = load_diff().parse_dump(Path(path).read_text(encoding="utf-8"))
     return files
 
 
-def write_file(path, title, files):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return load_diff().write_dump(path, title, "", files)
-
-
-def count_lines(path):
-    with open(path, encoding="utf-8") as fh:
-        return sum(1 for _ in fh)
-
-
-# --- Diff helpers ----------------------------------------------------------
-
-def split(baseline, current):
-    """Return (common, delta, deleted).
-
-    common  = files in both, identical content           (from baseline)
-    delta   = files in current that are new or modified  (from current)
-    deleted = files in baseline absent from current
+def output_paths_for(cwd):
+    """Return (baseline_path, delta_path):
+       project_dump_<basename>_baseline.md
+       project_dump_<basename>_delta.md
     """
+    dm = load_dump()
+    scanned = _scanned_dir(cwd)
+    base = dm.output_path_with_dirname(Path("project_dump.md"), scanned)
+    return (
+        base.with_name(f"{base.stem}_baseline{base.suffix}"),
+        base.with_name(f"{base.stem}_delta{base.suffix}"),
+    )
+
+
+# --- Patch generation ------------------------------------------------------
+
+def make_patch_chunk(path, old_text, new_text):
+    """Return a git-style patch for one file.
+
+    old_text=None  → added file
+    new_text=None  → deleted file
+    both           → modified (or no-op if equal)
+    """
+    old_exists = old_text is not None
+    new_exists = new_text is not None
+
+    if old_exists and new_exists and old_text == new_text:
+        return ""
+
+    if old_exists and new_exists:
+        header = f"diff --git a/{path} b/{path}\n"
+        from_label, to_label = f"a/{path}", f"b/{path}"
+        old_lines = old_text.splitlines(keepends=True) if old_text else []
+        new_lines = new_text.splitlines(keepends=True) if new_text else []
+    elif old_exists:
+        header = f"diff --git a/{path} b/{path}\ndeleted file mode 100644\n"
+        from_label, to_label = f"a/{path}", "/dev/null"
+        old_lines = old_text.splitlines(keepends=True) if old_text else []
+        new_lines = []
+    else:
+        header = f"diff --git a/{path} b/{path}\nnew file mode 100644\n"
+        from_label, to_label = "/dev/null", f"b/{path}"
+        old_lines = []
+        new_lines = new_text.splitlines(keepends=True) if new_text else []
+
+    raw = list(difflib.unified_diff(
+        old_lines, new_lines, fromfile=from_label, tofile=to_label,
+        lineterm="\n",
+    ))
+    if not raw:
+        return ""
+
+    body = []
+    for line in raw:
+        if not line.endswith("\n"):
+            body.append(line + "\n")
+            body.append("\\ No newline at end of file\n")
+        else:
+            body.append(line)
+
+    return header + "".join(body) + "\n"
+
+
+def build_delta(baseline, current):
+    """Return git-style patch text from baseline → current (added + modified
+    + deleted files)."""
     bmap = dict(baseline)
     cmap = dict(current)
-    common  = sorted((p, c) for p, c in baseline
-                     if p in cmap and cmap[p] == c)
-    delta   = sorted((p, c) for p, c in current
-                     if p not in bmap or bmap[p] != c)
-    deleted = sorted(p for p in bmap if p not in cmap)
-    return common, delta, deleted
+    chunks = []
+    for path in sorted(set(bmap) | set(cmap)):
+        chunk = make_patch_chunk(path, bmap.get(path), cmap.get(path))
+        if chunk:
+            chunks.append(chunk)
+    return "".join(chunks)
 
 
-# --- Adopting --latest -----------------------------------------------------
+def split_stats(baseline, current):
+    bmap = dict(baseline)
+    cmap = dict(current)
+    common   = [p for p in cmap if p in bmap and bmap[p] == cmap[p]]
+    modified = [p for p in cmap if p in bmap and bmap[p] != cmap[p]]
+    added    = [p for p in cmap if p not in bmap]
+    deleted  = [p for p in bmap if p not in cmap]
+    return common, modified, added, deleted
+
+
+# --- Writing outputs -------------------------------------------------------
+
+def write_baseline(path, cwd, files):
+    """Write baseline.md — SCANNED DIRECTORY + TREE + FILE blocks."""
+    dm = load_dump()
+    scanned = _scanned_dir(cwd)
+
+    include_dirs = {d for d in getattr(dm, "DEFAULT_INCLUDE_DIRS", []) if d}
+    tree_exclude = [d for d in getattr(dm, "DEFAULT_TREE_EXCLUDE_DIRS", []) if d]
+    dumped_paths = [scanned / rel for rel, _ in files]
+
+    tree_dict = dm.build_tree(scanned, include_dirs, tree_exclude, dumped_paths)
+    tree_text = dm.render_tree(tree_dict, str(scanned))
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write(HEADER + "\n")
+        fh.write(f"SCANNED DIRECTORY: {scanned}\n")
+        fh.write(HEADER + "\n\n")
+
+        fh.write(HEADER + "\n")
+        fh.write("DIRECTORY TREE\n")
+        fh.write(HEADER + "\n")
+        fh.write("```\n")
+        fh.write(tree_text + "\n")
+        fh.write("```\n\n")
+
+        total = len(files)
+        for i, (rel, content) in enumerate(files, 1):
+            fh.write(HEADER + "\n")
+            fh.write(f"FILE {i}/{total}: {rel}\n")
+            fh.write(HEADER + "\n")
+            fh.write("```python\n")
+            fh.write(content)
+            if content and not content.endswith("\n"):
+                fh.write("\n")
+            fh.write("```\n\n")
+
+
+def write_delta(path, cwd, baseline_desc, delta_text, stats):
+    """Write delta.md — header comments + git-style patch."""
+    common, modified, added, deleted = stats
+    scanned = _scanned_dir(cwd)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write("# Delta — generated by dumps_evolve.py\n")
+        fh.write(f"# Baseline: {baseline_desc}\n")
+        fh.write(f"# Current:  {scanned}\n")
+        fh.write(f"# Stats: {len(modified)} modified, {len(added)} added, "
+                 f"{len(deleted)} deleted, {len(common)} unchanged\n\n")
+        if delta_text:
+            fh.write(delta_text)
+        else:
+            fh.write("# (no changes)\n")
+
+
+def write_latest(path, cwd, files):
+    """Write latest.md — full dump with tree (same format as baseline)."""
+    write_baseline(path, cwd, files)
+
+
+# --- Patch application (for merge) -----------------------------------------
+
+def extract_patch_body(text):
+    """Strip leading '# comments' from a delta file; return patch text."""
+    lines = text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if line.startswith("diff --git ") or line.startswith("--- "):
+            return "".join(lines[i:])
+    return text
+
+
+def apply_patch(files, patch_text):
+    """Apply git patch `patch_text` to `files` (as a temp dir), return the
+    resulting [(path, content)] list."""
+    with tempfile.TemporaryDirectory(prefix="dumps_evolve_apply_") as tmp_str:
+        tmp = Path(tmp_str)
+        for rel, content in files:
+            p = tmp / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".patch", delete=False, encoding="utf-8",
+        ) as pf:
+            pf.write(patch_text)
+            patch_file = pf.name
+
+        try:
+            r = subprocess.run(
+                ["git", "apply", "--whitespace=nowarn", patch_file],
+                cwd=tmp, capture_output=True, text=True,
+            )
+            if r.returncode != 0:
+                raise RuntimeError(f"git apply failed: {r.stderr.strip()}")
+        finally:
+            try:
+                os.unlink(patch_file)
+            except OSError:
+                pass
+
+        result = []
+        for p in sorted(tmp.rglob("*")):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(tmp)
+            result.append((str(rel), p.read_text(encoding="utf-8")))
+        return result
+
+
+# --- Adopt -----------------------------------------------------------------
 
 def adopt_latest(src_str):
-    """Validate that `src_str` parses as a dump, then move it to latest.md."""
+    """Validate `src_str` as a dump and move it to latest.md."""
     src = Path(src_str)
     if not src.is_file():
         print(f"error: --latest file not found: {src}", file=sys.stderr)
         return False
-
     try:
-        files = parse_file(src)
+        files = parse_dump_file(src)
     except Exception as e:
         print(f"error: {src} does not parse as a dump: {e}", file=sys.stderr)
         return False
     if not files:
         print(f"error: {src} contains no FILE blocks", file=sys.stderr)
         return False
-
     if src.resolve() == LATEST_PATH.resolve():
         print(f"{LATEST_PATH.name} already in place ({len(files)} files)",
               file=sys.stderr)
         return True
-
     if LATEST_PATH.exists():
         print(f"warning: overwriting existing {LATEST_PATH.name}",
               file=sys.stderr)
     try:
         src.replace(LATEST_PATH)
     except OSError as e:
-        print(f"error: cannot move {src} -> {LATEST_PATH}: {e}", file=sys.stderr)
+        print(f"error: cannot move {src} -> {LATEST_PATH}: {e}",
+              file=sys.stderr)
         return False
     print(f"Adopted {src} -> {LATEST_PATH.name} ({len(files)} files)",
           file=sys.stderr)
@@ -248,15 +445,16 @@ def adopt_latest(src_str):
 # --- Modes -----------------------------------------------------------------
 
 def cmd_run(args):
-    cwd = Path.cwd()
+    cwd = Path.cwd().resolve()
 
     if args.latest:
         if not adopt_latest(args.latest):
             return 1
 
+    # Reference state
     if LATEST_PATH.exists():
         try:
-            baseline = parse_file(LATEST_PATH)
+            baseline = parse_dump_file(LATEST_PATH)
         except Exception as e:
             print(f"error: cannot parse {LATEST_PATH}: {e}", file=sys.stderr)
             return 1
@@ -265,41 +463,48 @@ def cmd_run(args):
         try:
             baseline = dump_git(DEFAULT_REF, cwd)
         except Exception as e:
-            print(f"error: cannot dump git {DEFAULT_REF}: {e}", file=sys.stderr)
+            print(f"error: cannot dump git {DEFAULT_REF}: {e}",
+                  file=sys.stderr)
             return 1
         baseline_desc = f"git {DEFAULT_REF}"
 
-    print(f"Reference: {baseline_desc}", file=sys.stderr)
+    print(f"Baseline: {baseline_desc} ({len(baseline)} files)", file=sys.stderr)
 
+    # Current working tree
     try:
         current = dump_dir(cwd)
     except Exception as e:
         print(f"error: cannot dump current state: {e}", file=sys.stderr)
         return 1
+    print(f"Current:  {_scanned_dir(cwd)} ({len(current)} files)",
+          file=sys.stderr)
 
-    common, delta, deleted = split(baseline, current)
+    # Classify
+    common, modified, added, deleted = split_stats(baseline, current)
+    cmap = dict(baseline)
+    baseline_files = [(p, cmap[p]) for p in common]
+
+    # Delta patch
+    delta_text = build_delta(baseline, current)
+
+    # Output paths
+    baseline_path, delta_path = output_paths_for(cwd)
 
     try:
-        n_b = write_file(BASELINE_PATH,
-                         f"Baseline — {len(common)} file(s) unchanged",
-                         common)
-        n_d = write_file(DELTA_PATH,
-                         f"Delta — {len(delta)} file(s) changed or added",
-                         delta)
+        write_baseline(baseline_path, cwd, baseline_files)
+        write_delta(delta_path, cwd, baseline_desc, delta_text,
+                    (common, modified, added, deleted))
     except OSError as e:
         print(f"error: cannot write outputs: {e}", file=sys.stderr)
         return 1
 
     print(file=sys.stderr)
-    print(f"Wrote {BASELINE_PATH.name}: {n_b} file(s), "
-          f"{count_lines(BASELINE_PATH)} lines", file=sys.stderr)
-    print(f"Wrote {DELTA_PATH.name}:    {n_d} file(s), "
-          f"{count_lines(DELTA_PATH)} lines", file=sys.stderr)
-    if deleted:
-        print(f"  (also: {len(deleted)} file(s) present in reference, "
-              f"absent in cwd)", file=sys.stderr)
-    if n_d == 0:
-        print(f"  (no changes since {baseline_desc})", file=sys.stderr)
+    print(f"Wrote {baseline_path.name}: {len(baseline_files)} file(s)",
+          file=sys.stderr)
+    print(f"Wrote {delta_path.name}:    {len(modified)} modified, "
+          f"{len(added)} added, {len(deleted)} deleted", file=sys.stderr)
+    if not modified and not added and not deleted:
+        print(f"  (no changes vs {baseline_desc})", file=sys.stderr)
     return 0
 
 
@@ -312,44 +517,50 @@ def cmd_merge(delta_arg, latest_arg):
             return 1
 
     try:
-        delta  = dict(parse_file(delta_path))
-        latest = dict(parse_file(latest_src))
+        base_files = parse_dump_file(latest_src)
     except Exception as e:
-        print(f"error: cannot parse inputs: {e}", file=sys.stderr)
+        print(f"error: cannot parse {latest_src}: {e}", file=sys.stderr)
         return 1
 
-    merged = {**latest, **delta}          # delta overrides latest
-    files = sorted(merged.items())
+    delta_text = delta_path.read_text(encoding="utf-8")
+    patch_text = extract_patch_body(delta_text)
+    if not patch_text.strip() or patch_text.lstrip().startswith("#"):
+        print("error: delta contains no patch hunks", file=sys.stderr)
+        return 1
 
-    tmp = LATEST_PATH.parent / (LATEST_PATH.name + ".tmp")
     try:
-        n = write_file(tmp, f"Merged snapshot — {len(files)} file(s)", files)
-        os.replace(tmp, LATEST_PATH)
+        merged = apply_patch(base_files, patch_text)
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    cwd = Path.cwd().resolve()
+    try:
+        write_latest(LATEST_PATH, cwd, merged)
     except OSError as e:
-        tmp.unlink(missing_ok=True)
         print(f"error: cannot write {LATEST_PATH}: {e}", file=sys.stderr)
         return 1
 
     print(f"Merged {delta_path.name} onto {latest_src.name} "
           f"-> {LATEST_PATH.name}", file=sys.stderr)
-    print(f"  {n} file(s), {count_lines(LATEST_PATH)} lines", file=sys.stderr)
+    print(f"  {len(merged)} file(s)", file=sys.stderr)
     return 0
 
-
-# --- CLI -------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(
         prog="dumps_evolve.py",
-        description="Delta dump: compare the working tree against latest.md "
-                    "(or git HEAD), or merge two dumps into a new latest.md.",
+        description="Two-file delta dump: baseline (unchanged + tree) and "
+                    "delta (git-style patch) against latest.md or git HEAD. "
+                    "Or merge a patch-file delta onto a full dump to produce "
+                    "a new latest.md.",
     )
     ap.add_argument("--latest", metavar="FILE",
                     help="adopt FILE as latest.md (moved into place), then "
                          "diff cwd against it.")
     ap.add_argument("merge", nargs="*", metavar="FILE",
                     help="merge mode: DELTA LATEST -> new latest.md "
-                         "(DELTA overrides LATEST on path collision).")
+                         "(DELTA is a patch file, LATEST a full dump).")
     args = ap.parse_args()
 
     if args.latest and args.merge:
