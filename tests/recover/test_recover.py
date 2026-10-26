@@ -1650,7 +1650,50 @@ def test_36():
     check_apply("36_ellipsis_without_scope", extra)
 
 
+def test_37():
+    """Replace-pair with a bare object-literal `new` body preserves
+    the base's `const` prefix.
+
+    The pair is detected via Find: / with: prose.  The new body is
+    `board = {...}` (no prefix); the base has `const board = {...}`.
+    Raw replace would produce `board = {...}` -- losing the
+    declaration.  `_try_object_literal_splice_for_pair` locates the
+    base declaration and splices the object, keeping the prefix.
+    """
+
+    def extra(target, run):
+        rec = run["manifest"].get("files", {}).get("board.js", {})
+        assert rec, (
+            f"board.js missing from manifest files; "
+            f"manifest files: {list(run['manifest'].get('files', {}))}"
+        )
+        assert rec.get("trust") == "HIGH", (
+            f"expected trust=HIGH, got {rec.get('trust')}; "
+            f"verification: {rec.get('verification')}"
+        )
+        assert rec.get("verification", {}).get("pairs_applied", 0) == 1, (
+            f"expected 1 pair applied, got {rec}"
+        )
+        content = (target / "board.js").read_text()
+        assert "const board" in content, (
+            f"base's `const` prefix lost:\n{content}"
+        )
+        assert "b: 2" in content, (
+            f"new field missing:\n{content}"
+        )
+        assert content.count("board") == 1, (
+            f"expected exactly 1 'board', got "
+            f"{content.count('board')}:\n{content}"
+        )
+        assert content.count("{") == content.count("}"), (
+            f"unbalanced braces:\n{content}"
+        )
+
+    check_apply("37_replace_pair_object_literal", extra)
+
+
 def main():
+
     tests = [
         ("01", test_01), ("02", test_02), ("03", test_03),
         ("04", test_04), ("05", test_05), ("06", test_06),
@@ -1659,7 +1702,8 @@ def main():
         ("12", test_12), ("13", test_13), ("14", test_14),
         ("15", test_15), ("16", test_16), ("17", test_17), ("19", test_19), ("20", test_20), ("21", test_21),
         ("18", test_18), ("22", test_22), ("23", test_23), ("24", test_24), ("25", test_25), ("26", test_26), ("27", test_27), ("28", test_28), ("29", test_29), ("30", test_30), ("31", test_31), ("32", test_32), ("33", test_33),
-        ("34", test_34), ("35", test_35), ("36", test_36)]
+        ("34", test_34), ("35", test_35), ("36", test_36),
+        ("37", test_37)]
     failed = 0
     for name, fn in tests:
         try:

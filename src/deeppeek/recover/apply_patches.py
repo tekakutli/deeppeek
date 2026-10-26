@@ -1302,6 +1302,84 @@ def _pair_ambiguous(base, old, new):
     return old in base and new in base
 
 
+def _try_object_literal_splice_for_pair(base, old_body, new_body):
+    """Route a replace-pair whose new side is an object-literal
+    assignment through `_try_object_literal_splice`, preserving the
+    base's declaration prefix.
+
+    Raw replace (`base.replace(old, new, 1)`) silently strips the
+    base's leading declaration keyword: a pair whose old side is
+    `const board = { a: 1 };` and whose new side is
+    `board = { a: 1, b: 2 };` produces `board = { a: 1, b: 2 };` --
+    no `const` -- which either throws a Temporal Dead Zone error or
+    silently rebinds the name as an implicit global.  The splice
+    branch in `_try_object_literal_splice` preserves the prefix by
+    construction.
+
+    CRUCIAL: this is a prefix-preservation REFINEMENT of the
+    existing match, not a broader trigger.  It fires only when the
+    pair's premise holds -- old_body matches in base (exact or
+    whitespace-normalized, unique).  If old is absent or ambiguous,
+    fail-closed applies exactly as it did before.
+
+    Returns None (i.e. falls through to the raw-replace path) when:
+      - `new_body` is not an object-literal assignment, or
+      - `old_body` does not match base (fail-closed premise), or
+      - `old_body` and `new_body` name different variables (a
+        rename / repurpose, which raw replace handles correctly), or
+      - `_try_object_literal_splice` itself fails -- usually because
+        the base has no declaration for the variable, meaning the
+        pair is a fresh insert that raw replace is the right tool
+        for.
+    """
+    new_stripped = new_body.strip()
+    if not new_stripped:
+        return None
+    new_m = _OBJECT_LITERAL_ASSIGNMENT_RE.match(new_stripped)
+    if not new_m:
+        return None
+    new_id_m = re.search(
+        r'([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*=\s*$',
+        new_m.group("prefix").rstrip(),
+    )
+    if not new_id_m:
+        return None
+    new_var = new_id_m.group(1)
+
+    # Premise check -- same condition the raw-replace path requires.
+    # A pair whose old body is absent from base is state-drifted or
+    # ambiguous; fail-closed is the right answer, not "guess and
+    # splice".
+    exact_match = old_body in base and base.count(old_body) == 1
+    if not exact_match:
+        def _norm(s):
+            return "\n".join(ln.rstrip() for ln in s.splitlines())
+        base_norm = _norm(base)
+        old_norm = _norm(old_body)
+        normalized_match = (old_norm in base_norm
+                            and base_norm.count(old_norm) == 1)
+        if not normalized_match:
+            return None
+
+    # Only fire when old and new name the same variable.  A rename
+    # (old names `x`, new names `y`) must NOT be routed here -- raw
+    # replace correctly handles the identifier change.
+    old_stripped = old_body.strip()
+    old_m = _OBJECT_LITERAL_ASSIGNMENT_RE.match(old_stripped)
+    if old_m:
+        old_id_m = re.search(
+            r'([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*=\s*$',
+            old_m.group("prefix").rstrip(),
+        )
+        if not old_id_m or old_id_m.group(1) != new_var:
+            return None
+    elif not re.search(
+            r'\b' + re.escape(new_var) + r'\b', old_stripped):
+        return None
+
+    return _try_object_literal_splice(base, new_stripped, new_var)
+
+
 def _try_replace_pair(base, old, new):
     if not old.strip():
         return None
@@ -1315,6 +1393,15 @@ def _try_replace_pair(base, old, new):
     # replace (which would produce two copies of `new`).
     if _pair_ambiguous(base, old, new):
         return None
+
+    # Object-literal `new` body: route through the splice branch so
+    # the base's const/let/var/export prefix is preserved.  Raw
+    # replace would strip it.  Fires only when old_body matches in
+    # base, so the fail-closed contract for state-drifted pairs is
+    # unchanged.
+    _spliced = _try_object_literal_splice_for_pair(base, old, new)
+    if _spliced is not None:
+        return _spliced
 
     # Exact match (old must be unique).
     if old in base and base.count(old) == 1:

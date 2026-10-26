@@ -105,6 +105,28 @@ fence is safe. If the body is not clean, no rule saves the
 message. Rule 2 is the load-bearing constraint. The outer fence
 is the reward.
 
+**Rule 3 failure is silent to the emitter.** Rules 1, 5, and
+6 all fail in ways the emitter can observe: rule 1 produces
+a file whose bytes differ from intent (visible in the file);
+rule 5 raises a SyntaxError from the target's parser
+(visible in a traceback the reader can show the AI); rule 6
+refuses to write (visible in the run's stderr). Rule 2
+(literal backticks) and rule 3 (outer width) are different
+— both fail in the markdown parse, which happens after the
+AI's response is finalized and before the reader sees it.
+The AI's view of its own output is the byte stream it
+emitted; that stream is contiguous. The renderer's view is
+a parsed tree; that tree may split at a point the stream
+does not. The break happens in the parse, not in the stream.
+
+The diagnostic when the reader reports "everything after
+point X is broken": find the first fenced block in the
+message whose body contains a backtick run of width at
+least the outer fence's width. That is where the outer fence
+closed. The fix is at that boundary, not at "the part that
+looks broken after it" — the reader saw a different parse
+of the same bytes.
+
 **Batching.** Every bash message is one round-trip through the
 renderer, one chance for something to go wrong.
 
@@ -143,6 +165,31 @@ documenting code-fenced code), the outer fence must be wider
 than any inner fence. Four-backtick outer with three-backtick
 inner works; four-backtick outer with four-backtick inner
 breaks. Rule: outer width must exceed maximum inner width.
+
+**The self-referential trap.** A file whose *purpose* is to
+display three-backtick fences — a markdown-parser fixture,
+a README documenting code fences, this document, a dump of
+markdown files — is where rule 3 matters most and where it
+is most tempting to skip. The failure is not ignorance of
+the rule; it is the "this is obviously code"
+rationalization: the file's content is known, the fences
+inside it are expected, and the width check feels redundant.
+That rationalization is the failure. Rule 3 has no exception
+for "but the file is supposed to contain fences" — the
+required outer width is determined by the bytes inside the
+fence, not by the file's intent.
+
+Tells that a file is in this class: the path or purpose
+mentions "fixture", "example", "doc", "README",
+"prompt", "dump", or "EMISSION"; the file is a markdown
+file whose content is a markdown sample. For such a file,
+either widen the outer fence (four-backtick outer around
+three-backtick inner, the common shape), or apply rule 2 to
+the *inner* content (construct the inner three-backtick runs
+via chr(96) * 3 in the emission script; the emitted file
+still contains raw fences). Both are correct. Rule 3 is
+cheaper; rule 2 produces a cleaner emission script. Choose
+one — do not choose "neither, because it's obvious."
 
 **No fence — the piping case.** When the AI's output goes
 directly into another process (a text-injection command, a
@@ -341,6 +388,14 @@ verified programmatic edits it is safe by construction.
   `chr(96) * 3`.
 - **Three-backtick outer fence around a body that also contains
   three-backtick fences** — use four-backtick outer.
+- **Emitting a self-referential file inside a narrow outer
+  fence** — a markdown fixture, a doc-about-markdown,
+  this document, a dump of markdown files. The body
+  necessarily contains fences the same width as the outer,
+  so the outer closes early and everything after it in the
+  message renders as prose. See *The fence-width ladder →
+  The self-referential trap*. The failure is silent to the
+  emitter and catastrophic to the reader.
 - **Fencing the bash when the output will be machine-parsed** —
   the receiver treats the fence as content; emit plain prose.
 - **Docstring inside a triple-double example** — use `def`
@@ -471,3 +526,17 @@ failed.
   or *the reader will see this as a code cell* and skipping the
   sentinel. The parser sees characters, not intent. Sentinelize
   every literal occurrence, no exceptions.
+
+- **"This is obviously code" is not an exemption.** Every
+  rule in this document has a rationalization that skips it
+  in a specific case. Rule 3's rationalization is "but the
+  file is supposed to contain fences" — a markdown
+  fixture, a dump of markdown files, a doc-about-markdown.
+  This is the case rule 3 exists for, and it is the case
+  most likely to be skipped. The failure has now happened
+  once inside this very document's history: a fixture
+  emission was written with a three-backtick outer fence
+  because "of course it's a fixture", and the message
+  broke at the first inner fence. The rule was in view; the
+  rationalization still fired. When the check is trivial, do
+  the check.

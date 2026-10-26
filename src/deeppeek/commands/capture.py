@@ -46,6 +46,77 @@ from ..capture.service import (
 from ..recover.pipeline import RecoverConfig, run as recover_run
 
 
+# ---------------------------------------------------------------------------
+# Shared capture-side args (used by `capture` AND `conversation`)
+# ---------------------------------------------------------------------------
+
+def add_capture_side_args(p: argparse.ArgumentParser) -> None:
+    """Add the capture-side arguments shared by `capture` and `conversation`.
+
+    `-o` is NOT included: `capture` needs to accept the magic string
+    "auto", so it defines `-o` itself.  `conversation` uses a plain
+    Path default.  Everything else (slicer, LLM-free capture options)
+    is identical between the two commands.
+    """
+    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--watch", action="store_true")
+    p.add_argument("--start-prompt")
+    p.add_argument("--end-prompt")
+    p.add_argument("--match-mode",
+                   choices=["substring", "exact", "regex"],
+                   default="substring")
+    p.add_argument("--start-index", type=int)
+    p.add_argument("--end-index", type=int)
+    p.add_argument("--context", type=int, default=0)
+    p.add_argument(
+        "--last", type=int, default=None, metavar="N",
+        help="keep only the last N user turns.",
+    )
+    p.add_argument(
+        "--last-regex", default=None, metavar="PATTERN",
+        help="anchor at the LAST user prompt whose content matches "
+             "PATTERN (Python regex), slice to end.  Overrides --last.",
+    )
+    p.add_argument("--no-thinking", action="store_true")
+    p.add_argument("--no-hints", action="store_true")
+    p.add_argument("--latex", action="store_true")
+    p.add_argument("--json", action="store_true",
+                   help="emit JSON instead of Markdown")
+    p.add_argument("--timeout", type=float, default=None)
+
+
+def capture_config_from_args(args: argparse.Namespace) -> CaptureConfig:
+    """Build a CaptureConfig from the shared capture-side args.
+
+    `output` is always None: both callers write the returned text to
+    disk themselves (capture to decide auto vs path, conversation to
+    apply its conversation.md default).  `capture_conversation` does
+    not write, so this field is unused on this code path.
+    """
+    return CaptureConfig(
+        port=args.port,
+        watch=args.watch,
+        output=None,
+        start_prompt=args.start_prompt,
+        end_prompt=args.end_prompt,
+        start_index=args.start_index,
+        end_index=args.end_index,
+        match_mode=args.match_mode,
+        context=args.context,
+        include_thinking=not args.no_thinking,
+        include_hints=not args.no_hints,
+        latex=args.latex,
+        as_json=args.json,
+        timeout=args.timeout,
+        last_user_turns=args.last,
+        last_regex=args.last_regex,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Register / run
+# ---------------------------------------------------------------------------
+
 def register(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "capture",
@@ -70,31 +141,7 @@ def register(sub: argparse._SubParsersAction) -> None:
         help="skip recovery; write the markdown file only (requires -o; "
              "nothing would be saved otherwise)",
     )
-    p.add_argument("--port", type=int, default=8765)
-    p.add_argument("--watch", action="store_true")
-    p.add_argument("--start-prompt")
-    p.add_argument("--end-prompt")
-    p.add_argument("--match-mode",
-                   choices=["substring", "exact", "regex"],
-                   default="substring")
-    p.add_argument("--start-index", type=int)
-    p.add_argument("--end-index", type=int)
-    p.add_argument("--context", type=int, default=0)
-    p.add_argument(
-        "--last", type=int, default=None, metavar="N",
-        help="keep only the last N user turns.",
-    )
-    p.add_argument(
-        "--last-regex", default=None, metavar="PATTERN",
-        help="anchor at the LAST user prompt whose content matches "
-             "PATTERN (Python regex), slice to end.  Overrides --last.",
-    )
-    p.add_argument("--no-thinking", action="store_true")
-    p.add_argument("--no-hints", action="store_true")
-    p.add_argument("--latex", action="store_true")
-    p.add_argument("--json", action="store_true",
-                   help="emit JSON instead of Markdown (disables recovery)")
-    p.add_argument("--timeout", type=float, default=None)
+    add_capture_side_args(p)
 
     # ---- recovery-side flags ----
     p.add_argument("--recover-to", type=Path, default=None)
@@ -162,24 +209,7 @@ def run(args: argparse.Namespace) -> int:
             return 3
 
     try:
-        result = capture_conversation(CaptureConfig(
-            port=args.port,
-            watch=args.watch,
-            output=None,
-            start_prompt=args.start_prompt,
-            end_prompt=args.end_prompt,
-            start_index=args.start_index,
-            end_index=args.end_index,
-            match_mode=args.match_mode,
-            context=args.context,
-            include_thinking=not args.no_thinking,
-            include_hints=not args.no_hints,
-            latex=args.latex,
-            as_json=args.json,
-            timeout=args.timeout,
-            last_user_turns=args.last,
-            last_regex=args.last_regex,
-        ))
+        result = capture_conversation(capture_config_from_args(args))
     except KeyboardInterrupt:
         return 1
 

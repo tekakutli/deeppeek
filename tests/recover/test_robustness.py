@@ -1347,7 +1347,95 @@ def test_object_literal_splice_export_preserved():
     assert "b: 2" in result
 
 
+# ============================================================
+# Replace-pair object-literal prefix preservation
+# ============================================================
+#
+# `_try_replace_pair` used to run `base.replace(old, new, 1)`
+# unconditionally after the drift/ambiguity guards.  When `new` is
+# a bare object-literal assignment (`board = {...}`) and `old` is
+# a declaration (`const board = {...}`), that produces
+# `board = {...}` -- no `const` -- which either throws a TDZ error
+# or silently rebinds the name as an implicit global.  The splice
+# branch preserves the base prefix.
+
+def test_replace_pair_object_literal_preserves_const():
+    from deeppeek.recover.apply_patches import _try_replace_pair
+    base = "const board = { a: 1 };"
+    old = "const board = { a: 1 };"
+    new = "board = { a: 1, b: 2 };"
+    result = _try_replace_pair(base, old, new)
+    assert result is not None, "expected pair to apply"
+    assert "const board" in result, (
+        f"base's `const` prefix lost:\n{result}"
+    )
+    assert "b: 2" in result, f"new field missing:\n{result}"
+    assert result.count("board") == 1, (
+        f"expected exactly 1 'board', got "
+        f"{result.count('board')}:\n{result}"
+    )
+
+
+def test_replace_pair_object_literal_export_preserved():
+    from deeppeek.recover.apply_patches import _try_replace_pair
+    base = "export const board = { a: 1 };"
+    old = "export const board = { a: 1 };"
+    new = "board = { a: 1, b: 2 };"
+    result = _try_replace_pair(base, old, new)
+    assert result is not None, "expected pair to apply"
+    assert "export const board" in result, (
+        f"full prefix lost:\n{result}"
+    )
+    assert "b: 2" in result
+
+
+def test_replace_pair_object_literal_old_absent_still_fails():
+    """If old is absent from base (state drift or ambiguous), the
+    pair still fail-closes -- the splice path must not bypass the
+    fail-closed contract."""
+    from deeppeek.recover.apply_patches import _try_replace_pair
+    base = "export const state = { value: 1 };"
+    old = "export const state = { value: 999 };"
+    new = "state = { value: 2 };"
+    result = _try_replace_pair(base, old, new)
+    assert result is None, (
+        f"expected fail-closed (old absent), got {result!r}"
+    )
+
+
+def test_replace_pair_object_literal_rename_falls_through():
+    """When old and new name different variables, the object-literal
+    splice path must NOT fire -- that's a rename, and raw replace
+    handles it.  The existing `board` declaration in base is not
+    clobbered."""
+    from deeppeek.recover.apply_patches import _try_replace_pair
+    base = "const other = { x: 1 };\nconst board = { a: 1 };\n"
+    old = "const other = { x: 1 };"
+    new = "board = { y: 2 };"
+    result = _try_replace_pair(base, old, new)
+    if result is not None:
+        assert "const board = { a: 1 }" in result, (
+            f"object-literal splice clobbered the existing "
+            f"`board` declaration:\n{result}"
+        )
+
+
+def test_replace_pair_non_object_literal_skips_splice():
+    """When the new body is not an object-literal assignment, the
+    splice path must not fire.  Raw replace handles it (as before)."""
+    from deeppeek.recover.apply_patches import _try_replace_pair
+    base = "export function foo() {\n  return 1;\n}\n"
+    old = "export function foo() {\n  return 1;\n}"
+    new = "export function foo() {\n  return 2;\n}"
+    result = _try_replace_pair(base, old, new)
+    assert result is not None, "expected pair to apply"
+    assert "return 2" in result
+    assert "return 1" not in result
+    assert result.count("export function foo") == 1
+
+
 def main():
+
     tests = [
         ("resolve module dotted top not recovered",
          test_resolve_module_dotted_top_not_recovered),
@@ -1497,6 +1585,17 @@ def main():
          test_object_literal_splice_const_omitted),
         ("object_literal_splice export preserved",
          test_object_literal_splice_export_preserved),
+        # Replace-pair object-literal prefix preservation
+        ("replace_pair object_literal preserves const",
+         test_replace_pair_object_literal_preserves_const),
+        ("replace_pair object_literal export preserved",
+         test_replace_pair_object_literal_export_preserved),
+        ("replace_pair object_literal old absent fails",
+         test_replace_pair_object_literal_old_absent_still_fails),
+        ("replace_pair object_literal rename falls through",
+         test_replace_pair_object_literal_rename_falls_through),
+        ("replace_pair non object literal skips splice",
+         test_replace_pair_non_object_literal_skips_splice),
     ]
     failed = 0
     for name, fn in tests:

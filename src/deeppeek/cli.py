@@ -5,6 +5,7 @@ import sys
 from . import __version__
 from .commands import (
     capture as capture_cmd,
+    conversation as conversation_cmd,
     recover as recover_cmd,
     extension as extension_cmd,
     diagnose as diagnose_cmd,
@@ -27,6 +28,7 @@ def _build_root_parser() -> argparse.ArgumentParser:
                    help="verbose diagnostics to stderr")
     sub = p.add_subparsers(dest="command", required=True)
     capture_cmd.register(sub)
+    conversation_cmd.register(sub)
     recover_cmd.register(sub)
     pipe_cmd.register(sub)
     type_cmd.register(sub)
@@ -43,6 +45,7 @@ def _build_root_parser() -> argparse.ArgumentParser:
 
 _DISPATCH = {
     "capture": capture_cmd.run,
+    "conversation": conversation_cmd.run,
     "recover": recover_cmd.run,
     "pipe": pipe_cmd.run,
     "type": type_cmd.run,
