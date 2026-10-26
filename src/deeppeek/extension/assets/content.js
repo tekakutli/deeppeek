@@ -118,6 +118,21 @@
       }
     }
 
+    if (msg.type === "DSX_CLEAR") {
+      if (!(await ensurePageWorldFn("__dsx_clear_json"))) {
+        console.error("DSX: page-world clear unavailable.");
+        return { success: false, reason: "page-world clear unavailable" };
+      }
+      try {
+        const argsJson = JSON.stringify({ opts: msg.opts || {} });
+        const resultJson = await window.wrappedJSObject.__dsx_clear_json(argsJson);
+        return JSON.parse(resultJson);
+      } catch (e) {
+        console.error("DSX: clear threw:", e);
+        return { success: false, reason: `clear threw: ${e.message}` };
+      }
+    }
+
     return null;
   });
 

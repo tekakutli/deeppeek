@@ -111,28 +111,43 @@ def _has_code_signal(body: str) -> bool:
 
 
 def _has_strong_blockquote_attribution(b: Block) -> bool:
-    """True iff a blockquoted block carries enough evidence to be
-    treated as a committed patch rather than thought-process
-    reasoning.
+    """Return False: blockquoted content is NEVER a committed edit.
 
-    The only signal strong enough is an EXACT-prose attribution:
-    the AI named exactly one target file in the surrounding
-    prose, above the fence, with no ambiguity.  That is what
-    `attributed_by == "prose"` records.
+    A blockquote is the AI's reasoning wrapper. Both deeppeek's own
+    formatter (`formatter.py`) and the browser GUI wrap thought
+    process in `> `. If the AI wants to write an edit, it writes it
+    outside the blockquote.
 
-    Header-attributed blockquoted content is skipped.  Verb
-    heuristics ("add this", "replace with", ...) were tried and
-    rejected: thought-process prose uses those words constantly,
-    so they never separate "the assistant committed this code"
-    from "the assistant reasoned about this code".
+    Prior versions allowed exact-prose attribution to override this,
+    on the theory "the AI named the target file in prose, so this
+    must be the code for that file." That theory is wrong, and the
+    pg_state.py corruption in this conversation is the counterexample:
 
-    A legitimate answer that arrives blockquoted and is silently
-    skipped is a lost patch.  A legitimate answer that arrives
-    blockquoted and is applied when it should not be is a
-    corruption.  A lost patch is visible in the manifest; a
-    corruption is not.  The gate errs on the side of visible.
+      · The AI's prose named `pg_state.py` among other files it was
+        analyzing.
+      · The blockquoted fragment contained code from a DIFFERENT
+        file (`pg_panel_fields.py`'s `syncPanelFields` guard).
+      · Pass 4 attributed the fragment to `pg_state.py` because that
+        was the only file in the surrounding ~1000 chars of prose.
+      · Pass 6 applied it, inserting an `if (...)` statement directly
+        inside an object literal. Braces balanced, so validation
+        passed.
+
+    A filename mention in prose is *weak* evidence about which file a
+    specific code fragment belongs to. It can only name ONE file at a
+    time, and AI reasoning often discusses several files. The
+    blockquote format is *strong* evidence about intent. When they
+    disagree, the structural signal wins.
+
+    Users who want their code committed should write it in a file
+    section (`### \`path/to/file\``) or in non-blockquoted prose. Both
+    produce headers or prose attribution that work correctly. The
+    only content this rule eliminates is a small number of legitimate
+    blockquoted edits — the cost of which is one lost patch per run,
+    versus one silently-corrupted file per run under the previous
+    policy.
     """
-    return b.attributed_by == "prose"
+    return False
 
 
 def pass5_deduplicate(records: dict,

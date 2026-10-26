@@ -23,9 +23,34 @@ detects the failure classes that matter for those projects:
      `.py` strings.  Catches a scoped replace that silently dropped
      an entire section.
 
+  5. JavaScript parse validation — when tree-sitter + a matching
+     grammar is available (the `[ast]` extra), the JS content is
+     parsed with a real grammar.  Balance checks cannot detect scope
+     errors: an `if (...) { ... }` statement inserted between two
+     `key: value,` object members is brace-balanced but
+     syntactically invalid.  A parse check catches it.
+
 All checks return None on success, or a one-line string describing
 the failure.  Any non-None return means the file must be fail-closed
 (LOW trust -> low_trust/) so the target tree is preserved.
+
+PARSE-METHOD TRACKING
+=====================
+`validate_content` sets the module-level `_LAST_PARSE_METHOD` to one
+of:
+
+    "none"    no JS content was checked (nothing to verify)
+    "balance" JS was checked with brace-balance only (no parser
+              available for this language, or the parse check was
+              skipped by design, e.g. .jsx where JSX support varies
+              across tree-sitter-javascript versions)
+    "parse"   JS was checked with a real grammar
+
+Callers (notably `validate.pass8_verify`) can read this after a
+successful call to record the verification method in the manifest.
+A manifest that reports `content_valid: "ok"` from a balance-only
+check is honest about its limits; one reported from a parse check is
+not.  Callers that don't read the flag see no behaviour change.
 """
 
 import ast
@@ -40,6 +65,12 @@ from typing import Optional
 # can record audit trail in the manifest.  Reset by
 # the caller before each invocation.
 _LAST_DEDUP_DETAILS = []
+
+# Set by validate_content to record how the file was verified.
+# "none" / "balance" / "parse".  Callers that want to distinguish
+# "verified by a real grammar" from "verified by balance only" read
+# this after validate_content returns.  See module docstring.
+_LAST_PARSE_METHOD = "none"
 
 
 _JS_EXTS = frozenset({".js", ".mjs", ".jsx", ".ts", ".tsx"})
@@ -165,10 +196,100 @@ def _function_presence_check(base: str, result: str,
 
 
 # ---------------------------------------------------------------------------
+# tree-sitter helpers (optional — no hard dependency)
+# ---------------------------------------------------------------------------
+#
+# The parse-validation layer is a pure improvement: when tree-sitter
+# and a matching grammar are importable, the JS content is parsed and
+# syntax errors are caught.  When they are not, the existing balance
+# checks are the whole story — no behaviour change from pre-parse
+# validate_output.
+#
+# Parser lookup goes through `ast_anchor._get_parser`, which already
+# caches per-language parsers in `_parser_cache`.  That cache is the
+# reason the probe is cheap even when validate_content calls this once
+# per embedded JS string.
+
+def _get_js_parser(lang: str):
+    """Return a tree-sitter parser for `lang`, or None.
+
+    `lang` is a tree-sitter language id ("javascript",
+    "typescript", "tsx", "python").  Only the JS-family ids are
+    passed from this module; python uses ast.parse, not tree-sitter.
+    """
+    try:
+        from .ast_anchor import _get_parser
+    except ImportError:
+        return None
+    try:
+        return _get_parser(lang)
+    except Exception:
+        return None
+
+
+def _js_lang_for_ext(ext: str) -> Optional[str]:
+    """Return the tree-sitter language id to parse `ext` files with,
+    or None to skip the parse check.
+
+    `.jsx` is intentionally mapped to None: JSX support varies
+    across tree-sitter-javascript versions, and a false parse error
+    on a legitimate JSX file is worse than a balance-only check.
+    The pg_state.py failure class (a brace-balanced but
+    syntactically-invalid fragment in plain JS) is caught by the
+    balance checks for `.jsx` too — the only thing skipped is the
+    additional parse confirmation.
+    """
+    if ext == ".ts":
+        return "typescript"
+    if ext == ".tsx":
+        return "tsx"
+    if ext in (".js", ".mjs"):
+        return "javascript"
+    return None
+
+
+def _iter_ts_nodes(node):
+    yield node
+    for child in node.children:
+        yield from _iter_ts_nodes(child)
+
+
+def _first_error_location(tree) -> Optional[tuple]:
+    """Return 1-based (line, col) of the first tree-sitter ERROR
+    node, or None if no ERROR node is found."""
+    if tree is None or getattr(tree, "root_node", None) is None:
+        return None
+    for node in _iter_ts_nodes(tree.root_node):
+        if node.type == "ERROR" or getattr(node, "is_error", False):
+            try:
+                sp = node.start_point
+                return (sp[0] + 1, sp[1] + 1)
+            except Exception:
+                return None
+    return None
+
+
+# ---------------------------------------------------------------------------
 # JS structural checks
 # ---------------------------------------------------------------------------
 
-def _js_structural_check(text: str, label: str) -> Optional[str]:
+def _js_structural_check(text: str, label: str,
+                         parse_lang: Optional[str] = None,
+                         ) -> Optional[str]:
+    """Structural validation for JS content.
+
+    `parse_lang` is the tree-sitter language id to use for a final
+    parse-validation pass.  When None, that pass is skipped (only
+    balance/indent/duplicate checks run — the pre-parse behaviour).
+    When set but the parser is unavailable, the pass is silently
+    skipped (no new hard dependency; `_LAST_PARSE_METHOD` records the
+    downgrade as "balance").
+
+    Mutates the module-level `_LAST_PARSE_METHOD`.  Callers are
+    expected to reset it before calling (validate_content does).
+    """
+    global _LAST_PARSE_METHOD
+
     braces, parens, brackets, unclosed = _js_balance(text)
     if braces != 0:
         return f"{label}: unbalanced braces ({braces:+d})"
@@ -207,6 +328,52 @@ def _js_structural_check(text: str, label: str) -> Optional[str]:
         if d in seen:
             return f"{label}: duplicate top-level declaration '{d}'"
         seen[d] = True
+
+    # Parse validation — the last line of defence.  Balance checks
+    # can verify punctuation; only a grammar can verify that the
+    # punctuation is arranged in a valid scope.  The pg_state.py
+    # corruption shape (an `if` between two `key: value,` object
+    # members) passes every balance check above and fails here.
+    if parse_lang is not None:
+        parser = _get_js_parser(parse_lang)
+        if parser is None:
+            # No parser for this language.  Fall back to balance-only;
+            # record the downgrade so the manifest can honestly report
+            # "ok (balance-only)" rather than "ok".
+            if _LAST_PARSE_METHOD == "none":
+                _LAST_PARSE_METHOD = "balance"
+        else:
+            try:
+                tree = parser.parse(text.encode("utf-8"))
+                if tree is not None and tree.root_node.has_error:
+                    loc = _first_error_location(tree)
+                    if loc is not None:
+                        line, col = loc
+                        return (f"{label}: JavaScript parse error at "
+                                f"line {line}, col {col} (invalid "
+                                f"syntax) — likely a patch was "
+                                f"inserted where its statement shape "
+                                f"does not fit")
+                    return (f"{label}: JavaScript parse error (invalid "
+                            f"syntax) — likely a patch was inserted "
+                            f"where its statement shape does not fit")
+                _LAST_PARSE_METHOD = "parse"
+            except Exception:
+                # Parser crashed — treat as balance-only so a broken
+                # parser doesn't cause false rejections.  Downgrade
+                # `_LAST_PARSE_METHOD` only if we haven't already
+                # upgraded to "parse" (which can happen when a .py
+                # file has multiple embedded JS strings and an
+                # earlier one parsed cleanly).
+                if _LAST_PARSE_METHOD == "none":
+                    _LAST_PARSE_METHOD = "balance"
+    else:
+        # Caller opted out of parse validation (e.g. .jsx).  Still
+        # run the balance checks (already done above); record that
+        # the verification was balance-only.
+        if _LAST_PARSE_METHOD == "none":
+            _LAST_PARSE_METHOD = "balance"
+
     return None
 
 
@@ -312,7 +479,17 @@ def validate_content(content: str, path: str,
                      base: Optional[str] = None,
                      allow_missing: Optional[set] = None,
                      ) -> Optional[str]:
-    """Return None if content is structurally OK, else an error string."""
+    """Return None if content is structurally OK, else an error string.
+
+    SIDE EFFECT: sets the module-level `_LAST_PARSE_METHOD` to one of
+    `"none"`, `"balance"`, or `"parse"`, describing how the JS parts
+    of `content` were verified.  Callers that want to record the
+    verification method in the manifest read this after the call
+    returns.  See module docstring for the semantics of each value.
+    """
+    global _LAST_PARSE_METHOD
+    _LAST_PARSE_METHOD = "none"
+
     if content is None:
         return f"{path}: content is None"
     if not content.strip():
@@ -321,7 +498,8 @@ def validate_content(content: str, path: str,
     ext = Path(path).suffix.lower()
 
     if ext in _JS_EXTS:
-        err = _js_structural_check(content, path)
+        parse_lang = _js_lang_for_ext(ext)
+        err = _js_structural_check(content, path, parse_lang=parse_lang)
         if err:
             return err
         if base:
@@ -351,7 +529,12 @@ def validate_content(content: str, path: str,
                 if err:
                     return err
             elif _looks_like_js(block):
-                err = _js_structural_check(block, label)
+                # Embedded JS is always plain JavaScript (playgrounds
+                # don't ship JSX or TS inside Python strings).  Parse
+                # with the JS grammar specifically; never fall through
+                # to the .jsx opt-out.
+                err = _js_structural_check(
+                    block, label, parse_lang="javascript")
                 if err:
                     return err
                 # Cross-language guard: CSS appearing in JS that

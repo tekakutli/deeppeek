@@ -4,6 +4,7 @@
 //   window.__dsx_attach_json(json)     — attach via JSON (bridge entry)
 //   window.__dsx_type_json(json)       — type text into composer (bridge entry)
 //   window.__dsx_enter_json(json)      — press Enter on composer (bridge entry)
+//   window.__dsx_clear_json(json)      — clear composer text and files
 //
 // Extraction sources, tried in order: indexeddb, then fiber.
 // There is no DOM-sweep fallback — if both miss, extraction throws.
@@ -944,6 +945,97 @@
       result = { success: false, reason: `doEnter threw: ${e.message}` };
     }
     console.log("[deeppeek:enter] result:", result);
+    return JSON.stringify(result);
+  };
+
+  // ==================================================================
+  // Part 9 — composer clearing (deeppeek prompt delete)
+  // ==================================================================
+
+  async function doClear(opts) {
+    const result = {
+      success: false,
+      files_removed: 0,
+      files_remaining: 0,
+      textarea_cleared: false,
+      textarea_found: false
+    };
+
+    // 1. Clear the textarea using the native setter
+    const ta = document.querySelector('textarea');
+    if (ta) {
+      result.textarea_found = true;
+      ta.focus();
+      try {
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')
+          .set.call(ta, '');
+        ta.dispatchEvent(new InputEvent('input', {
+          bubbles: true, cancelable: true, inputType: 'deleteContentBackward',
+        }));
+        ta.dispatchEvent(new Event('change', { bubbles: true }));
+        result.textarea_cleared = (ta.value === '');
+      } catch (e) {
+        console.warn('[deeppeek:clear] textarea clear failed:', e);
+      }
+    }
+
+    // 2. Remove file chips rapidly
+    let guard = 0;
+    while (guard++ < 50) {
+      // Re-query the first chip on each pass (since they shift)
+      const chip = document.querySelector('.ds-animated-size-item');
+      if (!chip) break;
+
+      const tabbables = chip.querySelectorAll('div[tabindex="0"]');
+      if (tabbables.length === 0) break;
+
+      // The remove button is always the last tabindex="0" div in the chip
+      const removeBtn = tabbables[tabbables.length - 1];
+      const propsKey = Object.keys(removeBtn).find(k => k.startsWith('__reactProps$'));
+
+      if (propsKey && removeBtn[propsKey] && typeof removeBtn[propsKey].onClick === 'function') {
+        try {
+          removeBtn[propsKey].onClick({
+            preventDefault: () => {},
+            stopPropagation: () => {},
+            target: removeBtn,
+            currentTarget: removeBtn,
+            nativeEvent: new MouseEvent('click')
+          });
+          result.files_removed++;
+        } catch (e) {
+          console.warn('[deeppeek:clear] onClick failed:', e);
+          break;
+        }
+      } else {
+        try {
+          removeBtn.click();
+          result.files_removed++;
+        } catch (_) {
+          break;
+        }
+      }
+
+      // Yield for 0ms. This just allows React one event-loop tick to flush the DOM update.
+      await new Promise(r => setTimeout(r, 0));
+    }
+
+    result.files_remaining = document.querySelectorAll('.ds-animated-size-item').length;
+    result.success = result.files_remaining === 0 && (result.textarea_cleared || !result.textarea_found);
+    return result;
+  }
+
+  window.__dsx_clear_json = async function(argsJson) {
+    let args = {};
+    try { args = JSON.parse(argsJson || '{}'); } catch (_) {}
+    const opts = (args.opts && typeof args.opts === 'object') ? args.opts : {};
+    let result;
+    try {
+      result = await doClear(opts);
+    } catch (e) {
+      result = { success: false, reason: `doClear threw: ${e.message}` };
+    }
+    console.log('[deeppeek:clear] result:', result);
     return JSON.stringify(result);
   };
 })();

@@ -193,6 +193,42 @@ function attachHandlers(es) {
     } catch (_) {}
   });
 
+  // ---- clear (deeppeek prompt delete) ----
+  es.addEventListener("clear", async (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+    const batchId = data.batch_id;
+    const opts = data.opts || {};
+
+    console.log(`DSX: clear received (batch=${batchId})`);
+
+    let result = { success: false, reason: "no active deepseek tab" };
+    try {
+      const [tab] = await browser.tabs.query({
+        active: true, currentWindow: true,
+      });
+      if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+        const resp = await browser.tabs.sendMessage(tab.id, {
+          type: "DSX_CLEAR",
+          opts,
+        });
+        result = resp || { success: false, reason: "no response from content script" };
+      }
+    } catch (err) {
+      result = { success: false, reason: `sendMessage threw: ${err.message}` };
+    }
+
+    console.log(`DSX: clear result (batch=${batchId}):`, result);
+
+    try {
+      await fetch(`${DSX_URL}/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ __ack: "clear", batch_id: batchId, result }),
+      });
+    } catch (_) {}
+  });
+
   es.onopen = () => {
     console.log("DSX: SSE connected");
     wasConnected = true;
