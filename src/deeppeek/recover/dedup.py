@@ -143,6 +143,54 @@ _CODE_PUNCT_LINE_RE = re.compile(
     r'|<\/?[A-Za-z]'              # HTML/XML tag
 )
 
+_TOKEN_RE = re.compile(
+    r'[A-Za-z_$][\w$]*|[0-9]+|"[^"]*"|\'[^\']*\'|`[^`]*`'
+)
+
+
+def _meaningful_tokens(text):
+    """Identifier-and-literal tokens of length >= 4, excluding pure digits."""
+    if not text:
+        return set()
+    return {
+        t for t in _TOKEN_RE.findall(text)
+        if len(t) >= 4 and not t.isdigit()
+    }
+
+
+def _top_level_decls(text):
+    """Names declared at top level by def/function/class/const/let/var."""
+    if not text:
+        return set()
+    return set(re.findall(
+        r'^(?:export\s+)?(?:async\s+)?'
+        r'(?:def|function|class|const|let|var)\s+([A-Za-z_$][\w$]*)',
+        text, re.MULTILINE,
+    ))
+
+
+def _token_subset(real_body, pre_body):
+    """True iff the real body's meaningful tokens are a subset of pre's,
+    AND the two bodies share at least one top-level declaration name.
+
+    The pg_state.py / comfyui_krita.py failure mode this catches: an AI
+    "full" print that truncates one or more regions with a placeholder
+    (`... (docstring unchanged) ...`, `/* ... rest unchanged */`) drops
+    the pre-existing helpers and docstrings.  Verbatim substring fails
+    because the placeholder text isn't in base.  Token-subset succeeds
+    because every identifier the fragment actually uses appears in
+    base; only the placeholder is new, and it carries no meaningful
+    tokens.
+
+    False positives (the real body just happens to be a token-subset of
+    pre by chance) are mitigated by the top-level-decl requirement:
+    the real body must declare something that pre also declares.
+    """
+    real_tokens = _meaningful_tokens(real_body)
+    pre_tokens  = _meaningful_tokens(pre_body)
+    if not real_tokens or not real_tokens.issubset(pre_tokens):
+        return False
+    return bool(_top_level_decls(real_body) & _top_level_decls(pre_body))
 
 def _has_code_signal(body: str) -> bool:
     """True iff `body` looks like code rather than prose.
@@ -433,7 +481,15 @@ def pass5_deduplicate(records: dict,
                 if not real_body:
                     all_subset = False
                     break
-                if not any(real_body in pb for pb in pre_bodies.values()):
+                is_subset = False
+                for pb in pre_bodies.values():
+                    if real_body in pb:
+                        is_subset = True
+                        break
+                    if _token_subset(real_body, pb):
+                        is_subset = True
+                        break
+                if not is_subset:
                     all_subset = False
                     break
             if all_subset:

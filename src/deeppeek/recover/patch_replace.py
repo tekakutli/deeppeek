@@ -120,22 +120,6 @@ def _try_single_line_replace(base, raw_body, context_before=""):
 # ===========================================================================
 
 def _try_object_literal_splice(base, body_stripped, varname):
-    """Replace an object literal in place, preserving the base's
-    leading prefix.
-
-    Handles these base shapes:
-      · `export const X = { ... }`
-      · `const X = { ... }`
-      · `let X = { ... }`
-      · `var X = { ... }`
-      · `X = { ... }` (assignment)
-      · `a.b.c = { ... }` (dotted assignment)
-      · `X: { ... }` (object-literal entry)
-
-    The body must be one of the same shapes (plus `X = { ... }`
-    assignment).  The result keeps the base's prefix (`export const`
-    / `const` / `let` / `var`).
-    """
     if not varname:
         return None
     name = re.escape(varname)
@@ -144,9 +128,51 @@ def _try_object_literal_splice(base, body_stripped, varname):
         + name + r'\s*[=:])\s*\{',
         re.MULTILINE,
     )
-    base_m = base_re.search(base)
-    if not base_m:
+    matches = list(base_re.finditer(base))
+    if not matches:
         return None
+
+    # FIX A: a common identifier like `args` or `config` can appear
+    # multiple times in the same file.  Searching for the first match
+    # and splicing there silently corrupts the wrong scope — the
+    # comfy_connect/comfy_generate `args=` failure.  Use the body's
+    # own content to disambiguate: the correct candidate is the one
+    # that already contains the most of the body's distinctive lines.
+    # If two candidates tie, fail-closed: no anchor is safe enough.
+    if len(matches) > 1:
+        # Meaningful body lines — drop short lines (single-char
+        # punctuation) and blank lines so a match isn't gamed by
+        # generic `}` / `},` lines.
+        body_lines = [
+            ln.strip() for ln in body_stripped.split("\n")
+            if ln.strip() and len(ln.strip()) >= 8
+        ]
+
+        def _block_at(m):
+            open_idx = m.end() - 1
+            close_idx = _find_matching_brace(base, open_idx)
+            if close_idx == -1:
+                return None
+            return base[m.start():close_idx + 1]
+
+        scored = []
+        for m in matches:
+            block = _block_at(m)
+            if block is None:
+                continue
+            score = sum(1 for ln in body_lines if ln in block)
+            scored.append((score, m))
+
+        if not scored:
+            return None
+        scored.sort(key=lambda x: -x[0])
+        if len(scored) > 1 and scored[0][0] == scored[1][0]:
+            return None
+        if scored[0][0] == 0:
+            return None
+        base_m = scored[0][1]
+    else:
+        base_m = matches[0]
 
     prefix_from_base = base_m.group(1)
     file_prefix = base[:base_m.start()]

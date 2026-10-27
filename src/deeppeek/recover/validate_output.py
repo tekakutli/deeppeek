@@ -1014,3 +1014,61 @@ def _dedup_repeated_statements(content, path, base=None,
         print(f"  [dedup-stmt] {path}: removed duplicate line "
               f"{text!r}", file=sys.stderr)
     return chr(10).join(out), len(removals)
+
+def _extract_object_literal_occurrences(content):
+    """Return [(var_name, open_pos, close_pos, keys_set)] for every
+    top-level object literal in `content`."""
+    out = []
+    for m in re.finditer(
+            r'^(?:[ \t]*)(?:(?:export\s+)?(?:const|let|var)\s+)?'
+            r'([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*=\s*\{',
+            content, re.MULTILINE):
+        var_name = m.group(1)
+        open_brace = content.find("{", m.start())
+        close_brace = _find_matching_close_char(content, open_brace)
+        if close_brace == -1:
+            continue
+        body = content[open_brace + 1:close_brace]
+        keys = set()
+        for km in re.finditer(
+                r'["\']?([A-Za-z_$][\w$]*)["\']?\s*:', body):
+            keys.add(km.group(1))
+        if keys:
+            out.append((var_name, m.start(), close_brace, keys))
+    return out
+
+
+def verify_object_keys_preserved(base, result, path):
+    """Return an error string iff a pre-existing top-level object
+    literal lost keys in `result`, else None.
+
+    A record's pre-existing baseline declares `args = {--host, --port,
+    --check, --watch, --subscribe_timeout}`.  A patch that splices a
+    replacement object literal into the wrong `args=` occurrence
+    silently removes those keys.  Every downstream check still sees
+    a syntactically-valid file; only this check names the specific
+    key set that vanished.
+
+    Matching is per occurrence, not per variable name: two `args={}`
+    blocks both exist; the check requires *some* resulting occurrence
+    to still cover the base's keys.
+    """
+    base_occs   = _extract_object_literal_occurrences(base)
+    result_occs = _extract_object_literal_occurrences(result)
+    missing = []
+    for base_name, _, _, base_keys in base_occs:
+        found = False
+        for result_name, _, _, result_keys in result_occs:
+            if result_name != base_name:
+                continue
+            # Cover at least 80% of base's keys — allows a single
+            # legitimate removal, catches a wholesale replacement.
+            if len(base_keys & result_keys) >= 0.8 * len(base_keys):
+                found = True
+                break
+        if not found:
+            missing.append(base_name)
+    if missing:
+        return (f"{path}: pre-existing object literal(s) lost their "
+                f"original keys: {sorted(set(missing))[:5]}")
+    return None
