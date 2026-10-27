@@ -45,23 +45,41 @@ written at their original trust.  That is how a broken
 `pg_masks.py` imported it) got written at HIGH trust and blanked
 the playground on load.
 
-Pass 7.6 (`pass7_6_demote_on_missing_export`) turns the specific
-`missing_js_export` finding into a fail-closed signal: when the
-target declares the symbol but does not export it, both the target
-and the importer are demoted to LOW.  Under default
-`--min-trust MEDIUM` neither is written; the target tree is
-preserved and `warnings.txt` tells the user exactly which `export`
-is missing.
+Pass 7.7 (`pass7_7_repair_js_imports`) attempts a mechanical repair
+first: when the target declares the symbol but does not export it,
+it rewrites the declaration to add `export`.  Adding `export` is
+strictly more permissive — it cannot break a consumer — so this is
+safe to do without user interaction.  If repair succeeds the
+problem is removed from the list and the target stays at its
+original trust.
 
-Pass 7.6 does NOT do transitive demotion (an importer of a demoted
-target is not automatically demoted).  The reasoning: the user can
-fix `pg_state.py` from `low_trust/`, and the next run applies the
-importers against the fixed state.  A transitive rule would also
-have to reason about `--min-trust` transitions and would fail-close
-files that are independently correct.  If the user finds they want
-transitive demotion, the right place to add it is here — after
-pass 7.6, walk `records` and demote any record whose JS imports
-resolve to a demoted target.
+Pass 7.6 (`pass7_6_demote_on_missing_export`) is the fallback: it
+demotes both sides of an unrepairable finding so the target file
+isn't written broken.  Under default `--min-trust MEDIUM` neither
+is written; the target tree is preserved and `warnings.txt` tells
+the user exactly which `export` is missing.
+
+RECONCILIATION (PASS 8.7)
+=========================
+Pass 8.7 (`pass8_7_reconcile`) runs after pass 8.5 and before pass
+8.6 (cross-file duplicate detection).  For each record that would
+fail-close, it tries excluding each applied patch/pair in turn and
+keeps the minimal exclusion set that lets the remainder pass every
+check.  When the rebuilt content differs from the record's base
+(meaning real changes will be written), the record is promoted; when
+it equals base (meaning nothing would change), the record stays
+fail-closed — see `reconcile.py` for the "reconciled to base is not
+a rescue" invariant.
+
+RESIDUAL EMISSION
+=================
+After pass 9 writes its output and returns cleanly, a residual
+markdown file is emitted alongside the manifest: a smaller
+`conversation.md` containing only the blocks that did NOT reach a
+successful placement.  The residual is intended as the input to a
+subsequent `deeppeek recover` run once the user has edited the
+failed blocks (or the target).  It never affects the primary run's
+output — it is purely additive.  See `residual.py`.
 
 CRASH REPORTING
 ===============
@@ -80,9 +98,12 @@ The safe defaults per pass:
     pass 6     → records keep base content (no patches applied)
     pass 7     → {"exports": {}, "imports": {}, "problems": []}
     pass 7.5   → [] (no JS problems)
+    pass 7.7   → (original problem list unchanged)
     pass 7.6   → 0 (no demotions)
     pass 8     → (no-op; no per-file verification)
     pass 8.5   → (no-op; no symbol demotions)
+    pass 8.7   → 0 (no reconciliations)
+    pass 9     → caught by the writer's own try/except
 
 These defaults are conservative: a crashed pass cannot accidentally
 make the result WORSE than "do nothing for that pass".
@@ -136,6 +157,10 @@ class RecoverConfig:
     verbose: bool = False
     trace: bool = False
     llm_verbose: bool = False
+    # Residual output.  None → reports_dir/residual.md (the default
+    # location, next to manifest.json and warnings.txt).  Path("-") →
+    # stdout, for shell pipelines.  Any other path → that file.
+    residual_path: Optional[Path] = None
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +580,13 @@ def run(cfg: RecoverConfig) -> int:
                   file=sys.stderr)
 
     # ---- pass 7.6 (wrapped) — FIX 2 ----
+    # Turn a `missing_js_export` finding into a trust signal.  When
+    # the target DECLARES the symbol but does not EXPORT it, both
+    # the target and the importer are demoted to LOW so neither is
+    # written under default --min-trust.  Without this, cross-
+    # validate findings were informational-only and the pg_masks /
+    # pg_state silent corruption could be written at HIGH trust
+    # (the playground would blank on load with a JS ReferenceError).
     if js_problems:
         n_export_demoted = _run_pass(
             "7.6 (missing-export)",
@@ -635,6 +667,37 @@ def run(cfg: RecoverConfig) -> int:
             print(f"  [!] files may be partially written to "
                   f"{cfg.out_dir}/", file=sys.stderr)
         return 1
+
+    # ---- residual emission (additive; never blocks the run) ----
+    # Runs after pass 9 so `rec.trust`, `rec.verification`, and the
+    # per-patch `applied_by` statuses reflect the final state.  The
+    # residual file is a smaller conversation.md containing only the
+    # blocks that did not land in the target tree, ready to be
+    # re-run (after editing) as `deeppeek recover residual.md`.
+    #
+    # The try/except here is deliberately separate from pass 9's —
+    # a residual emission failure must not change the exit code of a
+    # successful recovery.
+    try:
+        from .residual import emit_residual
+        _residual_path = cfg.residual_path
+        if _residual_path is None:
+            _residual_path = (
+                cfg.apply_to / "deeppeek" / "residual.md"
+                if cfg.apply_to is not None
+                else cfg.out_dir / "residual.md"
+            )
+        emit_residual(
+            records=records,
+            blocks=blocks,
+            dump_display=dump_display,
+            min_trust=cfg.min_trust,
+            out_path=_residual_path,
+            verbose=cfg.trace,
+        )
+    except Exception as e:
+        print(f"  [!] residual emission failed: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
 
     print(f"  total time: {time.monotonic() - t_start:.1f}s")
     if run_errors:

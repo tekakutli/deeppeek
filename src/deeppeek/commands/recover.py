@@ -1,5 +1,6 @@
 """`deeppeek recover` — thin adapter over recover.pipeline.run()."""
 import argparse
+import sys
 from pathlib import Path
 
 from ..recover.pipeline import RecoverConfig, run as recover_run
@@ -37,6 +38,16 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--no-llm-ping", dest="llm_ping", action="store_false")
     p.add_argument("--cache-dir", type=Path, default=None)
     p.add_argument("--trace", action="store_true")
+    p.add_argument(
+        "--emit-residual", type=Path, default=None, metavar="PATH",
+        help="Write a residual markdown file containing only the blocks "
+             "that did not reach a successful placement.  This is a "
+             "smaller conversation.md, ready to be re-run as "
+             "`deeppeek recover residual.md` after the user has edited "
+             "the failed blocks (or the target).  Defaults to "
+             "<reports>/residual.md.  Pass `-` to write to stdout "
+             "(useful for shell pipelines).",
+    )
     p.set_defaults(func=run)
 
 
@@ -70,5 +81,6 @@ def run(args: argparse.Namespace) -> int:
         cache_dir=args.cache_dir,
         verbose=getattr(args, "verbose", False),
         trace=args.trace,
+        residual_path=getattr(args, "emit_residual", None),
     )
     return recover_run(cfg)
