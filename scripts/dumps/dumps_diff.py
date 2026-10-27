@@ -11,26 +11,51 @@ because unchanged files appear once instead of twice.
 
 Usage:
     dumps_diff.py DUMP1 DUMP2 [-o1 OUT1] [-o2 OUT2] [-o3 OUT3] [--keep-tree]
+
+Parser note: dump.py writes each file as a 4-line opener, the file's raw
+content, and a closer.  The opener is:
+
+  · a 70-equals header line
+  · a "FILE i/N: path" line
+  · another 70-equals header line
+  · a fence-opener line consisting of three backticks followed by "python"
+
+The closer is: a line of three backticks, then a blank line.
+
+The file's content may itself contain fence lines (markdown, docstrings).
+So blocks are located by matching the exact opener, split at the next
+opener (or EOF), and the LAST occurrence of "three-backticks + two
+newlines" in each slice is trimmed — that is always dump.py's own closer,
+regardless of what is inside the content.  Stray `FILE i/N:` markers that
+survive inside content are filtered out by a majority vote on N (all real
+blocks in one dump share the same N).
 """
 
 import argparse
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 HEADER = "=" * 70
 
-# A file block always starts like:  <HEADER>\nFILE i/N: <path>
+# Triple-backtick, built at runtime so this file's own markdown fences
+# are never broken by its source.
+_BT3 = "`" * 3
+
+# Block opener regex — see module docstring.
 FILE_BLOCK_START = re.compile(
-    r'(?m)^' + re.escape(HEADER) + r'\nFILE \d+/\d+: '
+    r'(?m)^' + re.escape(HEADER) + r'\n'
+    r'FILE (\d+)/(\d+): (.+)\n'
+    + re.escape(HEADER) + r'\n'
+    + _BT3 + r'python\n'
 )
-FILE_LINE_RE = re.compile(r'^FILE \d+/\d+: (.*)$')
 
 # The DIRECTORY TREE section, if present, is:
 #   <HEADER>\nDIRECTORY TREE\n<HEADER>\n```\n<tree>\n```\n\n
 TREE_BLOCK_RE = re.compile(
     re.escape(HEADER) + r'\nDIRECTORY TREE\n' + re.escape(HEADER) +
-    r'\n```\n.*?\n```\n\n',
+    r'\n' + _BT3 + r'\n.*?\n' + _BT3 + r'\n\n',
     re.DOTALL,
 )
 
@@ -38,37 +63,43 @@ TREE_BLOCK_RE = re.compile(
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
-def parse_block(block: str) -> tuple[str, str]:
-    """Parse one 'FILE i/N: path' block into (path, content)."""
-    lines = block.split("\n")
-    m = FILE_LINE_RE.match(lines[1])
-    if not m:
-        raise ValueError(f"Malformed FILE line: {lines[1]!r}")
-    path = m.group(1)
-
-    # Content is lines[4:-1], but the writer may or may not have appended a
-    # trailing newline before the closing fence, so strip trailing blanks
-    # then drop the closing ``` line.
-    end = len(lines)
-    while end > 4 and lines[end - 1] == "":
-        end -= 1
-    if end > 4 and lines[end - 1] == "```":
-        content_lines = lines[4 : end - 1]
-    else:
-        content_lines = lines[4:end]
-    return path, "\n".join(content_lines)
-
-
 def parse_dump(text: str) -> tuple[str, list[tuple[str, str]]]:
-    """Return (preamble, [(path, content), ...]) preserving original order."""
-    starts = [m.start() for m in FILE_BLOCK_START.finditer(text)]
-    if not starts:
+    """Return (preamble, [(path, content), ...]) preserving original order.
+
+    See the module docstring for the robustness strategy.  Normalizes
+    CRLF to LF first so the closer check is line-ending-agnostic.
+    """
+    text = text.replace("\r\n", "\n")
+
+    matches = list(FILE_BLOCK_START.finditer(text))
+    if not matches:
         return text, []
-    preamble = text[: starts[0]]
+
+    # Majority vote on N — every real block in one dump shares N.
+    n_counts = Counter(m.group(2) for m in matches)
+    intended_n = n_counts.most_common(1)[0][0]
+    kept = [m for m in matches if m.group(2) == intended_n]
+    if not kept:
+        return text, []
+
+    preamble = text[: kept[0].start()]
+    closer = _BT3 + "\n\n"
+
     files: list[tuple[str, str]] = []
-    for i, start in enumerate(starts):
-        end = starts[i + 1] if i + 1 < len(starts) else len(text)
-        files.append(parse_block(text[start:end]))
+    for idx, m in enumerate(kept):
+        start = m.start()
+        end = kept[idx + 1].start() if idx + 1 < len(kept) else len(text)
+        path = m.group(3)
+
+        # Content starts right after the opener.
+        block_content = text[start:end][m.end() - start:]
+
+        # The LAST "```\n\n" is always dump.py's closer.
+        pos = block_content.rfind(closer)
+        content = block_content[:pos] if pos != -1 else block_content
+
+        files.append((path, content))
+
     return preamble, files
 
 
@@ -94,11 +125,11 @@ def write_dump(out_path: Path, title: str, preamble: str,
             fh.write(HEADER + "\n")
             fh.write(f"FILE {i}/{total}: {path}\n")
             fh.write(HEADER + "\n")
-            fh.write("```python\n")
+            fh.write(_BT3 + "python\n")
             fh.write(content)
             if content and not content.endswith("\n"):
                 fh.write("\n")
-            fh.write("```\n\n")
+            fh.write(_BT3 + "\n\n")
     return total
 
 
@@ -133,10 +164,6 @@ def main() -> int:
     dict1 = dict(files1)
     dict2 = dict(files2)
 
-    # Classify while preserving original order within each dump.
-    #   changed1 = files deleted in commit2 OR modified
-    #   changed2 = files added in commit2  OR modified
-    #   common   = files present in both with identical content
     changed1 = [(p, dict1[p]) for p, _ in files1
                 if p not in dict2 or dict2[p] != dict1[p]]
     changed2 = [(p, dict2[p]) for p, _ in files2
@@ -171,7 +198,6 @@ def main() -> int:
         pre1, common,
     )
 
-    # Report
     l1, l2, l3 = count_lines(out1), count_lines(out2), count_lines(out3)
     lin1, lin2 = count_lines(args.dump1), count_lines(args.dump2)
     in_total = lin1 + lin2

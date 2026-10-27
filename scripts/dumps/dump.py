@@ -3,7 +3,7 @@
 Dump files (filtered by extension) into a single markdown file.
 
 Usage:
-    dump.py [-a AFFIX] [-r] [-t] [-o PATH] [FILE ...]
+    dump.py [-a AFFIX] [-r] [-t] [-o PATH] [--exclude-file PATH]... [FILE ...]
 
 If one or more FILE positional arguments are provided, ONLY those files are
 dumped (deduplicated, in sorted order). Their paths are interpreted relative
@@ -13,38 +13,35 @@ what you get. A directory tree is always rendered, rooted at the common
 parent directory of the listed files.
 
 When no FILE arguments are given, the script scans DEFAULT_DIR using the
-configured filters below — behavior identical to the original version.
+configured filters below.
 
-All configuration (directory, extensions, default affix, default recursion,
-tree-only, excluded directories, included/excluded filename substrings) is
-done via the variables at the top of this file. The CLI flags -a/--affix,
--r/--recursive, and -t/--tree-only override their DEFAULT_* counterparts
-when provided.
+Files whose own content *looks like another dump* — i.e. contains a
+`=====...=====\nFILE i/N: ...` block header at line start — are skipped
+by default (DEFAULT_SKIP_DUMP_FILES = True). This prevents an
+"oh-no, a dump of a dump" situation where re-parsing a generated dump
+would pick up the inner FILE markers as if they were top-level files.
+Disable with `--no-skip-dump-files` if you really want to include them.
 
 The output filename has two modes:
 
-    · Default (no -o/--output): DEFAULT_OUT (e.g. "project_dump.md") with
-      the scanned directory's basename appended before the suffix, so
-      scanning ".../myproject" writes "project_dump_myproject.md" in the
-      CURRENT directory.
+    · Default (no -o/--output): DEFAULT_OUT with the scanned directory's
+      basename appended before the suffix, so scanning ".../myproject"
+      writes "project_dump_myproject.md" in the CURRENT directory.
 
-    · -o PATH: write exactly to PATH, no suffix transformation.  Use this
-      when the caller needs a deterministic filename and location (e.g.
-      deeppeek's evolve pipeline writes both dumps into a temp workspace).
+    · -o PATH: write exactly to PATH.  A special value "-" writes the dump
+      to stdout (for piping); the "Total lines" summary then goes to stderr,
+      so stdout is purely the dump.
 
-The scanned directory is always recorded at the top of the output. When
-recursion is enabled (-r or DEFAULT_RECURSIVE = True), or files are listed
-explicitly, a directory tree is also prepended. The tree shows every
-directory under the scanned root (even ones excluded from dumping), minus
-anything listed in DEFAULT_TREE_EXCLUDE_DIRS; only files that were actually
-dumped are listed inside it.
-
-With -t/--tree-only the file contents are omitted: only the directory tree
-is written. This flag implies recursion.
+CLI flags -a/--affix, -r/--recursive, -t/--tree-only override their
+DEFAULT_* counterparts. --exclude-file PATH (repeatable) excludes one
+exact file by resolved path — useful when another program (e.g.
+dumps_evolve.py) must keep its own inputs out of the scan.
 """
 
 import argparse
+import io
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -66,28 +63,32 @@ DEFAULT_AFFIX      = None             # e.g. "_test" (substring matched in filen
 DEFAULT_RECURSIVE  = False            # descend into subdirectories
 DEFAULT_TREE_ONLY  = False            # only emit the directory tree, no file contents
 
+# If True, files whose *own content* contains a `=====...=====\nFILE i/N: `
+# block header at line start are skipped.  This is what prevents a stale
+# baseline.md / common.md / committed example dump from being folded into
+# the current dump — which would later confuse any dump parser (including
+# dumps_diff.py / dumps_evolve.py).  Turn off if you actually want to dump
+# a file that documents the dump format.
+DEFAULT_SKIP_DUMP_FILES = True
+
 # Directories to skip when dumping files. Two kinds of entries are supported:
 #   - Plain names (no "/"), e.g. "node_modules": matches a directory with that
 #     basename at ANY depth.
 #   - Relative paths, e.g. "thisDirectory/thatDirectory": matched against the
 #     directory's path RELATIVE TO THE SCANNED DIRECTORY, so only that exact
-#     directory (and its subtree) is skipped — siblings of "thatDirectory"
-#     inside "thisDirectory" are still dumped.
+#     directory (and its subtree) is skipped.
 # Directories skipped here still appear in the DIRECTORY TREE, unless they are
 # also listed in DEFAULT_TREE_EXCLUDE_DIRS below.
 DEFAULT_EXCLUDE_DIRS = [
     ".git", "__pycache__", ".venv", "venv", "node_modules",
     "lib", "bin",
     "kritomatic_xremap", "other_scripts", "playgrounds",
-    "data/comfy_panel",
-    # e.g. "src/vendor" to skip only ./src/vendor
+    "data/comfy_panel/history/",
 ]
 
 # Directories to hide from the DIRECTORY TREE. Same matching rules as
-# DEFAULT_EXCLUDE_DIRS (plain name = basename at any depth; entry containing
-# a "/" = path relative to the scanned directory). This only affects the tree
-# rendering — it never changes which files are dumped. An empty list means
-# every directory is shown in the tree.
+# DEFAULT_EXCLUDE_DIRS. This only affects the tree rendering — it never
+# changes which files are dumped.
 DEFAULT_TREE_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modules",
                              "lib", "bin",
                              "target", "release",
@@ -95,23 +96,15 @@ DEFAULT_TREE_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modul
 ]
 
 # Directory names whitelist: if NON-EMPTY, only descend into subdirectories
-# whose basename is in this list (exact match, case-sensitive). Matching is
-# applied at every level. If empty ([]), every subdirectory is descended
-# into (subject to DEFAULT_EXCLUDE_DIRS). Directories in DEFAULT_EXCLUDE_DIRS
-# are always skipped, even if they appear here.
-# e.g. ["src", "tests"] to only walk into those two top-level folders.
+# whose basename is in this list.
 DEFAULT_INCLUDE_DIRS = []
 
 # Filename substrings whitelist: if NON-EMPTY, a file is only kept when its
-# filename contains AT LEAST ONE of these substrings (partial match,
-# case-sensitive). Leave empty ([]) to disable this filter entirely.
-# e.g. ["_config", "settings"] to only dump config-like files.
-# DEFAULT_INCLUDE_FILE_SUBSTRINGS = ["cable", "pg", "room"]
+# filename contains AT LEAST ONE of these substrings.
 DEFAULT_INCLUDE_FILE_SUBSTRINGS = []
 
-# Filename substrings blacklist: if a filename contains ANY of these
-# (partial match, case-sensitive), the file is skipped.
-# e.g. [".min.", "_test", ".bak"]
+# Filename substrings blacklist: if a filename contains ANY of these, the
+# file is skipped.
 DEFAULT_EXCLUDE_FILE_SUBSTRINGS = ["project_dump", "shrinking", "tests"]
 # ---------------------------------------------------------------------------
 
@@ -119,6 +112,12 @@ HEADER = "=" * 70
 
 # Sentinel key used inside the tree dict to hold the files of a directory.
 _FILES = "\0files"
+
+# Detection pattern for "this file is itself a dump": the exact 70-equals
+# header followed by a FILE i/N: line.  Anchored at line start.
+_DUMP_MARKER_RE = re.compile(
+    r"(?m)^" + re.escape(HEADER) + r"\nFILE \d+/\d+: "
+)
 
 
 def normalize_ext(ext: str) -> str | None:
@@ -128,6 +127,19 @@ def normalize_ext(ext: str) -> str | None:
     if not ext.startswith("."):
         ext = "." + ext
     return ext
+
+
+def _looks_like_dump(path: Path) -> bool:
+    """True if `path`'s content contains a top-level FILE block header.
+
+    Used to skip dumping dumps-of-dumps (stale baseline.md, common.md, a
+    committed example showing the format, …).
+    """
+    try:
+        content = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return bool(_DUMP_MARKER_RE.search(content))
 
 
 def dir_matches(rel_dir: Path, name: str, patterns: list[str]) -> bool:
@@ -163,6 +175,7 @@ def find_files(
     include_file_substrings: list[str],
     exclude_file_substrings: list[str],
     recursive: bool = True,
+    skip_dump_files: bool = True,
 ) -> list[Path]:
     results: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -175,7 +188,7 @@ def find_files(
         ]
 
         # if a whitelist of directories was provided, only descend into
-        # those (checked at every level); empty list = descend into all
+        # those; empty list = descend into all
         if include_dirs:
             dirnames[:] = [d for d in dirnames if d in include_dirs]
 
@@ -188,7 +201,6 @@ def find_files(
                 continue
             if affix and affix not in name:
                 continue
-            # whitelist: if set, filename must contain at least one of these
             if include_file_substrings and not any(
                 s in name for s in include_file_substrings
             ):
@@ -197,7 +209,10 @@ def find_files(
                 s in name for s in exclude_file_substrings
             ):
                 continue
-            results.append(Path(dirpath) / name)
+            full = Path(dirpath) / name
+            if skip_dump_files and _looks_like_dump(full):
+                continue
+            results.append(full)
 
     results.sort()
     return results
@@ -231,11 +246,8 @@ def build_tree(
 
     Every directory found under `root` is included — including directories
     that were excluded from dumping — except those matching
-    `tree_exclude_dirs`. The files listed inside each directory are only the
-    ones that were actually dumped.
-
-    Directories map to sub-dicts; the files of a directory live under the
-    special `_FILES` key as a list of names.
+    `tree_exclude_dirs`.  The files listed inside each directory are only
+    the ones that were actually dumped.
     """
     dumped = {Path(os.path.relpath(f, root)) for f in dumped_files}
     tree: dict = {}
@@ -244,14 +256,11 @@ def build_tree(
         rel_dir = Path(os.path.relpath(dirpath, root))
         rel_parts = () if rel_dir == Path(".") else rel_dir.parts
 
-        # Hide tree-excluded directories (but do NOT apply the dumping
-        # exclude list here — excluded dirs should still show up).
         dirnames[:] = [
             d for d in dirnames
             if not dir_matches(rel_dir / d, d, tree_exclude_dirs)
         ]
 
-        # Keep the tree scoped to the include whitelist, if one is set.
         if include_dirs:
             dirnames[:] = [d for d in dirnames if d in include_dirs]
 
@@ -273,8 +282,7 @@ def build_tree_from_files(
 ) -> dict:
     """Build a tree dict from an explicit file list.
 
-    Unlike `build_tree`, this does not walk the filesystem: only the
-    directories that lead to one of `files` appear in the tree. Files still
+    Only the directories that lead to one of `files` appear.  Files still
     inside a directory matched by `tree_exclude_dirs` are pruned from the
     tree (but they will still be dumped — this only affects rendering).
     """
@@ -341,23 +349,16 @@ def resolve_listed_files(file_args: list[str], base_dir: Path) -> list[Path]:
 
 
 def output_path_with_dirname(base_out: Path, scanned_dir: Path) -> Path:
-    """Append the basename of `scanned_dir` to `base_out` before its suffix.
-
-    e.g. ("project_dump.md", "/home/user/myproject") -> "project_dump_myproject.md"
-    """
+    """Append the basename of `scanned_dir` to `base_out` before its suffix."""
     dirname = scanned_dir.name
     if not dirname:  # e.g. scanning filesystem root "/"
         return base_out
-    # Sanitize a bit so we don't create weird filenames
     dirname = dirname.replace(os.sep, "_").replace("/", "_")
     return base_out.with_name(f"{base_out.stem}_{dirname}{base_out.suffix}")
 
 
 def _emit_file_contents(fh, files, display_fn, total):
-    """Write `FILE i/N:` blocks for each file into `fh`.
-
-    `display_fn(f)` returns the path string shown in the header.
-    """
+    """Write `FILE i/N:` blocks for each file into `fh`."""
     for i, f in enumerate(files, 1):
         fh.write(HEADER + "\n")
         fh.write(f"FILE {i}/{total}: {display_fn(f)}\n")
@@ -379,16 +380,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Dump files into a markdown file. "
                     "All paths/extensions come from variables in the script; "
-                    "only the affix, recursion, tree-only mode, and output "
-                    "path can be overridden on the CLI. Pass one or more "
-                    "FILE arguments to dump only those files."
+                    "CLI overrides exist for affix, recursion, tree-only, "
+                    "output path, and per-file exclusions. Pass one or more "
+                    "FILE arguments to dump only those files.",
     )
     parser.add_argument(
         "files", nargs="*",
         help=("Optional explicit list of files to dump. When provided, the "
-              "directory scan and all filters are bypassed; a tree rooted at "
-              "the files' common parent is always emitted. Paths are "
-              "interpreted relative to DEFAULT_DIR."),
+              "directory scan and all filters are bypassed."),
     )
     parser.add_argument(
         "-a", "--affix", default=None,
@@ -398,28 +397,40 @@ def main() -> int:
     )
     parser.add_argument(
         "-r", "--recursive", action="store_true", default=None,
-        help=("Recurse into subdirectories. Also prepends a directory tree "
-              "of the scanned directory to the output. "
+        help=("Recurse into subdirectories. Also prepends a directory tree. "
               f"(hardcoded default: {DEFAULT_RECURSIVE})"),
     )
     parser.add_argument(
         "-t", "--tree-only", action="store_true", default=None,
-        help=("Only write the directory tree; skip dumping the file "
-              "contents. Implies recursion. "
+        help=("Only write the directory tree. Implies recursion. "
               f"(hardcoded default: {DEFAULT_TREE_ONLY})"),
     )
     parser.add_argument(
         "-o", "--output", type=Path, default=None,
-        help=("Write the dump to this exact path. No directory-name suffix "
-              "is applied — the file is created exactly where you say "
+        help=("Write the dump to this exact path. \"-\" writes the dump "
+              "to stdout, keeping stdout free of anything but the dump. "
               f"(default: {DEFAULT_OUT} with _<scanned-dir> appended)"),
+    )
+    parser.add_argument(
+        "--exclude-file", action="append", default=[], metavar="PATH",
+        help=("Exclude this exact file (by resolved path) from the scan. "
+              "Repeatable."),
+    )
+    parser.add_argument(
+        "--skip-dump-files", dest="skip_dump_files",
+        action="store_true", default=None,
+        help=("Skip files whose content looks like another dump (default)."),
+    )
+    parser.add_argument(
+        "--no-skip-dump-files", dest="skip_dump_files",
+        action="store_false", default=None,
+        help=("Include files whose content looks like another dump."),
     )
     args = parser.parse_args()
 
     root = Path(DEFAULT_DIR)
-    # If -o/--output was given, honour it exactly. Otherwise use DEFAULT_OUT
-    # and let output_path_with_dirname add the scanned directory's basename.
     out = args.output if args.output else Path(DEFAULT_OUT)
+    to_stdout = args.output is not None and str(args.output) == "-"
 
     extensions = [e for e in (normalize_ext(x) for x in DEFAULT_EXTENSIONS) if e]
     exclude_dirs = [d for d in DEFAULT_EXCLUDE_DIRS if d]
@@ -427,20 +438,20 @@ def main() -> int:
     include_dirs = {d for d in DEFAULT_INCLUDE_DIRS if d}
     include_file_substrings = [s for s in DEFAULT_INCLUDE_FILE_SUBSTRINGS if s]
     exclude_file_substrings = [s for s in DEFAULT_EXCLUDE_FILE_SUBSTRINGS if s]
+    exclude_paths = {Path(p).resolve() for p in args.exclude_file}
+    skip_dump_files = (
+        args.skip_dump_files if args.skip_dump_files is not None
+        else DEFAULT_SKIP_DUMP_FILES
+    )
 
-    # Tree-only: CLI forces True, otherwise fall back to the hardcoded default
     tree_only = True if args.tree_only else DEFAULT_TREE_ONLY
 
     if args.files:
-        # ------------------------------------------------------------------
-        # File-list mode: user gave explicit files, bypass the scanner.
-        # ------------------------------------------------------------------
         files = resolve_listed_files(args.files, root)
         if not files:
             print("No valid files provided.", file=sys.stderr)
             return 1
 
-        # Tree root = common parent of all listed files.
         try:
             common = Path(os.path.commonpath([str(f) for f in files]))
         except ValueError:
@@ -451,12 +462,8 @@ def main() -> int:
             common = common.parent
 
         tree_root = common
-        # A tree is always emitted in file-list mode.
         recursive = True
     else:
-        # ------------------------------------------------------------------
-        # Directory-scan mode: identical to the original script.
-        # ------------------------------------------------------------------
         affix = args.affix if args.affix is not None else DEFAULT_AFFIX
         if affix == "":
             affix = None
@@ -472,7 +479,10 @@ def main() -> int:
             include_file_substrings,
             exclude_file_substrings,
             recursive,
+            skip_dump_files,
         )
+        if exclude_paths:
+            files = [f for f in files if f.resolve() not in exclude_paths]
         if not files:
             msg = f"No files found in '{root}'"
             if extensions:
@@ -490,58 +500,56 @@ def main() -> int:
         tree_root = root
 
     total = len(files)
-
-    # Resolve the tree root to an absolute path, and derive the
-    # human-readable label used in the "SCANNED DIRECTORY:" header.
     scanned_dir = Path(os.path.abspath(str(tree_root)))
 
-    # If no explicit -o was given, decorate DEFAULT_OUT with the scanned
-    # directory's basename (original behaviour).  With -o, the caller owns
-    # the exact path — write there verbatim.
     if not args.output:
         out = output_path_with_dirname(out, scanned_dir)
 
-    out.parent.mkdir(parents=True, exist_ok=True)
+    fh = io.StringIO()
+    fh.write(HEADER + "\n")
+    fh.write(f"SCANNED DIRECTORY: {scanned_dir}\n")
+    fh.write(HEADER + "\n\n")
 
-    with out.open("w", encoding="utf-8") as fh:
-        # Always record which directory was scanned
+    if recursive:
         fh.write(HEADER + "\n")
-        fh.write(f"SCANNED DIRECTORY: {scanned_dir}\n")
-        fh.write(HEADER + "\n\n")
+        fh.write("DIRECTORY TREE\n")
+        fh.write(HEADER + "\n")
+        fh.write("```\n")
+        if args.files:
+            tree = build_tree_from_files(tree_root, files, tree_exclude_dirs)
+        else:
+            tree = build_tree(tree_root, include_dirs, tree_exclude_dirs, files)
+        fh.write(render_tree(tree, str(tree_root)) + "\n")
+        fh.write("```\n\n")
 
-        if recursive:
-            fh.write(HEADER + "\n")
-            fh.write("DIRECTORY TREE\n")
-            fh.write(HEADER + "\n")
-            fh.write("```\n")
-            if args.files:
-                tree = build_tree_from_files(tree_root, files, tree_exclude_dirs)
-            else:
-                tree = build_tree(tree_root, include_dirs, tree_exclude_dirs, files)
-            fh.write(render_tree(tree, str(tree_root)) + "\n")
-            fh.write("```\n\n")
+    if not tree_only:
+        if args.files:
+            display_fn = lambda f: os.path.relpath(str(f), str(scanned_dir))
+        else:
+            def display_fn(f):
+                s = str(f)
+                return s[2:] if s.startswith("./") else s
+        _emit_file_contents(fh, files, display_fn, total)
 
-        # Skip the file contents entirely in tree-only mode
-        if not tree_only:
-            if args.files:
-                # File-list mode: show paths relative to the tree root.
-                display_fn = lambda f: os.path.relpath(str(f), str(scanned_dir))
-            else:
-                # Scan mode: preserve original behaviour exactly.
-                def display_fn(f):
-                    s = str(f)
-                    return s[2:] if s.startswith("./") else s
-            _emit_file_contents(fh, files, display_fn, total)
+    content = fh.getvalue()
+    line_count = len(content.splitlines()) if content else 0
 
-    # Count and report the total number of lines in the output file (stdout)
-    with out.open("r", encoding="utf-8") as fh:
-        line_count = sum(1 for _ in fh)
-    print(f"Total lines in output: {line_count}", file=sys.stdout)
+    if to_stdout:
+        sys.stdout.write(content)
+        sys.stdout.flush()
+        print(f"Total lines in output: {line_count}", file=sys.stderr)
+        target = "<stdout>"
+    else:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(content, encoding="utf-8")
+        print(f"Total lines in output: {line_count}", file=sys.stdout)
+        target = str(out)
 
     if tree_only:
-        print(f"Wrote tree only ({total} file(s)) to {out}", file=sys.stderr)
+        print(f"Wrote tree only ({total} file(s)) to {target}",
+              file=sys.stderr)
     else:
-        print(f"Wrote {total} file(s) to {out}", file=sys.stderr)
+        print(f"Wrote {total} file(s) to {target}", file=sys.stderr)
     return 0
 
 

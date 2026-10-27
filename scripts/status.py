@@ -35,8 +35,16 @@ def paint(enabled, code, text):
 
 
 def git(*args):
+    # Always disable color for captured output.  We colorize ourselves,
+    # and leftover ANSI codes in the raw diff would break the header and
+    # hunk-marker parsing below (e.g. if the user has color.ui=always).
     return subprocess.run(
-        ["git", "-c", "core.quotepath=false", *args],
+        ["git",
+         "-c", "core.quotepath=false",
+         "-c", "color.ui=never",
+         "-c", "color.diff=never",
+         "-c", "color.status=never",
+         *args],
         capture_output=True, text=True, check=False,
     ).stdout
 
@@ -59,10 +67,20 @@ def subject(*revs):
     return git("log", "-1", "--format=%s", *revs).strip()
 
 
+# Two-character statuses that denote unmerged paths during a merge/rebase.
+# These would otherwise map through their first letter and be reported as
+# "deleted" / "new file" / etc., which is wrong.
+_UNMERGED_CODES = {"DD", "AU", "UD", "UA", "DU", "AA", "UU"}
+
+
 def pretty_status(code):
+    """Map a `git diff --name-status` code to a human-readable word."""
+    if code in _UNMERGED_CODES:
+        return "unmerged"
+    first = code[0] if code else "M"
     return {"M": "modified", "D": "deleted", "A": "new file",
             "R": "renamed",  "C": "copied",  "T": "typechange",
-            "U": "unmerged"}.get(code[0], "modified")
+            "U": "unmerged"}.get(first, "modified")
 
 
 def unstaged_files():
@@ -85,9 +103,18 @@ SKIP_DIFF_HEADER = (
 
 
 def diff_bodies():
+    """Return one diff body per section, in the same order as
+    `git diff --name-status` (which is the order `unstaged_files()`
+    uses).
+
+    Combined diffs (`` diff --cc ``, produced for unmerged paths during
+    a merge or rebase) are included so that every file listed by
+    `--name-status` has a corresponding body slot; otherwise positional
+    matching in `render()` would silently drop trailing files.
+    """
     bodies, body, active = [], [], False
     for line in git("diff").splitlines():
-        if line.startswith("diff --git "):
+        if line.startswith("diff --git ") or line.startswith("diff --cc "):
             if active:
                 bodies.append("\n".join(body).rstrip("\n"))
             body, active = [], True
@@ -110,6 +137,8 @@ def colorize_body(body, enabled):
         return body
     out = []
     for line in body.splitlines():
+        # `@@@` is the combined-diff hunk marker; `@@` the normal one.
+        # `startswith("@@")` matches both.
         if line.startswith("@@"):
             out.append(paint(True, Ansi.CYAN,  line))
         elif line.startswith("+"):
@@ -128,8 +157,12 @@ def render(color):
     head = info.get("head", "HEAD")
     if head == "(detached)":
         sha = info.get("oid", "")[:12]
-        head_disp = paint(color, Ansi.BOLD, sha)
+        head_disp = paint(color, Ansi.BOLD, sha) if sha else head
         subj = subject(sha) if sha else ""
+    elif head == "(initial)":
+        # Empty repository: no commits yet, so nothing to describe.
+        head_disp = paint(color, Ansi.MAGENTA, "(initial)")
+        subj = ""
     else:
         head_disp = paint(color, Ansi.MAGENTA, head)
         subj = subject(head)
@@ -151,8 +184,14 @@ def render(color):
     bodies = diff_bodies()
     out.append(f"Unstaged changes ({len(files)})")
 
-    for (path, word), body in zip(files, bodies):
-        pad = " " * (10 - len(word))
+    # Position-based match is correct because both commands are driven
+    # by the same diff and see the same file set in the same order.  Be
+    # defensive anyway: if the counts ever diverge (e.g. some git config
+    # or a future git behavior changes things), show every file rather
+    # than silently truncating to the shorter side.
+    for i, (path, word) in enumerate(files):
+        body = bodies[i] if i < len(bodies) else ""
+        pad = " " * max(0, 10 - len(word))
         out.append(f"{paint(color, Ansi.YELLOW, word)}{pad} {path}")
         if body:
             out.append(colorize_body(body, color))
