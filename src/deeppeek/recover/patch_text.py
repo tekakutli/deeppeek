@@ -154,7 +154,18 @@ def _is_ellipsis_line(line):
         if stripped.endswith(suffix):
             stripped = stripped[:-len(suffix)].strip()
             break
-    return stripped in ("...", "\u2026")
+    if stripped in ("...", "\u2026"):
+        return True
+    # NEW: the AI's common idiom is `// ... rest unchanged` or
+    # `# ... (unchanged)`.  Treat any comment starting with `... ` as
+    # an ellipsis marker — the "rest unchanged" tail is exactly what
+    # the splice machinery is for.  A bare `...abc` (no space) is
+    # also accepted; `...12345` inside code is very rare and would
+    # only trigger the "already-in-base" no-op path, not a
+    # corruption.
+    if stripped.startswith("...") or stripped.startswith("\u2026"):
+        return True
+    return False
 
 
 def _has_ellipsis_marker(body):

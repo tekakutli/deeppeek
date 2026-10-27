@@ -14,11 +14,12 @@ loop calls for each patch.  It dispatches, in order:
   7. object-literal splices
   8. context inserts
   9. object-entry inserts
- 10. insert-before-anchor        (FIX 3)
- 11. insert-between-anchors      (FIX 3)
- 12. insert-after-anchor
- 13. AST anchor (optional dependency)
- 14. structural append
+ 10. insert-into-named-scope        (FIX 8)
+ 11. insert-before-anchor           (FIX 3)
+ 12. insert-between-anchors         (FIX 3)
+ 13. insert-after-anchor
+ 14. AST anchor (optional dependency)
+ 15. structural append
 
 IMPORT REPLACE
 ==============
@@ -35,6 +36,17 @@ finds the same-module import in base, and reindents the original
 body to match.  It intentionally ignores the "add"/"insert" prose
 blocklist that `_try_single_line_replace` respects — adding a name
 to an import list IS a replacement of the import statement.
+
+INSERT-INTO-NAMED-SCOPE (FIX 8)
+===============================
+An indented body whose prose names its containing class/function
+("In `handle_thing`, after X" / "add to `MyHandler`") has no
+self-declared scope and no anchor line, so it fell through every
+earlier heuristic and the structural-append fallback refused it
+(module-level `try:` / decorated method).  The new heuristic finds
+the named scope in base, optionally walks past the anchor inside
+it, and inserts at end-of-block.  See `patch_heuristics.
+_try_insert_into_named_scope`.
 
 BEFORE-ANCHOR AND BETWEEN-ANCHORS (FIX 3)
 =========================================
@@ -97,6 +109,7 @@ from .patch_heuristics import (
     _try_object_literal_splice, _try_raw_diff_patch,
     _try_structural_append, _delete_exact_block,
     _OBJECT_LITERAL_ASSIGNMENT_RE,
+    _try_insert_into_named_scope,
 )
 from .prose import _extract_scope_from_body
 
@@ -318,6 +331,15 @@ def _try_deterministic_patch_inner(base, patch, path=""):
         return inserted
 
     inserted = _try_object_entry_insert(base, raw_body, context_before)
+    if inserted is not None:
+        return inserted
+
+    # NEW: "In `SCOPE`, after X" / "add to `SCOPE`" — insert an
+    # indented body into a named class or function.  Runs before
+    # the anchor heuristics because the prose's scope binding is
+    # more specific than a bare "after `X`".
+    inserted = _try_insert_into_named_scope(
+        base, raw_body, context_before, path)
     if inserted is not None:
         return inserted
 

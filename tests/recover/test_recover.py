@@ -1754,6 +1754,75 @@ def test_38():
     check_apply("32_symbol_check_wrong_file", extra,
                 skip_file_compare=True, min_trust="MEDIUM")
 
+def test_40():
+    """Insert into named scope (Fix 8).
+
+    Two indented fragments, each with prose that names its container.
+    Fragment 1 (try/except) gets inserted into `handle_thing` after
+    the `payload.get` anchor.  Fragment 2 (@command method) gets
+    inserted into `MyHandler`.
+
+    Without `_try_insert_into_named_scope`:
+      · Fragment 1 falls through to structural-append → module-level
+        `try:` → sanity-rejected (inpaint_server.py failure shape).
+      · Fragment 2 falls through to structural-append → decorated
+        function outside class → ast.parse failure (comfyui.py
+        failure shape).
+    Both files fail closed; the target tree is preserved.
+    """
+
+    def extra(target, run):
+        decisions = run["manifest"].get("decisions", {})
+        dec = decisions.get("target.py", {})
+        assert dec, (
+            f"target.py missing from manifest decisions; "
+            f"decisions keys: {list(decisions)}")
+        assert dec.get("trust") == "HIGH", (
+            f"expected trust=HIGH, got {dec.get('trust')}; "
+            f"verification: {dec.get('verification')}, "
+            f"warnings: {dec.get('warnings')}")
+        assert dec.get("written") is True, (
+            f"expected written=True, got {dec.get('written')}")
+        assert len(dec.get("patch_failures", [])) == 0, (
+            f"expected no failed patches, got "
+            f"{dec.get('patch_failures')}")
+
+        content = (target / "target.py").read_text()
+
+        # Fragment 1: try/except inserted into handle_thing.
+        assert 'extra = float(payload.get("extra") or 0.0)' in content, (
+            f"try/except fragment missing:\n{content}")
+        new_try_pos = content.index("extra = float")
+        return_pos = content.index(
+            'return {"name": name, "timeout": timeout}')
+        assert new_try_pos < return_pos, (
+            f"new try/except placed AFTER return:\n{content}")
+
+        # Fragment 2: @command method inserted into MyHandler.
+        assert "def new_cmd(self, params):" in content, (
+            f"new method missing:\n{content}")
+        for name in ("existing_cmd", "new_cmd"):
+            ln = next(
+                (l for l in content.splitlines()
+                 if f"def {name}" in l), None)
+            assert ln is not None, f"def {name} missing:\n{content}"
+            assert ln.startswith("    "), (
+                f"{name} not at class-body indent: {ln!r}")
+            assert not ln.startswith("        "), (
+                f"{name} over-indented (inside another method?): {ln!r}")
+
+        existing_body_end = content.index('return {"ok": True}')
+        new_def_pos = content.index("def new_cmd")
+        assert new_def_pos > existing_body_end, (
+            f"new_cmd placed before existing_cmd body:\n{content}")
+
+        import ast as _ast
+        _ast.parse(content)
+
+    check_apply("40_insert_into_named_scope", extra,
+                skip_file_compare=True, min_trust="MEDIUM")
+
+
 def main():
 
     tests = [
@@ -1765,7 +1834,8 @@ def main():
         ("15", test_15), ("16", test_16), ("17", test_17), ("19", test_19), ("20", test_20), ("21", test_21),
         ("18", test_18), ("22", test_22), ("23", test_23), ("24", test_24), ("25", test_25), ("26", test_26), ("27", test_27), ("28", test_28), ("29", test_29), ("30", test_30), ("31", test_31), ("32", test_32), ("33", test_33),
         ("34", test_34), ("35", test_35), ("36", test_36),
-        ("37", test_37), ("38", test_38)]
+        ("37", test_37), ("38", test_38),
+        ("40", test_40)]
     failed = 0
     for name, fn in tests:
         try:

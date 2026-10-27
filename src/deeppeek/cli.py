@@ -7,6 +7,7 @@ from .commands import (
     capture as capture_cmd,
     conversation as conversation_cmd,
     recover as recover_cmd,
+    restore as restore_cmd,
     extension as extension_cmd,
     diagnose as diagnose_cmd,
     pipe as pipe_cmd,
@@ -30,6 +31,7 @@ def _build_root_parser() -> argparse.ArgumentParser:
     capture_cmd.register(sub)
     conversation_cmd.register(sub)
     recover_cmd.register(sub)
+    restore_cmd.register(sub)
     pipe_cmd.register(sub)
     type_cmd.register(sub)
     enter_cmd.register(sub)
@@ -47,6 +49,7 @@ _DISPATCH = {
     "capture": capture_cmd.run,
     "conversation": conversation_cmd.run,
     "recover": recover_cmd.run,
+    "restore": restore_cmd.run,
     "pipe": pipe_cmd.run,
     "type": type_cmd.run,
     "enter": enter_cmd.run,

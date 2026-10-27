@@ -10,6 +10,17 @@ an in-place apply against an existing directory: recovered files go
 directly into apply_to, files marked [DEL] are deleted from it, and
 all reports are written into `apply_to/deeppeek/`.
 
+LAST-CONVERSATION SAVE
+======================
+When the input came from a file (cfg.dump_path is not None), the
+dump text is saved to `<cwd>/.deeppeek/last.md` before recovery
+begins, so `deeppeek restore` can copy it back later.  The
+`.deeppeek/` directory is self-gitignored (it contains its own
+`.gitignore` with `*`).  Only the most recent dump is kept — each
+run overwrites the previous one.  In-memory inputs (`capture`
+without `-o`) do not trigger the save: there is nothing on disk to
+round-trip.  See `recover/last_conversation.py`.
+
 ROBUSTNESS: PER-PASS EXCEPTION BOUNDARIES
 =========================================
 Every pass from 2.5 onward runs inside `_run_pass`, which catches
@@ -348,6 +359,22 @@ def run(cfg: RecoverConfig) -> int:
     except SystemExit as e:
         print(str(e), file=sys.stderr)
         return 3
+
+    # Save the input dump for `deeppeek restore`.  Only file inputs
+    # trigger this — an in-memory `capture` has no on-disk dump to
+    # round-trip.  Overwrites each run; the directory is
+    # self-gitignored via `.deeppeek/.gitignore`.  Failure is
+    # non-fatal: saving is a convenience, not a pipeline step.
+    if cfg.dump_path is not None:
+        try:
+            from .last_conversation import save_last
+            _saved = save_last(dump_text)
+            if cfg.verbose:
+                print(f"[last] saved conversation to {_saved}",
+                      file=sys.stderr)
+        except Exception as _e:
+            print(f"  [!] could not save last conversation: {_e}",
+                  file=sys.stderr)
 
     err = _validate_apply_to(cfg)
     if err is not None:
