@@ -75,6 +75,7 @@ from .patch_text import (
     _has_ellipsis_marker, _split_at_ellipsis,
     _find_matching_brace, _reindent_body, _insert_lines_in_inner,
     _body_starts_with_comment, _find_leading_comment_start,
+    _first_identifier,
 )
 
 
@@ -333,6 +334,192 @@ def _looks_like_scope_close(line):
 
 
 # ===========================================================================
+#  Prefix-modification helpers (Fix 9)
+# ===========================================================================
+#
+# A body of the form:
+#
+#     export function foo() {
+#       ... context lines ...
+#       <new lines replacing an existing line>
+#       // ... rest unchanged
+#     }
+#
+# is a PREFIX MODIFICATION: one existing line is replaced by a run of
+# new lines, and the rest of the scope body is preserved verbatim.
+# Pure-insert semantics would duplicate the existing line (or place
+# the new lines at the wrong position).  The motivating shape:
+# `computeMaskBBox` in pg_pixels.py replaces one
+# `const W = ... , H = ...;` with two separate `const W = ...;` /
+# `const H = ...;` declarations, marked with `// ... rest unchanged`.
+#
+# The semantics below are deliberately narrow:
+#   · context lines must appear verbatim in base;
+#   · a run of NEW lines replaces exactly ONE base line, matched by
+#     the run's first line's first non-keyword identifier within a
+#     small window of base positions;
+#   · a single-line run is INSERT, not REPLACE — the caller falls
+#     back to pure-insert semantics (this is what makes the
+#     pg_view_inpaint.py "add an early-out guard" shape work);
+#   · if the identifier match fails, prefix-mod returns None and the
+#     caller falls back to pure-insert;
+#   · comment-only suffix is documentation (dropped).
+
+def _is_comment_only(lines):
+    """True iff every non-blank line in `lines` is a comment."""
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+        if not (s.startswith("//") or s.startswith("#")
+                or s.startswith("/*") or s.endswith("*/")
+                or s.startswith("*")):
+            return False
+    return True
+
+
+def _nearest_ident_line(base_stripped, base_pos, target_ident,
+                        search_ahead=3):
+    """Find a base line at position >= base_pos whose first
+    non-keyword identifier matches `target_ident`, within
+    `search_ahead` non-blank lines.
+
+    Blank lines are skipped without consuming the search budget, so
+    a single blank separator between context and the replaced line
+    does not eat the window.  Returns the line index, or None.
+    """
+    checked = 0
+    for j in range(base_pos, len(base_stripped)):
+        line = base_stripped[j]
+        if not line:
+            continue
+        checked += 1
+        if checked > search_ahead:
+            return None
+        if _first_identifier(line) == target_ident:
+            return j
+    return None
+
+
+def _try_prefix_modification(inner_prefix, base_scope_inner):
+    """Splice `inner_prefix` into `base_scope_inner` under
+    prefix-modification semantics.
+
+    `inner_prefix` is a mix of context lines (present verbatim in
+    base) and one-or-more runs of NEW lines.  Each run REPLACES one
+    corresponding base line rather than being inserted next to it.
+    The match is: the run's FIRST line has the same first
+    non-keyword identifier as the base line being replaced, located
+    within `_nearest_ident_line`'s search window from the current
+    base position.
+
+    Fires only when a run has >= 2 lines.  A single-line run is an
+    INSERT (a new statement before an existing one), not a
+    replacement; the pure-insert path handles that correctly.  The
+    fixture 18 shape (pg_view_inpaint.py: `if (board.fullCanvas)
+    return;` inserted before `if (!board.imageEl) return;`) is a
+    single-line run and must not fire prefix-mod.
+
+    Returns the spliced scope text, or None if the shape doesn't
+    fit prefix-mod (caller should fall back to insert semantics).
+    """
+    if not inner_prefix:
+        return None
+
+    base_lines = base_scope_inner.split("\n")
+    base_stripped = [ln.strip() for ln in base_lines]
+
+    result = []
+    base_pos = 0
+    i = 0
+    saw_new_run = False
+
+    while i < len(inner_prefix):
+        ln = inner_prefix[i]
+        stripped = ln.strip()
+        if not stripped:
+            # Blank line: if the next base line is also blank,
+            # consume it from base (preserving base's whitespace).
+            # Otherwise emit the inner blank standalone.
+            if base_pos < len(base_stripped) and not base_stripped[base_pos]:
+                result.append(base_lines[base_pos])
+                base_pos += 1
+            else:
+                result.append(ln)
+            i += 1
+            continue
+
+        # Context line: present verbatim in base from base_pos onward.
+        try:
+            match_idx = base_stripped.index(stripped, base_pos)
+        except ValueError:
+            match_idx = -1
+
+        if match_idx >= 0:
+            result.extend(base_lines[base_pos:match_idx + 1])
+            base_pos = match_idx + 1
+            i += 1
+            continue
+
+        # NEW run starting at i.  Collect consecutive lines that
+        # are NOT verbatim in base (skipping over blanks that
+        # belong to the run itself).
+        run_lines = []
+        while i < len(inner_prefix):
+            curr = inner_prefix[i]
+            curr_stripped = curr.strip()
+            if curr_stripped and curr_stripped in base_stripped:
+                break
+            run_lines.append(curr)
+            i += 1
+
+        if not run_lines:
+            return None  # shouldn't happen; guard
+
+        # Locate the base line this run replaces.  Must match on
+        # the FIRST line's identifier and be within a few lines of
+        # base_pos.  If no match, this run is a pure insert, not a
+        # modification — refuse and let the caller try insert
+        # semantics.
+        first_run_stripped = run_lines[0].strip()
+        target_ident = _first_identifier(first_run_stripped)
+        if not target_ident:
+            return None
+        replace_at = _nearest_ident_line(
+            base_stripped, base_pos, target_ident)
+        if replace_at is None:
+            return None
+
+        # Discriminate prefix-modification from pure-insert.  A
+        # run of one new line is an INSERT (a new statement before
+        # an existing one); prefix-modification replaces one base
+        # line with a MULTI-LINE run.  The pg_view_inpaint.py shape
+        # (`if (board.inpaintFullCanvas) return;` inserted before
+        # `if (!board.imageEl) return;`) is one new line and MUST
+        # NOT fire prefix-mod — pure-insert handles it correctly.
+        # The computeMaskBBox shape (2 new `const W` / `const H`
+        # declarations replacing 1 combined `const W = ..., H =
+        # ...;` line) is the multi-line shape prefix-mod exists
+        # for.
+        if len(run_lines) < 2:
+            return None
+
+        # Preserve any base lines strictly between base_pos and
+        # replace_at (blank separators, comments).
+        result.extend(base_lines[base_pos:replace_at])
+        result.extend(run_lines)
+        base_pos = replace_at + 1
+        saw_new_run = True
+
+    result.extend(base_lines[base_pos:])
+
+    if not saw_new_run:
+        return None  # no modification found; not prefix-mod
+
+    return "\n".join(result)
+
+
+# ===========================================================================
 #  Ellipsis splice
 # ===========================================================================
 
@@ -360,6 +547,22 @@ def _try_ellipsis_splice(base, body, context_before=""):
         inner_suffix = suffix_lines
 
     base_scope_inner = base[body_open:body_close]
+
+    # NEW: prefix-modification semantics.  Fires before pure-insert.
+    # Handles "replace line X with lines Y,Z; rest unchanged" — a
+    # shape pure-insert cannot express (insert would duplicate X).
+    modified = _try_prefix_modification(inner_prefix, base_scope_inner)
+    if modified is not None:
+        if modified == base_scope_inner:
+            return base
+        return base[:body_open] + modified + base[body_close:]
+
+    # Comment-only suffix is documentation (the AI's explanation of
+    # what was elided), not code to insert.  Ignore it.
+    if _is_comment_only(inner_suffix):
+        inner_suffix = []
+
+    # Fall back to pure-insert semantics.
     base_stripped_set = {
         ln.strip() for ln in base_scope_inner.splitlines() if ln.strip()
     }

@@ -1823,6 +1823,70 @@ def test_40():
                 skip_file_compare=True, min_trust="MEDIUM")
 
 
+def test_41():
+    """Prefix modification via ellipsis.
+
+    Exercises `_try_prefix_modification` inside `_try_ellipsis_splice`.
+    The body replaces ONE existing line (`const W = m.img.width, H =
+    m.img.height;`) with TWO new declarations, marked with a
+    comment-wrapped ellipsis (`// ... rest unchanged`).
+
+    Distinguishing property: pure-insert would DUPLICATE the existing
+    line, producing two `const W =` declarations in the same scope.
+    Prefix-mod must replace it in place.
+    """
+
+    def extra(target, run):
+        dec = run["manifest"].get("decisions", {}).get("compute.js", {})
+        assert dec, (
+            "compute.js missing from manifest decisions; "
+            "decisions keys: " + repr(list(run["manifest"].get("decisions", {}))))
+        assert dec.get("trust") == "HIGH", (
+            "expected trust=HIGH, got " + repr(dec.get("trust")) +
+            "; verification: " + repr(dec.get("verification")) +
+            ", warnings: " + repr(dec.get("warnings")))
+        assert dec.get("written") is True, (
+            "expected written=True, got " + repr(dec.get("written")))
+        assert len(dec.get("patch_failures", [])) == 0, (
+            "expected no failed patches, got " +
+            repr(dec.get("patch_failures")))
+
+        content = (target / "compute.js").read_text()
+
+        # New declarations present.
+        assert "const W = m.rotatedCanvas ? m.rotatedW : m.w;" in content, (
+            "new W declaration missing:\n" + content)
+        assert "const H = m.rotatedCanvas ? m.rotatedH : m.h;" in content, (
+            "new H declaration missing:\n" + content)
+
+        # Original line replaced, not duplicated.
+        assert "const W = m.img.width" not in content, (
+            "original base line not replaced (duplicate decl bug):\n"
+            + content)
+        assert content.count("const W =") == 1, (
+            "expected exactly 1 'const W =' (no duplicate), got "
+            + str(content.count("const W =")) + ":\n" + content)
+        assert content.count("const H =") == 1, (
+            "expected exactly 1 'const H =' (no duplicate), got "
+            + str(content.count("const H =")) + ":\n" + content)
+
+        # Base tail preserved verbatim.
+        assert "let minX = W, minY = H, maxX = -1, maxY = -1;" in content, (
+            "base tail (let minX...) lost:\n" + content)
+        assert ("return {x: minX, y: minY, w: maxX - minX + 1, "
+                "h: maxY - minY + 1};") in content, (
+            "return statement lost:\n" + content)
+
+        # Structural integrity.
+        assert content.count("{") == content.count("}"), (
+            "unbalanced braces:\n" + content)
+        assert content.count("(") == content.count(")"), (
+            "unbalanced parens:\n" + content)
+
+    check_apply("41_prefix_modification", extra,
+                skip_file_compare=True, min_trust="MEDIUM")
+
+
 def main():
 
     tests = [
@@ -1835,7 +1899,7 @@ def main():
         ("18", test_18), ("22", test_22), ("23", test_23), ("24", test_24), ("25", test_25), ("26", test_26), ("27", test_27), ("28", test_28), ("29", test_29), ("30", test_30), ("31", test_31), ("32", test_32), ("33", test_33),
         ("34", test_34), ("35", test_35), ("36", test_36),
         ("37", test_37), ("38", test_38),
-        ("40", test_40)]
+        ("40", test_40), ("41", test_41)]
     failed = 0
     for name, fn in tests:
         try:

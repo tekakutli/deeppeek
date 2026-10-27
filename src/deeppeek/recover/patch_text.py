@@ -156,15 +156,17 @@ def _is_ellipsis_line(line):
             break
     if stripped in ("...", "\u2026"):
         return True
-    # NEW: the AI's common idiom is `// ... rest unchanged` or
-    # `# ... (unchanged)`.  Treat any comment starting with `... ` as
-    # an ellipsis marker — the "rest unchanged" tail is exactly what
-    # the splice machinery is for.  A bare `...abc` (no space) is
-    # also accepted; `...12345` inside code is very rare and would
-    # only trigger the "already-in-base" no-op path, not a
-    # corruption.
-    if stripped.startswith("...") or stripped.startswith("\u2026"):
-        return True
+    # Comment-wrapped ellipsis with trailing explanation:
+    #   `// ... rest unchanged`, `# ... (unchanged)`, `... foo`.
+    # Only accepted when the trailing text starts with a letter
+    # (prose) — `...(args)` (JS spread), `...abc` bare-token form,
+    # `...123`, etc. would be real code, not a marker.
+    if stripped.startswith("..."):
+        after = stripped[3:].lstrip()
+        return (not after) or after[0].isalpha()
+    if stripped.startswith("\u2026"):
+        after = stripped[1:].lstrip()
+        return (not after) or after[0].isalpha()
     return False
 
 

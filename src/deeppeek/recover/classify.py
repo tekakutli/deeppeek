@@ -261,8 +261,23 @@ def _classify_one_heuristic(b: Block) -> None:
         b.confidence = 0.95
         return
 
+    # Final catch-all.  A `full` print ALWAYS starts at column 0;
+    # an indented first line means this is a fragment (a method body,
+    # a class-inner fragment, etc.), not a module.  Without this
+    # check, an indented 100-line method body lands here as `full`
+    # and the sanity gate later rejects it with "SyntaxError at
+    # line 1: unexpected indent" — which reads as "bad content"
+    # rather than "misrouted fragment".  Classifying it as `partial`
+    # routes it through the insert paths (`_try_insert_into_named_
+    # scope` when a target class/function exists, `PARTIAL_ONLY`
+    # otherwise) so the failure diagnostic names the actual
+    # structural problem.
     b.is_code_file = True
-    b.kind = "full"
+    first_line = next((ln for ln in b.body.splitlines() if ln.strip()), "")
+    if first_line and first_line[0] in (" ", "\t"):
+        b.kind = "partial"
+    else:
+        b.kind = "full"
     b.confidence = 0.85
 
 
