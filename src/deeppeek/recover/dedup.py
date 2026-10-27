@@ -263,17 +263,38 @@ def _already_in_other_file(block: Block,
                            records: dict,
                            blocks_by_idx: dict) -> Optional[str]:
     """Return the path of another record whose base contains the
-    block's body verbatim, or None.
+    block's body, or None.
 
-    Used to catch prose attribution that happened to match a filename
-    in the prose but landed on the wrong target.  The fragment is
-    already in a DIFFERENT pre-existing file — it's a reference, not
-    a new insertion.
+    Two match modes:
+
+      · Exact substring — the block's body is contiguous in the
+        other file's base.  This is the original behaviour.
+
+      · Fuzzy line match — at least 85% of the block's lines are
+        present in the other file's base (exact or token-
+        equivalent).  This catches inline fragments of longer
+        functions: block 86 in the inpaint conversation is
+        `_clearImageAction`'s prefix (six lines, closed by a bare
+        `}`), while the base it references in `pg_panel_bindings.py`
+        is those same six lines followed by
+        `import("./pg_dispatch.js").then(...)` and a different `}`
+        line.  Exact substring fails because the closing brace is
+        not contiguous; per-line fuzzy succeeds.
+
+    Threshold 0.85 is deliberately conservative.  A block whose
+    content is fully shadowed by another file's base is very
+    unlikely to be a legitimate edit of the current file — the
+    prose attribution guessed wrong.  Failing closed here costs
+    one manual copy; a false negative (applying the block anyway)
+    corrupts the wrong file, whose content then diverges from the
+    intended shape.
 
     Only checks *preexisting* records: a block that IS the base of
     the current file is already handled by the chosen-full filter
     in `pass5_deduplicate`.
     """
+    from .patch_text import _content_present_in_base
+
     body = block.body.strip()
     if not body or len(body) < 20:
         return None
@@ -288,6 +309,9 @@ def _already_in_other_file(block: Block,
         if other_base is None:
             continue
         if body in other_base.body:
+            return other_path
+        if _content_present_in_base(other_base.body, body,
+                                    threshold=0.85):
             return other_path
     return None
 

@@ -34,6 +34,35 @@ an oversight.
 catches a crash and prints a message, so a bug in the writer never
 produces a silent no-op.
 
+CROSS-VALIDATE TRUST DEMOTION (FIX 2)
+=====================================
+Pass 7 (Python imports/exports) and pass 7.5 (JS imports/exports)
+both emit problems into `run.cross_validate.problems`.  Historically
+those findings were informational: they set the exit code and
+appeared in the manifest, but the affected records were still
+written at their original trust.  That is how a broken
+`pg_state.py` (declared `_rotateMask` but didn't export it, while
+`pg_masks.py` imported it) got written at HIGH trust and blanked
+the playground on load.
+
+Pass 7.6 (`pass7_6_demote_on_missing_export`) turns the specific
+`missing_js_export` finding into a fail-closed signal: when the
+target declares the symbol but does not export it, both the target
+and the importer are demoted to LOW.  Under default
+`--min-trust MEDIUM` neither is written; the target tree is
+preserved and `warnings.txt` tells the user exactly which `export`
+is missing.
+
+Pass 7.6 does NOT do transitive demotion (an importer of a demoted
+target is not automatically demoted).  The reasoning: the user can
+fix `pg_state.py` from `low_trust/`, and the next run applies the
+importers against the fixed state.  A transitive rule would also
+have to reason about `--min-trust` transitions and would fail-close
+files that are independently correct.  If the user finds they want
+transitive demotion, the right place to add it is here — after
+pass 7.6, walk `records` and demote any record whose JS imports
+resolve to a demoted target.
+
 CRASH REPORTING
 ===============
 A crashed pass reports:
@@ -50,6 +79,8 @@ The safe defaults per pass:
     pass 5     → (no-op; records keep whatever state pass 3 gave them)
     pass 6     → records keep base content (no patches applied)
     pass 7     → {"exports": {}, "imports": {}, "problems": []}
+    pass 7.5   → [] (no JS problems)
+    pass 7.6   → 0 (no demotions)
     pass 8     → (no-op; no per-file verification)
     pass 8.5   → (no-op; no symbol demotions)
 
@@ -79,8 +110,11 @@ from .dedup import pass5_deduplicate
 from .apply_patches import pass6_apply_patches
 from .validate import (
     pass7_cross_validate, pass7_5_js_validate,
+    pass7_6_demote_on_missing_export,
+    pass7_7_repair_js_imports,
     pass8_verify, pass8_5_check_symbols,
 )
+from .reconcile import pass8_7_reconcile
 from .write import pass9_write
 
 
@@ -496,6 +530,41 @@ def run(cfg: RecoverConfig) -> int:
     else:
         print("  clean")
 
+    # ---- pass 7.7 (wrapped) — repair JS export findings ----
+    if js_problems:
+        _repaired, _remaining = _run_pass(
+            "7.7 (repair)", pass7_7_repair_js_imports,
+            ([], js_problems),
+            run_errors, records, js_problems, cfg.trace,
+        ) or ([], js_problems)
+        if _repaired:
+            _repaired_probs = {id(r["problem"]) for r in _repaired}
+            cross_validate["problems"] = [
+                p for p in cross_validate.get("problems", [])
+                if id(p) not in _repaired_probs
+            ]
+            cross_validate["repaired"] = [
+                {"problem": r["problem"], "repair": r["repair"],
+                 "target": r["target"]} for r in _repaired
+            ]
+            for r in _repaired:
+                print(f"    [repair] {r['target']}: {r['repair']}",
+                      file=sys.stderr)
+            js_problems = _remaining
+            print(f"  {len(_repaired)} JS problem(s) auto-repaired",
+                  file=sys.stderr)
+
+    # ---- pass 7.6 (wrapped) — FIX 2 ----
+    if js_problems:
+        n_export_demoted = _run_pass(
+            "7.6 (missing-export)",
+            pass7_6_demote_on_missing_export, 0,
+            run_errors, records, js_problems, cfg.trace,
+        ) or 0
+        if n_export_demoted:
+            print(f"  {n_export_demoted} record(s) demoted to LOW "
+                  f"for missing JS export(s)", file=sys.stderr)
+
     # ---- pass 8 (wrapped) ----
     print("[pass 8] verifying...")
     _run_pass_no_return(
@@ -509,6 +578,17 @@ def run(cfg: RecoverConfig) -> int:
         "8.5 (symbols)", pass8_5_check_symbols, run_errors,
         records, blocks_by_idx=blocks_by_idx,
     )
+
+    # ---- pass 8.7 (wrapped) — reconciliation ----
+    print("[pass 8.7] reconciling fail-closed records...")
+    n_reconciled = _run_pass(
+        "8.7 (reconcile)", pass8_7_reconcile, 0,
+        run_errors, records, blocks_by_idx, cfg.trace,
+    ) or 0
+    if n_reconciled:
+        print(f"  {n_reconciled} record(s) reconciled "
+              f"(excluded misattributed/unplaceable items)",
+              file=sys.stderr)
 
     # ---- cross-file duplicate detection (wrapped) ----
     from .cross_file import find_cross_file_duplicates

@@ -14,6 +14,12 @@ The `.py` file itself parses fine.  Pass 7.5 catches this by
 extracting the JS exports from the target's string literal and
 checking every imported name against them.
 
+Pass 7.6 (FIX 2) DEMOTES the involved records to LOW trust.
+Previously, cross-validation findings were informational only:
+they were recorded in `cross_validate.problems` and set the exit
+code, but the files involved were still written to the target at
+their original trust level.  See `pass7_6_demote_on_missing_export`.
+
 Pass 8 verifies ast.parse for .py files and checks that patches took
 effect.
 
@@ -232,6 +238,252 @@ def pass7_5_js_validate(records: dict) -> list:
 
     return problems
 
+# ---------------------------------------------------------------------------
+# Pass 7.6 — demote on missing JS export (FIX 2)
+# ---------------------------------------------------------------------------
+#
+# Cross-validation findings are trust signals, not just
+# informational.  A `missing_js_export` finding means an importer
+# will throw ReferenceError at module load time; if the target file
+# *declares but does not export* the missing name, the whole
+# ecosystem is broken (the playground will blank).  Both sides must
+# fail-closed so the target tree is preserved and the user can fix
+# the export manually.
+#
+# The specific failure (pg_state.py `_rotateMask`):
+#
+#   · pg_masks.py imports `_rotateMask` from `./pg_state.js`.
+#   · pg_state.py's STATE_JS declares `function _rotateMask(...)`
+#     but does NOT prefix it with `export`.
+#   · pass7_5_js_validate correctly emits:
+#       {"type": "missing_js_export", "from": "pg_masks.py",
+#        "target": "pg_state.py", "name": "_rotateMask"}
+#   · write.py still wrote pg_state.py at HIGH trust.
+#   · The playground blanks on module load.
+#
+# Pass 7.6 fixes this by demoting both records to LOW when the
+# declaration exists but the export does not.  When the declaration
+# does not exist either (a genuine "the whole module wasn't
+# recovered" case), pass 7.5's `missing_js_module` / pass 7's
+# `missing_module` already handles it; the target file is not
+# written because the record state is MISSING/PARTIAL_ONLY.
+
+_JS_DECL_RE_FOR_MISSING_EXPORT = re.compile(
+    r'\b(?:function|class|const|let|var)\s+([A-Za-z_$][\w$]*)'
+)
+
+
+def _js_target_declares_but_does_not_export(
+        target_rec: FileRecord, name: str) -> bool:
+    """True iff `target_rec.content` declares `name` but does not
+    export it.  Uses the same JS-extraction path as symbols.py so
+    embedded string literals are handled identically.
+    """
+    from .symbols import (
+        _is_js_lang, _extract_dominant_js_string, _extract_js_exports,
+    )
+    if target_rec.content is None:
+        return False
+    js = None
+    if _is_js_lang(target_rec.path):
+        js = target_rec.content
+    elif target_rec.path.endswith(".py"):
+        js = _extract_dominant_js_string(target_rec.content)
+    if js is None:
+        return False
+    exports = _extract_js_exports(js)
+    if name in exports:
+        return False
+    for m in _JS_DECL_RE_FOR_MISSING_EXPORT.finditer(js):
+        if m.group(1) == name:
+            return True
+    return False
+
+
+def pass7_6_demote_on_missing_export(
+        records: dict,
+        js_problems: list,
+        verbose: bool = False) -> int:
+    """Demote records that participate in a `missing_js_export`
+    finding where the target DECLARES the missing name but doesn't
+    export it.
+
+    Returns the number of records demoted (may be 0).
+
+    Both the importer and the target are demoted: the importer will
+    throw at module load; the target needs its `export` fixed.  If
+    the target does not actually declare the name, this is a
+    "missing module" case, handled elsewhere — do not demote here,
+    the record is likely MISSING or PARTIAL_ONLY already.
+    """
+    n_demoted = 0
+    for prob in js_problems:
+        if prob.get("type") != "missing_js_export":
+            continue
+        from_path = prob["from"]
+        target_path = prob["target"]
+        name = prob["name"]
+
+        if target_path not in records:
+            continue
+        target_rec = records[target_path]
+        if not _js_target_declares_but_does_not_export(
+                target_rec, name):
+            continue
+
+        # Demote the target: the export is missing, so anything that
+        # imports the name will break.  Fail-closed.
+        if target_rec.trust != "LOW":
+            target_rec.trust = "LOW"
+            target_rec.verification["missing_export"] = name
+            target_rec.warnings.append(
+                f"missing_js_export: {name!r} is declared in this "
+                f"file but not exported; imported by {from_path}")
+            n_demoted += 1
+            if verbose:
+                print(f"  [pass 7.6] {target_path}: missing export "
+                      f"{name!r} (imported by {from_path}); "
+                      f"demoted to LOW", file=sys.stderr)
+
+        # Demote the importer: at module load, the import will
+        # throw.  Fail-closed.
+        if from_path in records:
+            from_rec = records[from_path]
+            if from_rec.trust != "LOW":
+                from_rec.trust = "LOW"
+                from_rec.verification.setdefault(
+                    "missing_export_deps", []).append(
+                        {"module": target_path, "name": name})
+                from_rec.warnings.append(
+                    f"missing_js_export: imports {name!r} from "
+                    f"{target_path} but the export is not present "
+                    f"(declared but not exported)")
+                n_demoted += 1
+                if verbose:
+                    print(f"  [pass 7.6] {from_path}: missing "
+                          f"import {name!r} from {target_path}; "
+                          f"demoted to LOW", file=sys.stderr)
+
+    return n_demoted
+
+# ---------------------------------------------------------------------------
+# Pass 7.7 — repair JS export findings (FIX)
+# ---------------------------------------------------------------------------
+#
+# `pass7_6_demote_on_missing_export` is the *fallback*: it demotes both
+# sides of a missing-export finding so the target file isn't written
+# broken.  But in the common case the repair is trivial — the target
+# declares the symbol; only the `export` keyword is missing.  Adding
+# `export` is strictly more permissive; it cannot break a consumer.
+#
+# Pass 7.7 runs *before* pass 7.6.  If repair succeeds, the problem is
+# removed from the list and pass 7.6 never sees it.
+#
+# Only `missing_js_export` is repaired.  `missing_js_import` /
+# `missing_js_module` are left as findings: the import path or export
+# source cannot be synthesized from the finding alone, and getting it
+# wrong introduces a different kind of breakage.
+
+def _repair_missing_export(rec, name, verbose=False):
+    """Add `export ` before the declaration of `name` in rec.content.
+    Returns True if the repair succeeded and re-validates."""
+    from .validate_output import validate_content
+    from .symbols import (
+        _is_js_lang, _extract_dominant_js_string, _extract_js_exports,
+    )
+
+    content = rec.content
+    if content is None:
+        return False
+
+    pattern = re.compile(
+        r'^([ \t]*)((?:async\s+)?(?:function|class|const|let|var)\s+'
+        + re.escape(name) + r'\b)',
+        re.MULTILINE,
+    )
+    m = pattern.search(content)
+    if m is None:
+        if verbose:
+            print(f"  [repair] {rec.path}: no declaration of "
+                  f"{name!r} found", file=sys.stderr)
+        return False
+
+    line_start = content.rfind("\n", 0, m.start()) + 1
+    prefix_on_line = content[line_start:m.start(2)]
+    if re.search(r'\bexport\b', prefix_on_line):
+        return False  # already exported
+
+    insert_at = m.start(2)
+    repaired = content[:insert_at] + "export " + content[insert_at:]
+
+    err = validate_content(repaired, rec.path)
+    if err is not None:
+        if verbose:
+            print(f"  [repair] {rec.path}: adding `export` before "
+                  f"{name!r} broke validation: {err}", file=sys.stderr)
+        return False
+
+    # Verify the export actually took effect on the JS side.
+    if _is_js_lang(rec.path):
+        js = repaired
+    elif rec.path.endswith(".py"):
+        js = _extract_dominant_js_string(repaired)
+    else:
+        js = None
+    if js is None or name not in _extract_js_exports(js):
+        if verbose:
+            print(f"  [repair] {rec.path}: regex matched but "
+                  f"{name!r} still not exported", file=sys.stderr)
+        return False
+
+    rec.content = repaired
+    rec.warnings.append(
+        f"auto-repaired: added `export` before {name!r} "
+        f"declaration (imported by another file)")
+    if verbose:
+        print(f"  [repair] {rec.path}: added `export` before {name!r}",
+              file=sys.stderr)
+    return True
+
+
+def pass7_7_repair_js_imports(records, js_problems, verbose=False):
+    """Attempt to repair `missing_js_export` findings by adding
+    `export` to the target's declaration.  Returns
+    `(repaired, remaining)` where `repaired` is a list of
+    `{problem, repair, target}` dicts and `remaining` is the list of
+    problems that could not be repaired."""
+    repaired = []
+    remaining = []
+    repaired_set = set()  # (target_path, name)
+    for prob in js_problems:
+        if prob.get("type") != "missing_js_export":
+            remaining.append(prob)
+            continue
+        target = prob.get("target")
+        name = prob.get("name")
+        key = (target, name)
+        if key in repaired_set:
+            # Same problem, different importer.  Already repaired.
+            repaired.append({
+                "problem": prob,
+                "repair": f"added `export` before {name!r}",
+                "target": target,
+            })
+            continue
+        target_rec = records.get(target)
+        if target_rec is None:
+            remaining.append(prob)
+            continue
+        if _repair_missing_export(target_rec, name, verbose):
+            repaired_set.add(key)
+            repaired.append({
+                "problem": prob,
+                "repair": f"added `export` before {name!r}",
+                "target": target,
+            })
+        else:
+            remaining.append(prob)
+    return repaired, remaining
 
 def _resolve_js_module(module: str, from_path: str,
                        records: dict) -> Optional[str]:

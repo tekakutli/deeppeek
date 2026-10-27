@@ -17,6 +17,12 @@ The heuristics, in dispatch order:
   _try_context_insert           2–30 lines, unique first-or-last-line
                                 anchor
   _try_object_entry_insert      2–5 lines of `key: value,` entries
+  _try_insert_before_anchor     body inserted BEFORE a unique line /
+                                identifier named by "before `X`"
+                                prose (FIX 3)
+  _try_insert_between_anchors   body inserted between two named blocks
+                                ("between the `Image` and `Masks`
+                                `<details>` blocks") (FIX 3)
   _try_insert_after_anchor      body inserted after a unique line /
                                 call / identifier-block matching a
                                 backtick phrase in prose
@@ -57,6 +63,57 @@ rules apply:
     anchor is itself a comma-continuation* — the container context
     is preserved by the anchor line.  `_context_insert_ok` encodes
     this: complete statement OR anchor ends with `,`.
+
+HTML COMPLETENESS (Fix 3)
+=========================
+`_body_is_complete_at_boundary` also accepts HTML closing tags as
+statements.  A block ending with `</details>`, `</summary>`,
+`</div>`, etc. is structurally complete — it closes the tag it
+opened.  The between-anchors heuristic (which lands new
+`<details>` blocks) and the before-anchor heuristic (which can
+land any complete body) both need to accept it.  Without the HTML
+branch, a body ending in `</details>` was refused as incomplete,
+so the pg_base.py `View` block could never be placed between the
+`Image` and `Masks` blocks.
+
+ANCHOR-LINE SAFETY
+==================
+Inserting AFTER a line that opens an unclosed block (`{`, `(`,
+`[`) lands the body *inside* that block.  `_anchor_line_is_safe`
+refuses such anchors.  The pg_panel_scrubs.py failure case: the
+only anchor available for the `viewRotation` field was
+`pgkitRegisterField("status.running", {` — an object-literal
+opener.  Inserting after it would put the new field inside the
+`status.running` registration.  The safe answer is `None`; the
+before-anchor heuristic (which needs no such safety gate) is what
+should place this body.
+
+MULTI-OCCURRENCE ANCHORS (Fix 5)
+================================
+An anchor identifier may appear more than once — most commonly,
+once in a docstring (prose describing the identifier) and once in
+the actual code.  The pg_panel_scrubs.py failure case: the prose
+says "before the `status.running` field"; `status.running` appears
+once in the module docstring (`\`status.running\` is a read-only
+boolean registered at the bottom,`) and once in the registration
+(`pgkitRegisterField("status.running", {`).  The original
+`if base.count(anchor_text) != 1: continue` guard rejected the
+anchor entirely.
+
+`_try_insert_before_anchor` now collects ALL occurrences and tries
+them right-to-left (bottom-of-file first — the most likely
+intended code location for "before the X field").  For each
+occurrence, it skips:
+
+  · lines that are just a closer (`}`, `];`, etc.) — inserting
+    before them would land inside the block that just closed, and
+  · lines with no strong code signal (no `=`, `(`, `{`, `[`, or
+    `;` on the line) — those are typically prose/docstring
+    mentions, not usable code anchors.
+
+This is fail-closed: if no occurrence passes both checks, the
+heuristic returns None and the patch fails with a legible
+diagnostic.
 
 No imports from patch_scope or patch_pairs — this module is the
 bottom of the "apply strategy" subtree.
@@ -106,9 +163,10 @@ _OBJECT_LITERAL_ASSIGNMENT_RE = re.compile(
 #
 #   _body_is_complete_at_boundary(body)
 #       Strict.  Body's last non-blank line must end with `;`, `}`,
-#       `)`, or be a comment.  Used by `_try_insert_after_anchor`,
-#       where the surrounding context is a statement stream and a
-#       continuation fragment would corrupt both neighbours.
+#       `)`, `</...>`, or be a comment.  Used by
+#       `_try_insert_after_anchor`, where the surrounding context
+#       is a statement stream and a continuation fragment would
+#       corrupt both neighbours.
 #
 #   _context_insert_ok(anchor_line, body)
 #       Relaxed.  Passes if the body is complete OR the anchor line
@@ -120,7 +178,8 @@ def _body_is_complete_at_boundary(body):
     """True iff `body` can be inserted between two lines as a
     complete statement.
 
-    Complete = last non-blank line ends with `;`, `}`, or `)`,
+    Complete = last non-blank line ends with `;`, `}`, `)`, or is a
+    closing HTML tag (`</details>`, `</summary>`, …),
     OR the body is a single-line comment (`// ...` or `# ...`),
     OR the body is a standalone block comment (`/* ... */`).
     Everything else is either a continuation (ends with `,`,
@@ -142,6 +201,13 @@ def _body_is_complete_at_boundary(body):
         return True
     if last == "}":
         return True
+    # FIX 3: HTML closing tags count as complete.  A block ending
+    # with `</details>` closes the tag it opened.  The between-
+    # anchors heuristic needs this (the pg_base.py `View` block
+    # ends in `</details>`); the before-anchor heuristic inherits
+    # it (any complete body is a valid before-anchor insert).
+    if last.startswith("</"):
+        return True
     return False
 
 
@@ -149,7 +215,7 @@ def _context_insert_ok(anchor_line, body):
     """The body can be inserted adjacent to the anchor iff either:
 
     - the body is a complete statement (last non-blank line ends with
-      `;`, `}`, `)`, or is a comment), OR
+      `;`, `}`, `)`, `</...>`, or is a comment), OR
     - the anchor line ends with `,`, so the body is being appended
       to a comma-separated container (object literal, array,
       parameter list).
@@ -166,6 +232,80 @@ def _context_insert_ok(anchor_line, body):
     if anchor_line.strip().endswith(","):
         return True
     return False
+
+
+# ===========================================================================
+#  Anchor-line safety (Fix 4)
+# ===========================================================================
+#
+# Inserting AFTER a line that opens an unclosed block lands the body
+# *inside* that block.  The pg_panel_scrubs.py failure case: the only
+# anchor for the `viewRotation` field was
+# `pgkitRegisterField("status.running", {` — an opener.  Inserting
+# after it puts the new field inside the `status.running`
+# registration; the resulting file is not the intended edit.
+#
+# `_anchor_line_is_safe` refuses such anchors.  The pattern that
+# uses it (`_try_insert_after_anchor`'s statement match) then falls
+# through, allowing the before-anchor heuristic (which has no such
+# constraint — it inserts at the opening position, not inside) to
+# place the body.
+#
+# The check is purely textual: a line is unsafe iff the number of
+# opening brackets exceeds the number of closing brackets on that
+# single line.  This misses the (rare) case where a multi-line
+# expression opens a bracket on the anchor line and closes it
+# several lines down; those patches are caught by the structural
+# sanity gate.
+
+def _anchor_line_is_safe(base, line_start):
+    """True iff inserting AFTER the line at `line_start` is safe.
+
+    A line is unsafe iff it opens more brackets than it closes:
+    inserting after it lands inside the enclosing block.
+    """
+    line_end = base.find("\n", line_start)
+    if line_end == -1:
+        line_end = len(base)
+    line = base[line_start:line_end]
+    opens = (line.count("{") + line.count("(") + line.count("["))
+    closes = (line.count("}") + line.count(")") + line.count("]"))
+    return opens <= closes
+
+
+# ===========================================================================
+#  Closer-only and code-signal predicates (Fix 5)
+# ===========================================================================
+#
+# `_line_is_closer_only` is used by `_try_insert_before_anchor`:
+# inserting before a bare `}` lands the body inside the block that
+# just closed.
+#
+# `_line_has_code_signal` distinguishes code lines from prose
+# mentions.  The pg_panel_scrubs.py anchor (`status.running`)
+# appears once in the module docstring (prose) and once in a
+# `pgkitRegisterField(...)` call (code).  Reverse-order iteration
+# hits the code occurrence first, which is what we want; the
+# code-signal check is a second guard against the (rarer) case
+# where only a prose occurrence is available.  Without it, the
+# heuristic could insert a block *inside* a docstring.  Strong
+# code signals are the punctuation that virtually never appears in
+# prose: `=`, `(`, `{`, `[`, `;`.
+
+_CLOSER_ONLY_RE = re.compile(r'^[}\]\)]+[;,)]*$')
+
+_STRONG_CODE_SIGNAL_RE = re.compile(r'[=({\[;]')
+
+
+def _line_is_closer_only(line):
+    return bool(_CLOSER_ONLY_RE.match(line.strip()))
+
+
+def _line_has_code_signal(line):
+    """True iff `line` contains at least one character that is a
+    near-certain code marker: `=`, `(`, `{`, `[`, `;`.  Prose and
+    docstring mentions do not have these."""
+    return bool(_STRONG_CODE_SIGNAL_RE.search(line))
 
 
 # ===========================================================================
@@ -503,6 +643,252 @@ def _try_object_entry_insert(base, body, context_before):
 
 
 # ===========================================================================
+#  Insert-before-anchor (FIX 3 + FIX 5)
+# ===========================================================================
+#
+# The pg_panel_scrubs.py failure case: prose says "Add at the bottom
+# (before the `status.running` field):" and the body is a 39-line
+# block that should be inserted BEFORE that field.  The after-anchor
+# heuristic has no "before" mode; `_try_insert_after_anchor` would
+# try to insert after `pgkitRegisterField("status.running", {`, which
+# lands the body inside the object literal.  Fix 4 blocks that
+# (anchor-line-safety), leaving this heuristic to place the body
+# correctly.
+#
+# The heuristic parses the prose for `\bbefore\b ... `X`` patterns,
+# resolves the most recent (rightmost) match to a unique line in
+# base, and inserts the body at the anchor line's start with the
+# anchor line's indent.
+#
+# MULTI-OCCURRENCE (Fix 5): an anchor identifier may appear more
+# than once — most commonly, once in a docstring (prose mentioning
+# it) and once in the actual code.  The pg_panel_scrubs.py base has
+# `status.running` in the module docstring AND in the
+# `pgkitRegisterField(...)` call.  We collect every occurrence, try
+# them right-to-left (bottom-of-file first — the most likely
+# intended code location for "before the X field"), and skip each
+# one that (a) is a closer-only line, or (b) has no strong code
+# signal (no `=`, `(`, `{`, `[`, or `;` — i.e. it's prose).  This
+# is fail-closed: if no occurrence qualifies, the heuristic returns
+# None and the patch fails with a legible diagnostic.
+
+_BEFORE_PROSE_RE = re.compile(
+    r'\bbefore\b[^.\n]{0,120}?`([^`\n]+)`',
+    re.IGNORECASE,
+)
+
+
+def _try_insert_before_anchor(base, body, context_before):
+    """Insert `body` before the line named by the most recent
+    "before `X`" phrase in the prose.
+
+    Called from `_try_deterministic_patch_inner` before the
+    after-anchor heuristic so that "before X" is preferred over
+    "after X" when the prose supports either reading.  Returns the
+    patched base, or None.
+    """
+    if not body or not body.strip():
+        return None
+    body_stripped = body.strip()
+    if not _body_is_complete_at_boundary(body_stripped):
+        return None
+
+    matches = _BEFORE_PROSE_RE.findall(context_before or "")
+    if not matches:
+        return None
+
+    for anchor_text in reversed(matches):
+        anchor_text = anchor_text.strip()
+        if len(anchor_text) < 6:
+            continue
+
+        # Collect every occurrence of the anchor.  Multi-occurrence
+        # is common: docstrings often mention the identifier in
+        # prose while the actual code is much lower in the file.
+        positions = []
+        start = 0
+        while True:
+            p = base.find(anchor_text, start)
+            if p == -1:
+                break
+            positions.append(p)
+            start = p + 1
+        if not positions:
+            continue
+
+        # Try from bottom-of-file to top-of-file.  "Before the X
+        # field" most often means the bottom-most declaration.
+        for idx in reversed(positions):
+            line_start = base.rfind("\n", 0, idx) + 1
+            line_end = base.find("\n", line_start)
+            if line_end == -1:
+                line_end = len(base)
+            line = base[line_start:line_end]
+
+            # Refuse if the anchor line is JUST a closer — the body
+            # would land inside the block that just closed.
+            if _line_is_closer_only(line):
+                continue
+
+            # Refuse if the line has no strong code signal — likely
+            # a prose/docstring mention, not a usable code anchor.
+            # This guard prevents inserting into a module docstring
+            # when the identifier only appears in prose.
+            if not _line_has_code_signal(line):
+                continue
+
+            indent = line[:len(line) - len(line.lstrip())]
+            reindented = _reindent_body(indent, body_stripped)
+            insertion = reindented.rstrip() + "\n"
+            result = base[:line_start] + insertion + base[line_start:]
+            if result != base:
+                return result
+
+    return None
+
+
+# ===========================================================================
+#  Insert-between-anchors (FIX 3)
+# ===========================================================================
+#
+# The pg_base.py failure case: prose says "Insert between the Image
+# and Masks `<details>` blocks in `PG_PANEL_BODY`:" and the body is a
+# new `<details><summary>View</summary>…</details>` block.  Neither
+# `_try_context_insert` (needs a unique body line) nor
+# `_try_insert_after_anchor` (needs a backtick identifier) can express
+# this.  The new `<details>` block has no anchor line of its own —
+# the anchor is the *pair* of existing blocks.
+#
+# The heuristic parses "between X and Y <what>" from the prose,
+# resolves X and Y to their containing block ranges (via
+# `_find_named_block_end`), verifies X's range ends before Y's
+# starts, and inserts the body just before Y's start.
+#
+# Anchors can be:
+#   · `<details><summary>Name</summary>…</details>` — Name is the
+#     summary text.
+#   · `export const Name = { … }` / `const Name = { … }` — Name is
+#     the variable.
+#   · `function name(…) { … }` / `def name(…):` / `class Name {`
+#     — Name is the function/class name.
+
+_BETWEEN_RE = re.compile(
+    r'\bbetween\b[^.\n]{0,120}?'
+    r'(?:the\s+)?([A-Za-z][\w ]{1,50}?)\s+(?:and|&)\s+'
+    r'(?:the\s+)?([A-Za-z][\w ]{1,50}?)\s+'
+    r'(?:<[^>]+>|blocks?|sections?|fields?|functions?|elements?)',
+    re.IGNORECASE,
+)
+
+
+def _find_named_block_end(base, name):
+    """Return (start_char, end_char) of the block named `name`, or
+    None.
+
+    Handles three block shapes:
+      · `<details><summary>name</summary>…</details>`
+      · `(export )?(const|let|var) name = { … };`
+      · `(export )?(async )?(function|def|class) name … { … }`
+    """
+    if not name:
+        return None
+
+    # <details> block by summary text
+    pat_details = re.compile(
+        r'<details\b[^>]*>\s*<summary>\s*'
+        + re.escape(name) + r'\s*</summary>.*?</details>',
+        re.DOTALL | re.IGNORECASE)
+    m = pat_details.search(base)
+    if m:
+        return (m.start(), m.end())
+
+    # Object literal by identifier
+    pat_obj = re.compile(
+        r'(?:^|\n)(?:export\s+)?(?:const|let|var)\s+'
+        + re.escape(name) + r'\s*=\s*\{',
+        re.MULTILINE)
+    m = pat_obj.search(base)
+    if m:
+        open_idx = base.find("{", m.end() - 1)
+        if open_idx != -1:
+            close_idx = _find_matching_brace(
+                base, open_idx, is_python=False)
+            if close_idx != -1:
+                # Consume a trailing `;` if present.
+                end = close_idx + 1
+                if end < len(base) and base[end] == ";":
+                    end += 1
+                return (m.start(), end)
+
+    # Function / class by name
+    pat_fn = re.compile(
+        r'(?:^|\n)(?:export\s+)?(?:async\s+)?'
+        r'(?:function|def|class)\s+' + re.escape(name) + r'\b',
+        re.MULTILINE)
+    m = pat_fn.search(base)
+    if m:
+        open_idx = base.find("{", m.end())
+        if open_idx != -1:
+            close_idx = _find_matching_brace(
+                base, open_idx, is_python=False)
+            if close_idx != -1:
+                return (m.start(), close_idx + 1)
+
+    return None
+
+
+def _try_insert_between_anchors(base, body, context_before):
+    """Insert `body` between the two blocks named in a
+    "between X and Y <what>" phrase in the prose.
+
+    Returns the patched base, or None.
+    """
+    if not body or not body.strip():
+        return None
+    body_stripped = body.strip()
+    if not _body_is_complete_at_boundary(body_stripped):
+        return None
+
+    cleaned = (context_before or "").replace("`", "")
+    m = _BETWEEN_RE.search(cleaned)
+    if not m:
+        return None
+
+    name_a = m.group(1).strip()
+    name_b = m.group(2).strip()
+    if not name_a or not name_b or name_a == name_b:
+        return None
+
+    range_a = _find_named_block_end(base, name_a)
+    range_b = _find_named_block_end(base, name_b)
+    if range_a is None or range_b is None:
+        return None
+
+    # Order them: A must end before B starts.  If the prose said
+    # "between B and A", the blocks still appear in file order; swap
+    # here so the insert point is B's start.
+    if range_a[1] <= range_b[0]:
+        insert_at_char = range_b[0]
+    elif range_b[1] <= range_a[0]:
+        insert_at_char = range_a[0]
+    else:
+        # Overlapping — prose is ambiguous or the extractor matched
+        # the wrong blocks.  Fail-closed.
+        return None
+
+    line_start = base.rfind("\n", 0, insert_at_char) + 1
+    line_end = base.find("\n", line_start)
+    if line_end == -1:
+        line_end = len(base)
+    line = base[line_start:line_end]
+    indent = line[:len(line) - len(line.lstrip())]
+    reindented = _reindent_body(indent, body_stripped)
+    insertion = reindented.rstrip() + "\n\n"
+    result = base[:line_start] + insertion + base[line_start:]
+    return result if result != base else None
+
+
+# ===========================================================================
 #  Insert-after-anchor
 # ===========================================================================
 
@@ -620,6 +1006,16 @@ def _try_insert_after_anchor(base, body, context_before):
             line_lead += base[p_scan]
             p_scan += 1
         anchor_indent = line_lead
+
+        # Fix 4: refuse if the anchor line opens an unclosed block.
+        # Inserting after it would land inside.  The before-anchor
+        # heuristic (which has no such constraint) is the correct
+        # placement for these anchors — e.g. "before the
+        # `status.running` field" when the anchor line is
+        # `pgkitRegisterField("status.running", {`.
+        if not _anchor_line_is_safe(base, line_start):
+            continue
+
         line_end = base.find("\n", idx)
         if line_end == -1:
             line_end = len(base)
@@ -957,6 +1353,22 @@ def _try_structural_append(base, body, path):
     from .ast_anchor import _LANG_BY_EXT
     container_lang = _LANG_BY_EXT.get(ext)
     if container_lang is None:
+        return None
+
+    # FIX 7: refuse to append a Python statement keyword at module
+    # level.  A `try:` / `for:` / `while:` / `with:` block appended
+    # at column 0 references function-local names that don't exist
+    # at module scope; the resulting file parses cleanly (they're
+    # valid statements) but is broken at runtime.  This is the
+    # inpaint_server.py `output_rotation` corruption shape: the
+    # try/except was appended after `RAW_ROUTES` at module level.
+    # The module-level check in validate_output catches it
+    # post-write; refusing here is fail-closed earlier.
+    if container_lang == "python" and w in _STMT_KEYWORDS:
+        print(f"  [structural] {path}: refusing to append Python "
+              f"statement keyword {w!r} at module level "
+              f"(refs to function locals would be undefined)",
+              file=sys.stderr)
         return None
 
     if body_lang == container_lang:

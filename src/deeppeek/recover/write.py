@@ -11,11 +11,48 @@ New in 2026-11-01 (b): trust reason names the specific check
 Unattributed orphans report their first content line.
 
 New in 2026-11-01 (c): `patch_failure_reasons` in `decisions[path]`.
-Each failed patch records its `idx`, `first_line`, and `reason`.
-`warnings.txt` gets a `[PATCH_FAILED]` line per failed patch.  The
-final summary prints one PATCH_FAILED / PAIR_FAILED line per failure
-so the user sees the diagnostics in the console without opening
-files.
+Each failed patch records its `idx`, `first_line`, `context_before`,
+and `reason`.  `warnings.txt` gets a `[PATCH_FAILED]` line per failed
+patch.  The final summary prints one PATCH_FAILED / PAIR_FAILED line
+per failure so the user sees the diagnostics in the console without
+opening files.
+
+New in 2026-11-01 (d): `patch_failure_reasons` also records
+`context_before` (truncated to 800 chars).  When a heuristic refuses
+a patch because the prose didn't match — e.g. an "insert between the
+Image and Masks `<details>` blocks" phrase that didn't parse — the
+manifest carries the actual prose the heuristic saw, so the failure
+can be diagnosed from the manifest alone rather than by re-reading
+the conversation dump.
+
+New in 2026-11-01 (e): `_compute_block_disposition` now respects
+trust.  A block in a rejected-record previously showed as "applied"
+because the record's *state* was FULL_PLUS_PATCH; that misreads the
+outcome when trust was LOW and `written == False`.  The disposition
+now falls back to "block_unapplied" / "block_failed" / "block_partial"
+when the record was not actually written.
+
+New in 2026-11-01 (f): reconciliation feedback.  Two additions:
+
+  · A `reconciled_to_base` record — one where pass 8.7 excluded every
+    applied item and the record's content equals the pre-existing
+    base — is skipped silently, with the exclusions recorded in
+    `warnings.txt` and the `reconciled` field on the manifest
+    decision.  This is the correct outcome for a record whose only
+    changes were misattributed: the target file's pre-existing
+    content is preserved, nothing is overwritten, and the audit
+    trail still says which block was refused and why.
+
+  · `preexisting_unmodified` now treats `skipped_misattributed` and
+    `skipped_unplaceable` as no-op statuses (alongside
+    `already-present`).  A pre-existing baseline whose only "patches"
+    were excluded by reconciliation has *not* been modified — the
+    skip is correct and the warning is legible.
+
+New in 2026-11-01 (g): the final summary reports reconciliation
+counts alongside the fail-closed count, so the operator sees
+"reconciled: N records, M items excluded" when pass 8.7 rescued a
+run that would otherwise have been fail-closed end to end.
 """
 
 import hashlib
@@ -34,6 +71,13 @@ from .core import (
 )
 from .llm import LLMClient
 from .validate import _py_imports, _is_likely_local
+
+
+_NO_OP_STATUSES = frozenset({
+    "already-present",
+    "skipped_misattributed",
+    "skipped_unplaceable",
+})
 
 
 def _scan_mentioned_files(dump_text: str) -> set:
@@ -62,10 +106,6 @@ def _aggregate_missing_imports(records: dict) -> set:
         check for the submodule file specifically.
       · Neither is recovered  → report ``pg_comfy.py`` (once), not
         ``image.py``.
-
-    Prior logic reduced every import to its last dotted component
-    and produced spurious ``image.py`` entries (from
-    ``pg_comfy.image``), which pointed the user at the wrong path.
     """
     recovered_files = {
         _basename(p) for p, r in records.items()
@@ -96,23 +136,14 @@ def _aggregate_missing_imports(records: dict) -> set:
             top_pkg  = top_name + "/__init__.py"
 
             if top_file in recovered_paths:
-                # Single-file top-level module is recovered.
-                # Whatever the sub-path means (attribute, class,
-                # function) the ``file`` is present; the sub-path
-                # is not a missing file.
                 continue
             if top_pkg in recovered_paths:
-                # Recovered as a package.  A submodule is only
-                # missing if it is a real multi-level path AND
-                # no file at that path is recovered.
                 if len(parts) > 1:
                     sub_file = "/".join(parts) + ".py"
                     if sub_file in recovered_paths:
                         continue
                     expected.add(os.path.basename(sub_file))
                 continue
-            # Top-level not recovered: report the top-level file
-            # once, not its last component.
             expected.add(top_file)
 
     return expected - recovered_files
@@ -217,7 +248,24 @@ def _trust_reason(rec: FileRecord) -> str:
 def _compute_block_disposition(b, records):
     """One-word summary of a block's fate.  Used in
     `_debug.blocks` and (indirectly) by the warnings
-    summarizer."""
+    summarizer.
+
+    Trust-aware: a block in a rejected-record previously showed as
+    "applied" because the record's *state* was FULL_PLUS_PATCH; that
+    misreads the outcome when trust was LOW and `written == False`.
+    The disposition now reflects what actually happened:
+
+      · `applied` — record written with this block's patch applied.
+      · `block_skipped_misattributed` / `block_skipped_unplaceable` —
+        pass 8.7 excluded the block and the rest of the record
+        wrote cleanly.
+      · `block_failed` — patch failed and no reconciliation could
+        recover the record.
+      · `block_unapplied` — record fail-closed; block's patch may
+        have applied but the file was not written.
+      · `block_partial` — pair member in a record that was not
+        written.
+    """
     if getattr(b, "disposition", None):
         return b.disposition
     if b.classified_by == "preexisting":
@@ -229,8 +277,6 @@ def _compute_block_disposition(b, records):
                     "SINGLE_FULL", "FULL_PLUS_PATCH",
                     "MULTI_FULL"):
                 return "orphan_attributed_skipped"
-            # Record was written, but check whether THIS block's
-            # own patch was the one applied.
             _own_patch = next(
                 (p for p in rec.patches
                  if p.get("idx") == b.idx),
@@ -250,18 +296,45 @@ def _compute_block_disposition(b, records):
             return "blockquote_skip"
         return "orphan_unattributed"
     if getattr(b, "paired_with", None) is not None:
+        # Pair member: report the record-level outcome so a pair in
+        # a written record is distinguishable from one in a
+        # skipped record.
+        rec = records.get(b.output_path) if b.output_path else None
+        if rec is None:
+            return "paired"
+        if rec.trust == "LOW" and not getattr(rec, "_was_written", False):
+            return "block_partial"
         return "paired"
     if b.output_path is None:
         return "unresolved"
     rec = records.get(b.output_path)
     if rec is None:
         return "unmatched"
-    if rec.state in (
+    if rec.state not in (
             "SINGLE_FULL", "FULL_PLUS_PATCH", "MULTI_FULL"):
-        return "applied"
-    if rec.state == "PARTIAL_ONLY":
-        return "partial"
-    return "unapplied"
+        if rec.state == "PARTIAL_ONLY":
+            return "partial"
+        return "unapplied"
+
+    # Look at the block's own patch status first — this is what
+    # reconciliation changes.
+    _own = next(
+        (p for p in rec.patches if p.get("idx") == b.idx),
+        None)
+    if _own is not None:
+        status = _own.get("applied_by")
+        if status == "skipped_misattributed":
+            return "block_skipped_misattributed"
+        if status == "skipped_unplaceable":
+            return "block_skipped_unplaceable"
+        if status == "failed":
+            return "block_failed" if rec.trust == "LOW" else "applied"
+
+    if rec.trust == "LOW" and not getattr(rec, "_was_written", False):
+        return "block_unapplied"
+    if getattr(rec, "sanity_rejected", False):
+        return "block_unapplied"
+    return "applied"
 
 
 def _orphan_first_line(block: Block) -> str:
@@ -285,6 +358,23 @@ def _patch_first_line(patch: dict, limit: int = 60) -> str:
         if s:
             return s[:limit]
     return ""
+
+
+def _patch_context(patch: dict, limit: int = 800) -> str:
+    """Return the patch's `context_before`, truncated to `limit`
+    characters with a trailing ellipsis marker when longer.
+
+    FIX (2026-11-01, d): when a heuristic refuses a patch because
+    the surrounding prose didn't match any of its patterns, the
+    manifest needs to show the prose the heuristic saw.  Without
+    it, the diagnostic string ("no heuristic matched…") is an
+    opaque verdict that can't be acted on without re-reading the
+    dump.  `context_before` closes that gap.
+    """
+    ctx = (patch.get("context_before") or "").strip()
+    if len(ctx) <= limit:
+        return ctx
+    return ctx[:limit - 3] + "..."
 
 
 def pass9_write(records: dict,
@@ -316,10 +406,6 @@ def pass9_write(records: dict,
         aux_dir = out_dir / "llm_audit"
         reports_dir = out_dir
 
-    # Defensive: an empty `records` after pass 3 means the pipeline
-    # failed before grouping.  Emit a loud diagnostic so the manifest
-    # (which will have empty `decisions`) is not mistaken for "the
-    # conversation had no code blocks".
     if not records:
         print("  [!] pipeline produced zero file records — the "
               "conversation may have had no parseable code blocks, "
@@ -327,8 +413,6 @@ def pass9_write(records: dict,
               "the block list and warnings.txt.",
               file=sys.stderr)
 
-    # Surface any pass crashes at the top of warnings.txt so the
-    # manifest is self-explanatory without external logs.
     _run_errors = run_errors or []
 
     files_dir.mkdir(parents=True, exist_ok=True)
@@ -350,7 +434,6 @@ def pass9_write(records: dict,
     for _err in _run_errors:
         warnings_lines.append(
             f"[PASS_FAILED] {_err['pass']}: {_err['error']}")
-        # The full traceback follows as a single indented block.
         for _line in (_err.get("traceback") or "").splitlines():
             warnings_lines.append(f"  {_line}")
     written: dict = {}
@@ -371,7 +454,6 @@ def pass9_write(records: dict,
         for w in rec.warnings:
             warnings_lines.append(f"[{path}] [WARN] {w}")
 
-        # Per-pair failure detail: name which pair(s) failed and why.
         for r in rec.verification.get("pair_records", []):
             if r.get("applied_by") != "failed":
                 continue
@@ -402,7 +484,6 @@ def pass9_write(records: dict,
                     f"[{path}] [PAIR_FAILED] {kind} pair "
                     f"(old={oi}, new={ni}, scope={scope}): {reason}")
 
-        # Per-patch failure detail.
         for p in rec.patches:
             if p.get("applied_by") != "failed":
                 continue
@@ -411,8 +492,12 @@ def pass9_write(records: dict,
             warnings_lines.append(
                 f"[{path}] [PATCH_FAILED] idx={p['idx']} "
                 f"(first line: {first_line!r}): {reason}")
+            _ctx = _patch_context(p)
+            if _ctx:
+                warnings_lines.append(
+                    f"[{path}] [PATCH_FAILED_CONTEXT] idx={p['idx']}: "
+                    f"{_ctx!r}")
 
-        # Per-patch insertion-filter detail.
         for p in rec.patches:
             if not p.get("filtered_duplicate_lines"):
                 continue
@@ -437,11 +522,6 @@ def pass9_write(records: dict,
             warnings_lines.append(
                 f"[{path}] [SANITY] {reason}; target file preserved")
 
-            # Structural brace repair suggestion, if any.  Written to
-            # low_trust/<name>.repaired alongside the original.  The
-            # target file remains the pre-existing version; the user
-            # reviews the suggestion and copies it over manually if
-            # they accept it.
             if rec.content is not None:
                 rejected_dir = aux_dir / "rejected"
                 rejected_dir.mkdir(parents=True, exist_ok=True)
@@ -484,6 +564,30 @@ def pass9_write(records: dict,
             exit_code = max(exit_code, 2)
             continue
 
+        # FIX (2026-11-01, f): reconciled-to-base early skip.  When
+        # pass 8.7 excluded every applied item and the rebuilt content
+        # equals the pre-existing base, the target file is already
+        # what we would write.  Skip cleanly; the per-item exclusions
+        # are already in `warnings.txt` and the `reconciled` field
+        # documents the audit trail.
+        if (rec.verification.get("reconciled_to_base")
+                and rec.preexisting_base):
+            reason = ("reconciled to base: applied items were "
+                      "excluded as misattributed or unplaceable; "
+                      "no net change")
+            warnings_lines.append(f"[{path}] [NO_CHANGE] {reason}")
+            skipped.append({
+                "path": path, "state": rec.state, "reason": reason,
+                "source_blocks": rec.source_blocks,
+                "warnings": rec.warnings,
+                "verification": rec.verification,
+            })
+            if verbose:
+                print(f"  SKIPPED {path} (no change): {reason}",
+                      file=sys.stderr)
+            preexisting_skipped_count += 1
+            continue
+
         if rec.state in ("PARTIAL_ONLY", "MISSING"):
             reason = f"no full print (state={rec.state})"
             warnings_lines.append(
@@ -519,20 +623,19 @@ def pass9_write(records: dict,
             exit_code = max(exit_code, 2)
             continue
 
-        # "No conversation changes" means: no patch and no pair was
-        # attempted with any effect.  A "failed" patch is an attempt
-        # that could not land — it is NOT a no-op.  Treating it as
-        # "preexisting unmodified" would silently hide the failure
-        # before the trust check could route it to low_trust/.
-        #
-        # "already-present" patches ARE no-ops: the content is
-        # already in the file, so the target needs no write.
+        # FIX (2026-11-01, f): no-op statuses now include the
+        # reconciliation skip statuses.  A pre-existing baseline
+        # whose only "patches" were excluded by pass 8.7 has not
+        # been modified; skip cleanly.
         preexisting_unmodified = (
             rec.preexisting_base
-            and not rec.pairs
             and not any(
-                p.get("applied_by") != "already-present"
+                p.get("applied_by") not in _NO_OP_STATUSES
                 for p in rec.patches
+            )
+            and not any(
+                r.get("applied_by") not in _NO_OP_STATUSES
+                for r in rec.verification.get("pair_records", [])
             )
         )
         if preexisting_unmodified:
@@ -624,6 +727,13 @@ def pass9_write(records: dict,
             content += "\n"
         target.write_text(content)
         actually_written.add(out_name)
+
+        # Mark the record as actually written so _compute_block_disposition
+        # can distinguish "state says written" from "write actually ran".
+        try:
+            rec._was_written = True
+        except Exception:
+            pass
 
         sha = hashlib.sha256(content.encode()).hexdigest()
         manifest_base = apply_to if apply_to is not None else out_dir
@@ -811,8 +921,6 @@ def pass9_write(records: dict,
         for name in sorted(overwritten_low):
             warnings_lines.append(f"  deeppeek/low_trust/{name}")
 
-    # Consolidated repair-suggestion index.  One entry per
-    # sanity-rejected record that has a `.repaired` suggestion ready.
     repairs_manifest = {}
     for rec_path, rec in records.items():
         if not getattr(rec, "repair_content", None):
@@ -827,13 +935,6 @@ def pass9_write(records: dict,
                 "sanity_repair_closers"),
             "suggested_file": f"{rec_out_name}.repaired",
         }
-    # Always write repairs.json, even when empty.  An empty `{}` is
-    # the honest, predictable answer: "we scanned every sanity-rejected
-    # record, none produced a suggestion."  Its absence was previously
-    # indistinguishable from "write.py never ran the repair scan".
-    # Per-file refusal reasons live on each record's
-    # `verification.sanity_repair_reason` in the manifest; this file is
-    # the consolidated index of suggestions actually produced.
     (reports_dir / "repairs.json").write_text(
         json.dumps(repairs_manifest, indent=2))
 
@@ -899,6 +1000,7 @@ def pass9_write(records: dict,
             {
                 "idx": p["idx"],
                 "first_line": _patch_first_line(p, limit=70),
+                "context_before": _patch_context(p, limit=800),
                 "reason": p.get("failure_reason", "unknown"),
             }
             for p in rec.patches
@@ -1009,6 +1111,7 @@ def pass9_write(records: dict,
             "no_content":  [],
             "collision":   [],
             "preexisting": [],
+            "no_change":   [],
             "other":       [],
         }
         for s in skipped:
@@ -1023,6 +1126,8 @@ def pass9_write(records: dict,
                 by_reason["no_content"].append(s["path"])
             elif "basename collision" in r:
                 by_reason["collision"].append(s["path"])
+            elif "reconciled to base" in r:
+                by_reason["no_change"].append(s["path"])
             elif "pre-existing" in r:
                 by_reason["preexisting"].append(s["path"])
             else:
@@ -1070,7 +1175,6 @@ def pass9_write(records: dict,
               file=sys.stderr)
         print(f"    (use --min-trust LOW to force-write them)",
               file=sys.stderr)
-        # Per-failure detail in the summary.
         for fpath, frec in sorted(records.items()):
             if frec.trust != "LOW":
                 continue
@@ -1086,6 +1190,9 @@ def pass9_write(records: dict,
                 print(f"    PATCH_FAILED {fpath} idx={pf['idx']}: "
                       f"{first_line!r} — {reason}",
                       file=sys.stderr)
+                ctx = _patch_context(pf, limit=200)
+                if ctx:
+                    print(f"      context: {ctx!r}", file=sys.stderr)
             for r in frec.verification.get("pair_records", []):
                 if r.get("applied_by") != "failed":
                     continue
@@ -1095,10 +1202,26 @@ def pass9_write(records: dict,
                 print(f"    PAIR_FAILED {fpath} (old={oi}): {reason}",
                       file=sys.stderr)
 
-    # Cross-file hint: if the same file has ONLY state-drift
-    # failures across all its pairs, the base for that file is
-    # very likely stale -- the previous conversation's changes
-    # never landed there.
+    # FIX (2026-11-01, g): reconciliation summary.  Reports how many
+    # records pass 8.7 rescued and how many items it excluded, so the
+    # operator sees "reconciled: N records, M items excluded" when
+    # the run landed cleanly only because reconciliation dropped
+    # specific items.  Silent when no record was reconciled.
+    n_reconciled_records = sum(
+        1 for r in records.values()
+        if "reconciled" in r.verification
+    )
+    if n_reconciled_records:
+        total_excluded = sum(
+            len(r.verification["reconciled"]["excluded"])
+            for r in records.values()
+            if "reconciled" in r.verification
+        )
+        print(f"  reconciled: {n_reconciled_records} record(s), "
+              f"{total_excluded} item(s) excluded "
+              f"(see warnings.txt for details)",
+              file=sys.stderr)
+
     stale_files = []
     for fpath, frec in records.items():
         pf = frec.verification.get("pair_records") or []
@@ -1116,7 +1239,7 @@ def pass9_write(records: dict,
     if stale_files:
         print(f"  [hint] {len(stale_files)} file(s) look like "
               f"their base predates this conversation "
-              f"({", ".join(sorted(stale_files))}); consider "
+              f"({', '.join(sorted(stale_files))}); consider "
               f"applying the previous conversation first.",
               file=sys.stderr)
 

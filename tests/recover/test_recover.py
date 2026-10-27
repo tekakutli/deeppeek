@@ -1691,6 +1691,68 @@ def test_37():
 
     check_apply("37_replace_pair_object_literal", extra)
 
+def test_38():
+    """Reconciliation must not promote a fail-closed record whose only
+    applied items are excluded.
+
+    Companion to test_32 — same fixture, same defect (unresolved symbol
+    introduced by a patch that was attributed to the wrong file) — but
+    this test asserts the specific reconciliation invariant rather than
+    the generic fail-closed behavior.
+
+    The pipeline's pass 8.7 reconciliation pass, when it "rescues" a
+    record by excluding every applied item, produces content
+    byte-identical to the pre-existing base.  That is not a rescue: no
+    change is being written.  The record must remain LOW, `reconciled`
+    must NOT appear in its verification, and `reconciled_to_base` must
+    NOT be set (that field is only set for records that actually
+    promote past the to-base guard).
+
+    Without this guard, a future change to `pass8_7_reconcile` that
+    promotes to-base records would silently mark records HIGH while
+    writing nothing — masking the underlying defect from the user.
+    The five fixture-driven fail-closed tests (11, 16, 17, 26, 32)
+    already cover the outcome; this test names the invariant those
+    outcomes depend on.
+    """
+
+    def extra(target, run):
+        decisions = run["manifest"].get("decisions", {})
+        dec = decisions.get("bindings.js", {})
+        assert dec, (
+            f"bindings.js missing from manifest decisions; "
+            f"decisions keys: {list(decisions)}")
+        assert dec.get("trust") == "LOW", (
+            f"expected trust=LOW (reconciliation to base is a "
+            f"no-op, not a rescue), got {dec.get('trust')!r}; "
+            f"verification={dec.get('verification')!r}")
+        assert dec.get("written") is False, (
+            f"expected written=False, got {dec.get('written')}")
+
+        verification = dec.get("verification", {})
+        assert "reconciled" not in verification, (
+            f"expected NO `reconciled` field — pass 8.7 should "
+            f"have bailed before committing exclusions when the "
+            f"only applied item is the failing one; "
+            f"got reconciled={verification.get('reconciled')!r}")
+        assert "reconciled_to_base" not in verification, (
+            f"expected NO `reconciled_to_base` field — that field "
+            f"is only set on records that actually promote past "
+            f"the to-base guard; "
+            f"got reconciled_to_base="
+            f"{verification.get('reconciled_to_base')!r}")
+
+        # The failure itself must remain visible.
+        assert "unresolved_calls" in verification, (
+            f"expected unresolved_calls to survive in verification "
+            f"(the record was not reconciled), got {verification!r}")
+        assert "registerField" in verification.get(
+                "unresolved_calls", []), (
+            f"expected 'registerField' in unresolved_calls, got "
+            f"{verification.get('unresolved_calls')!r}")
+
+    check_apply("32_symbol_check_wrong_file", extra,
+                skip_file_compare=True, min_trust="MEDIUM")
 
 def main():
 
@@ -1703,7 +1765,7 @@ def main():
         ("15", test_15), ("16", test_16), ("17", test_17), ("19", test_19), ("20", test_20), ("21", test_21),
         ("18", test_18), ("22", test_22), ("23", test_23), ("24", test_24), ("25", test_25), ("26", test_26), ("27", test_27), ("28", test_28), ("29", test_29), ("30", test_30), ("31", test_31), ("32", test_32), ("33", test_33),
         ("34", test_34), ("35", test_35), ("36", test_36),
-        ("37", test_37)]
+        ("37", test_37), ("38", test_38)]
     failed = 0
     for name, fn in tests:
         try:

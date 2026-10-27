@@ -14,12 +14,14 @@ loop calls for each patch.  It dispatches, in order:
   7. object-literal splices
   8. context inserts
   9. object-entry inserts
- 10. insert-after-anchor
- 11. AST anchor (optional dependency)
- 12. structural append
+ 10. insert-before-anchor        (FIX 3)
+ 11. insert-between-anchors      (FIX 3)
+ 12. insert-after-anchor
+ 13. AST anchor (optional dependency)
+ 14. structural append
 
-IMPORT REPLACE (new)
-====================
+IMPORT REPLACE
+==============
 A multi-line import body whose module matches a single-line import
 in base would previously fall through every heuristic:
 
@@ -28,20 +30,44 @@ in base would previously fall through every heuristic:
     both lines in a multi-line import are continuations, not lines
     that appear in base.
 
-The pg_panel_bindings.py failure case: body is
-
-    import { board, setImage, clearImage, _scheduleDraw,
-             view, _applyRotation } from "./pg_state.js";
-
-and base has
-
-    import { board, setImage, clearImage, _scheduleDraw } from "./pg_state.js";
-
 `_try_import_replace` joins continuation lines, parses the import,
 finds the same-module import in base, and reindents the original
 body to match.  It intentionally ignores the "add"/"insert" prose
 blocklist that `_try_single_line_replace` respects — adding a name
 to an import list IS a replacement of the import statement.
+
+BEFORE-ANCHOR AND BETWEEN-ANCHORS (FIX 3)
+=========================================
+Two gaps closed at once:
+
+  · "before the `status.running` field" — the prose names an
+    existing line; the block should be inserted *before* it, not
+    after.  `_try_insert_after_anchor` only knows how to insert
+    after; the pg_panel_scrubs.py `viewRotation` block needed
+    `_try_insert_before_anchor`.
+
+  · "between the Image and Masks `<details>` blocks" — the prose
+    names two existing blocks; the block should be inserted
+    between them.  Neither `_try_context_insert` (needs a unique
+    body line) nor `_try_insert_after_anchor` (needs a backtick
+    identifier) can express this.  The pg_base.py `View` block
+    needed `_try_insert_between_anchors`.
+
+Both new heuristics share an `_anchor_line_is_safe` predicate:
+the anchor line must not open a brace/paren/bracket that closes
+later, because inserting after it would land *inside* the
+enclosing block.  Anchors like
+`pgkitRegisterField("status.running", {` are unsafe; the insert
+must walk forward to the end of the enclosing block and insert
+there.
+
+Both new heuristics are tried BEFORE `_try_insert_after_anchor`
+because their prose forms ("before X", "between X and Y") are
+more specific than the generic "after X" case; if they match,
+they produce a tighter result than the after-anchor heuristic
+would.  The two are mutually exclusive in practice: `_BEFORE_
+PROSE_RE` requires the word "before", `_BETWEEN_RE` requires
+"between", and neither prose form contains the other.
 
 Also exports `attribute_sanity_failure`, the helper that names the
 patch responsible for a sanity-gate rejection.  It lives here
@@ -67,6 +93,7 @@ from .patch_scope import (
 from .patch_heuristics import (
     _try_single_line_replace, _try_context_insert,
     _try_object_entry_insert, _try_insert_after_anchor,
+    _try_insert_before_anchor, _try_insert_between_anchors,
     _try_object_literal_splice, _try_raw_diff_patch,
     _try_structural_append, _delete_exact_block,
     _OBJECT_LITERAL_ASSIGNMENT_RE,
@@ -200,10 +227,9 @@ def _try_deterministic_patch_inner(base, patch, path=""):
         # already-present / failed classification.
         return None
 
-    # NEW: import replace.  Runs before the generic single-line path
+    # Import replace.  Runs before the generic single-line path
     # because a multi-line import is not a single line and would
-    # otherwise be blocked by every context-insert check.  See
-    # module docstring.
+    # otherwise be blocked by every context-insert check.
     imported = _try_import_replace(base, raw_body)
     if imported is not None:
         return imported
@@ -292,6 +318,20 @@ def _try_deterministic_patch_inner(base, patch, path=""):
         return inserted
 
     inserted = _try_object_entry_insert(base, raw_body, context_before)
+    if inserted is not None:
+        return inserted
+
+    # FIX 3: before-anchor and between-anchors heuristics.
+    # Both run before `_try_insert_after_anchor` because their prose
+    # forms ("before X", "between X and Y") are more specific than
+    # the generic "after X" case.  They are mutually exclusive in
+    # practice: `_BEFORE_PROSE_RE` requires the word "before",
+    # `_BETWEEN_RE` requires "between".
+    inserted = _try_insert_before_anchor(base, raw_body, context_before)
+    if inserted is not None:
+        return inserted
+
+    inserted = _try_insert_between_anchors(base, raw_body, context_before)
     if inserted is not None:
         return inserted
 

@@ -26,18 +26,40 @@ several thousand lines.  The split separates:
     surrounding helpers.  Stable shape; opens upward only for new
     record-level concepts (a new op type, a new verification field).
 
-BACKWARD COMPATIBILITY
-======================
-Every name this module exported before the split is still
-reachable at the same path.  The re-export loop at the bottom of
-this file imports everything from the seven sub-modules; `from
-deeppeek.recover.apply_patches import _foo` continues to work for
-every `_foo` that was previously defined in this file, whether
-`_foo` now lives in patch_text, patch_scope, patch_heuristics,
-patch_pairs, patch_diag, or patch_dispatch.
+BROADER CONTEXT RETRY (2026-11-01, FIX 5)
+=========================================
+When every deterministic heuristic fails on a patch, retry once with
+`context_before` merged from the *adjacent blocks in the same record*.
+The pg_panel_scrubs.py failure case: "before the `status.running`
+field" prose was attached to the *import* block, not the *rotation*
+block, so the rotation block's context_before had no anchor.  The
+import block's context is one or two blocks back — within reach.
+Merging it in lets `_try_insert_before_anchor` find the anchor it
+needs.
 
-Tests that import internal names from this file (as
-`tests/recover/test_*.py` do) require no changes.
+This is cheap (one extra deterministic attempt, only on failure) and
+catches the "the prose spans two blocks" shape without touching the
+extractor's contract.
+
+BLOCKQUOTED STRUCTURAL CHECK (FIX 6)
+====================================
+A blockquoted-orphan patch that survives `_has_strong_blockquote_
+attribution` (exact prose + commit language) is the AI's explicit
+commit, but it can still land in the wrong place — the
+pg_panel_bindings.py case: a thought-process fragment landed inside
+`_inpaintAction`'s body between `canvasB64` and `selectionB64`.
+`validate_content` catches it post-write, but by then the corrupted
+content has already been recorded as `applied` and the record is
+demoted to LOW.  `_try_blockquoted_patch` trial-validates the
+*just-applied* result inside pass 6; if the result is structurally
+invalid, the attempt is refused and the patch is marked failed
+instead of applied.
+
+Only blockquoted-orphan patches get this treatment.  Normal patches
+already benefit from the pass-8 verify; per-patch validation there
+would refuse legitimate intermediate states (a patch that is
+intentionally one half of a fragment closed by the next).  Blockquoted
+orphans have no such excuse — they arrive as complete units.
 
 MODULE MAP
 ==========
@@ -117,8 +139,105 @@ def _diagnose_patch_failure(patch, content, base):
         return (f"diagnostic raised {type(e).__name__}: {e}; "
                 f"patch could not be applied")
 
+
 # ===========================================================================
-#  Main loop: pass 6
+#  Broader-context retry helper (FIX 5)
+# ===========================================================================
+#
+# On deterministic failure, retry once with the context of the
+# *previous* blocks in the same record.  This catches the shape where
+# the anchor-prose ("before the `status.running` field") is attached
+# to the block *before* the content block, not the content block
+# itself.  See the module docstring.
+
+def _broader_context_for(patch, blocks_by_idx, records, path):
+    """Return `patch["context_before"]` merged with the previous
+    blocks' prose from the same record.
+
+    The merge is:
+        <context of the previous 2 blocks, joined by newlines>
+        <original context_before>
+
+    Order matters: `_BEFORE_PROSE_RE` in patch_heuristics scans
+    right-to-left for the most recent match, so the original
+    context ends up *after* the merged prose.  If the original
+    context already contains an anchor, the retry does not fire
+    (see the caller — the broader retry only runs when the first
+    attempt returns None).
+    """
+    rec = records.get(path)
+    if rec is None:
+        return patch.get("context_before", "")
+    by_idx = sorted(rec.source_blocks)
+    try:
+        i = by_idx.index(patch["idx"])
+    except ValueError:
+        return patch.get("context_before", "")
+
+    parts = []
+    for j in range(max(0, i - 2), i):
+        b = blocks_by_idx.get(by_idx[j])
+        if b and b.context_before:
+            parts.append(b.context_before)
+    parts.append(patch.get("context_before", ""))
+    return "\n".join(parts)
+
+
+# ===========================================================================
+#  Blockquoted structural check (FIX 6)
+# ===========================================================================
+#
+# A blockquoted-orphan patch is the AI's explicit commit, but thought
+# fragments can land in the wrong scope (pg_panel_bindings.py: a
+# fragment landed inside `_inpaintAction`'s body between two const
+# declarations, corrupting the function signature).  Trial-validate
+# the result before accepting.
+
+def _is_blockquoted_strong(b_idx, blocks_by_idx):
+    """True iff block `b_idx` is a blockquoted orphan with strong
+    attribution (exact prose + commit language).  These are the
+    patches that get the structural trial check.
+    """
+    b = blocks_by_idx.get(b_idx) if blocks_by_idx else None
+    if b is None:
+        return False
+    if not b.in_blockquote:
+        return False
+    from .dedup import _has_strong_blockquote_attribution
+    try:
+        return _has_strong_blockquote_attribution(b)
+    except Exception:
+        return False
+
+
+def _try_blockquoted_patch(content, patch, path):
+    """Apply the patch, then trial-validate.  If the result is
+    structurally invalid, revert and return None.
+
+    Used only for blockquoted-orphan patches (see
+    `_is_blockquoted_strong`).  Non-blockquoted patches keep the
+    plain `_try_deterministic_patch` path — they benefit from pass-8
+    verify without the per-patch double-check, and legitimately
+    produce intermediate states (a fragment closed by a later patch)
+    that per-patch validation would refuse.
+    """
+    from .validate_output import validate_content
+    result = _try_deterministic_patch(content, patch, path)
+    if result is None:
+        return None
+    if result == content:
+        # No-op; do not re-validate.
+        return result
+    trial = validate_content(result, path)
+    if trial is not None:
+        patch["structural_check"] = f"failed: {trial}"
+        return None
+    patch["structural_check"] = "ok"
+    return result
+
+
+# ===========================================================================
+#  Insertion-filter helper
 # ===========================================================================
 
 def _filter_body_by_blocks(body, base_stripped_set, record_inserted):
@@ -157,6 +276,10 @@ def _sanity_gate(base, result):
     from .sanity import is_suspicious
     return is_suspicious(base, result)
 
+
+# ===========================================================================
+#  Main loop: pass 6
+# ===========================================================================
 
 def pass6_apply_patches(records, blocks_by_idx, llm):
     import sys
@@ -217,8 +340,16 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
             else:
                 patch_to_apply = patch
 
-            result = _try_deterministic_patch(
-                content, patch_to_apply, path)
+            # FIX 6: route blockquoted-orphan patches through the
+            # structural-check wrapper.  Normal patches use the
+            # plain dispatcher.
+            if _is_blockquoted_strong(patch["idx"], blocks_by_idx):
+                result = _try_blockquoted_patch(
+                    content, patch_to_apply, path)
+            else:
+                result = _try_deterministic_patch(
+                    content, patch_to_apply, path)
+
             if result is not None:
                 if result == content:
                     patch["applied_by"] = "already-present"
@@ -230,8 +361,12 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                 continue
 
             if was_filtered:
-                result = _try_deterministic_patch(
-                    content, patch, path)
+                if _is_blockquoted_strong(patch["idx"], blocks_by_idx):
+                    result = _try_blockquoted_patch(
+                        content, patch, path)
+                else:
+                    result = _try_deterministic_patch(
+                        content, patch, path)
                 if result is not None:
                     if result == content:
                         patch["applied_by"] = "already-present"
@@ -263,6 +398,35 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                 if _deletion_already_applied(
                         patch_to_apply["body"], content):
                     patch["applied_by"] = "already-present"
+                    continue
+
+            # FIX 5: retry once with merged context before falling
+            # through to the LLM.  The pg_panel_scrubs.py failure
+            # case: the "before `status.running`" prose was attached
+            # to the import block, not the rotation block.  The
+            # merged context lets `_try_insert_before_anchor` see
+            # the anchor.
+            broader = _broader_context_for(
+                patch_to_apply, blocks_by_idx, records, path)
+            if broader != patch_to_apply.get("context_before", ""):
+                broader_patch = {
+                    **patch_to_apply, "context_before": broader}
+                if _is_blockquoted_strong(patch["idx"], blocks_by_idx):
+                    retry_result = _try_blockquoted_patch(
+                        content, broader_patch, path)
+                else:
+                    retry_result = _try_deterministic_patch(
+                        content, broader_patch, path)
+                if retry_result is not None:
+                    if retry_result == content:
+                        patch["applied_by"] = "already-present"
+                        patch["broader_context"] = True
+                    else:
+                        record_inserted |= _collect_inserted_lines(
+                            content, retry_result)
+                        content = retry_result
+                        patch["applied_by"] = "deterministic"
+                        patch["broader_context"] = True
                     continue
 
             all_deterministic = False

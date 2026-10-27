@@ -16,12 +16,29 @@ raises; the pair-failure diagnostics are called from
 `patch_pairs._apply_pairs`, which has its own per-pair exception
 boundary).  A bug in a diagnostic must never turn a fail-closed
 patch into a silent skip.
+
+INCOMPLETE SCOPED BODY (FIX 4)
+==============================
+`_diagnose_scoped_failure` used to fall through to the generic
+"replacement produced no change" message for every non-ellipsis
+scoped-replace failure.  That made the pg_pixels.py failure
+unreadable: the actual cause was that the body omitted its final
+`}` (the block ended with a `// ... rest unchanged` comment), so
+`_new_body_is_complete_for_scope` correctly refused a full
+replacement and `_try_scoped_partial_splice` correctly refused to
+splice (nothing to add).
+
+The diagnostic now names that shape directly.  No behaviour
+change to the pipeline; the message the user sees improves.
 """
 
 import re
 
 from .patch_text import _has_ellipsis_marker
-from .patch_scope import _find_scope_in_base, _SCOPE_PATTERNS
+from .patch_scope import (
+    _find_scope_in_base, _SCOPE_PATTERNS,
+    _new_body_is_complete_for_scope,
+)
 from .patch_heuristics import _OBJECT_LITERAL_ASSIGNMENT_RE
 from .prose import _extract_scope_from_body
 from .core import _is_deletion_instruction, _looks_like_diff_body
@@ -69,6 +86,35 @@ def _diagnose_scoped_failure(base, scope_name, new_body=""):
                 f"prefix/suffix contained no new lines to place")
     if not scope_name:
         return "scope name is empty"
+
+    # FIX 4: incomplete scoped body.  When the new body omits the
+    # scope's closer AND `_try_scoped_partial_splice` cannot build a
+    # balance-preserving splice, `_apply_scoped` correctly returns
+    # None to prevent corruption.  Name that shape specifically so
+    # the user can fix the block (add the closer, or use an ellipsis
+    # marker for a partial body).
+    if new_body:
+        for make_pattern in _SCOPE_PATTERNS:
+            try:
+                pattern = make_pattern(scope_name)
+            except re.error:
+                continue
+            m = pattern.search(base)
+            if not m:
+                continue
+            base_scope = base[m.start():m.end()]
+            if not _new_body_is_complete_for_scope(
+                    base_scope, new_body):
+                return (f"scope {scope_name!r} body is incomplete "
+                        f"(missing the scope's closer — a final "
+                        f"`}}` or `</details>`); a scoped-replace "
+                        f"with an incomplete body would corrupt "
+                        f"the file, so it is refused rather than "
+                        f"performed.  Either include the closer, or "
+                        f"use an ellipsis marker (`...`) to request "
+                        f"a partial splice.")
+            break
+
     for make_pattern in _SCOPE_PATTERNS:
         try:
             pattern = make_pattern(scope_name)

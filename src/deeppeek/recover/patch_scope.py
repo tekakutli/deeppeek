@@ -48,6 +48,18 @@ braces are balanced — it just isn't a declaration).  This is the
 pg_comfy_client.py corruption shape.  `_scope_signature_ok` is the
 check; `_apply_scoped` returns None when it fails.
 
+FULL-REPLACE FALLTHROUGH MUST FAIL CLOSED
+=========================================
+When `_try_scoped_partial_splice` returns None, the body is
+incomplete AND unspliceable.  A full replacement of the scope with
+an incomplete body is *guaranteed* to leave an unbalanced brace
+(and, with high probability, to nest the body's trailing comment
+into an unclosed block).  `_apply_scoped` therefore returns None
+in that case, so the caller records the pair as failed and the
+record fail-closes.  The pg_pixels.py corruption shape (a scoped
+pair whose body omitted its final `}` — block 99 — was silently
+accepted as a full replace, leaving `+1` unbalanced brace).
+
 Imports from patch_text; imports from prose (for
 `_extract_scope_from_body`).
 
@@ -490,17 +502,27 @@ def _apply_scoped(base, scope_name, new_body):
                 base_scope_text, new_body):
             spliced = _try_scoped_partial_splice(
                 base_scope_text, new_body)
-            if spliced is not None:
-                if m_start < len(base) and base[m_start] == "\n":
-                    indent_pos = m_start + 1
-                    base_indent = ""
-                else:
-                    indent_pos = base.rfind("\n", 0, m_start) + 1
-                    base_indent = base[indent_pos:m_start]
-                reindented = _reindent_body(base_indent, spliced)
-                if not _scope_signature_ok(reindented):
-                    return None
-                return base[:indent_pos] + reindented + base[m_end:]
+            if spliced is None:
+                # FIX 1: an incomplete body that also can't be
+                # spliced is a fail-closed case, not a fall-through
+                # to full replacement. A full replace with an
+                # incomplete body always leaves the result
+                # unbalanced (the base's closer is dropped but the
+                # body's closer is absent), which corrupts the file
+                # silently. This is the pg_pixels.py shape: block
+                # 99's body ends with `// ... rest unchanged; ...`
+                # instead of `}`.
+                return None
+            if m_start < len(base) and base[m_start] == "\n":
+                indent_pos = m_start + 1
+                base_indent = ""
+            else:
+                indent_pos = base.rfind("\n", 0, m_start) + 1
+                base_indent = base[indent_pos:m_start]
+            reindented = _reindent_body(base_indent, spliced)
+            if not _scope_signature_ok(reindented):
+                return None
+            return base[:indent_pos] + reindented + base[m_end:]
 
         # Full replacement (original logic).
         if m_start < len(base) and base[m_start] == "\n":
