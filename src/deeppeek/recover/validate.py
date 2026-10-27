@@ -1,8 +1,18 @@
 """
 recover.validate — Pass 7 (cross-validate imports) and Pass 8
-(verify files).
+(verify files), plus Pass 7.5 (JS cross-validation).
 
 Pass 7 is a pure read over the recovered content.
+
+Pass 7.5 (NEW) extends the import/export cross-check to JS modules
+and to JS embedded inside `.py` string literals.  The pg_masks.py
+failure case: `pg_masks.py` imports `_rotateMask` from
+`./pg_state.js`, and `pg_state.py`'s `STATE_JS` string literal
+does not export `_rotateMask`.  At browser load time this throws
+a JS `ReferenceError`, blanking the playground canvas silently.
+The `.py` file itself parses fine.  Pass 7.5 catches this by
+extracting the JS exports from the target's string literal and
+checking every imported name against them.
 
 Pass 8 verifies ast.parse for .py files and checks that patches took
 effect.
@@ -22,8 +32,8 @@ The specific shape that broke the panel-fade conversation:
     patch 1 (deletion, "delete this block"): applies
     patch 2 (diff, deletion of the same block): sees block already
         gone, marks itself `already-present`
-    verify: patch 1 is deterministic, block is gone → the
-        deleted block's lines look "missing" → trust drops to LOW
+    verify: patch 1 is deterministic, block is gone -> the
+        deleted block's lines look "missing" -> trust drops to LOW
     result: pg_state.py is written to .deeppeek/low_trust/ even
         though both patches succeeded, and the tree version is
         unchanged.
@@ -138,6 +148,114 @@ def pass7_cross_validate(records: dict[str, FileRecord]) -> dict:
                     for p, imps in imports.items()},
         "problems": problems,
     }
+
+
+# ---------------------------------------------------------------------------
+# Pass 7.5 — JS import/export cross-validation
+# ---------------------------------------------------------------------------
+#
+# Catches: pg_masks.py imports _rotateMask from ./pg_state.js, and
+# pg_state.py's STATE_JS string literal doesn't export _rotateMask.
+# The .py file parses fine; the JS ReferenceError only fires in the
+# browser at module-load time.  Without this pass, deeppeek writes
+# the file, reports HIGH trust, and the user discovers the bug days
+# later when the playground blanks.
+
+def pass7_5_js_validate(records: dict) -> list:
+    """Return list of problems for JS modules.
+
+    Each problem is a dict with `type` in
+    {`missing_js_module`, `missing_js_export`},
+    plus the same shape as pass7's problems so they can be merged
+    into the manifest's `cross_validate.problems` list.
+    """
+    from .symbols import (
+        _is_js_lang, _extract_js_imports_with_src,
+        _extract_dominant_js_string, _extract_js_exports,
+    )
+
+    problems = []
+    seen = set()
+
+    for path, rec in records.items():
+        if rec.content is None:
+            continue
+
+        js_source = None
+        if _is_js_lang(path):
+            js_source = rec.content
+        elif path.endswith(".py"):
+            js_source = _extract_dominant_js_string(rec.content)
+
+        if js_source is None:
+            continue
+
+        imports = _extract_js_imports_with_src(js_source)
+        for name, module in imports:
+            if not module.startswith("."):
+                continue
+
+            target_path = _resolve_js_module(module, path, records)
+            if target_path is None:
+                key = (path, module)
+                if key not in seen:
+                    seen.add(key)
+                    problems.append({
+                        "type": "missing_js_module",
+                        "from": path,
+                        "module": module,
+                    })
+                continue
+
+            target_rec = records[target_path]
+            target_js = None
+            if _is_js_lang(target_path):
+                target_js = target_rec.content
+            elif target_path.endswith(".py"):
+                target_js = _extract_dominant_js_string(
+                    target_rec.content)
+
+            if target_js is None:
+                continue
+
+            exports = _extract_js_exports(target_js)
+            if name not in exports:
+                key = (path, target_path, name)
+                if key not in seen:
+                    seen.add(key)
+                    problems.append({
+                        "type": "missing_js_export",
+                        "from": path,
+                        "target": target_path,
+                        "name": name,
+                    })
+
+    return problems
+
+
+def _resolve_js_module(module: str, from_path: str,
+                       records: dict) -> Optional[str]:
+    """Resolve a relative JS import to the record that emits it.
+
+    `./pg_state.js` imported from `pg_masks.py` resolves to
+    `pg_state.py` when that file's `STATE_JS` string literal
+    contains the actual JS.  Try each plausible extension in order.
+    """
+    base = module
+    for ext in (".js", ".mjs", ".cjs", ".ts", ".tsx"):
+        if base.endswith(ext):
+            base = base[:-len(ext)]
+            break
+
+    dirname = os.path.dirname(from_path)
+    for ext in (".js", ".mjs", ".cjs", ".ts", ".tsx", ".py"):
+        cand = os.path.normpath(
+            os.path.join(dirname, base + ext)
+        ).replace("\\", "/")
+        if cand in records and records[cand].content is not None:
+            return cand
+
+    return None
 
 
 def _py_exports(body: str) -> set[str]:
@@ -444,7 +562,8 @@ def pass8_verify(records: dict[str, FileRecord],
         # passes instead of fail-closing.  Two classes are handled:
         # duplicate `if (COND) { ... }` with identical normalized
         # bodies in the same scope, and duplicate module-scope
-        # `const NAME = ...;` (plus its trailing `if (NAME) { ... }`).
+        # `const NAME = ...;` (plus its trailing
+        # `if (NAME) { ... }`).
         # This is the fix for test_31 (duplicate if-guards) and for
         # the pg_panel_scrubs.py "duplicate top-level declaration"
         # fail-closed case in the real conversation.

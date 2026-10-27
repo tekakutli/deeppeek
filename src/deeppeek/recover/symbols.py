@@ -322,6 +322,36 @@ def _extract_js_imports(content: str) -> set:
                     names.add(part)
     return names
 
+_JS_IMPORT_WITH_SRC_RE = re.compile(
+    r'import\s+'
+    r'(?:'
+    r'\*\s+as\s+([A-Za-z_$][\w$]*)'
+    r'|([A-Za-z_$][\w$]*)'
+    r'|\{\s*([^}]+?)\s*\}'
+    r')'
+    r'\s+from\s*["\']([^"\']+)["\']'
+)
+
+
+def _extract_js_imports_with_src(content: str):
+    """Return [(imported_name, module_specifier), ...]."""
+    out = []
+    blanked = _blank_js_comments(content)
+    for m in _JS_IMPORT_WITH_SRC_RE.finditer(blanked):
+        module = m.group(4)
+        if m.group(1):
+            out.append((m.group(1), module))
+        elif m.group(2):
+            out.append((m.group(2), module))
+        elif m.group(3):
+            for part in m.group(3).split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if " as " in part:
+                    part = part.split(" as ", 1)[1].strip()
+                out.append((part, module))
+    return out
 
 _JS_DECL_RE = re.compile(
     r'(?:^|\n)[ \t]*(?:export\s+)?(?:async\s+)?'

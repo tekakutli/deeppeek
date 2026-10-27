@@ -34,6 +34,30 @@ Supporting predicates (`_patch_already_present`,
 declared.  They are drift-tolerant by way of patch_text's
 `_content_present_in_base` (see the DRIFT-FIX comments below).
 
+Boundary completeness
+=====================
+Two insert heuristics place the body between two other lines:
+`_try_insert_after_anchor` and `_try_context_insert`.  Different
+rules apply:
+
+  · `_try_insert_after_anchor` inserts after a *statement*.  The
+    body must be a complete statement — last non-blank line ends
+    with `;`, `}`, `)`, or is a comment.  A fragment ending with
+    `,` is a continuation; landing it between two statements
+    corrupts both.  This is the pg_comfy_client.py shape: the
+    `body: JSON.stringify({...}),` fragment from the thought
+    process was inserted between the signature's parameter list
+    and the closing parenthesis, producing a genuinely broken
+    function.  `_body_is_complete_at_boundary` catches it.
+
+  · `_try_context_insert` inserts next to a *line*, which may be
+    inside a comma-separated container (object literal, array,
+    parameter list at the point of already-complete prior params).
+    A fragment ending with `,` is a valid insertion here *when the
+    anchor is itself a comma-continuation* — the container context
+    is preserved by the anchor line.  `_context_insert_ok` encodes
+    this: complete statement OR anchor ends with `,`.
+
 No imports from patch_scope or patch_pairs — this module is the
 bottom of the "apply strategy" subtree.
 """
@@ -70,6 +94,78 @@ _OBJECT_LITERAL_ASSIGNMENT_RE = re.compile(
     r')'
     r'\s*\{'
 )
+
+
+# ===========================================================================
+#  Boundary-completeness predicates
+# ===========================================================================
+#
+# An anchor-based insert places the body between two existing lines.
+# The rules differ by heuristic — see the module docstring for the
+# full reasoning.  Summary:
+#
+#   _body_is_complete_at_boundary(body)
+#       Strict.  Body's last non-blank line must end with `;`, `}`,
+#       `)`, or be a comment.  Used by `_try_insert_after_anchor`,
+#       where the surrounding context is a statement stream and a
+#       continuation fragment would corrupt both neighbours.
+#
+#   _context_insert_ok(anchor_line, body)
+#       Relaxed.  Passes if the body is complete OR the anchor line
+#       ends with `,`.  Used by `_try_context_insert`, where the
+#       anchor line's comma is the container context that makes a
+#       fragment valid.
+
+def _body_is_complete_at_boundary(body):
+    """True iff `body` can be inserted between two lines as a
+    complete statement.
+
+    Complete = last non-blank line ends with `;`, `}`, or `)`,
+    OR the body is a single-line comment (`// ...` or `# ...`),
+    OR the body is a standalone block comment (`/* ... */`).
+    Everything else is either a continuation (ends with `,`,
+    `+`, `*`, etc.), an opener (ends with `{` or `(`), or a
+    fragment.
+    """
+    if not body or not body.strip():
+        return False
+    lines = [ln for ln in body.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    first = lines[0].strip()
+    last = lines[-1].strip()
+    if last.startswith("//") or last.startswith("#"):
+        return True
+    if last.startswith("/*") and last.endswith("*/"):
+        return True
+    if last.endswith((";", "}", ")")):
+        return True
+    if last == "}":
+        return True
+    return False
+
+
+def _context_insert_ok(anchor_line, body):
+    """The body can be inserted adjacent to the anchor iff either:
+
+    - the body is a complete statement (last non-blank line ends with
+      `;`, `}`, `)`, or is a comment), OR
+    - the anchor line ends with `,`, so the body is being appended
+      to a comma-separated container (object literal, array,
+      parameter list).
+
+    The comma-anchor case covers the object-entry insert pattern:
+    `key: value,` before `other: value,` is a valid addition to the
+    object literal even though the added line itself ends with `,`.
+    Without this branch, `inpaintFullCanvas: false,` before
+    `inpaintPrompt: "",` would be refused because neither line is
+    a "complete statement" by the strict predicate.
+    """
+    if _body_is_complete_at_boundary(body):
+        return True
+    if anchor_line.strip().endswith(","):
+        return True
+    return False
 
 
 # ===========================================================================
@@ -296,7 +392,7 @@ def _try_context_insert(base, body):
         return out
 
     last_line = body_lines[-1]
-    if _unique(last_line):
+    if _unique(last_line) and _context_insert_ok(last_line, body):
         candidates = _filter_new(body_lines[:-1])
         if candidates:
             anchor_stripped = last_line.strip()
@@ -318,7 +414,8 @@ def _try_context_insert(base, body):
     # original closer becomes unmatched (-1 brace).  Refuse and let
     # the caller fall through to `_try_insert_after_anchor`.
     first_line_opens = first_line.count("{") - first_line.count("}")
-    if first_line_opens <= 0 and _unique(first_line):
+    if (first_line_opens <= 0 and _unique(first_line)
+            and _context_insert_ok(first_line, body)):
         candidates = _filter_new(body_lines[1:])
         if candidates:
             anchor_stripped = first_line.strip()
@@ -420,6 +517,11 @@ _CALL_ONLY_RE = re.compile(r'^[A-Za-z_$][\w$]*\s*\(')
 def _try_insert_after_anchor(base, body, context_before):
     body_stripped = body.strip()
     if not body_stripped:
+        return None
+    # Boundary completeness — see module docstring.  A fragment whose
+    # last non-blank line ends with `,` is a continuation, not a
+    # complete statement; landing it between two lines corrupts both.
+    if not _body_is_complete_at_boundary(body_stripped):
         return None
     body_lines = body_stripped.splitlines()
     if len(body_lines) < 2 or len(body_lines) > 40:

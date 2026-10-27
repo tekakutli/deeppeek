@@ -78,7 +78,8 @@ from .attribute import pass4_attribute_orphans
 from .dedup import pass5_deduplicate
 from .apply_patches import pass6_apply_patches
 from .validate import (
-    pass7_cross_validate, pass8_verify, pass8_5_check_symbols,
+    pass7_cross_validate, pass7_5_js_validate,
+    pass8_verify, pass8_5_check_symbols,
 )
 from .write import pass9_write
 
@@ -470,6 +471,28 @@ def run(cfg: RecoverConfig) -> int:
                       f"'{p['target']}' — not exported")
         if len(xv) > 10:
             print(f"    ... and {len(xv) - 10} more (see warnings.txt)")
+    else:
+        print("  clean")
+
+    # ---- pass 7.5 (wrapped) ----
+    print("[pass 7.5] cross-validating JS imports/exports...")
+    js_problems = _run_pass(
+        "7.5 (js-validate)", pass7_5_js_validate, [],
+        run_errors, records,
+    ) or []
+    if js_problems:
+        cross_validate["problems"] = (
+            cross_validate.get("problems", []) + js_problems)
+        print(f"  {len(js_problems)} JS import problem(s):")
+        for p in js_problems[:10]:
+            if p["type"] == "missing_js_module":
+                print(f"    [{p['from']}] imports '{p['module']}' — "
+                      f"not recovered")
+            elif p["type"] == "missing_js_export":
+                print(f"    [{p['from']}] imports '{p['name']}' from "
+                      f"'{p['target']}' — not exported")
+        if len(js_problems) > 10:
+            print(f"    ... and {len(js_problems) - 10} more")
     else:
         print("  clean")
 

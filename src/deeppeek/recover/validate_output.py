@@ -30,6 +30,14 @@ detects the failure classes that matter for those projects:
      `key: value,` object members is brace-balanced but
      syntactically invalid.  A parse check catches it.
 
+  6. Module-level statement regression - for Python files.  A patch
+     that should have been inserted inside a function but was
+     appended at module level shows up as a new `try:` /
+     `for:` / `while:` / `with:` at column 0 that wasn't in
+     the base.  Catches the inpaint_server.py `output_rotation`
+     corruption shape (three patches appended at module level after
+     `RAW_ROUTES`).
+
 All checks return None on success, or a one-line string describing
 the failure.  Any non-None return means the file must be fail-closed
 (LOW trust -> low_trust/) so the target tree is preserved.
@@ -56,6 +64,7 @@ not.  Callers that don't read the flag see no behaviour change.
 import ast
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
@@ -143,6 +152,50 @@ def _js_balance(text: str) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# Module-level statement regression (Python files)
+# ---------------------------------------------------------------------------
+#
+# The inpaint_server.py corruption shape: three fragments that
+# reference function locals (payload, batch) were appended at
+# module level by structural-append.  The result is syntactically
+# valid Python, so ast.parse passes; the check below catches the
+# class of "statement added at module level that wasn't there
+# before" without needing to know what names are undefined.
+
+_MODULE_STMT_KEYWORDS = ("try", "except", "finally", "for", "while", "with")
+
+_TOP_LEVEL_STMT_RE = re.compile(
+    r"^(?:" + "|".join(_MODULE_STMT_KEYWORDS) + r")\b",
+    re.MULTILINE,
+)
+
+
+def _module_level_stmts_added(content: str, base: Optional[str]) -> list:
+    """Return statement keywords at column 0 whose count increased
+    from `base` to `content`.
+
+    Only try/except/finally/for/while/with are considered.  `if`
+    is deliberately excluded: `if __name__ == "__main__":` is a
+    legitimate module-level addition.
+    """
+    def _count(text):
+        counter = Counter()
+        if not text:
+            return counter
+        for m in _TOP_LEVEL_STMT_RE.finditer(text):
+            if text.rfind("\n", 0, m.start()) + 1 == m.start():
+                counter[m.group(0)] += 1
+        return counter
+    after = _count(content)
+    before = _count(base or "")
+    added = []
+    for kw, n in after.items():
+        if n > before.get(kw, 0):
+            added.append(kw)
+    return sorted(added)
+
+
+# ---------------------------------------------------------------------------
 # Function / declaration presence
 # ---------------------------------------------------------------------------
 
@@ -225,6 +278,81 @@ def _get_js_parser(lang: str):
         return _get_parser(lang)
     except Exception:
         return None
+
+
+def _js_parse_check_subprocess(text: str, lang: str) -> Optional[str]:
+    """Run tree-sitter parse in the repo .venv's Python.
+
+    The current interpreter may lack tree-sitter (a pipx install does;
+    the repo .venv usually has it).  `ast_anchor` already has a
+    subprocess fallback for its own anchoring work; this reuses the
+    same plumbing so validation catches syntax errors even when the
+    in-process parser is unavailable.
+
+    Returns None if the parser is unavailable (no verdict); returns
+    a diagnostic string if a parse error was found; returns None if
+    the content parsed cleanly.
+    """
+    try:
+        from .ast_anchor import _find_venv_python, _src_dir, _has_venv_ast
+    except ImportError:
+        return None
+    if not _has_venv_ast():
+        return None
+    py = _find_venv_python()
+    if py is None:
+        return None
+    import json
+    import subprocess
+    payload = json.dumps({"text": text, "lang": lang})
+    helper = (
+        "import json, sys\n"
+        f"sys.path.insert(0, {str(_src_dir())!r})\n"
+        "from deeppeek.recover.ast_anchor import _get_parser\n"
+        "data = json.load(sys.stdin)\n"
+        "parser = _get_parser(data['lang'])\n"
+        "if parser is None:\n"
+        "    sys.stdout.write(json.dumps({'available': False}))\n"
+        "    sys.exit(0)\n"
+        "def _walk(n):\n"
+        "    yield n\n"
+        "    for c in n.children:\n"
+        "        yield from _walk(c)\n"
+        "tree = parser.parse(data['text'].encode('utf-8'))\n"
+        "if tree.root_node.has_error:\n"
+        "    loc = None\n"
+        "    for n in _walk(tree.root_node):\n"
+        "        if n.type == 'ERROR':\n"
+        "            sp = n.start_point\n"
+        "            loc = [sp[0] + 1, sp[1] + 1]\n"
+        "            break\n"
+        "    sys.stdout.write(json.dumps("
+        "{'available': True, 'error': True, 'loc': loc}))\n"
+        "else:\n"
+        "    sys.stdout.write(json.dumps("
+        "{'available': True, 'error': False}))\n"
+    )
+    try:
+        proc = subprocess.run(
+            [str(py), "-c", helper],
+            input=payload, capture_output=True, text=True, timeout=10.0,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        result = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not result.get("available"):
+        return None
+    if not result.get("error"):
+        return None
+    loc = result.get("loc")
+    if loc:
+        return f"parse error at line {loc[0]}, col {loc[1]}"
+    return "parse error"
 
 
 def _js_lang_for_ext(ext: str) -> Optional[str]:
@@ -334,12 +462,20 @@ def _js_structural_check(text: str, label: str,
     # punctuation is arranged in a valid scope.  The pg_state.py
     # corruption shape (an `if` between two `key: value,` object
     # members) passes every balance check above and fails here.
+    #
+    # When in-process tree-sitter is unavailable, fall back to the
+    # repo .venv subprocess.  This is the only way to catch the
+    # pg_comfy_client.py signature corruption when deeppeek runs
+    # from pipx (which has no tree-sitter installed).
     if parse_lang is not None:
         parser = _get_js_parser(parse_lang)
         if parser is None:
-            # No parser for this language.  Fall back to balance-only;
-            # record the downgrade so the manifest can honestly report
-            # "ok (balance-only)" rather than "ok".
+            sub_err = _js_parse_check_subprocess(text, parse_lang)
+            if sub_err is not None:
+                return (f"{label}: JavaScript {sub_err} "
+                        f"(via venv tree-sitter) — likely a patch was "
+                        f"inserted where its statement shape does not "
+                        f"fit")
             if _LAST_PARSE_METHOD == "none":
                 _LAST_PARSE_METHOD = "balance"
         else:
@@ -513,6 +649,22 @@ def validate_content(content: str, path: str,
         except SyntaxError as e:
             return (f"{path}: python SyntaxError at line {e.lineno}: "
                     f"{e.msg}")
+
+        # NEW: module-level statement regression.  A patch that
+        # should have been inserted inside a function but landed at
+        # module level (structural_append / context_insert after a
+        # module-level anchor) shows up as new try:/for:/while:/with:
+        # at column 0.  Catches the inpaint_server.py corruption
+        # shape: three patches referencing function locals appended
+        # at module level after RAW_ROUTES.
+        if base:
+            added_stmts = _module_level_stmts_added(content, base)
+            if added_stmts:
+                return (f"{path}: module-level statement(s) added at "
+                        f"column 0 that weren't in base: {added_stmts}"
+                        f" — a patch that should have been inserted "
+                        f"into a function was likely appended at "
+                        f"module level")
 
         base_js_texts = []
         if base:

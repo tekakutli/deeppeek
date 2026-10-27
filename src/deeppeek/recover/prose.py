@@ -32,6 +32,18 @@ to the original", "only the top", "start of", "prefix of", etc., the
 block that follows is understood to be a *prefix* of the new body —
 a scoped-replace should splice, not replace.  `is_partial_replacement`
 reports this to the patcher.
+
+SCOPE EXTRACTION SKIPS STRING LITERALS
+======================================
+A JS-in-Python fragment (`STATE_JS = r\"\"\"...export function
+resetView...\"\"\"`) contains a `function resetView` inside a triple-
+quoted Python string.  `_extract_scope_from_body` must NOT treat
+that inner JS function as the scope — the outer Python assignment
+is the container.  We detect triple-quoted string spans and skip
+any scope match inside them.  This is the pg_state.py failure
+class: a `full` block whose body starts with `STATE_JS = r\"\"\"`
+was misdetected as a scoped replace of the first JS function it
+contained.
 """
 
 import re
@@ -344,16 +356,27 @@ def parse_intent(context_before: str) -> Intent:
 # ---------------------------------------------------------------------------
 # Scope extraction from body
 # ---------------------------------------------------------------------------
+#
+# NEW: skip matches that fall inside a triple-quoted string literal.
+# A JS-in-Python fragment (`STATE_JS = r\"\"\"...\"\"\"`) contains
+# JS functions INSIDE the Python string.  The true outer scope is
+# the Python assignment; treating the inner JS function as the scope
+# causes self-nesting when that assignment is also the base.
 
-def _extract_scope_from_body(body: str) -> tuple:
-    """Return (name, kind) extracted from the block body, or ("", "")."""
-    if not body:
-        return "", ""
-    for pattern, kind in _SCOPE_FROM_BODY_PATTERNS:
-        m = pattern.search(body)
-        if m:
-            return m.group(1).strip(), kind
-    return "", ""
+_STRING_SPAN_RE = re.compile(
+    r'(?:[rbufRBUF]{0,2})(?:""".*?"""|\'\'\'.*?\'\'\')',
+    re.DOTALL,
+)
+
+
+def _string_spans(body: str):
+    """Return [(start, end)] char ranges of every triple-quoted
+    string literal in `body`."""
+    return [(m.start(), m.end()) for m in _STRING_SPAN_RE.finditer(body)]
+
+
+def _inside_any(pos: int, spans: list) -> bool:
+    return any(start <= pos < end for start, end in spans)
 
 
 _SCOPE_FROM_BODY_PATTERNS = [
@@ -381,3 +404,24 @@ _SCOPE_FROM_BODY_PATTERNS = [
         re.MULTILINE),
      "javascript"),
 ]
+
+
+def _extract_scope_from_body(body: str) -> tuple:
+    """Return (name, kind) extracted from the block body, or ("", "").
+
+    Skips matches inside triple-quoted string literals — a JS-in-
+    Python fragment must not be scoped by its inner JS functions.
+    The pg_state.py failure case: `STATE_JS = r\"\"\"...export
+    function resetView...\"\"\"` was extracted as scope=`resetView`,
+    which then nested the whole file inside itself when the block was
+    also the base.
+    """
+    if not body:
+        return "", ""
+    spans = _string_spans(body)
+    for pattern, kind in _SCOPE_FROM_BODY_PATTERNS:
+        for m in pattern.finditer(body):
+            if _inside_any(m.start(), spans):
+                continue
+            return m.group(1).strip(), kind
+    return "", ""

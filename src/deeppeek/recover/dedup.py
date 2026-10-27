@@ -7,6 +7,36 @@ or a scoped replace is *removed* from the normal trailing-patch path
 — it becomes a structured edit that `apply_patches` handles
 separately.
 
+PAIR VALIDATION AGAINST THE BASE
+================================
+Not every `paired_with = -1` block is a valid scoped replace.  Two
+cases are rejected here, and the block falls through to the
+trailing-patch path:
+
+  1. The pair targets the chosen full-print block itself.  A block
+     that IS the base cannot be a scoped replace *of* itself — the
+     result would nest the block inside itself (the pg_state.py
+     failure mode).
+
+  2. The scope named by the pair does not exist in the base.  This
+     is an insert of a NEW scope, not a replace of an existing one.
+     `_apply_scoped` correctly fails, but the pair is recorded as a
+     failure and drags the record to LOW for no good reason.  The
+     block instead goes through `_try_context_insert` or
+     `_try_insert_after_anchor`, where "insert between X and Y" prose
+     can actually land.
+
+CROSS-FILE DUPLICATE ATTRIBUTION
+================================
+An orphan blockquoted block attributed by prose can be misattributed
+— the prose names a file, but the content belongs to a DIFFERENT
+file's pre-existing source.  The pg_inpaint.py failure: a 4-line
+fragment from `_inpaintAction` was attributed to `pg_inpaint.py`
+because the prose mentioned "inpaint result", while the fragment was
+already verbatim in `pg_panel_bindings.py`.  We check: if the
+fragment is already present in a DIFFERENT pre-existing record, the
+attribution was a false positive; skip the block.
+
 SILENT-DROP POLICY (2026-11-01c)
 ================================
 Any attributed partial block whose body shows a code signal becomes
@@ -43,6 +73,7 @@ from .core import (
     _looks_like_diff_body,
 )
 from .pairing import detect_all, build_pairs
+from .patch_scope import _scope_in_base
 
 
 _EXPORT_CONST_OBJECT_RE = re.compile(
@@ -119,8 +150,8 @@ def _has_code_signal(body: str) -> bool:
 # content is speculative.  The one signal strong enough to override
 # that convention is **exact prose attribution** — the prose
 # immediately above the fence names exactly ONE target file
-# (`attributed_by == "prose"`).  That is the AI's explicit
-# "Update file X with this code" instruction.
+# (`attributed_by == "prose"`) AND that prose reads as an instruction
+# to commit code, not as a description of where something lives.
 #
 # Every other attribution strength is rejected:
 #
@@ -130,49 +161,135 @@ def _has_code_signal(body: str) -> bool:
 #     the pg_inpaint.py counterexample: a prose_nearest blockquoted
 #     block was applied AFTER a correct scoped-replace pair had
 #     already fixed the file, nesting `buildContextMaskB64` inside
-#     itself.  Balanced-brace clean, silently wrong.  The
-#     pg_state.py counterexample from an earlier revision is the
-#     same shape: "the AI's prose named `pg_state.py` among other
-#     files", i.e., multi-file guess, not exact single-file
-#     attribution.
+#     itself.  Balanced-brace clean, silently wrong.
 #
 #   · `body_header`, `anchor`, `subset` — incidental matches
 #     against the thinking's working notes.  The AI is not
 #     signalling "commit this"; it happens to mention a filename, or
-#     an anchor line, or a snippet.  The pipeline previously applied
-#     these and produced two warnings per block for no benefit.
+#     an anchor line, or a snippet.
+#
+#   · `prose` where the prose merely NAMES the destination file
+#     without instructing insertion.  This is the pg_comfy_client.py
+#     counterexample: an orphan blockquoted `body: JSON.stringify`
+#     fragment was applied because the prose mentioned
+#     `pg_comfy_client.py`, but the prose was describing what the
+#     file does, not asking for the fragment to be inserted.  It
+#     landed in the signature and corrupted the destructured
+#     parameter list.
 #
 # Do not inline the check at any call site.  Every consumer of the
 # blockquote policy calls `_has_strong_blockquote_attribution`,
-# which reads `_STRONG_BQ_ATTR`.  To make the policy more or less
-# permissive, edit `_STRONG_BQ_ATTR` — the predicate and every gate
-# that uses it pick up the change together.  A prior version had an
-# inline `_STRONG_BQ_ATTR` check in one gate (`orphan_patches`)
-# and a predicate call in the other (`_is_real_patch`); a
-# tightening of the predicate silently diverged from the inline
-# check, producing two contradictory policies within the same
-# function — that drift is the bug this comment exists to prevent.
+# which reads `_STRONG_BQ_ATTR` and `_prose_has_commit_language`.
+# To make the policy more or less permissive, edit either one — the
+# predicate and every gate that uses it pick up the change together.
+# A prior version had an inline `_STRONG_BQ_ATTR` check in one gate
+# (`orphan_patches`) and a predicate call in the other
+# (`_is_real_patch`); a tightening of the predicate silently
+# diverged from the inline check, producing two contradictory
+# policies within the same function — that drift is the bug this
+# comment exists to prevent.
 
 _STRONG_BQ_ATTR = frozenset({"prose"})
+
+
+# Prose verbs/phrases that mark an *instruction* ("insert this here")
+# as opposed to a *description* ("this file contains X", "the patch
+# modifies Y").  Only instructions are strong enough to override the
+# blockquote-is-thinking convention.  The list is deliberately narrow:
+# adding weak verbs (e.g. "here is", "this") makes the gate fire on
+# descriptive prose.
+_COMMIT_VERBS = (
+    "add this", "add the following", "insert this",
+    "insert the following", "replace", "change",
+    "update", "use this", "apply this", "here is the new",
+    "here's the new", "here is the updated",
+    "here's the updated",
+    "with:", "with the following",
+)
+
+
+def _prose_has_commit_language(prose: str) -> bool:
+    """True iff the prose reads as an instruction to commit the
+    following block, not as a description of where something lives.
+
+    A prose line like "the patch modifies `runInpaint`" names a file
+    but does not commit code; a prose line like "add this to
+    `runInpaint`" does.  Blockquoted orphans only override the
+    blockquote-is-thinking convention when the prose is an
+    instruction.
+    """
+    lower = (prose or "").lower()
+    return any(v in lower for v in _COMMIT_VERBS)
 
 
 def _has_strong_blockquote_attribution(b: Block) -> bool:
     """True iff the block's attribution is strong enough to override
     the blockquote-is-thinking convention.
 
-    Only `attributed_by == "prose"` qualifies — the surrounding prose
-    names EXACTLY ONE target file, which is the AI's explicit
-    "Update file X with this code" instruction.  Every other
-    attribution strength is rejected; see the module-level
-    blockquote policy comment for the full reasoning and the
-    counterexamples that motivated the current boundary.
+    Two conditions, both required:
+
+      1. `attributed_by == "prose"` — the surrounding prose names
+         EXACTLY ONE target file.  `prose_nearest` (the multi-file
+         guess) is rejected; see the module-level blockquote policy
+         comment for the counterexamples.
+
+      2. The prose carries commit language — "add this", "replace",
+         "update", "with:", etc.  A prose line that merely NAMES the
+         destination file without instructing the model to insert
+         code is not a commit signal.  This is the pg_comfy_client.py
+         counterexample: an orphan blockquoted `body: JSON.stringify`
+         fragment was applied because the prose mentioned the file,
+         but the prose was describing what the file does, not asking
+         for the fragment to be inserted.  It landed in the signature
+         and corrupted the destructured parameter list.
 
     This predicate and `_STRONG_BQ_ATTR` are the SINGLE source of
     truth for the policy.  Every call site in `pass5_deduplicate` —
     the `orphan_patches` construction and `_is_real_patch` — must
     go through this predicate.  Callers must not inline the check.
     """
-    return b.attributed_by in _STRONG_BQ_ATTR
+    return (
+        b.attributed_by in _STRONG_BQ_ATTR
+        and _prose_has_commit_language(b.context_before)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cross-file presence — attribution sanity check
+# ---------------------------------------------------------------------------
+
+def _already_in_other_file(block: Block,
+                           current_path: str,
+                           records: dict,
+                           blocks_by_idx: dict) -> Optional[str]:
+    """Return the path of another record whose base contains the
+    block's body verbatim, or None.
+
+    Used to catch prose attribution that happened to match a filename
+    in the prose but landed on the wrong target.  The fragment is
+    already in a DIFFERENT pre-existing file — it's a reference, not
+    a new insertion.
+
+    Only checks *preexisting* records: a block that IS the base of
+    the current file is already handled by the chosen-full filter
+    in `pass5_deduplicate`.
+    """
+    body = block.body.strip()
+    if not body or len(body) < 20:
+        return None
+    for other_path, other_rec in records.items():
+        if other_path == current_path:
+            continue
+        if not other_rec.preexisting_base:
+            continue
+        if other_rec.last_full_idx is None:
+            continue
+        other_base = blocks_by_idx.get(other_rec.last_full_idx)
+        if other_base is None:
+            continue
+        if body in other_base.body:
+            return other_path
+    return None
 
 
 def pass5_deduplicate(records: dict,
@@ -235,20 +352,71 @@ def pass5_deduplicate(records: dict,
             fulls = []
             rec.preexisting_base = False
 
-        # ---- pair-assigned blocks are excluded from patches ----
+        # ---- pick chosen_full_idx BEFORE building pairs ----
+        # The pair validation (see next block) needs the base body
+        # to check scope existence and self-reference.  Picking the
+        # winner first lets the check read blocks_by_idx[chosen].
+        base_body = ""
+        chosen_idx = None
+        if fulls:
+            rec.all_full_idxs = fulls[:]
+            if len(fulls) == 1:
+                rec.chosen_full_idx = fulls[0]
+                rec.dedup_reason = (
+                    "preexisting_base" if rec.preexisting_base
+                    else "single_full")
+            else:
+                chosen, reason = _dedup_pick(path, fulls, blocks_by_idx)
+                rec.chosen_full_idx = chosen
+                rec.dedup_reason = reason
+                if verbose:
+                    print(f"  [pass 5] {path}: chose idx={chosen} "
+                          f"({reason}); candidates={fulls}",
+                          file=sys.stderr)
+            rec.last_full_idx = rec.chosen_full_idx
+            chosen_idx = rec.chosen_full_idx
+            base_body = blocks_by_idx[chosen_idx].body
+
+        # ---- pair-assigned blocks (with validation) ----
+        #
+        # A scoped pair is only valid when:
+        #   · it does NOT target the chosen full block itself
+        #     (self-nesting: the block IS the base), AND
+        #   · the scope name exists in the base (this is a
+        #     REPLACE, not an INSERT of a new scope).
+        #
+        # When either check fails, the pair is rejected and the
+        # block falls through to the trailing-patch path, where the
+        # insert heuristics have a chance.  See module docstring.
         pair_idxs_for_this_file = set()
         for anchor, pair in global_pairs.items():
             if pair["old_idx"] == -1:
                 b = blocks_by_idx[anchor]
-                if b.output_path == path:
-                    pair_idxs_for_this_file.add(anchor)
-                    rec.pairs.append({
-                        "old_idx": -1,
-                        "new_idx": anchor,
-                        "scope_hint": "scoped",
-                        "scope_name": pair["scope_name"],
-                        "new_body": pair["new_body"],
-                    })
+                if b.output_path != path:
+                    continue
+                if anchor == chosen_idx:
+                    if verbose:
+                        print(f"  [pass 5] {path}: skipping scoped pair "
+                              f"idx={anchor} (targets chosen full)",
+                              file=sys.stderr)
+                    continue
+                if base_body and not _scope_in_base(
+                        base_body, pair["scope_name"],
+                        getattr(b, "scope_hint", "") or ""):
+                    if verbose:
+                        print(f"  [pass 5] {path}: scoped pair idx="
+                              f"{anchor} scope={pair['scope_name']!r} "
+                              f"not in base; treating as insert",
+                              file=sys.stderr)
+                    continue
+                pair_idxs_for_this_file.add(anchor)
+                rec.pairs.append({
+                    "old_idx": -1,
+                    "new_idx": anchor,
+                    "scope_hint": "scoped",
+                    "scope_name": pair["scope_name"],
+                    "new_body": pair["new_body"],
+                })
             else:
                 b_old = blocks_by_idx[pair["old_idx"]]
                 b_new = blocks_by_idx[pair["new_idx"]]
@@ -277,15 +445,32 @@ def pass5_deduplicate(records: dict,
         # and `_is_real_patch` below must share the SAME predicate;
         # inlining the check here was the source of the two-gate
         # drift bug this comment guards against.
-        orphan_patches = [
-            b.idx for b in blocks_by_idx.values()
-            if b.is_orphan and b.attributed_to == path
-            and b.kind != "full"
-            and b.idx not in pair_idxs_for_this_file
-            and block_owner.get(b.idx) == path
-            and (not b.in_blockquote
-                 or _has_strong_blockquote_attribution(b))
-        ]
+        #
+        # Cross-file presence: an orphan blockquoted block whose
+        # body is already verbatim in a DIFFERENT pre-existing
+        # record is a reference, not a new insertion.  Prose
+        # attribution that happens to name a filename does not
+        # override this — the AI's own source already proves where
+        # the fragment lives.  pg_inpaint.py failure case.
+        orphan_patches = []
+        for _b in blocks_by_idx.values():
+            if not (_b.is_orphan and _b.attributed_to == path
+                    and _b.kind != "full"
+                    and _b.idx not in pair_idxs_for_this_file
+                    and block_owner.get(_b.idx) == path
+                    and (not _b.in_blockquote
+                         or _has_strong_blockquote_attribution(_b))):
+                continue
+            if _b.in_blockquote:
+                other = _already_in_other_file(
+                    _b, path, records, blocks_by_idx)
+                if other is not None:
+                    if verbose:
+                        print(f"  [pass 5] {path}: skipping orphan "
+                              f"idx={_b.idx} — already in {other!r}",
+                              file=sys.stderr)
+                    continue
+            orphan_patches.append(_b.idx)
         partials = sorted(partials + orphan_patches)
 
         if verbose and rec.pairs:
@@ -302,25 +487,7 @@ def pass5_deduplicate(records: dict,
                 rec.state = "PARTIAL_ONLY" if partials else "MISSING"
             continue
 
-        rec.all_full_idxs = fulls[:]
-
-        if len(fulls) == 1:
-            rec.chosen_full_idx = fulls[0]
-            rec.dedup_reason = (
-                "preexisting_base" if rec.preexisting_base else "single_full"
-            )
-        else:
-            chosen, reason = _dedup_pick(path, fulls, blocks_by_idx)
-            rec.chosen_full_idx = chosen
-            rec.dedup_reason = reason
-            if verbose:
-                print(f"  [pass 5] {path}: chose idx={chosen} "
-                      f"({reason}); candidates={fulls}",
-                      file=sys.stderr)
-
-        rec.last_full_idx = rec.chosen_full_idx
-
-        chosen_idx = rec.chosen_full_idx
+        # chosen_full_idx already set above.
 
         def _is_real_patch(p_idx: int) -> bool:
             if p_idx in pair_idxs_for_this_file:

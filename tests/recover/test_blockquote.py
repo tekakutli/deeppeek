@@ -26,8 +26,15 @@ AI's reasoning, not its final answer.  Four behaviours matter:
      clean, syntactically valid JavaScript, silently wrong.
 
   3. Blockquoted fences with exact-prose attribution ARE applied,
-     matching the previous behaviour.  This is the case where the
-     AI is explicitly saying "Update file X with this code".
+     but only when the prose carries commit language ("add this",
+     "replace", "update", "with:", etc.).  A prose line that merely
+     names the destination file is a description, not an instruction.
+     This is the pg_comfy_client.py counterexample: an orphan
+     blockquoted `body: JSON.stringify` fragment was applied because
+     the prose mentioned the destination file, but the prose was
+     describing what the file does, not asking for the fragment to be
+     inserted.  It landed in the signature and corrupted the
+     destructured parameter list.
 
   4. The two gates in `pass5_deduplicate` that enforce the
      blockquote policy — the `orphan_patches` construction and
@@ -37,7 +44,8 @@ AI's reasoning, not its final answer.  Four behaviours matter:
      silently diverged from the inline check, producing two
      contradictory policies within the same function.  The
      consistency tests at the bottom of this file guard against
-     that class of regression.
+     that class of regression, and now also check the
+     commit-language requirement.
 
 The motivating case for the blockquote handling: conversation2.md,
 where every assistant message was a thought-process blockquote.  The
@@ -59,6 +67,7 @@ from deeppeek.recover.attribute import pass4_attribute_orphans
 from deeppeek.recover.dedup import (
     pass5_deduplicate,
     _has_strong_blockquote_attribution,
+    _prose_has_commit_language,
     _STRONG_BQ_ATTR,
 )
 from deeppeek.recover.write import _compute_block_disposition
@@ -252,8 +261,8 @@ def test_blockquoted_weak_attr_not_patched():
 
 
 def test_blockquoted_prose_attr_still_patched():
-    """A blockquoted orphan with STRONG attribution (prose) MUST
-    become a patch.
+    """A blockquoted orphan with STRONG attribution (prose + commit
+    language) MUST become a patch.
 
     The prose attribution -- "Update `a.js`:" appearing right above
     the blockquoted fence -- is the AI's explicit intent to commit
@@ -274,7 +283,8 @@ def test_blockquoted_prose_attr_still_patched():
     bq = Block(
         idx=1, header_path=None, modifier=None, fence_lang="js",
         body="newFunc();\n", body_line_count=1,
-        context_before="Update `a.js`:", line_start=0, line_end=2,
+        context_before="Update `a.js` with:",
+        line_start=0, line_end=2,
         is_orphan=True, is_code_file=True, kind="partial",
         in_blockquote=True,
         attributed_to="a.js", attributed_by="prose",
@@ -393,64 +403,131 @@ def test_via_llm_not_set_without_llm_patch():
 # The two gates in `pass5_deduplicate` that enforce the blockquote
 # policy are the `orphan_patches` construction and `_is_real_patch`.
 # Both MUST call `_has_strong_blockquote_attribution`; neither may
-# inline the check.  A prior version had an inline check in one gate
+# inline the check.
+#
+# The contract has TWO conditions, both required:
+#
+#   1. `attributed_by` is in `_STRONG_BQ_ATTR` (currently just
+#      {"prose"} — exact single-file attribution).
+#   2. The prose carries commit language ("add this", "replace",
+#      "update", "with:", etc.).  A prose line that merely names the
+#      destination file is a description, not an instruction.
+#
+# A prior version had an inline `_STRONG_BQ_ATTR` check in one gate
 # and a predicate call in the other; when the predicate was tightened
-# to always-return-False, the two gates silently disagreed, and
+# to require commit language, the two gates silently disagreed, and
 # `test_blockquoted_prose_attr_still_patched` was the only thing that
-# noticed.  These tests lock in the single-source-of-truth contract.
+# noticed.  These tests lock in the single-source-of-truth contract
+# AND the two-condition semantics.
 
 def test_blockquote_policy_is_single_source_of_truth():
     """`_has_strong_blockquote_attribution` must agree with
-    membership in `_STRONG_BQ_ATTR`.  If a future change tightens
-    the predicate without updating the set (or vice versa), this
-    fails immediately rather than only after the drift surfaces as
-    a contradictory policy between the two gates.
+    `(attr in _STRONG_BQ_ATTR) AND commit_language` for every
+    attribution and prose combination.  If a future change tightens
+    the predicate without updating the set (or vice versa), or
+    loosens the commit-language requirement, this fails immediately.
     """
-    for attr in ("prose", "prose_nearest", "body_header",
-                 "anchor", "subset", "blockquote_skip",
-                 None, "unattributed"):
+    cases = [
+        # (attr, prose, expected)
+        ("prose", "add this to the file:", True),
+        ("prose", "add the following to the file:", True),
+        ("prose", "replace the block with:", True),
+        ("prose", "update the file:", True),
+        ("prose", "with:", True),
+        ("prose", "with the following:", True),
+        ("prose", "here is the new version:", True),
+        # No commit language — this is the pg_comfy_client.py shape.
+        ("prose", "the patch modifies this file:", False),
+        ("prose", "this file contains:", False),
+        ("prose", "", False),
+        # Not in _STRONG_BQ_ATTR, regardless of prose.
+        ("prose_nearest", "add this to the file:", False),
+        ("prose_nearest", "", False),
+        ("body_header", "add this to the file:", False),
+        ("anchor", "add this to the file:", False),
+        ("subset", "add this to the file:", False),
+        (None, "add this to the file:", False),
+        ("unattributed", "add this to the file:", False),
+    ]
+    for attr, prose, expected in cases:
         b = Block(
             idx=0, header_path=None, modifier=None, fence_lang="js",
             body="x();\n", body_line_count=1,
-            context_before="", line_start=0, line_end=1,
+            context_before=prose, line_start=0, line_end=1,
             is_orphan=True, is_code_file=True, kind="partial",
             in_blockquote=True, attributed_by=attr,
         )
-        predicate_says_strong = _has_strong_blockquote_attribution(b)
-        set_says_strong = attr in _STRONG_BQ_ATTR
-        assert predicate_says_strong == set_says_strong, (
-            f"_has_strong_blockquote_attribution disagrees with "
-            f"_STRONG_BQ_ATTR for attribution={attr!r}: "
-            f"predicate={predicate_says_strong}, "
-            f"set={set_says_strong}.  A future tightening of one "
-            f"without the other will re-create the two-gate drift "
-            f"bug.")
+        actual = _has_strong_blockquote_attribution(b)
+        assert actual == expected, (
+            f"_has_strong_blockquote_attribution(attr={attr!r}, "
+            f"prose={prose!r}) returned {actual}, expected {expected}.  "
+            f"A drift between the predicate, _STRONG_BQ_ATTR, and "
+            f"_prose_has_commit_language will re-create the two-gate "
+            f"drift bug this test guards against.")
 
 
 def test_prose_attribution_is_strong():
-    """Lock the positive case: exact `prose` attribution overrides
-    the blockquote convention."""
+    """Lock the positive case: `prose` attribution + commit
+    language overrides the blockquote convention."""
     b = Block(
         idx=0, header_path=None, modifier=None, fence_lang="js",
         body="x();\n", body_line_count=1,
-        context_before="", line_start=0, line_end=1,
+        context_before="add this to the file:",
+        line_start=0, line_end=1,
         is_orphan=True, is_code_file=True, kind="partial",
         in_blockquote=True, attributed_by="prose",
     )
     assert _has_strong_blockquote_attribution(b) is True
 
 
-def test_prose_nearest_is_not_strong():
-    """Lock the negative case: `prose_nearest` (multi-file guess)
-    does NOT override the blockquote convention."""
+def test_prose_attribution_without_commit_language_is_not_strong():
+    """A prose line that merely names the destination file is not
+    enough — the AI was describing where the code lives, not
+    instructing insertion.  This is the pg_comfy_client.py
+    counterexample: an orphan blockquoted `body: JSON.stringify`
+    fragment was applied because the prose mentioned the destination
+    file, but the prose was describing what the file does, not
+    asking for the fragment to be inserted.  It landed in the
+    signature and corrupted the destructured parameter list."""
     b = Block(
         idx=0, header_path=None, modifier=None, fence_lang="js",
         body="x();\n", body_line_count=1,
-        context_before="", line_start=0, line_end=1,
+        context_before="the patch modifies this file:",
+        line_start=0, line_end=1,
+        is_orphan=True, is_code_file=True, kind="partial",
+        in_blockquote=True, attributed_by="prose",
+    )
+    assert _has_strong_blockquote_attribution(b) is False
+
+
+def test_prose_nearest_is_not_strong():
+    """Lock the negative case: `prose_nearest` (multi-file guess)
+    does NOT override the blockquote convention, even when the
+    prose carries commit language."""
+    b = Block(
+        idx=0, header_path=None, modifier=None, fence_lang="js",
+        body="x();\n", body_line_count=1,
+        context_before="add this to the file:",
+        line_start=0, line_end=1,
         is_orphan=True, is_code_file=True, kind="partial",
         in_blockquote=True, attributed_by="prose_nearest",
     )
     assert _has_strong_blockquote_attribution(b) is False
+
+
+def test_prose_has_commit_language_verbs():
+    """Lock the commit-verb list.  Adding or removing a verb here
+    changes which prose overrides the blockquote convention; this
+    test makes that change deliberate."""
+    assert _prose_has_commit_language("add this to the file") is True
+    assert _prose_has_commit_language("replace with:") is True
+    assert _prose_has_commit_language("update the file:") is True
+    assert _prose_has_commit_language("with the following:") is True
+    assert _prose_has_commit_language("here is the new version:") is True
+    # Descriptions, not instructions:
+    assert _prose_has_commit_language("the patch modifies X:") is False
+    assert _prose_has_commit_language("this file contains X:") is False
+    assert _prose_has_commit_language("") is False
 
 
 def main():
@@ -483,8 +560,12 @@ def main():
          test_blockquote_policy_is_single_source_of_truth),
         ("prose attribution is strong",
          test_prose_attribution_is_strong),
+        ("prose attribution without commit language is not strong",
+         test_prose_attribution_without_commit_language_is_not_strong),
         ("prose_nearest is not strong",
          test_prose_nearest_is_not_strong),
+        ("prose_has_commit_language verbs",
+         test_prose_has_commit_language_verbs),
     ]
     failed = 0
     for name, fn in tests:

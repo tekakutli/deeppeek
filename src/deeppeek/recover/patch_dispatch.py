@@ -6,15 +6,42 @@ loop calls for each patch.  It dispatches, in order:
 
   1. deletions (if the body / prose is a deletion instruction)
   2. raw diffs
-  3. single-line replaces
-  4. scoped replaces (if the body declares a scope that exists in base)
-  5. ellipsis splices, with fallback
-  6. object-literal splices
-  7. context inserts
-  8. object-entry inserts
-  9. insert-after-anchor
- 10. AST anchor (optional dependency)
- 11. structural append
+  3. import replaces (multi-line import -> single-line import and
+     vice versa)
+  4. single-line replaces
+  5. scoped replaces (if the body declares a scope that exists in base)
+  6. ellipsis splices, with fallback
+  7. object-literal splices
+  8. context inserts
+  9. object-entry inserts
+ 10. insert-after-anchor
+ 11. AST anchor (optional dependency)
+ 12. structural append
+
+IMPORT REPLACE (new)
+====================
+A multi-line import body whose module matches a single-line import
+in base would previously fall through every heuristic:
+
+  · `_try_single_line_replace` requires exactly one non-blank line.
+  · `_try_context_insert` needs a unique first or last line — but
+    both lines in a multi-line import are continuations, not lines
+    that appear in base.
+
+The pg_panel_bindings.py failure case: body is
+
+    import { board, setImage, clearImage, _scheduleDraw,
+             view, _applyRotation } from "./pg_state.js";
+
+and base has
+
+    import { board, setImage, clearImage, _scheduleDraw } from "./pg_state.js";
+
+`_try_import_replace` joins continuation lines, parses the import,
+finds the same-module import in base, and reindents the original
+body to match.  It intentionally ignores the "add"/"insert" prose
+blocklist that `_try_single_line_replace` respects — adding a name
+to an import list IS a replacement of the import statement.
 
 Also exports `attribute_sanity_failure`, the helper that names the
 patch responsible for a sanity-gate rejection.  It lives here
@@ -24,6 +51,8 @@ and the block/record shapes.
 Imports from patch_text, patch_scope, patch_heuristics, patch_diag,
 and ast_anchor (lazy, optional).
 """
+
+import re
 
 from .core import _is_deletion_instruction, _looks_like_diff_body
 from .patch_text import (
@@ -44,6 +73,93 @@ from .patch_heuristics import (
 )
 from .prose import _extract_scope_from_body
 
+
+# ===========================================================================
+#  Import replace
+# ===========================================================================
+
+# A single import statement.  `[^}]*` for the names inside `{}` (no
+# nested braces in an import list — an import alias is `A as B`, no
+# expression syntax).  `[^"']+` for the module path (no quotes inside
+# a module path).  `;?` because some projects omit the semicolon.
+_IMPORT_JOIN_RE = re.compile(
+    r'import\s+\{([^}]*)\}\s*from\s*["\']([^"\']+)["\']\s*;?',
+    re.DOTALL,
+)
+
+# Continuations of a single logical line: end with `,`, `{`, `(`,
+# or backslash.  Used by `_join_continuations` so a 2-line import is
+# parsed as 1 logical line.
+_CONTINUATION_ENDINGS = (",", "{", "(", "\\")
+
+
+def _join_continuations(body: str) -> str:
+    """Join lines that are syntactic continuations of a single
+    logical line.
+
+    A continuation line ends with `,`, `{`, `(`, or `\\`.  The next
+    line is appended to the previous line's right side.  Blank lines
+    start a fresh logical line.
+    """
+    if not body:
+        return body
+    lines = body.split("\n")
+    result = [lines[0]] if lines else [""]
+    for line in lines[1:]:
+        if not line.strip():
+            result.append(line)
+            continue
+        prev = result[-1].rstrip()
+        if prev.endswith(_CONTINUATION_ENDINGS) and line.lstrip():
+            result[-1] = prev + " " + line.lstrip()
+        else:
+            result.append(line)
+    return "\n".join(result)
+
+
+def _try_import_replace(base, raw_body):
+    """If body is an import statement and base has an import from the
+    same module, replace the base's import with the body.
+
+    Intentionally ignores the `add`/`insert` prose blocklist that
+    `_try_single_line_replace` respects: adding a name to an import
+    list IS a replacement of the import statement, regardless of how
+    the prose frames it.
+
+    Returns the patched base, or None.
+
+    The body may be single-line or multi-line — a continuation line
+    (ending with `,`/`{`/`(`/`\\`) is joined to its predecessor for
+    the purposes of parsing.  The ORIGINAL multi-line body is what
+    gets inserted, reindented to the base's import indent.
+    """
+    joined = _join_continuations(raw_body)
+    m = _IMPORT_JOIN_RE.search(joined)
+    if not m:
+        return None
+    module = m.group(2)
+
+    # Locate the matching import in base.  We iterate lines (single-
+    # line import per line) rather than re-running the regex over the
+    # whole base because the base may contain *other* import
+    # statements; we want the one from the same module.
+    for line in base.split("\n"):
+        stripped = line.strip()
+        lm = _IMPORT_JOIN_RE.match(stripped)
+        if not lm:
+            continue
+        if lm.group(2) != module:
+            continue
+        indent = line[:len(line) - len(line.lstrip())]
+        reindented = _reindent_body(indent, raw_body.strip())
+        result = base.replace(line, reindented, 1)
+        return result if result != base else None
+    return None
+
+
+# ===========================================================================
+#  Dispatcher
+# ===========================================================================
 
 def _try_deterministic_patch(base, patch, path=""):
     """Crash-isolated entry point.
@@ -83,6 +199,14 @@ def _try_deterministic_patch_inner(base, patch, path=""):
         # `_try_raw_diff_patch` failed, fall through to the
         # already-present / failed classification.
         return None
+
+    # NEW: import replace.  Runs before the generic single-line path
+    # because a multi-line import is not a single line and would
+    # otherwise be blocked by every context-insert check.  See
+    # module docstring.
+    imported = _try_import_replace(base, raw_body)
+    if imported is not None:
+        return imported
 
     # Single-line replace
     single_line = _try_single_line_replace(base, raw_body, context_before)
@@ -154,8 +278,7 @@ def _try_deterministic_patch_inner(base, patch, path=""):
     # Object-literal splice
     m = _OBJECT_LITERAL_ASSIGNMENT_RE.match(body_stripped)
     if m:
-        import re as _re
-        id_m = _re.search(
+        id_m = re.search(
             r'([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*=\s*$',
             m.group("prefix").rstrip(),
         )

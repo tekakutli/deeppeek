@@ -21,6 +21,33 @@ The `_scope_in_base` predicate is exported for the dispatch layer's
 pre-check (patch_dispatch), which routes scope-declaring bodies to
 this module *before* they can fall through to the insert heuristics.
 
+PARTIAL-SPLICE BALANCE VALIDATION
+=================================
+`_try_scoped_partial_splice` line-diffs a truncated scope body
+against the base scope and inserts the new lines.  A body ending
+with a *comment* (e.g. `// ... rest unchanged; ...`) instead of a
+`...` marker or the actual scope closer is a partial body that will
+never carry a balanced brace count on its own.
+
+When the line-diff produces a result whose brace/paren/bracket
+balance differs from the base scope's, the resulting content is
+unbalanced and will fail-closed at the sanity gate — but the patch
+has already been recorded as a failure, dragging the record to LOW
+trust for no good reason.  We catch it here and refuse the splice
+instead.  This is the pg_pixels.py failure case: block 99 ends with
+`// ... rest unchanged; ...` and the splice dropped the base's
+closing `}`.
+
+SCOPE SIGNATURE INTEGRITY
+=========================
+After a scoped replace, the resulting scope text must still START
+with a recognisable declaration line.  A scoped replace that produces
+`outputRotation body: JSON.stringify({...})` as the new "declaration"
+is broken in a way that a brace-balance check cannot detect (the
+braces are balanced — it just isn't a declaration).  This is the
+pg_comfy_client.py corruption shape.  `_scope_signature_ok` is the
+check; `_apply_scoped` returns None when it fails.
+
 Imports from patch_text; imports from prose (for
 `_extract_scope_from_body`).
 
@@ -66,6 +93,143 @@ _SCOPE_PATTERNS = [
         r"(?:^|\n)[ \t]*" + re.escape(name) + r"\s*=\s*\{.*?\n[ \t]*\};?",
         re.DOTALL),
 ]
+
+
+# ===========================================================================
+#  Scope-declaration signature check
+# ===========================================================================
+#
+# After a scoped replace, the resulting scope must still start with a
+# recognisable declaration. A body like
+#
+#     outputRotation body: JSON.stringify({
+#         canvas_b64: canvasB64,
+#         ...
+#     }),}) {
+#
+# has balanced braces, but it is not a declaration. This is the exact
+# corruption shape produced by an orphan-patch insert inside a scoped
+# replace; without this check the file is written as valid-JSON-in-
+# signature-parens, which is neither valid JS nor a recognisable
+# function.
+#
+# The check must accept four declaration "families":
+#
+#   · JavaScript: function / class / const / let / var, optionally
+#     with `export` and/or `async`, optionally with `extends`.
+#   · Python: def / class, optionally `async`-prefixed.
+#   · HTML: <details> scope blocks.
+#   · Anything that precedes those — leading comments (`//`, `#`,
+#     `/* … */` single- or multi-line) and decorators (`@…`) — is
+#     skipped before the first-meaningful-line test.
+#
+# Anything else fails.  Concretely that rejects the
+# pg_comfy_client.py shape (a signature mangled into a bare
+# identifier expression) while accepting:
+#
+#   · test_10's `<details class="section" open>` first line,
+#   · test_apply_scoped_consumes_comment_with_blank's
+#     `/* New docstring */` leading line,
+#   · test_apply_scoped_consumes_decorator's `// new` leading line.
+
+_SCOPE_DECL_RE_JS = re.compile(
+    r"^(?:export\s+)?(?:async\s+)?(?:function|class|const|let|var)"
+    r"\s+[A-Za-z_$][\w$]*"
+    r"(?:\s+extends\s+[A-Za-z_$][\w$.]*)?"
+    r"\s*[\(=:{]",
+    re.MULTILINE,
+)
+
+_PY_SCOPE_DECL_RE = re.compile(
+    r"^(?:async\s+)?(?:def|class)\s+[A-Za-z_]\w*",
+    re.MULTILINE,
+)
+
+_DETAILS_DECL_RE = re.compile(
+    r"^<details\b",
+    re.IGNORECASE,
+)
+
+
+def _is_scope_decl_line(line):
+    """True iff `line` begins with a scope declaration in one of the
+    languages deeppeek handles: JS function/class/const/let/var (with
+    optional `export`, `async`, and `extends`), Python def/class (with
+    optional `async`), or an HTML `<details>` block.
+    """
+    if not line:
+        return False
+    return bool(
+        _SCOPE_DECL_RE_JS.match(line)
+        or _PY_SCOPE_DECL_RE.match(line)
+        or _DETAILS_DECL_RE.match(line)
+    )
+
+
+def _first_meaningful_line(text):
+    """Return the first line of `text` that is not blank, not a line
+    comment (`//` or `#`), not a `/* ... */` block comment (single-
+    or multi-line), and not a decorator (`@...`).
+
+    Returns None if no such line exists.
+
+    This is the SINGLE source of truth for "what counts as leading
+    noise" in scope-signature checks.  Consumers (currently only
+    `_scope_signature_ok`) must not inline the skipping logic — that
+    was the source of the previous divergence between
+    `_scope_signature_ok`'s first-line check and the partial/full
+    paths in `_apply_scoped`.
+    """
+    if not text:
+        return None
+    in_block_comment = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if in_block_comment:
+            if "*/" not in stripped:
+                continue
+            after = stripped.split("*/", 1)[1].strip()
+            in_block_comment = False
+            if not after:
+                continue
+            stripped = after
+        if stripped.startswith("/*"):
+            if "*/" in stripped:
+                after = stripped.split("*/", 1)[1].strip()
+                if not after:
+                    continue
+                stripped = after
+            else:
+                in_block_comment = True
+                continue
+        if stripped.startswith(("//", "#", "@")):
+            continue
+        return stripped
+    return None
+
+
+def _scope_signature_ok(scope_text):
+    """The replaced scope must still start with a recognisable
+    declaration line, after skipping leading comments and decorators.
+
+    Accepted shapes:
+      - JS: `function`/`class`/`const`/`let`/`var` declarations
+        (with optional `export`/`async` prefixes and `extends`
+        clauses)
+      - Python: `def`/`class`, optionally `async`-prefixed
+      - HTML: `<details>` scope blocks
+
+    Rejected: anything else.  Concretely this catches the
+    pg_comfy_client.py corruption shape — a body whose first
+    identifier is not a scope-decl keyword
+    (`outputRotation body: JSON.stringify({...})`).
+    """
+    first = _first_meaningful_line(scope_text)
+    if first is None:
+        return False
+    return _is_scope_decl_line(first)
 
 
 # ===========================================================================
@@ -257,10 +421,25 @@ def _try_scoped_partial_splice(base_scope_text, new_body):
     from `base_scope_text` are skipped (a partial body shouldn't be
     silently removing content — that would be a full replace).
 
+    BALANCE VALIDATION: after the splice, verify that the result has
+    the same brace/paren/bracket balance as the base scope.  If not,
+    refuse.  The pg_pixels.py failure case: block 99 ends with a
+    *comment* (`// ... rest unchanged; ...`) instead of a `...`
+    marker or the actual `}` closer.  SequenceMatcher treated the
+    missing closer as a 'delete' from new, which was correctly
+    skipped, but a subsequent 'replace' opcode still removed the
+    base's closing brace.  The result had `+1` unclosed brace.
+    Refusing here keeps the record at HIGH trust rather than
+    fail-closing on a corruption the splice itself caused.
+
     Returns the spliced scope text, or None when the diff adds
     nothing (meaning the "new" body is a strict subset of the old —
-    a truncation, not an extension)."""
+    a truncation, not an extension), or when the result would be
+    unbalanced.
+    """
     import difflib
+    from .validate_output import _js_balance
+
     base_lines = base_scope_text.split("\n")
     new_lines = new_body.split("\n")
     sm = difflib.SequenceMatcher(None, base_lines, new_lines)
@@ -281,6 +460,8 @@ def _try_scoped_partial_splice(base_scope_text, new_body):
         return None
     result_text = "\n".join(result)
     if result_text == base_scope_text:
+        return None
+    if _js_balance(result_text) != _js_balance(base_scope_text):
         return None
     return result_text
 
@@ -317,6 +498,8 @@ def _apply_scoped(base, scope_name, new_body):
                     indent_pos = base.rfind("\n", 0, m_start) + 1
                     base_indent = base[indent_pos:m_start]
                 reindented = _reindent_body(base_indent, spliced)
+                if not _scope_signature_ok(reindented):
+                    return None
                 return base[:indent_pos] + reindented + base[m_end:]
 
         # Full replacement (original logic).
@@ -336,5 +519,7 @@ def _apply_scoped(base, scope_name, new_body):
         while m_end > m_start and base[m_end - 1] == "\n":
             m_end -= 1
         reindented = _reindent_body(base_indent, new_body)
+        if not _scope_signature_ok(reindented):
+            return None
         return base[:indent_pos] + reindented + base[m_end:]
     return None

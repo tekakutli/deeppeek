@@ -66,7 +66,8 @@ _REFINE_DUMP_EXCLUDE_EXTRA = ["commands", "extension"]
 
 DEFAULT_PROMPT_TEMPLATE = """\
 This is the outcome of my deeppeek utility trying to apply the patches
-you just printed.  Attached: {conversation_name} (what recover was
+you just printed through: "deeppeek recover {conversation_name} --apply-here".
+Attached: {conversation_name} (what recover was
 given), diff.txt (what actually changed on disk), the reports under
 deeppeek/, and {deeppeek_dump_name} (a dump of deeppeek's own source).
 

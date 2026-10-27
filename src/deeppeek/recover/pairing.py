@@ -25,8 +25,22 @@ A single block becomes a scoped-replace (`paired_with = -1`) when:
     3. Its body carries a scope marker AND its prose has a
        replace/add verb.
 
-Case 2 is the fix for "Replace the entire Inpainting `<details>` … with:"
-when the scope name is only in the body.
+SCOPED BLOCKS MUST BE `partial`
+===============================
+A `full` block is a complete file print.  It becomes the record's
+`chosen_full_idx` in `pass5_deduplicate`; the block IS the base
+content.  A scoped replace of a sub-scope *inside itself* is always
+a self-nesting corruption — this is the pg_state.py failure case,
+where the body starts with `STATE_JS = r\"\"\"` and the prose says
+"Replace the whole `STATE_JS` string with this:".  The
+`_extract_scope_from_body` regex matched `export function
+resetView` inside the triple-quoted Python string and marked the
+block as a scoped replace of `resetView`.  `_apply_scoped` then
+nested the whole file inside `resetView`.
+
+Only `partial` blocks can be scoped-replace halves.  A `full` block
+is the whole file: it becomes the record's base, and any subsequent
+patches apply to it.  It is never itself a scoped replacement.
 """
 
 import re
@@ -82,8 +96,8 @@ def _bodies_look_like_versions(a: str, b: str) -> bool:
     the same scope.
 
     Two independent signals:
-      · similar size (within 3×)
-      · at least one shared "meaningful" line (≥10 chars).
+      - similar size (within 3x)
+      - at least one shared "meaningful" line (>=10 chars).
 
     Both are deliberately loose.  False positives are caught by the
     patcher (the pair will simply fail to apply); false negatives
@@ -182,8 +196,14 @@ def _detect_scoped(blocks: list) -> None:
             continue
         if b.is_orphan:
             continue
-        if b.kind not in ("partial", "full"):
+
+        # Scoped-replace is for *fragments* that replace a named
+        # sub-scope.  A `full` block is a complete file — the base
+        # itself.  Treating it as a scoped replace of a sub-scope
+        # inside itself is a self-nesting corruption (pg_state.py).
+        if b.kind != "partial":
             continue
+
         if b.classified_by == "preexisting":
             continue
 
