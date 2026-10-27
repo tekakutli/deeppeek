@@ -2,87 +2,31 @@
 recover.reconcile — Pass 8.7: reconcile fail-closed records by
 excluding the minimum set of patches/pairs that caused the failure.
 
-The pass-8.5 symbol check and the structural sanity gate both detect
-*real* problems — but they fail-close the *record*, which throws away
-the parts of the record that were fine.  A record can contain:
+See the pre-fix module docstring for the motivating cases and the
+"reconciled to base is not a rescue" invariant.
 
-  · one misattributed patch (content from another file, or a stray
-    thought fragment) alongside three correct patches;
-  · one patch whose body omits its closing brace alongside two
-    patches that apply cleanly;
-  · one applied patch that introduces an unresolved symbol alongside
-    the ones that don't.
+NEW: STALE-WARNING CLEANUP
+==========================
+Pass 6 appends `patch idx={idx} could not be applied (...)` warnings
+for every failed patch.  When reconciliation excludes a patch and
+promotes the record, those warnings are now stale — the patch is
+`skipped_unplaceable` or `skipped_misattributed`, not "failed".
+The pre-fix version left the warnings in place, producing
+confusing `warnings.txt` output like:
 
-In all three cases the *record* fails, but the *content* is mostly
-correct.  Writing only the correct parts — and telling the user
-exactly which patch was excluded and why — is strictly better than
-fail-closing the whole file.
+    [pg_panel_bindings.py] [WARN] patch idx=90 could not be applied (...)
+    [pg_panel_bindings.py] [WARN] excluded patch idx=90 (...): ...
 
-Reconciliation does this generally, without knowing *why* a patch
-is bad:
+on a record that was written at HIGH trust.  `pass8_7_reconcile`
+now removes the pass-6 warning for each excluded patch idx before
+adding its own reconciliation warning.
 
-  1. For each record that would fail-close, try replaying with each
-     candidate patch/pair excluded in turn.
-  2. Keep the exclusion that most reduces the failure count.  Repeat
-     until the record passes or no exclusion helps.
-  3. If it passes, commit: mark each excluded item
-     `skipped_misattributed` (was applied) or `skipped_unplaceable`
-     (was failed), rebuild content, restore trust to the record cap.
-  4. Emit one warning per excluded item, naming what failed and
-     — when the excluded content matches a different record — where
-     it probably belonged.
-
-"RECONCILED TO BASE" IS NOT A RESCUE
-====================================
-A record whose ONLY content is the failing item — one patch that
-didn't apply, one pair that failed, one fragment whose symbol is
-unresolved — can be trivially "fixed" by excluding that item.  The
-resulting content is byte-identical to `base`.  That is not a rescue:
-no change is being written.  The user asked for a specific edit and
-the edit could not be placed.
-
-`pass8_7_reconcile` refuses to promote in that case.  The record
-stays fail-closed, its diagnostic stays in `warnings.txt`, and the
-target file is preserved.
-
-REPLAY MUST MIRROR PASS 6's RETRY SEQUENCE
-==========================================
-Pass 6 tries each patch with the patch's own `context_before`
-first, then — if that fails — retries with `_broader_context_for`
-(merged context from adjacent blocks in the same record).  Some
-patches only apply on the second attempt: block 97's rotation-field
-patch in `pg_panel_scrubs.py`, for example, has only "Then append:"
-as its own context but succeeds because block 96's context (the
-import update, which sits immediately above it) reads
-"Add at the bottom (before the `status.running` field).  Also
-update the import line:".  The merged context contains the anchor
-phrase "before `status.running`", so `_try_insert_before_anchor`
-fires.
-
-`_replay_excluding` must therefore use the SAME retry sequence.  If
-it only tries the original `context_before`, replay fails for any
-patch that was originally applied via broader context — and
-reconciliation bails with `None`, leaving the fail-closed outcome
-in place.  That was the specific reason `pg_panel_scrubs.py` stayed
-LOW after pass 8.7 was first added: block 97 could not be replayed
-without the merged context, so excluding block 86 was never even
-tried.
-
-Interaction with pass 8.5 (symbols): the symbol check records an
-unresolved call on the *record*, not the patch.  Reconciliation
-rebuilds the record's content from `base` + kept items, so pass
-8.5's finding is re-evaluated against the rebuilt content — if the
-excluded patch was the source of the unresolved call, the rebuilt
-content has no unresolved calls and the record promotes.
-
-Interaction with pass 7.6/7.7 (JS export/import): those run *before*
-reconcile, so if repair succeeded the record never reached LOW.
-Reconcile is the fallback when repair couldn't fix the finding.
-
-Interaction with the sanity gate: a sanity_rejected record has
-already had its content reverted to base by the sanity gate.
-Reconciliation does not touch those (they are structurally defective
-end to end).
+The `patch or pair application failed; file not written` warning
+from pass 6 is also removed by `pass6_apply_patches` itself (see
+that module) — it never existed to be cleaned up here.  The
+"file not written" state is now reported accurately by
+`pass9_write`'s `trust=LOW below --min-trust` line, which fires
+only for records that actually stay LOW.
 """
 
 import sys
@@ -110,13 +54,6 @@ def _patch_key(patch):
 
 
 def _applied_keys(rec):
-    """Return the patch/pair keys worth trying to exclude.
-
-    Includes applied patches (deterministic, llm), applied pairs, and
-    failed patches/pairs.  Failed items are candidates because
-    excluding them removes a `patch_failed` / `pair_failed` failure
-    from the record's accounting without changing content.
-    """
     keys = []
     for p in rec.patches:
         status = p.get("applied_by")
@@ -135,21 +72,6 @@ def _applied_keys(rec):
 
 def _replay_excluding(rec, base, excluded_keys, path,
                       blocks_by_idx, records):
-    """Replay the record's pairs then patches against `base`, skipping
-    anything whose key is in `excluded_keys` AND skipping failed
-    items (they contributed nothing to content in the original run).
-    Returns the resulting content string, or None if a kept applied
-    patch could not be applied.
-
-    Uses the same retry sequence pass6 uses (see "REPLAY MUST MIRROR
-    PASS 6's RETRY SEQUENCE" in the module docstring): each patch is
-    tried with its original `context_before`, then with
-    `_broader_context_for`'s merged context.  Without this, any patch
-    that was originally applied only via broader-context retry would
-    fail in the replay — even though the exact same patch applied
-    cleanly in the original pass — and reconciliation would bail
-    with `None` (treating the record as unrecoverable).
-    """
     content = base
 
     pairs_kept = [
@@ -183,9 +105,6 @@ def _replay_excluding(rec, base, excluded_keys, path,
 
 
 def _count_failures(content, path, rec, base, records, excluded_keys):
-    """Return (count, list-of-descriptions) of validation failures
-    against `content`, honoring `excluded_keys` for the failed-patch
-    and failed-pair accounting."""
     from .validate_output import validate_content
     from .symbols import find_unresolved_calls
 
@@ -219,14 +138,6 @@ def _count_failures(content, path, rec, base, records, excluded_keys):
 
 
 def _find_minimum_exclusions(rec, base, records, path, blocks_by_idx):
-    """Return the minimal set of exclusion keys that yields zero
-    failures, or None if no exclusion set achieves that.
-
-    Greedy iterative: at each step, try each candidate exclusion and
-    pick the one that most reduces the failure count.  Stops when the
-    record passes, when no exclusion helps, or when every candidate
-    has been tried.
-    """
     candidates = _applied_keys(rec)
     if not candidates:
         return None
@@ -266,8 +177,6 @@ def _find_minimum_exclusions(rec, base, records, path, blocks_by_idx):
 
 
 def _fuzzy_locate_elsewhere(body, current_path, records):
-    """Search other records' content for a fuzzy match to `body`.
-    Returns the best-matching path, or None."""
     from .patch_text import _content_present_in_base
     body = (body or "").strip()
     if not body or len(body) < 40:
@@ -338,18 +247,93 @@ def _base_content(rec, blocks_by_idx):
     return block.body
 
 
+# NEW: warning patterns emitted by pass 6 that reconcile should
+# remove when it excludes the corresponding patch.  The
+# `patch idx=N could not be applied` line is per-patch; reconcile
+# removes it for each excluded idx.  The
+# `patch or pair application failed; file not written` line was
+# removed from pass 6 entirely (see apply_patches.py) so there is
+# nothing to clean up for it here.
+_PASS6_PATCH_WARN_PREFIX = "patch idx="
+
+
+def _clear_stale_pass6_warnings(rec, excluded_keys):
+    """Remove warnings that are stale after reconciliation.
+
+    Three warning classes are cleaned up:
+
+    1. `patch idx=N could not be applied (...)` — emitted by pass 6
+       for each failed patch.  When reconcile excludes patch N, the
+       patch is `skipped_unplaceable`/`skipped_misattributed`, not
+       "failed".  The per-patch warning is stale.
+
+    2. `N/M replace pair(s) failed: ...` — emitted by pass 6 when one
+       or more pairs fail.  After reconcile excludes the failing
+       pair(s), the record's live `pair_records` may have no
+       `applied_by == "failed"` entries.  The aggregate warning is
+       stale.
+
+    3. `unresolved symbol reference(s) introduced by patch: ...` —
+       emitted by pass 8.5 for records whose patches introduce
+       unresolved calls.  Reconcile pop's `rec.verification[
+       "unresolved_calls"]` after re-verifying the record is clean.
+       The pass-8.5 warning is stale.
+
+    Idempotent: calling twice does nothing the second time.
+    """
+    excluded_patch_idxs = set()
+    for key in excluded_keys:
+        if key[0] == "patch":
+            excluded_patch_idxs.add(key[1])
+
+    filtered = []
+    for w in rec.warnings:
+        # Class 1: per-patch "could not be applied" warnings.
+        if w.startswith("patch idx="):
+            try:
+                after = w[len("patch idx="):]
+                num_str = after.split(" ", 1)[0]
+                idx = int(num_str)
+            except (ValueError, IndexError):
+                filtered.append(w)
+                continue
+            if idx in excluded_patch_idxs:
+                continue
+            filtered.append(w)
+            continue
+
+        # Class 2: pair-failure aggregate warning.  Live state check:
+        # after reconcile has run, `pair_records` no longer contains
+        # any `failed` entries (reconcile rewrote them to
+        # `skipped_unplaceable` or `skipped_misattributed`).
+        if "replace pair(s) failed" in w:
+            live_failed = sum(
+                1 for r in rec.verification.get("pair_records", [])
+                if r.get("applied_by") == "failed"
+            )
+            if live_failed == 0:
+                continue
+            filtered.append(w)
+            continue
+
+        # Class 3: unresolved-symbol warning from pass 8.5.  Live
+        # state check: reconcile pop's `unresolved_calls` before
+        # calling this helper, so the field is either absent or
+        # empty when we're promoting.
+        if w.startswith(
+                "unresolved symbol reference(s) introduced by patch:"):
+            if not rec.verification.get("unresolved_calls"):
+                continue
+            filtered.append(w)
+            continue
+
+        filtered.append(w)
+    rec.warnings = filtered
+
+
 def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
     """Reconcile fail-closed records by excluding the minimum set of
-    patches/pairs that caused the failure.
-
-    Mutates records in place.  Records that cannot be reconciled (no
-    exclusion set yields a valid record) are left untouched (their
-    trust stays LOW).  Records whose reconciliation produces content
-    identical to base are also left untouched — see "reconciled to
-    base is not a rescue" in the module docstring.
-
-    Returns the number of records actually promoted (trust restored).
-    """
+    patches/pairs that caused the failure."""
     n_reconciled = 0
 
     for path, rec in records.items():
@@ -376,31 +360,12 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
                       f"set found", file=sys.stderr)
             continue
 
-        # Rebuild content FIRST so the to-base guard below can inspect
-        # it without committing the exclusion set.
         new_content = _replay_excluding(
             rec, base, set(excluded_keys), path,
             blocks_by_idx, records)
         if new_content is None:
             continue
 
-        # Reconciliation to base is not a rescue.  A record whose
-        # only applied items get excluded has no changes to write;
-        # promoting it would hide the fact that the user's
-        # requested edits never landed.  Fail-closed is the honest
-        # response — the diagnostic (which patch/pair failed and
-        # why) is the useful output, not a green checkmark.
-        #
-        # The five fail-closed test fixtures in test_recover.py
-        # (11, 16, 17, 26, 32) all land in this branch: a single
-        # patch or pair that failed or introduced an unresolved
-        # call, no other content to preserve.  They stay LOW.
-        #
-        # The case reconciliation IS for — the inpaint
-        # conversation's pg_panel_scrubs.py, where two clean
-        # patches (import + rotation block) would land once a
-        # misattributed fragment is excluded — produces
-        # new_content != base and falls through to promote.
         if new_content == base:
             if verbose:
                 print(f"  [reconcile] {path}: not promoting — "
@@ -408,7 +373,6 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
                       file=sys.stderr)
             continue
 
-        # Commit the exclusion set.
         for key in excluded_keys:
             if key[0] == "patch":
                 idx = key[1]
@@ -433,9 +397,6 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
                             r["applied_by"] = "skipped_misattributed"
                         break
 
-        # Safety net: re-run the same checks we relied on during the
-        # search, so a bug in `_find_minimum_exclusions` cannot
-        # commit bad content.
         from .validate_output import validate_content
         err = validate_content(new_content, path, base=base)
         if err is not None:
@@ -467,7 +428,6 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
                 ast.parse(new_content)
                 rec.verification["ast_parse"] = "ok"
             except SyntaxError:
-                # Should never happen; refuse to promote.
                 continue
 
         rec.trust = _trust_cap(rec)
@@ -479,6 +439,10 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
                 )} for k in excluded_keys
             ],
         }
+
+        # NEW: clear pass-6 stale warnings for excluded patches
+        # before adding the reconcile-specific warnings.
+        _clear_stale_pass6_warnings(rec, excluded_keys)
 
         for key in excluded_keys:
             diag = _diagnose_exclusion(key, rec, records)

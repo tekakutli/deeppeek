@@ -26,10 +26,16 @@ Two structural predicates deserve their own docstrings:
       work: a pair whose new_body is already in base in a reordered
       form does not fail as "state drift".
 
-Re-exported for backward compatibility: all names are reachable as
-`apply_patches._name` via the re-export loop at the bottom of
-apply_patches.py.  External code that imports a helper name from
-apply_patches continues to work.
+NEW: `_extract_preamble` / `_preserve_preamble`.
+
+When a FULL block replaces a pre-existing file, `pass6_apply_patches`
+uses the block's body as the new base.  If the block omits the
+pre-existing file's leading docstring / comment preamble (the AI
+printed the code but not the wrapper), the resulting content silently
+loses that preamble — the pg_state.py failure in the wild
+(`STATE_JS = r\"\"\"...\"\"\"` replaced a file whose first 17 lines
+were a module docstring).  `_preserve_preamble` restores the
+pre-existing preamble when the block doesn't have its own.
 """
 
 import re
@@ -87,6 +93,101 @@ def _content_present_in_base(base, content, threshold=0.8):
         if nl in base_exact or _tokens_key(nl) in base_tokens:
             matched += 1
     return matched / len(lines) >= threshold
+
+
+# ===========================================================================
+#  Preamble extraction / preservation  (NEW)
+# ===========================================================================
+#
+# A "preamble" is the leading docstring, shebang, or comment block of a
+# source file.  When a FULL block replaces a pre-existing file, the
+# pre-existing preamble must be preserved if the block omits it.
+
+def _extract_preamble(text):
+    """Return the leading preamble of `text`, or "" if none.
+
+    Handles, in order:
+      · shebang line (`#!/usr/bin/env python`)
+      · contiguous `#` comment lines (Python)
+      · `//` comment lines (JS / C-family)
+      · `/* ... */` block comments
+      · `<!-- ... -->` HTML comments
+      · Python triple-quoted docstring at line start
+
+    Returns the preamble as it appeared (indentation preserved,
+    including any blank lines between components).  Returns "" if the
+    file starts with code rather than a preamble.
+    """
+    if not text:
+        return ""
+    lines = text.split("\n")
+    n = len(lines)
+    i = 0
+
+    if lines[0].startswith("#!"):
+        i = 1
+
+    while i < n and lines[i].startswith("#"):
+        i += 1
+
+    while i < n and lines[i].startswith("//"):
+        i += 1
+
+    if i < n and lines[i].startswith("/*"):
+        for j in range(i, n):
+            if "*/" in lines[j]:
+                i = j + 1
+                break
+
+    if i < n and lines[i].lstrip().startswith("<!--"):
+        for j in range(i, n):
+            if "-->" in lines[j]:
+                i = j + 1
+                break
+
+    if i < n:
+        stripped = lines[i].lstrip()
+        for q in ('"""', "'''"):
+            if stripped.startswith(q):
+                rest = stripped[len(q):]
+                if q in rest:
+                    i += 1
+                else:
+                    for j in range(i + 1, n):
+                        if q in lines[j]:
+                            i = j + 1
+                            break
+                break
+
+    if i == 0:
+        return ""
+    return "\n".join(lines[:i])
+
+
+def _preserve_preamble(preexisting_body, block_body):
+    """If `block_body` lacks `preexisting_body`'s preamble (a leading
+    docstring or comment block) and doesn't carry one of its own,
+    prepend the pre-existing preamble.
+
+    Conservative: only fires when the block has NO preamble.  A block
+    that reprints its own preamble is treated as the author's explicit
+    choice of a new preamble; the pre-existing one is discarded.
+
+    Motivating case: block 94 in the pg_state.py conversation was a
+    `SINGLE_FULL` reprint of the file body — but it started at
+    `STATE_JS = r\"\"\"…\"\"\"` and omitted the 17-line module docstring
+    that pre-existed.  `pass6` used the block's body as the base and
+    `pass9` wrote it verbatim, silently dropping the docstring.  This
+    helper restores it.
+    """
+    if not preexisting_body or not block_body:
+        return block_body
+    pre_pre = _extract_preamble(preexisting_body)
+    if not pre_pre:
+        return block_body
+    if _extract_preamble(block_body):
+        return block_body
+    return pre_pre + "\n\n" + block_body
 
 
 # ===========================================================================
@@ -156,11 +257,6 @@ def _is_ellipsis_line(line):
             break
     if stripped in ("...", "\u2026"):
         return True
-    # Comment-wrapped ellipsis with trailing explanation:
-    #   `// ... rest unchanged`, `# ... (unchanged)`, `... foo`.
-    # Only accepted when the trailing text starts with a letter
-    # (prose) — `...(args)` (JS spread), `...abc` bare-token form,
-    # `...123`, etc. would be real code, not a marker.
     if stripped.startswith("..."):
         after = stripped[3:].lstrip()
         return (not after) or after[0].isalpha()
@@ -203,13 +299,6 @@ def _strip_ellipsis_lines(body):
 # ===========================================================================
 #  Empty-block detection (ellipsis fallthrough guard)
 # ===========================================================================
-#
-# Stripping `...` lines is safe only when the result is a complete
-# block.  If the `...` was the *entire* content of a `{ }` (e.g.
-# `set: (v) => { ... }` — a legitimate "logic elided" marker),
-# stripping produces `set: (v) => { }`, which is a semantically empty
-# block we do NOT want to insert.  Detecting that case lets the
-# fallthrough refuse instead of silently producing wrong code.
 
 _EMPTY_BLOCK_RE = re.compile(r'\{([^{}]*)\}')
 
@@ -226,8 +315,7 @@ def _count_empty_blocks(text):
 
 def _would_introduce_empty_block(original_body, stripped_body):
     """True iff stripping `...` introduced one or more new empty `{ }`
-    blocks.  Refusing in that case avoids inserting semantically-empty
-    code that was produced by the strip itself."""
+    blocks."""
     return _count_empty_blocks(stripped_body) > _count_empty_blocks(
         original_body
     )
@@ -252,14 +340,7 @@ def _body_starts_with_comment(body):
 
 
 def _find_leading_comment_start(base, indent_pos):
-    """Walk backward from indent_pos over a leading comment region
-    (block comment, consecutive line comments, or decorators).  Blank
-    lines BETWEEN the scope and its leading comment are traversed; a
-    blank line ABOVE an already-identified comment ends the walk.
-
-    Returns indent_pos unchanged when no leading comment exists, so a
-    caller gating on this function does nothing in the no-comment case.
-    """
+    """Walk backward from indent_pos over a leading comment region."""
     if indent_pos <= 0:
         return indent_pos
     pos = indent_pos
@@ -314,7 +395,6 @@ def _find_leading_comment_start(base, indent_pos):
             entered_comment = True
             continue
 
-        # Non-comment, non-blank line reached.
         if entered_comment:
             return pos
         return indent_pos
@@ -441,14 +521,7 @@ def _reindent_body(base_indent, body):
 
 def _reindent_body_to_indent(body, target_indent):
     """Shift every non-blank line of `body` so the first non-blank
-    line starts at `target_indent`.
-
-    DELIBERATELY NOT NAMED `_reindent_body`.  The module already has
-    a `_reindent_body(base_indent, body)` used by `_apply_scoped` and
-    `_try_insert_after_anchor`.  Naming this function `_reindent_body`
-    would shadow that one at module-load time and, because the two
-    take their arguments in opposite order, silently break every
-    scoped-replace and statement-anchor test."""
+    line starts at `target_indent`."""
     lines = body.rstrip().split("\n")
     base = ""
     for ln in lines:
@@ -519,8 +592,7 @@ def _insert_lines_in_inner(inner, new_lines, before_anchor=None,
 
 def _collect_inserted_lines(old_content, new_content):
     """Return the set of stripped lines whose count increased
-    old_content -> new_content.  Used to track what each pair/patch
-    has added to a record so later patches can be filtered against it."""
+    old_content -> new_content."""
     from collections import Counter
     old_count = Counter(
         line.strip() for line in old_content.split("\n") if line.strip()
@@ -535,17 +607,7 @@ def _collect_inserted_lines(old_content, new_content):
 
 
 def _split_body_into_blocks(body):
-    """Split body into top-level blocks.  A block is either:
-         - a statement ending in `;` when brace-depth is 0, or
-         - a brace-block ending in `}` when depth returns to 0.
-    Comments immediately preceding a block are attached to it.
-    Blank lines are attached to the following block.
-
-    Limitation: braces inside comments or strings can confuse depth
-    tracking.  This is rare enough that the conservative behaviour
-    (treating everything as one block) is safe: filtering then does
-    nothing, and pass-8 dedup remains the safety net.
-    """
+    """Split body into top-level blocks."""
     blocks = []
     current = []
     depth = 0
@@ -568,15 +630,7 @@ def _split_body_into_blocks(body):
 def _find_identifier_block_end_line(base, ident):
     """Return the line index (0-based) of the last line of the
     top-level statement that declares or first references `ident`,
-    or None.
-
-    Handles two shapes:
-      · single-line statement — returns that line
-      · multi-line block — returns the closing brace's line
-      · const-then-if pattern: `const x = ...;` followed by
-        `if (x) { ... }` — returns the closing brace of the if-block.
-        This is what "the `inpaintPromptEl` block" means in prose.
-    """
+    or None."""
     lines = base.split("\n")
     decl_re = re.compile(
         r'^(?:const|let|var|function|class)\s+' + re.escape(ident) + r'\b')

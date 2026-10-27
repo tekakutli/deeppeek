@@ -1,76 +1,42 @@
 """
 patch_scope — scope boundary detection and scoped-replace.
 
-A "scope" is a `function foo()`, `def foo():`, `class Foo {`,
-`export const foo = {`, `<details><summary>Foo</summary>`, or a
-plain assignment `foo.bar = {`.  Every one of these shapes is found
-by a pattern in `_SCOPE_PATTERNS`, which the rest of the pipeline
-consults to decide "does the body target an existing named scope?".
+See the pre-fix module docstring for the base description of what a
+scope is (function/class/const-assignment/<details>) and the
+invariants around partial-splice balance, scope-signature integrity,
+and full-replace fail-closed.
 
-The scoped-replace heuristic (`_apply_scoped`) is the most
-load-bearing path in the whole pipeline: it is what lets a single
-conversation block declare "here is the whole new `foo()`" and have
-that block replace `foo()` without duplicating anything.
+MULTI-SCOPE BODIES — REFINED
+=============================
+`_apply_scoped` splits multi-scope bodies via
+`_extract_top_level_scopes` and applies each scope separately, BUT
+only when *every* sub-scope exists in base.  Two cases:
 
-Separately, `_try_ellipsis_splice` handles the "prefix + `...` +
-suffix" abbreviation shape.  It lives here rather than in
-patch_heuristics because it is *scope-bound* — the splice target is
-always a scope, never a bare statement.
+  ALL sub-scopes exist (pg_pixels.py)
+    The body declares two functions that both already live in the
+    base.  Single-scope application would embed the second function
+    inside the first's span, while the base's original second copy
+    survived below — producing `Identifier already declared` at
+    load time.  Splitting into two scoped replaces fixes this.
 
-The `_scope_in_base` predicate is exported for the dispatch layer's
-pre-check (patch_dispatch), which routes scope-declaring bodies to
-this module *before* they can fall through to the insert heuristics.
-
-PARTIAL-SPLICE BALANCE VALIDATION
-=================================
-`_try_scoped_partial_splice` line-diffs a truncated scope body
-against the base scope and inserts the new lines.  A body ending
-with a *comment* (e.g. `// ... rest unchanged; ...`) instead of a
-`...` marker or the actual scope closer is a partial body that will
-never carry a balanced brace count on its own.
-
-When the line-diff produces a result whose brace/paren/bracket
-balance differs from the base scope's, the resulting content is
-unbalanced and will fail-closed at the sanity gate — but the patch
-has already been recorded as a failure, dragging the record to LOW
-trust for no good reason.  We catch it here and refuse the splice
-instead.  This is the pg_pixels.py failure case: block 99 ends with
-`// ... rest unchanged; ...` and the splice dropped the base's
-closing `}`.
-
-SCOPE SIGNATURE INTEGRITY
-=========================
-After a scoped replace, the resulting scope text must still START
-with a recognisable declaration line.  A scoped replace that produces
-`outputRotation body: JSON.stringify({...})` as the new "declaration"
-is broken in a way that a brace-balance check cannot detect (the
-braces are balanced — it just isn't a declaration).  This is the
-pg_comfy_client.py corruption shape.  `_scope_signature_ok` is the
-check; `_apply_scoped` returns None when it fails.
-
-FULL-REPLACE FALLTHROUGH MUST FAIL CLOSED
-=========================================
-When `_try_scoped_partial_splice` returns None, the body is
-incomplete AND unspliceable.  A full replacement of the scope with
-an incomplete body is *guaranteed* to leave an unbalanced brace
-(and, with high probability, to nest the body's trailing comment
-into an unclosed block).  `_apply_scoped` therefore returns None
-in that case, so the caller records the pair as failed and the
-record fail-closes.  The pg_pixels.py corruption shape (a scoped
-pair whose body omitted its final `}` — block 99 — was silently
-accepted as a full replace, leaving `+1` unbalanced brace).
-
-Imports from patch_text; imports from prose (for
-`_extract_scope_from_body`).
-
-No cyclic risk: patch_heuristics does not import this module, only
-patch_dispatch (which imports both) and patch_diag (which imports
-this for `_find_scope_in_base` and `_SCOPE_PATTERNS`).
+  SOME sub-scopes are NEW functions (pg_panel_bindings.py)
+    The body declares `_inpaintAction` (exists) plus two helper
+    functions that don't exist in base.  Attempting to scoped-replace
+    the new helpers fails (`_scope_in_base` returns False).  Splitting
+    propagates that failure and the whole pair is dropped.  The old
+    single-scope behavior — replace the first scope's span with the
+    whole new_body — correctly *inserts* the new helpers alongside
+    the replacement, which is what the AI intended.
 """
 
 import re
 
-from .prose import _extract_scope_from_body
+from .prose import (
+    _extract_scope_from_body,
+    _SCOPE_FROM_BODY_PATTERNS,
+    _string_spans,
+    _inside_any,
+)
 from .patch_text import (
     _has_ellipsis_marker, _split_at_ellipsis,
     _find_matching_brace, _reindent_body, _insert_lines_in_inner,
@@ -101,7 +67,6 @@ _SCOPE_PATTERNS = [
         r"(?:^|\n)(?:export\s+)?(?:const|let|var)\s+" + re.escape(name) +
         r"\s*=\s*\{.*?\n\};?",
         re.DOTALL),
-    # Plain (possibly dotted) assignment: `_els = {`, `board.x = {`.
     lambda name: re.compile(
         r"(?:^|\n)[ \t]*" + re.escape(name) + r"\s*=\s*\{.*?\n[ \t]*\};?",
         re.DOTALL),
@@ -111,39 +76,6 @@ _SCOPE_PATTERNS = [
 # ===========================================================================
 #  Scope-declaration signature check
 # ===========================================================================
-#
-# After a scoped replace, the resulting scope must still start with a
-# recognisable declaration. A body like
-#
-#     outputRotation body: JSON.stringify({
-#         canvas_b64: canvasB64,
-#         ...
-#     }),}) {
-#
-# has balanced braces, but it is not a declaration. This is the exact
-# corruption shape produced by an orphan-patch insert inside a scoped
-# replace; without this check the file is written as valid-JSON-in-
-# signature-parens, which is neither valid JS nor a recognisable
-# function.
-#
-# The check must accept four declaration "families":
-#
-#   · JavaScript: function / class / const / let / var, optionally
-#     with `export` and/or `async`, optionally with `extends`.
-#   · Python: def / class, optionally `async`-prefixed.
-#   · HTML: <details> scope blocks.
-#   · Anything that precedes those — leading comments (`//`, `#`,
-#     `/* … */` single- or multi-line) and decorators (`@…`) — is
-#     skipped before the first-meaningful-line test.
-#
-# Anything else fails.  Concretely that rejects the
-# pg_comfy_client.py shape (a signature mangled into a bare
-# identifier expression) while accepting:
-#
-#   · test_10's `<details class="section" open>` first line,
-#   · test_apply_scoped_consumes_comment_with_blank's
-#     `/* New docstring */` leading line,
-#   · test_apply_scoped_consumes_decorator's `// new` leading line.
 
 _SCOPE_DECL_RE_JS = re.compile(
     r"^(?:export\s+)?(?:async\s+)?(?:function|class|const|let|var)"
@@ -165,11 +97,6 @@ _DETAILS_DECL_RE = re.compile(
 
 
 def _is_scope_decl_line(line):
-    """True iff `line` begins with a scope declaration in one of the
-    languages deeppeek handles: JS function/class/const/let/var (with
-    optional `export`, `async`, and `extends`), Python def/class (with
-    optional `async`), or an HTML `<details>` block.
-    """
     if not line:
         return False
     return bool(
@@ -180,19 +107,6 @@ def _is_scope_decl_line(line):
 
 
 def _first_meaningful_line(text):
-    """Return the first line of `text` that is not blank, not a line
-    comment (`//` or `#`), not a `/* ... */` block comment (single-
-    or multi-line), and not a decorator (`@...`).
-
-    Returns None if no such line exists.
-
-    This is the SINGLE source of truth for "what counts as leading
-    noise" in scope-signature checks.  Consumers (currently only
-    `_scope_signature_ok`) must not inline the skipping logic — that
-    was the source of the previous divergence between
-    `_scope_signature_ok`'s first-line check and the partial/full
-    paths in `_apply_scoped`.
-    """
     if not text:
         return None
     in_block_comment = False
@@ -224,21 +138,6 @@ def _first_meaningful_line(text):
 
 
 def _scope_signature_ok(scope_text):
-    """The replaced scope must still start with a recognisable
-    declaration line, after skipping leading comments and decorators.
-
-    Accepted shapes:
-      - JS: `function`/`class`/`const`/`let`/`var` declarations
-        (with optional `export`/`async` prefixes and `extends`
-        clauses)
-      - Python: `def`/`class`, optionally `async`-prefixed
-      - HTML: `<details>` scope blocks
-
-    Rejected: anything else.  Concretely this catches the
-    pg_comfy_client.py corruption shape — a body whose first
-    identifier is not a scope-decl keyword
-    (`outputRotation body: JSON.stringify({...})`).
-    """
     first = _first_meaningful_line(scope_text)
     if first is None:
         return False
@@ -250,12 +149,6 @@ def _scope_signature_ok(scope_text):
 # ===========================================================================
 
 def _scope_in_base(base, scope_name, scope_kind):
-    """True iff `scope_name` exists in `base` as an extractable scope
-    of the given kind.
-
-    Conservative: if extraction doesn't find it, we don't claim it
-    exists.
-    """
     if not base or not scope_name:
         return False
     if scope_kind == "details":
@@ -268,7 +161,6 @@ def _scope_in_base(base, scope_name, scope_kind):
         return bool(re.search(
             rf"^(?:async\s+)?(?:def|class)\s+{esc}\b",
             base, re.MULTILINE))
-    # javascript (default)
     if re.search(rf"^(?:export\s+)?(?:async\s+)?"
                  rf"(?:function|class)\s+{esc}\b", base, re.MULTILINE):
         return True
@@ -276,6 +168,23 @@ def _scope_in_base(base, scope_name, scope_kind):
                  base, re.MULTILINE):
         return True
     return False
+
+
+def _scope_exists_any_kind(base, name):
+    """True iff `name` exists in `base` as a scope of *any* kind.
+
+    Used by `_apply_scoped`'s multi-scope gate: to decide whether the
+    split-into-individual-replaces path is safe, we need to know
+    whether every sub-scope of the body has a corresponding span in
+    base.  `_scope_in_base` requires an explicit `scope_kind`, which
+    we don't carry out of `_extract_top_level_scopes`, so this helper
+    tries all three.
+    """
+    return (
+        _scope_in_base(base, name, "javascript")
+        or _scope_in_base(base, name, "python")
+        or _scope_in_base(base, name, "details")
+    )
 
 
 def _find_scope_in_base(base, scope_name):
@@ -334,39 +243,96 @@ def _looks_like_scope_close(line):
 
 
 # ===========================================================================
-#  Prefix-modification helpers (Fix 9)
+#  Multi-scope extraction
 # ===========================================================================
-#
-# A body of the form:
-#
-#     export function foo() {
-#       ... context lines ...
-#       <new lines replacing an existing line>
-#       // ... rest unchanged
-#     }
-#
-# is a PREFIX MODIFICATION: one existing line is replaced by a run of
-# new lines, and the rest of the scope body is preserved verbatim.
-# Pure-insert semantics would duplicate the existing line (or place
-# the new lines at the wrong position).  The motivating shape:
-# `computeMaskBBox` in pg_pixels.py replaces one
-# `const W = ... , H = ...;` with two separate `const W = ...;` /
-# `const H = ...;` declarations, marked with `// ... rest unchanged`.
-#
-# The semantics below are deliberately narrow:
-#   · context lines must appear verbatim in base;
-#   · a run of NEW lines replaces exactly ONE base line, matched by
-#     the run's first line's first non-keyword identifier within a
-#     small window of base positions;
-#   · a single-line run is INSERT, not REPLACE — the caller falls
-#     back to pure-insert semantics (this is what makes the
-#     pg_view_inpaint.py "add an early-out guard" shape work);
-#   · if the identifier match fails, prefix-mod returns None and the
-#     caller falls back to pure-insert;
-#   · comment-only suffix is documentation (dropped).
+
+def _extract_details_span(body, start_pos):
+    close = body.find("</details>", start_pos)
+    if close == -1:
+        return None
+    return body[start_pos:close + len("</details>")]
+
+
+def _extract_js_span(body, start_pos):
+    open_brace = body.find("{", start_pos)
+    if open_brace == -1:
+        return None
+    close_brace = _find_matching_brace(body, open_brace, is_python=False)
+    if close_brace == -1:
+        return None
+    return body[start_pos:close_brace + 1]
+
+
+def _extract_python_span(body, start_pos):
+    line_start = body.rfind("\n", 0, start_pos) + 1
+    indent = start_pos - line_start
+    line_end = body.find("\n", start_pos)
+    if line_end == -1:
+        return body[start_pos:]
+    pos = line_end + 1
+    while pos < len(body):
+        next_end = body.find("\n", pos)
+        if next_end == -1:
+            next_end = len(body)
+        line = body[pos:next_end]
+        if line.strip():
+            line_indent = len(line) - len(line.lstrip())
+            if line_indent <= indent and not line.strip().startswith("#"):
+                return body[start_pos:pos].rstrip()
+        pos = next_end + 1
+    return body[start_pos:].rstrip()
+
+
+def _extract_top_level_scopes(body):
+    """Return [(name, scope_body_text)] for each top-level scope
+    declared in `body`, or [] when the body has zero or one scope."""
+    if not body:
+        return []
+    spans = _string_spans(body)
+    candidates = []
+    for pattern, kind in _SCOPE_FROM_BODY_PATTERNS:
+        for m in pattern.finditer(body):
+            if _inside_any(m.start(), spans):
+                continue
+            if m.start() > 0 and body[m.start() - 1] != "\n":
+                if not m.group(0).startswith("<details"):
+                    continue
+            candidates.append((m.start(), m.group(1).strip(), kind))
+
+    if len(candidates) < 2:
+        return []
+
+    seen_starts = set()
+    unique = []
+    for start, name, kind in sorted(candidates):
+        if start in seen_starts:
+            continue
+        seen_starts.add(start)
+        unique.append((start, name, kind))
+
+    if len(unique) < 2:
+        return []
+
+    results = []
+    for i, (start, name, kind) in enumerate(unique):
+        if kind == "details":
+            scope_body = _extract_details_span(body, start)
+        elif kind == "python":
+            scope_body = _extract_python_span(body, start)
+        else:
+            scope_body = _extract_js_span(body, start)
+        if not scope_body:
+            return []
+        results.append((name, scope_body))
+
+    return results
+
+
+# ===========================================================================
+#  Prefix-modification helpers
+# ===========================================================================
 
 def _is_comment_only(lines):
-    """True iff every non-blank line in `lines` is a comment."""
     for ln in lines:
         s = ln.strip()
         if not s:
@@ -380,14 +346,6 @@ def _is_comment_only(lines):
 
 def _nearest_ident_line(base_stripped, base_pos, target_ident,
                         search_ahead=3):
-    """Find a base line at position >= base_pos whose first
-    non-keyword identifier matches `target_ident`, within
-    `search_ahead` non-blank lines.
-
-    Blank lines are skipped without consuming the search budget, so
-    a single blank separator between context and the replaced line
-    does not eat the window.  Returns the line index, or None.
-    """
     checked = 0
     for j in range(base_pos, len(base_stripped)):
         line = base_stripped[j]
@@ -402,27 +360,6 @@ def _nearest_ident_line(base_stripped, base_pos, target_ident,
 
 
 def _try_prefix_modification(inner_prefix, base_scope_inner):
-    """Splice `inner_prefix` into `base_scope_inner` under
-    prefix-modification semantics.
-
-    `inner_prefix` is a mix of context lines (present verbatim in
-    base) and one-or-more runs of NEW lines.  Each run REPLACES one
-    corresponding base line rather than being inserted next to it.
-    The match is: the run's FIRST line has the same first
-    non-keyword identifier as the base line being replaced, located
-    within `_nearest_ident_line`'s search window from the current
-    base position.
-
-    Fires only when a run has >= 2 lines.  A single-line run is an
-    INSERT (a new statement before an existing one), not a
-    replacement; the pure-insert path handles that correctly.  The
-    fixture 18 shape (pg_view_inpaint.py: `if (board.fullCanvas)
-    return;` inserted before `if (!board.imageEl) return;`) is a
-    single-line run and must not fire prefix-mod.
-
-    Returns the spliced scope text, or None if the shape doesn't
-    fit prefix-mod (caller should fall back to insert semantics).
-    """
     if not inner_prefix:
         return None
 
@@ -438,9 +375,6 @@ def _try_prefix_modification(inner_prefix, base_scope_inner):
         ln = inner_prefix[i]
         stripped = ln.strip()
         if not stripped:
-            # Blank line: if the next base line is also blank,
-            # consume it from base (preserving base's whitespace).
-            # Otherwise emit the inner blank standalone.
             if base_pos < len(base_stripped) and not base_stripped[base_pos]:
                 result.append(base_lines[base_pos])
                 base_pos += 1
@@ -449,7 +383,6 @@ def _try_prefix_modification(inner_prefix, base_scope_inner):
             i += 1
             continue
 
-        # Context line: present verbatim in base from base_pos onward.
         try:
             match_idx = base_stripped.index(stripped, base_pos)
         except ValueError:
@@ -461,9 +394,6 @@ def _try_prefix_modification(inner_prefix, base_scope_inner):
             i += 1
             continue
 
-        # NEW run starting at i.  Collect consecutive lines that
-        # are NOT verbatim in base (skipping over blanks that
-        # belong to the run itself).
         run_lines = []
         while i < len(inner_prefix):
             curr = inner_prefix[i]
@@ -474,13 +404,8 @@ def _try_prefix_modification(inner_prefix, base_scope_inner):
             i += 1
 
         if not run_lines:
-            return None  # shouldn't happen; guard
+            return None
 
-        # Locate the base line this run replaces.  Must match on
-        # the FIRST line's identifier and be within a few lines of
-        # base_pos.  If no match, this run is a pure insert, not a
-        # modification — refuse and let the caller try insert
-        # semantics.
         first_run_stripped = run_lines[0].strip()
         target_ident = _first_identifier(first_run_stripped)
         if not target_ident:
@@ -490,22 +415,9 @@ def _try_prefix_modification(inner_prefix, base_scope_inner):
         if replace_at is None:
             return None
 
-        # Discriminate prefix-modification from pure-insert.  A
-        # run of one new line is an INSERT (a new statement before
-        # an existing one); prefix-modification replaces one base
-        # line with a MULTI-LINE run.  The pg_view_inpaint.py shape
-        # (`if (board.inpaintFullCanvas) return;` inserted before
-        # `if (!board.imageEl) return;`) is one new line and MUST
-        # NOT fire prefix-mod — pure-insert handles it correctly.
-        # The computeMaskBBox shape (2 new `const W` / `const H`
-        # declarations replacing 1 combined `const W = ..., H =
-        # ...;` line) is the multi-line shape prefix-mod exists
-        # for.
         if len(run_lines) < 2:
             return None
 
-        # Preserve any base lines strictly between base_pos and
-        # replace_at (blank separators, comments).
         result.extend(base_lines[base_pos:replace_at])
         result.extend(run_lines)
         base_pos = replace_at + 1
@@ -514,7 +426,7 @@ def _try_prefix_modification(inner_prefix, base_scope_inner):
     result.extend(base_lines[base_pos:])
 
     if not saw_new_run:
-        return None  # no modification found; not prefix-mod
+        return None
 
     return "\n".join(result)
 
@@ -548,21 +460,15 @@ def _try_ellipsis_splice(base, body, context_before=""):
 
     base_scope_inner = base[body_open:body_close]
 
-    # NEW: prefix-modification semantics.  Fires before pure-insert.
-    # Handles "replace line X with lines Y,Z; rest unchanged" — a
-    # shape pure-insert cannot express (insert would duplicate X).
     modified = _try_prefix_modification(inner_prefix, base_scope_inner)
     if modified is not None:
         if modified == base_scope_inner:
             return base
         return base[:body_open] + modified + base[body_close:]
 
-    # Comment-only suffix is documentation (the AI's explanation of
-    # what was elided), not code to insert.  Ignore it.
     if _is_comment_only(inner_suffix):
         inner_suffix = []
 
-    # Fall back to pure-insert semantics.
     base_stripped_set = {
         ln.strip() for ln in base_scope_inner.splitlines() if ln.strip()
     }
@@ -573,9 +479,6 @@ def _try_ellipsis_splice(base, body, context_before=""):
                   if ln.strip() and ln.strip() not in base_stripped_set]
 
     if not new_prefix and not new_suffix:
-        # All body lines are already in base — this is a no-op, not a
-        # failure.  Return base unchanged; the caller detects it via
-        # `result == content` and marks the patch `already-present`.
         return base
 
     prefix_anchor = None
@@ -608,14 +511,6 @@ def _try_ellipsis_splice(base, body, context_before=""):
 # ===========================================================================
 
 def _new_body_is_complete_for_scope(base_scope_text, new_body):
-    """True iff `new_body` looks like a complete replacement of
-    `base_scope_text`.
-
-    The heuristic: if `base_scope_text` ends with a "closer"
-    (`</details>` or `}`), `new_body` must end with the same closer.
-    A prefix that omits the closer is a partial-splice candidate, not
-    a full replacement.
-    """
     base_stripped = base_scope_text.rstrip()
     new_stripped = new_body.rstrip()
     if not new_stripped:
@@ -629,29 +524,6 @@ def _new_body_is_complete_for_scope(base_scope_text, new_body):
 
 
 def _try_scoped_partial_splice(base_scope_text, new_body):
-    """Splice `new_body`'s additions into `base_scope_text` line-wise.
-
-    Uses `difflib.SequenceMatcher` to compute the line-level diff.
-    Inserts and small replaces from `new_body` are applied; deletions
-    from `base_scope_text` are skipped (a partial body shouldn't be
-    silently removing content — that would be a full replace).
-
-    BALANCE VALIDATION: after the splice, verify that the result has
-    the same brace/paren/bracket balance as the base scope.  If not,
-    refuse.  The pg_pixels.py failure case: block 99 ends with a
-    *comment* (`// ... rest unchanged; ...`) instead of a `...`
-    marker or the actual `}` closer.  SequenceMatcher treated the
-    missing closer as a 'delete' from new, which was correctly
-    skipped, but a subsequent 'replace' opcode still removed the
-    base's closing brace.  The result had `+1` unclosed brace.
-    Refusing here keeps the record at HIGH trust rather than
-    fail-closing on a corruption the splice itself caused.
-
-    Returns the spliced scope text, or None when the diff adds
-    nothing (meaning the "new" body is a strict subset of the old —
-    a truncation, not an extension), or when the result would be
-    unbalanced.
-    """
     import difflib
     from .validate_output import _js_balance
 
@@ -670,7 +542,6 @@ def _try_scoped_partial_splice(base_scope_text, new_body):
             if (i2 - i1) <= (j2 - j1) * 2:
                 added_lines += (j2 - j1)
                 result[i1:i2] = new_lines[j1:j2]
-        # 'delete' — skipped deliberately
     if added_lines == 0:
         return None
     result_text = "\n".join(result)
@@ -681,7 +552,9 @@ def _try_scoped_partial_splice(base_scope_text, new_body):
     return result_text
 
 
-def _apply_scoped(base, scope_name, new_body):
+def _apply_scoped_single(base, scope_name, new_body):
+    """Apply a single-scope replacement (the original `_apply_scoped`
+    body, renamed)."""
     if not scope_name or not new_body.strip():
         return None
     if _has_ellipsis_marker(new_body):
@@ -698,23 +571,11 @@ def _apply_scoped(base, scope_name, new_body):
         m_end = m.end()
         base_scope_text = base[m_start:m_end]
 
-        # Partial splice: when the new body is a *prefix* of the
-        # base scope (missing the closer), splice the prefix in
-        # rather than truncating the base.
         if not _new_body_is_complete_for_scope(
                 base_scope_text, new_body):
             spliced = _try_scoped_partial_splice(
                 base_scope_text, new_body)
             if spliced is None:
-                # FIX 1: an incomplete body that also can't be
-                # spliced is a fail-closed case, not a fall-through
-                # to full replacement. A full replace with an
-                # incomplete body always leaves the result
-                # unbalanced (the base's closer is dropped but the
-                # body's closer is absent), which corrupts the file
-                # silently. This is the pg_pixels.py shape: block
-                # 99's body ends with `// ... rest unchanged; ...`
-                # instead of `}`.
                 return None
             if m_start < len(base) and base[m_start] == "\n":
                 indent_pos = m_start + 1
@@ -727,15 +588,12 @@ def _apply_scoped(base, scope_name, new_body):
                 return None
             return base[:indent_pos] + reindented + base[m_end:]
 
-        # Full replacement (original logic).
         if m_start < len(base) and base[m_start] == "\n":
             indent_pos = m_start + 1
             base_indent = ""
         else:
             indent_pos = base.rfind("\n", 0, m_start) + 1
             base_indent = base[indent_pos:m_start]
-        # Consume the leading comment above the scope iff the
-        # new_body carries its own comment.
         if _body_starts_with_comment(new_body):
             extended_start = _find_leading_comment_start(
                 base, indent_pos)
@@ -748,3 +606,55 @@ def _apply_scoped(base, scope_name, new_body):
             return None
         return base[:indent_pos] + reindented + base[m_end:]
     return None
+
+
+def _apply_scoped(base, scope_name, new_body):
+    """Apply a scoped replace, handling multi-scope bodies correctly.
+
+    Two modes:
+
+    ALL sub-scopes exist in base (e.g. pg_pixels.py)
+      Split into individual scoped replaces, one per sub-scope.  This
+      is required when the body declares two functions that both
+      already live in the base — single-scope application would
+      embed the second function inside the first's span while the
+      base's original copy survived below (duplicate declaration).
+
+    SOME sub-scopes are new functions (e.g. pg_panel_bindings.py)
+      Fall back to the original single-scope behavior: replace the
+      first scope's span with the ENTIRE new_body.  This correctly
+      *inserts* the new helper functions alongside the replacement.
+      Splitting would fail because `_scope_in_base` returns False
+      for the new helpers, and the pair would be dropped — leaving
+      the first scope's replacement un-applied even though the
+      user wanted it.
+
+    The distinction is critical: pg_pixels.py must split (dup bug);
+    pg_panel_bindings.py must NOT split (would drop the helper
+    additions).
+    """
+    if not scope_name or not new_body.strip():
+        return None
+    if _has_ellipsis_marker(new_body):
+        return _try_ellipsis_splice(base, new_body)
+
+    scopes = _extract_top_level_scopes(new_body)
+    if len(scopes) >= 2:
+        all_exist = all(
+            _scope_exists_any_kind(base, name)
+            for name, _sub_body in scopes
+        )
+        if all_exist:
+            current = base
+            for sub_name, sub_body in scopes:
+                result = _apply_scoped_single(
+                    current, sub_name, sub_body)
+                if result is None:
+                    return None
+                current = result
+            return current
+        # Fall through: some sub-scopes are new functions.  Use the
+        # single-scope behavior, which inserts the whole new_body at
+        # the first scope's span.  New helpers land correctly.
+
+    return _apply_scoped_single(base, scope_name, new_body)

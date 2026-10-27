@@ -1433,6 +1433,409 @@ def test_replace_pair_non_object_literal_skips_splice():
     assert "return 1" not in result
     assert result.count("export function foo") == 1
 
+# ============================================================
+# Fix 1 (multi-scope apply)  — pair body declares 2+ scopes
+# ============================================================
+#
+# The pg_pixels.py failure: pair 98's body declared two functions
+# (`_maskPixelData` and `hitTestMaskAtPoint`) but was applied as a
+# single scoped-replace of `_maskPixelData`.  The second function
+# was inserted at the same span, while the base's original copy
+# survived below — producing `Identifier 'hitTestMaskAtPoint' has
+# already been declared`.
+#
+# Fix: `_apply_scoped` splits multi-scope bodies via
+# `_extract_top_level_scopes` and applies each scope separately.
+
+def test_apply_scoped_multi_scope_body():
+    """A body declaring two functions must be split and applied as
+    two scoped replaces, not embedded as one replacement for the
+    first scope."""
+    from deeppeek.recover.apply_patches import _apply_scoped
+    base = (
+        "function foo() {\n"
+        "  return 1;\n"
+        "}\n"
+        "\n"
+        "function bar() {\n"
+        "  return 2;\n"
+        "}\n"
+    )
+    new_body = (
+        "function foo() {\n"
+        "  return 10;\n"
+        "}\n"
+        "\n"
+        "function bar() {\n"
+        "  return 20;\n"
+        "}\n"
+    )
+    result = _apply_scoped(base, "foo", new_body)
+    assert result is not None, (
+        "expected multi-scope apply to succeed")
+    assert result.count("function foo") == 1, (
+        f"expected exactly 1 'function foo', got "
+        f"{result.count('function foo')}:\n{result}")
+    assert result.count("function bar") == 1, (
+        f"expected exactly 1 'function bar', got "
+        f"{result.count('function bar')}:\n{result}")
+    assert "return 10" in result, f"new foo body missing:\n{result}"
+    assert "return 20" in result, f"new bar body missing:\n{result}"
+    assert "return 1\n" not in result, (
+        f"old foo body still present:\n{result}")
+    assert "return 2\n" not in result, (
+        f"old bar body still present:\n{result}")
+
+
+def test_apply_scoped_single_scope_unchanged():
+    """Single-scope body follows the original path unchanged."""
+    from deeppeek.recover.apply_patches import _apply_scoped
+    base = (
+        "function foo() {\n"
+        "  return 1;\n"
+        "}\n"
+        "\n"
+        "function unrelated() {\n"
+        "  return 99;\n"
+        "}\n"
+    )
+    new_body = (
+        "function foo() {\n"
+        "  return 2;\n"
+        "}\n"
+    )
+    result = _apply_scoped(base, "foo", new_body)
+    assert result is not None
+    assert "return 2" in result
+    assert "return 1\n" not in result
+    assert "function unrelated" in result, (
+        f"unrelated function lost:\n{result}")
+    assert "return 99" in result
+
+
+# ============================================================
+# Fix 2 (duplicate export decl detection)
+# ============================================================
+#
+# `_js_structural_check`'s duplicate-declaration regex must match
+# `export function` / `export const` / `export class` in addition
+# to the bare forms.  Pre-fix, two `export function foo() {}`
+# declarations slipped through undetected because the regex
+# required `function` to be the very first token on the line.
+
+def test_duplicate_export_function_detected():
+    from deeppeek.recover.validate_output import validate_content
+    content = (
+        "export function foo() {\n"
+        "  return 1;\n"
+        "}\n"
+        "export function foo() {\n"
+        "  return 2;\n"
+        "}\n"
+    )
+    err = validate_content(content, "test.js")
+    assert err is not None, (
+        "expected duplicate `export function foo` to be rejected")
+    assert "duplicate" in err.lower(), (
+        f"expected 'duplicate' in error, got {err!r}")
+    assert "foo" in err, f"expected declaration name in error, got {err!r}"
+
+
+def test_duplicate_export_const_detected():
+    from deeppeek.recover.validate_output import validate_content
+    content = (
+        "export const foo = 1;\n"
+        "export const foo = 2;\n"
+    )
+    err = validate_content(content, "test.js")
+    assert err is not None
+    assert "duplicate" in err.lower()
+
+
+def test_no_duplicate_still_passes():
+    """Sanity: the tightened regex must not flag legitimate code."""
+    from deeppeek.recover.validate_output import validate_content
+    content = (
+        "export function foo() { return 1; }\n"
+        "export function bar() { return 2; }\n"
+    )
+    err = validate_content(content, "test.js")
+    assert err is None, f"unexpected rejection: {err!r}"
+
+
+# ============================================================
+# Fix 3 (preamble preservation on full-block replace)
+# ============================================================
+#
+# The pg_state.py failure: block 94 was a full reprint of a file
+# body but omitted the 17-line module docstring.  Pass 6 used the
+# block body as the base and pass 9 wrote it verbatim, silently
+# dropping the docstring.
+
+def test_preserve_preamble_python_docstring():
+    from deeppeek.recover.patch_text import _preserve_preamble
+    preexisting = (
+        '"""Module docstring.\n'
+        '\n'
+        'Describes what the module does.\n'
+        '"""\n'
+        '\n'
+        'CONSTANT = 1\n'
+    )
+    block_body = "CONSTANT = 2\n"
+    result = _preserve_preamble(preexisting, block_body)
+    assert result.startswith('"""Module docstring.'), (
+        f"expected preamble preserved:\n{result}")
+    assert "CONSTANT = 2" in result
+    assert result.endswith("CONSTANT = 2\n")
+
+
+def test_preserve_preamble_block_has_own():
+    """If the block has its own preamble, use it verbatim — no
+    pre-existing preamble is prepended."""
+    from deeppeek.recover.patch_text import _preserve_preamble
+    preexisting = (
+        '"""Old docstring."""\n'
+        'CONSTANT = 1\n'
+    )
+    block_body = (
+        '"""New docstring."""\n'
+        'CONSTANT = 2\n'
+    )
+    result = _preserve_preamble(preexisting, block_body)
+    assert result == block_body, (
+        f"expected block body verbatim (own preamble wins):\n{result}")
+
+
+def test_preserve_preamble_no_preexisting_preamble():
+    """If the pre-existing file has no preamble, don't invent one."""
+    from deeppeek.recover.patch_text import _preserve_preamble
+    preexisting = "CONSTANT = 1\n"
+    block_body = "CONSTANT = 2\n"
+    result = _preserve_preamble(preexisting, block_body)
+    assert result == block_body
+
+
+def test_preserve_preamble_js_comment():
+    """JS leading comments are recognized as preamble."""
+    from deeppeek.recover.patch_text import _preserve_preamble
+    preexisting = (
+        "// Copyright 2026.\n"
+        "// All rights reserved.\n"
+        "\n"
+        "export function foo() { return 1; }\n"
+    )
+    block_body = "export function foo() { return 2; }\n"
+    result = _preserve_preamble(preexisting, block_body)
+    assert "// Copyright 2026." in result
+    assert "export function foo() { return 2; }" in result
+
+
+# ============================================================
+# Fix 4 (stale warning cleanup on reconcile)
+# ============================================================
+#
+# Pass 6 appends `patch idx=N could not be applied (...)` warnings
+# for failed patches.  When reconcile excludes patch N and promotes
+# the record, the warning is stale — the patch is now
+# `skipped_unplaceable`, not "failed".  Clean it up.
+
+def test_reconcile_clears_stale_pass6_warnings():
+    from deeppeek.recover.reconcile import (
+        _clear_stale_pass6_warnings)
+    from deeppeek.recover.core import FileRecord
+    rec = FileRecord(path="x.js", state="FULL_PLUS_PATCH")
+    rec.warnings = [
+        "patch idx=86 could not be applied (ellipsis block: ...)",
+        "patch idx=90 could not be applied (no scope)",
+        "patch or pair application failed; file not written",
+        "unrelated warning",
+    ]
+    excluded_keys = [("patch", 86), ("patch", 90)]
+    _clear_stale_pass6_warnings(rec, excluded_keys)
+    assert not any(
+        "patch idx=86 could not be applied" in w
+        for w in rec.warnings), (
+        f"stale warning for idx=86 not cleared: {rec.warnings!r}")
+    assert not any(
+        "patch idx=90 could not be applied" in w
+        for w in rec.warnings), (
+        f"stale warning for idx=90 not cleared: {rec.warnings!r}")
+    assert "unrelated warning" in rec.warnings, (
+        f"unrelated warning was cleared: {rec.warnings!r}")
+
+
+def test_reconcile_clears_only_excluded():
+    """Warnings for patches that were NOT excluded stay in place."""
+    from deeppeek.recover.reconcile import (
+        _clear_stale_pass6_warnings)
+    from deeppeek.recover.core import FileRecord
+    rec = FileRecord(path="x.js", state="FULL_PLUS_PATCH")
+    rec.warnings = [
+        "patch idx=1 could not be applied (a)",
+        "patch idx=2 could not be applied (b)",
+    ]
+    excluded_keys = [("patch", 1)]
+    _clear_stale_pass6_warnings(rec, excluded_keys)
+    assert len(rec.warnings) == 1
+    assert "patch idx=2" in rec.warnings[0], (
+        f"expected idx=2 warning preserved, got {rec.warnings!r}")
+
+
+def test_reconcile_no_excluded_patch_keys():
+    """Calling with no excluded patch keys leaves warnings alone."""
+    from deeppeek.recover.reconcile import (
+        _clear_stale_pass6_warnings)
+    from deeppeek.recover.core import FileRecord
+    rec = FileRecord(path="x.js", state="FULL_PLUS_PATCH")
+    orig = [
+        "patch idx=1 could not be applied (a)",
+    ]
+    rec.warnings = list(orig)
+    _clear_stale_pass6_warnings(rec, [("pair", -1, 5)])
+    assert rec.warnings == orig
+
+# ============================================================
+# Fix 1b (multi-scope with new functions) — pg_panel_bindings.py
+# ============================================================
+#
+# A multi-scope body may declare scopes that DON'T exist in base
+# (they're new functions being added alongside a replacement).
+# Splitting into individual scoped replaces would fail (the new
+# scopes have no span).  The correct behavior is the old single-
+# scope path: replace the first scope's span with the WHOLE new_body
+# — the new helpers get inserted at the first scope's position,
+# which is where the AI placed them.
+
+def test_apply_scoped_multi_scope_with_new_functions():
+    """Body declares `_inpaintAction` (exists) plus two new helpers.
+
+    Multi-scope splitting would return None (helpers not in base).
+    The fallback to single-scope must insert the whole body at the
+    first scope's position, correctly adding the helpers.
+    """
+    from deeppeek.recover.apply_patches import _apply_scoped
+    base = (
+        "async function _inpaintAction() {\n"
+        "  old_body();\n"
+        "}\n"
+        "\n"
+        "async function _clearImageAction() {\n"
+        "  clearImage();\n"
+        "}\n"
+    )
+    new_body = (
+        "async function _inpaintAction() {\n"
+        "  new_body();\n"
+        "  helper_a();\n"
+        "  helper_b();\n"
+        "}\n"
+        "\n"
+        "function _rotatedMaskToCanvasB64(mask) {\n"
+        "  return mask;\n"
+        "}\n"
+        "\n"
+        "function _setOriginalFromB64(b64) {\n"
+        "  return b64;\n"
+        "}\n"
+    )
+    result = _apply_scoped(base, "_inpaintAction", new_body)
+    assert result is not None, (
+        "expected multi-scope-with-new-helpers to succeed via "
+        "single-scope fallback")
+    assert result.count("async function _inpaintAction") == 1, (
+        f"expected exactly 1 '_inpaintAction', got "
+        f"{result.count('async function _inpaintAction')}:\n{result}")
+    assert "function _rotatedMaskToCanvasB64" in result, (
+        f"helper _rotatedMaskToCanvasB64 missing:\n{result}")
+    assert "function _setOriginalFromB64" in result, (
+        f"helper _setOriginalFromB64 missing:\n{result}")
+    assert "_clearImageAction" in result, (
+        f"unrelated function lost:\n{result}")
+    assert "old_body" not in result, (
+        f"old _inpaintAction body still present:\n{result}")
+    assert "new_body" in result
+    assert "helper_a" in result
+    assert "helper_b" in result
+
+
+def test_apply_scoped_multi_scope_all_existing_still_splits():
+    """The pg_pixels.py fix must still fire when ALL sub-scopes exist
+    in base — otherwise the duplicate-declaration bug regresses."""
+    from deeppeek.recover.apply_patches import _apply_scoped
+    base = (
+        "function _maskPixelData(mask) {\n"
+        "  old_m();\n"
+        "}\n"
+        "\n"
+        "export function hitTestMaskAtPoint(ix, iy) {\n"
+        "  old_h();\n"
+        "}\n"
+    )
+    new_body = (
+        "function _maskPixelData(mask) {\n"
+        "  new_m();\n"
+        "}\n"
+        "\n"
+        "export function hitTestMaskAtPoint(ix, iy) {\n"
+        "  new_h();\n"
+        "}\n"
+    )
+    result = _apply_scoped(base, "_maskPixelData", new_body)
+    assert result is not None
+    assert result.count("function _maskPixelData") == 1, (
+        f"expected exactly 1 '_maskPixelData', got "
+        f"{result.count('function _maskPixelData')}:\n{result}")
+    assert result.count(
+        "export function hitTestMaskAtPoint") == 1, (
+        f"expected exactly 1 'hitTestMaskAtPoint', got "
+        f"{result.count('export function hitTestMaskAtPoint')}:\n"
+        f"{result}")
+    assert "new_m" in result
+    assert "new_h" in result
+    assert "old_m" not in result
+    assert "old_h" not in result
+
+
+# ============================================================
+# Fix 4b (stale warning cleanup — additional classes)
+# ============================================================
+
+def test_reconcile_clears_pair_failure_warning():
+    """`N/M replace pair(s) failed` from pass 6 must be cleared once
+    reconcile rewrites the failing pairs to skipped_unplaceable."""
+    from deeppeek.recover.reconcile import _clear_stale_pass6_warnings
+    from deeppeek.recover.core import FileRecord
+    rec = FileRecord(path="x.py", state="FULL_PLUS_PATCH")
+    rec.verification["pair_records"] = [
+        {"applied_by": "skipped_unplaceable",
+         "pair": {"old_idx": -1, "new_idx": 103}},
+    ]
+    rec.warnings = [
+        "1/2 replace pair(s) failed: ...",
+    ]
+    _clear_stale_pass6_warnings(rec, [("pair", -1, 103)])
+    assert not rec.warnings, (
+        f"stale pair-failure warning not cleared: {rec.warnings!r}")
+
+
+def test_reconcile_clears_unresolved_symbol_warning():
+    """`unresolved symbol reference(s) introduced by patch` from
+    pass 8.5 must be cleared when the record's `unresolved_calls`
+    has been popped by reconcile."""
+    from deeppeek.recover.reconcile import _clear_stale_pass6_warnings
+    from deeppeek.recover.core import FileRecord
+    rec = FileRecord(path="x.py", state="FULL_PLUS_PATCH")
+    # After reconcile pop's unresolved_calls, this field is absent
+    rec.verification = {}
+    rec.warnings = [
+        "unresolved symbol reference(s) introduced by patch: "
+        "pgkitNotifyAll (patch almost certainly targeted the wrong file)",
+    ]
+    _clear_stale_pass6_warnings(rec, [("patch", 86)])
+    assert not rec.warnings, (
+        f"stale unresolved-symbol warning not cleared: "
+        f"{rec.warnings!r}")
 
 def main():
 
@@ -1596,6 +1999,38 @@ def main():
          test_replace_pair_object_literal_rename_falls_through),
         ("replace_pair non object literal skips splice",
          test_replace_pair_non_object_literal_skips_splice),
+        ("apply_scoped multi-scope body",
+         test_apply_scoped_multi_scope_body),
+        ("apply_scoped single scope unchanged",
+         test_apply_scoped_single_scope_unchanged),
+        ("duplicate export function detected",
+         test_duplicate_export_function_detected),
+        ("duplicate export const detected",
+         test_duplicate_export_const_detected),
+        ("no duplicate still passes",
+         test_no_duplicate_still_passes),
+        ("preserve preamble python docstring",
+         test_preserve_preamble_python_docstring),
+        ("preserve preamble block has own",
+         test_preserve_preamble_block_has_own),
+        ("preserve preamble no preexisting preamble",
+         test_preserve_preamble_no_preexisting_preamble),
+        ("preserve preamble js comment",
+         test_preserve_preamble_js_comment),
+        ("reconcile clears stale pass6 warnings",
+         test_reconcile_clears_stale_pass6_warnings),
+        ("reconcile clears only excluded",
+         test_reconcile_clears_only_excluded),
+        ("reconcile no excluded patch keys",
+         test_reconcile_no_excluded_patch_keys),
+        ("apply_scoped multi-scope with new functions",
+         test_apply_scoped_multi_scope_with_new_functions),
+        ("apply_scoped multi-scope all existing still splits",
+         test_apply_scoped_multi_scope_all_existing_still_splits),
+        ("reconcile clears pair failure warning",
+         test_reconcile_clears_pair_failure_warning),
+        ("reconcile clears unresolved symbol warning",
+         test_reconcile_clears_unresolved_symbol_warning),
     ]
     failed = 0
     for name, fn in tests:

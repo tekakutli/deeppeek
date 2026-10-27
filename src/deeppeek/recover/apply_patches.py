@@ -1,76 +1,27 @@
 """
 apply_patches — pass 6 (apply patches, then sanity-check the result).
 
-This module is now the *orchestrator*: it owns `pass6_apply_patches`
+This module is the *orchestrator*: it owns `pass6_apply_patches`
 (the main loop over records/patches), the sanity gate, and the
 per-record insertion filter.  The actual heuristics live in their
-own modules (see the module map at the bottom of this docstring).
+own modules.
 
-SPLIT RATIONALE
-===============
-`apply_patches.py` used to hold ~40 functions and had grown to
-several thousand lines.  The split separates:
+See the module docstring in the pre-fix version for the split
+rationale, broader-context retry, and the blockquoted structural
+check.  This version additionally:
 
-  · **Stable-ish infrastructure** — text primitives, scope detection,
-    LLM diff application, diagnostics.  These rarely change; when they
-    do, they change in one place and every consumer sees the update.
+  · Preserves the pre-existing file's preamble (leading docstring /
+    comment block) when a FULL block replaces a pre-existing file and
+    the block omits it (pg_state.py failure — block 94 discarded the
+    module docstring).
 
-  · **Growing heuristics** — patch_heuristics.  New shapes get added
-    here as they surface in the wild.  It's the module that grows.
-
-  · **Dispatch and pairing** — patch_pairs, patch_dispatch.  These
-    change when a new heuristic needs to slot into the chain, or when
-    drift-tolerance needs to reach further.
-
-  · **Orchestration** — this file.  The pass-6 main loop and its
-    surrounding helpers.  Stable shape; opens upward only for new
-    record-level concepts (a new op type, a new verification field).
-
-BROADER CONTEXT RETRY (2026-11-01, FIX 5)
-=========================================
-When every deterministic heuristic fails on a patch, retry once with
-`context_before` merged from the *adjacent blocks in the same record*.
-The pg_panel_scrubs.py failure case: "before the `status.running`
-field" prose was attached to the *import* block, not the *rotation*
-block, so the rotation block's context_before had no anchor.  The
-import block's context is one or two blocks back — within reach.
-Merging it in lets `_try_insert_before_anchor` find the anchor it
-needs.
-
-This is cheap (one extra deterministic attempt, only on failure) and
-catches the "the prose spans two blocks" shape without touching the
-extractor's contract.
-
-BLOCKQUOTED STRUCTURAL CHECK (FIX 6)
-====================================
-A blockquoted-orphan patch that survives `_has_strong_blockquote_
-attribution` (exact prose + commit language) is the AI's explicit
-commit, but it can still land in the wrong place — the
-pg_panel_bindings.py case: a thought-process fragment landed inside
-`_inpaintAction`'s body between `canvasB64` and `selectionB64`.
-`validate_content` catches it post-write, but by then the corrupted
-content has already been recorded as `applied` and the record is
-demoted to LOW.  `_try_blockquoted_patch` trial-validates the
-*just-applied* result inside pass 6; if the result is structurally
-invalid, the attempt is refused and the patch is marked failed
-instead of applied.
-
-Only blockquoted-orphan patches get this treatment.  Normal patches
-already benefit from the pass-8 verify; per-patch validation there
-would refuse legitimate intermediate states (a patch that is
-intentionally one half of a fragment closed by the next).  Blockquoted
-orphans have no such excuse — they arrive as complete units.
-
-MODULE MAP
-==========
-  patch_text          pure text primitives (leaf)
-  patch_scope         scope detection, scoped replace, ellipsis splice
-  patch_llm           LLM diff application
-  patch_heuristics    insert / replace / fuzzy heuristics
-  patch_pairs         replace-pair application + drift tolerance
-  patch_diag          failure diagnostics
-  patch_dispatch      deterministic-patch dispatcher + sanity attribution
-  apply_patches       this file — pass6_apply_patches + re-exports
+  · Does NOT emit the "file not written to target under default
+    --min-trust" warning.  That warning is misleading when pass 8.7
+    reconciliation later promotes the record; `pass9_write` already
+    emits the accurate "trust=LOW below --min-trust" line for records
+    that stay LOW.  Removing the pass-6 warning eliminates the stale-
+    warning class the pg_panel_bindings.py + pg_panel_scrubs.py
+    failures exhibited.
 """
 
 from typing import Optional
@@ -83,17 +34,6 @@ from .core import (
 )
 from .llm import LLMClient
 
-# ---------------------------------------------------------------------------
-# Re-export every name from the split modules so that
-# `from deeppeek.recover.apply_patches import X` keeps working
-# exactly as it did before the split.  The loop below mirrors the
-# module-level namespace the pre-split file exposed; own-name
-# definitions at the end of this file (`_filter_body_by_blocks`,
-# `_sanity_gate`, `pass6_apply_patches`) override any sub-module
-# names of the same spelling, because they are defined after the
-# loop.
-# ---------------------------------------------------------------------------
-
 from . import patch_text, patch_scope, patch_llm, patch_heuristics
 from . import patch_pairs, patch_diag, patch_dispatch
 
@@ -105,27 +45,6 @@ for _mod in (patch_text, patch_scope, patch_llm, patch_heuristics,
         globals()[_name] = getattr(_mod, _name)
 del _mod, _name
 
-# ---------------------------------------------------------------------------
-#  Local wrappers for the diagnostic functions.
-#
-#  These shadow the re-exports above.  Two reasons:
-#
-#    1. The wrapper's "never raises, always returns a string"
-#       contract is bound to its own module namespace: it must
-#       resolve `_diagnose_patch_failure_inner` from
-#       `apply_patches.__dict__`, not `patch_diag.__dict__`.  A
-#       pure re-export would make any caller that monkey-patches
-#       `apply_patches._diagnose_patch_failure_inner` (to prove the
-#       wrapper catches raises) a silent no-op.
-#
-#    2. `pass6_apply_patches` below calls `_diagnose_patch_failure`
-#       through a local name.  Keeping the local definition next to
-#       the caller makes the wrapper's behaviour inspectable from
-#       one place.
-#
-#  The actual diagnostic logic still lives in `patch_diag`; the
-#  local `_inner` delegates to it.  No logic is duplicated.
-# ---------------------------------------------------------------------------
 
 def _diagnose_patch_failure_inner(patch, content, base):
     from .patch_diag import _diagnose_patch_failure_inner as _impl
@@ -143,28 +62,8 @@ def _diagnose_patch_failure(patch, content, base):
 # ===========================================================================
 #  Broader-context retry helper (FIX 5)
 # ===========================================================================
-#
-# On deterministic failure, retry once with the context of the
-# *previous* blocks in the same record.  This catches the shape where
-# the anchor-prose ("before the `status.running` field") is attached
-# to the block *before* the content block, not the content block
-# itself.  See the module docstring.
 
 def _broader_context_for(patch, blocks_by_idx, records, path):
-    """Return `patch["context_before"]` merged with the previous
-    blocks' prose from the same record.
-
-    The merge is:
-        <context of the previous 2 blocks, joined by newlines>
-        <original context_before>
-
-    Order matters: `_BEFORE_PROSE_RE` in patch_heuristics scans
-    right-to-left for the most recent match, so the original
-    context ends up *after* the merged prose.  If the original
-    context already contains an anchor, the retry does not fire
-    (see the caller — the broader retry only runs when the first
-    attempt returns None).
-    """
     rec = records.get(path)
     if rec is None:
         return patch.get("context_before", "")
@@ -186,18 +85,8 @@ def _broader_context_for(patch, blocks_by_idx, records, path):
 # ===========================================================================
 #  Blockquoted structural check (FIX 6)
 # ===========================================================================
-#
-# A blockquoted-orphan patch is the AI's explicit commit, but thought
-# fragments can land in the wrong scope (pg_panel_bindings.py: a
-# fragment landed inside `_inpaintAction`'s body between two const
-# declarations, corrupting the function signature).  Trial-validate
-# the result before accepting.
 
 def _is_blockquoted_strong(b_idx, blocks_by_idx):
-    """True iff block `b_idx` is a blockquoted orphan with strong
-    attribution (exact prose + commit language).  These are the
-    patches that get the structural trial check.
-    """
     b = blocks_by_idx.get(b_idx) if blocks_by_idx else None
     if b is None:
         return False
@@ -211,22 +100,11 @@ def _is_blockquoted_strong(b_idx, blocks_by_idx):
 
 
 def _try_blockquoted_patch(content, patch, path):
-    """Apply the patch, then trial-validate.  If the result is
-    structurally invalid, revert and return None.
-
-    Used only for blockquoted-orphan patches (see
-    `_is_blockquoted_strong`).  Non-blockquoted patches keep the
-    plain `_try_deterministic_patch` path — they benefit from pass-8
-    verify without the per-patch double-check, and legitimately
-    produce intermediate states (a fragment closed by a later patch)
-    that per-patch validation would refuse.
-    """
     from .validate_output import validate_content
     result = _try_deterministic_patch(content, patch, path)
     if result is None:
         return None
     if result == content:
-        # No-op; do not re-validate.
         return result
     trial = validate_content(result, path)
     if trial is not None:
@@ -241,18 +119,6 @@ def _try_blockquoted_patch(content, patch, path):
 # ===========================================================================
 
 def _filter_body_by_blocks(body, base_stripped_set, record_inserted):
-    """Remove blocks whose non-context lines are ALL already inserted
-    by prior pairs/patches in this record.
-
-    Conservative rules:
-      - Context lines (present in the base) are never filtered.
-      - A block is only removed if EVERY non-context line is a
-        duplicate.  A single new line keeps the whole block.
-      - Structural integrity is preserved because filtering is per
-        whole block, not per line.
-
-    Returns (filtered_body, any_removed).
-    """
     if not body.strip():
         return body, False
     blocks = _split_body_into_blocks(body)
@@ -298,6 +164,30 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
             rec.trust = "LOW"
             continue
         base = base_block.body
+
+        # NEW: preserve the pre-existing file's preamble.
+        #
+        # When a FULL block replaces a pre-existing file and omits the
+        # pre-existing preamble (leading docstring / comment block),
+        # prepend it.  The pg_state.py failure: block 94 was
+        # `STATE_JS = r\"\"\"...\"\"\"` (the constant body only), the
+        # pre-existing file had a 17-line module docstring above it,
+        # and `pass9_write` wrote the block body verbatim — the
+        # docstring was lost.
+        #
+        # `_preserve_preamble` is a no-op when either side has no
+        # preamble or when the block has its own (explicit new
+        # docstring).  Only fires on the specific "block omits the
+        # pre-existing preamble" shape.
+        if rec.source_blocks:
+            for _idx in rec.source_blocks:
+                _pre = blocks_by_idx.get(_idx)
+                if (_pre is not None
+                        and _pre.classified_by == "preexisting"
+                        and _pre.body):
+                    base = _preserve_preamble(_pre.body, base)
+                    break
+
         content = base
 
         base_stripped_set = {
@@ -340,9 +230,6 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
             else:
                 patch_to_apply = patch
 
-            # FIX 6: route blockquoted-orphan patches through the
-            # structural-check wrapper.  Normal patches use the
-            # plain dispatcher.
             if _is_blockquoted_strong(patch["idx"], blocks_by_idx):
                 result = _try_blockquoted_patch(
                     content, patch_to_apply, path)
@@ -400,12 +287,6 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                     patch["applied_by"] = "already-present"
                     continue
 
-            # FIX 5: retry once with merged context before falling
-            # through to the LLM.  The pg_panel_scrubs.py failure
-            # case: the "before `status.running`" prose was attached
-            # to the import block, not the rotation block.  The
-            # merged context lets `_try_insert_before_anchor` see
-            # the anchor.
             broader = _broader_context_for(
                 patch_to_apply, blocks_by_idx, records, path)
             if broader != patch_to_apply.get("context_before", ""):
@@ -510,10 +391,14 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                 rec.verification["patches_incomplete"] = (
                     rec.verification.get("patches_incomplete", False)
                     or not all_ok)
-                rec.warnings.append(
-                    "patch or pair application failed; file not written "
-                    "to target under default --min-trust "
-                    "(override with --min-trust LOW to force-write)")
+                # NOTE: no "file not written" warning here.  Pass 9
+                # emits the accurate "trust=LOW below --min-trust"
+                # line for records that actually stay LOW; if pass
+                # 8.7 reconciliation promotes the record, no warning
+                # is correct (the file IS written).  Emitting the
+                # warning here unconditionally produced the stale-
+                # warning class in the pg_panel_bindings.py and
+                # pg_panel_scrubs.py failures.
                 print(f"  [pass 6] {path}: incomplete application -> LOW "
                       f"trust", file=sys.stderr)
             else:

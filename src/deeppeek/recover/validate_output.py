@@ -19,24 +19,21 @@ detects the failure classes that matter for those projects:
   3. Duplicate top-level declaration - for JS content.  Catches the
      same block being applied twice.
 
+     IMPORTANT (Fix for pg_pixels.py): the declaration regex MUST
+     handle the `export` / `async` prefixes.  The pre-fix version
+     matched only `^(?:const|let|var|function|class)\\s+…`, so
+     `export function foo() {…}` was never counted — the pg_pixels.py
+     failure slipped through with two `export function
+     hitTestMaskAtPoint` declarations in the same file.  This module
+     now matches `^(?:export\\s+)?(?:async\\s+)?(?:const|let|var|function|class)\\s+…`.
+
   4. `<details>` element count regression - for HTML content inside
-     `.py` strings.  Catches a scoped replace that silently dropped
-     an entire section.
+     `.py` strings.
 
   5. JavaScript parse validation — when tree-sitter + a matching
-     grammar is available (the `[ast]` extra), the JS content is
-     parsed with a real grammar.  Balance checks cannot detect scope
-     errors: an `if (...) { ... }` statement inserted between two
-     `key: value,` object members is brace-balanced but
-     syntactically invalid.  A parse check catches it.
+     grammar is available (the `[ast]` extra).
 
-  6. Module-level statement regression - for Python files.  A patch
-     that should have been inserted inside a function but was
-     appended at module level shows up as a new `try:` /
-     `for:` / `while:` / `with:` at column 0 that wasn't in
-     the base.  Catches the inpaint_server.py `output_rotation`
-     corruption shape (three patches appended at module level after
-     `RAW_ROUTES`).
+  6. Module-level statement regression - for Python files.
 
 All checks return None on success, or a one-line string describing
 the failure.  Any non-None return means the file must be fail-closed
@@ -45,20 +42,8 @@ the failure.  Any non-None return means the file must be fail-closed
 PARSE-METHOD TRACKING
 =====================
 `validate_content` sets the module-level `_LAST_PARSE_METHOD` to one
-of:
-
-    "none"    no JS content was checked (nothing to verify)
-    "balance" JS was checked with brace-balance only (no parser
-              available for this language, or the parse check was
-              skipped by design, e.g. .jsx where JSX support varies
-              across tree-sitter-javascript versions)
-    "parse"   JS was checked with a real grammar
-
-Callers (notably `validate.pass8_verify`) can read this after a
-successful call to record the verification method in the manifest.
-A manifest that reports `content_valid: "ok"` from a balance-only
-check is honest about its limits; one reported from a parse check is
-not.  Callers that don't read the flag see no behaviour change.
+of: "none" / "balance" / "parse".  Callers that want to record the
+verification method in the manifest read this after the call returns.
 """
 
 import ast
@@ -69,27 +54,12 @@ from pathlib import Path
 from typing import Optional
 
 
-# Accumulator that _dedup_repeated_statements
-# and _dedup_duplicate_blocks populate so callers
-# can record audit trail in the manifest.  Reset by
-# the caller before each invocation.
 _LAST_DEDUP_DETAILS = []
 
-# Set by validate_content to record how the file was verified.
-# "none" / "balance" / "parse".  Callers that want to distinguish
-# "verified by a real grammar" from "verified by balance only" read
-# this after validate_content returns.  See module docstring.
 _LAST_PARSE_METHOD = "none"
 
 
 _JS_EXTS = frozenset({".js", ".mjs", ".jsx", ".ts", ".tsx"})
-# `export` is only legal at module top-level in ESM.  An indented
-# `export function X()` or `export const X = ...` is invalid syntax
-# and — in the recovery pipeline — is a smoking gun for a nested
-# declaration inserted by a mis-firing anchor heuristic.  The
-# specific corruption: an ellipsis or context-insert heuristic
-# placed `export function buildContextMaskB64() {}` inside the
-# existing `buildContextMaskB64()` body.
 _INDENTED_EXPORT_RE = re.compile(
     r"^[ \t]+export\s+(?:function|class|const|let|var|default)\b",
     re.MULTILINE,
@@ -105,10 +75,7 @@ def _line_of(text: str, offset: int) -> int:
 
 
 def _js_balance(text: str) -> tuple:
-    """Return (braces, parens, brackets, strings_unclosed).
-
-    Skips content inside strings and comments.  Nonzero means unbalanced.
-    """
+    """Return (braces, parens, brackets, strings_unclosed)."""
     braces = parens = brackets = 0
     i, n = 0, len(text)
     in_str = None
@@ -154,13 +121,6 @@ def _js_balance(text: str) -> tuple:
 # ---------------------------------------------------------------------------
 # Module-level statement regression (Python files)
 # ---------------------------------------------------------------------------
-#
-# The inpaint_server.py corruption shape: three fragments that
-# reference function locals (payload, batch) were appended at
-# module level by structural-append.  The result is syntactically
-# valid Python, so ast.parse passes; the check below catches the
-# class of "statement added at module level that wasn't there
-# before" without needing to know what names are undefined.
 
 _MODULE_STMT_KEYWORDS = ("try", "except", "finally", "for", "while", "with")
 
@@ -172,12 +132,7 @@ _TOP_LEVEL_STMT_RE = re.compile(
 
 def _module_level_stmts_added(content: str, base: Optional[str]) -> list:
     """Return statement keywords at column 0 whose count increased
-    from `base` to `content`.
-
-    Only try/except/finally/for/while/with are considered.  `if`
-    is deliberately excluded: `if __name__ == "__main__":` is a
-    legitimate module-level addition.
-    """
+    from `base` to `content`."""
     def _count(text):
         counter = Counter()
         if not text:
@@ -229,8 +184,7 @@ def _function_presence_check(base: str, result: str,
                               allow_missing: Optional[set] = None,
                               ) -> Optional[str]:
     """Every top-level name declared in base must appear in result,
-    unless it is listed in `allow_missing` (declarations that a
-    deletion patch was explicitly instructed to remove)."""
+    unless it is listed in `allow_missing`."""
     if not base:
         return None
     base_names = _declared_names(base)
@@ -249,27 +203,10 @@ def _function_presence_check(base: str, result: str,
 
 
 # ---------------------------------------------------------------------------
-# tree-sitter helpers (optional — no hard dependency)
+# tree-sitter helpers (optional)
 # ---------------------------------------------------------------------------
-#
-# The parse-validation layer is a pure improvement: when tree-sitter
-# and a matching grammar are importable, the JS content is parsed and
-# syntax errors are caught.  When they are not, the existing balance
-# checks are the whole story — no behaviour change from pre-parse
-# validate_output.
-#
-# Parser lookup goes through `ast_anchor._get_parser`, which already
-# caches per-language parsers in `_parser_cache`.  That cache is the
-# reason the probe is cheap even when validate_content calls this once
-# per embedded JS string.
 
 def _get_js_parser(lang: str):
-    """Return a tree-sitter parser for `lang`, or None.
-
-    `lang` is a tree-sitter language id ("javascript",
-    "typescript", "tsx", "python").  Only the JS-family ids are
-    passed from this module; python uses ast.parse, not tree-sitter.
-    """
     try:
         from .ast_anchor import _get_parser
     except ImportError:
@@ -281,18 +218,6 @@ def _get_js_parser(lang: str):
 
 
 def _js_parse_check_subprocess(text: str, lang: str) -> Optional[str]:
-    """Run tree-sitter parse in the repo .venv's Python.
-
-    The current interpreter may lack tree-sitter (a pipx install does;
-    the repo .venv usually has it).  `ast_anchor` already has a
-    subprocess fallback for its own anchoring work; this reuses the
-    same plumbing so validation catches syntax errors even when the
-    in-process parser is unavailable.
-
-    Returns None if the parser is unavailable (no verdict); returns
-    a diagnostic string if a parse error was found; returns None if
-    the content parsed cleanly.
-    """
     try:
         from .ast_anchor import _find_venv_python, _src_dir, _has_venv_ast
     except ImportError:
@@ -356,17 +281,6 @@ def _js_parse_check_subprocess(text: str, lang: str) -> Optional[str]:
 
 
 def _js_lang_for_ext(ext: str) -> Optional[str]:
-    """Return the tree-sitter language id to parse `ext` files with,
-    or None to skip the parse check.
-
-    `.jsx` is intentionally mapped to None: JSX support varies
-    across tree-sitter-javascript versions, and a false parse error
-    on a legitimate JSX file is worse than a balance-only check.
-    The pg_state.py failure class (a brace-balanced but
-    syntactically-invalid fragment in plain JS) is caught by the
-    balance checks for `.jsx` too — the only thing skipped is the
-    additional parse confirmation.
-    """
     if ext == ".ts":
         return "typescript"
     if ext == ".tsx":
@@ -383,8 +297,6 @@ def _iter_ts_nodes(node):
 
 
 def _first_error_location(tree) -> Optional[tuple]:
-    """Return 1-based (line, col) of the first tree-sitter ERROR
-    node, or None if no ERROR node is found."""
     if tree is None or getattr(tree, "root_node", None) is None:
         return None
     for node in _iter_ts_nodes(tree.root_node):
@@ -406,15 +318,7 @@ def _js_structural_check(text: str, label: str,
                          ) -> Optional[str]:
     """Structural validation for JS content.
 
-    `parse_lang` is the tree-sitter language id to use for a final
-    parse-validation pass.  When None, that pass is skipped (only
-    balance/indent/duplicate checks run — the pre-parse behaviour).
-    When set but the parser is unavailable, the pass is silently
-    skipped (no new hard dependency; `_LAST_PARSE_METHOD` records the
-    downgrade as "balance").
-
-    Mutates the module-level `_LAST_PARSE_METHOD`.  Callers are
-    expected to reset it before calling (validate_content does).
+    Mutates the module-level `_LAST_PARSE_METHOD`.
     """
     global _LAST_PARSE_METHOD
 
@@ -428,10 +332,6 @@ def _js_structural_check(text: str, label: str,
     if unclosed:
         return f"{label}: unclosed string literal"
 
-    # NEW: indented `export` is invalid ESM — `export` must be at
-    # module top-level.  This catches the nested-declaration
-    # corruption where a scope decl was inserted inside another
-    # function body.
     _ie = _INDENTED_EXPORT_RE.search(text)
     if _ie:
         _line_no = text.count("\n", 0, _ie.start()) + 1
@@ -441,15 +341,15 @@ def _js_structural_check(text: str, label: str,
     # Column-0 declarations only.  JS `const` is block-scoped, so
     # `const res = ...` inside `uploadImageFile` and another
     # `const res = ...` inside `fetchStatus` are distinct bindings,
-    # not a duplicate.  Only unindented declarations at the top level
-    # of the JS file are true duplicates.  An earlier version of
-    # this check used `^\s*`, which flagged every local variable
-    # declared twice — the false-positive class that rejected
-    # pg_state.py, pg_pixels.py, pg_dispatch.py, pg_panel_bindings.py,
-    # pg_view_image.py, pg_comfy_client.py, and pg_krita_client.py
-    # on the conversation that revealed the bug.
+    # not a duplicate.
+    #
+    # FIX (pg_pixels.py): `export` / `async` prefixes must be
+    # matched.  The pre-fix regex missed both, so `export function
+    # foo()` was never counted — two `export function
+    # hitTestMaskAtPoint` declarations slipped through undetected.
     decls = re.findall(
-        r"^(?:const|let|var|function|class)\s+([A-Za-z_$][\w$]*)",
+        r"^(?:export\s+)?(?:async\s+)?"
+        r"(?:const|let|var|function|class)\s+([A-Za-z_$][\w$]*)",
         text, re.MULTILINE)
     seen = {}
     for d in decls:
@@ -457,16 +357,6 @@ def _js_structural_check(text: str, label: str,
             return f"{label}: duplicate top-level declaration '{d}'"
         seen[d] = True
 
-    # Parse validation — the last line of defence.  Balance checks
-    # can verify punctuation; only a grammar can verify that the
-    # punctuation is arranged in a valid scope.  The pg_state.py
-    # corruption shape (an `if` between two `key: value,` object
-    # members) passes every balance check above and fails here.
-    #
-    # When in-process tree-sitter is unavailable, fall back to the
-    # repo .venv subprocess.  This is the only way to catch the
-    # pg_comfy_client.py signature corruption when deeppeek runs
-    # from pipx (which has no tree-sitter installed).
     if parse_lang is not None:
         parser = _get_js_parser(parse_lang)
         if parser is None:
@@ -495,18 +385,9 @@ def _js_structural_check(text: str, label: str,
                             f"where its statement shape does not fit")
                 _LAST_PARSE_METHOD = "parse"
             except Exception:
-                # Parser crashed — treat as balance-only so a broken
-                # parser doesn't cause false rejections.  Downgrade
-                # `_LAST_PARSE_METHOD` only if we haven't already
-                # upgraded to "parse" (which can happen when a .py
-                # file has multiple embedded JS strings and an
-                # earlier one parsed cleanly).
                 if _LAST_PARSE_METHOD == "none":
                     _LAST_PARSE_METHOD = "balance"
     else:
-        # Caller opted out of parse validation (e.g. .jsx).  Still
-        # run the balance checks (already done above); record that
-        # the verification was balance-only.
         if _LAST_PARSE_METHOD == "none":
             _LAST_PARSE_METHOD = "balance"
 
@@ -574,23 +455,6 @@ def _looks_like_html(text: str) -> bool:
 
 
 def _looks_like_css(text: str) -> bool:
-    """True iff text contains CSS-specific structure that would
-    be meaningless or misleading inside a JS body.
-
-    Two patterns cover the observed failure shape and are
-    deliberately narrow enough to miss no valid JS:
-
-      1. A CSS ID selector at line start followed by `{`.
-         In JS, `#word {` can only appear inside a class body
-         as part of `#word() {` (a private method) or as
-         `#word = ...` (a private field).  CSS `#maskPromptRow
-         textarea {` -- hash-word followed by space and another
-         word and `{` -- has no JS interpretation.
-
-      2. Two or more `prop: value;` declarations on one line.
-         JS object literals use `,` between entries; `;`
-         after every value is CSS-only.
-    """
     if not text:
         return False
     if re.search(
@@ -615,14 +479,7 @@ def validate_content(content: str, path: str,
                      base: Optional[str] = None,
                      allow_missing: Optional[set] = None,
                      ) -> Optional[str]:
-    """Return None if content is structurally OK, else an error string.
-
-    SIDE EFFECT: sets the module-level `_LAST_PARSE_METHOD` to one of
-    `"none"`, `"balance"`, or `"parse"`, describing how the JS parts
-    of `content` were verified.  Callers that want to record the
-    verification method in the manifest read this after the call
-    returns.  See module docstring for the semantics of each value.
-    """
+    """Return None if content is structurally OK, else an error string."""
     global _LAST_PARSE_METHOD
     _LAST_PARSE_METHOD = "none"
 
@@ -650,13 +507,6 @@ def validate_content(content: str, path: str,
             return (f"{path}: python SyntaxError at line {e.lineno}: "
                     f"{e.msg}")
 
-        # NEW: module-level statement regression.  A patch that
-        # should have been inserted inside a function but landed at
-        # module level (structural_append / context_insert after a
-        # module-level anchor) shows up as new try:/for:/while:/with:
-        # at column 0.  Catches the inpaint_server.py corruption
-        # shape: three patches referencing function locals appended
-        # at module level after RAW_ROUTES.
         if base:
             added_stmts = _module_level_stmts_added(content, base)
             if added_stmts:
@@ -681,18 +531,10 @@ def validate_content(content: str, path: str,
                 if err:
                     return err
             elif _looks_like_js(block):
-                # Embedded JS is always plain JavaScript (playgrounds
-                # don't ship JSX or TS inside Python strings).  Parse
-                # with the JS grammar specifically; never fall through
-                # to the .jsx opt-out.
                 err = _js_structural_check(
                     block, label, parse_lang="javascript")
                 if err:
                     return err
-                # Cross-language guard: CSS appearing in JS that
-                # did not have CSS in base is a strong signal that
-                # a block from a different language was applied
-                # here.  Reject rather than write corrupted JS.
                 if (base_js_texts
                         and not base_js_css
                         and _looks_like_css(block)):
@@ -712,48 +554,12 @@ def validate_content(content: str, path: str,
 # ---------------------------------------------------------------------------
 # Duplicate-block deduplication
 # ---------------------------------------------------------------------------
-#
-# Duplicate application is one of the two ways a conversation with
-# overlapping code blocks produces corrupt output (the other is
-# truncation, handled by `repair.py`).  The shape:
-#
-#   · two adjacent source blocks with similar/identical content
-#   · both applied — once via `_try_insert_after_anchor`, once via
-#     `_try_structural_append`, once via `_try_context_insert`
-#   · result contains the same `if (COND) { ... }` guard twice, or
-#     the same `const NAME = ...; if (NAME) { ... }` wiring twice
-#
-# Detected and removed here, before `validate_content` runs.  If the
-# deduped content validates, it's written.  If not, the record
-# fail-closes as before — dedup never makes the result worse.
-#
-# Two classes:
-#
-#   Class A — duplicate `if (COND) { ... }` blocks
-#     Same normalized COND, same indent, within 100 lines of each
-#     other, bodies overlap after stripping whitespace.  This is the
-#     pg_panel_fields.py shape (guard block inserted twice).
-#
-#   Class B — duplicate `const NAME = ...;` at module scope
-#     Same NAME, indent 0.  Removes the second const and any
-#     immediately-following `if (NAME) { ... }`.  This is the
-#     pg_panel_scrubs.py shape (wiring pair inserted twice).
-#
-# Both classes are *always* bugs when the bodies overlap — either a
-# real user error (JS would reject the duplicate const; duplicate
-# if-conditions are redundant) or, in the recovery context, a
-# duplicate-insertion bug.  Removing the second is never worse than
-# leaving it.
 
 _IF_OPENER_RE = re.compile(
     r"^([ \t]*)if\s*\((.*)\)\s*(\{)\s*(?://.*)?$", re.MULTILINE)
 _MODULE_CONST_RE = re.compile(
     r"^const\s+([A-Za-z_$][\w$]*)\s*=", re.MULTILINE)
 
-# Class C: function/class declarations at column 0 (no indent).
-# The name capture group is for fast duplicate-detection; the
-# full declaration text (header + body) is what actually gets
-# compared during dedup.
 _FUNC_DECL_RE = re.compile(
     r"^((?:export\s+)?(?:async\s+)?function\s+"
     r"([A-Za-z_$][\w$]*)\s*\()",
@@ -766,7 +572,7 @@ _DEDUP_WINDOW_CHARS = 1500
 
 
 def _enclosing_scope_depth(content: str, pos: int) -> tuple:
-    """Return (depth, last_open_pos) at `pos`.  Strings/comments skipped."""
+    """Return (depth, last_open_pos) at `pos`."""
     depth = 0
     stack = []
     i = 0
@@ -805,19 +611,11 @@ def _enclosing_scope_depth(content: str, pos: int) -> tuple:
     return depth, (stack[-1] if stack else -1)
 
 
-
 def _norm_lines(s: str) -> str:
-    """Whitespace-normalized form: all non-blank lines stripped,
-    joined by newlines.  Used to compare two blocks for identity
-    regardless of indentation."""
     return "\n".join(ln.strip() for ln in s.splitlines() if ln.strip())
 
 
 def _strip_inline_strings(line: str) -> str:
-    """Remove single-line quoted strings, JS line comments, and
-    single-line JS block comments from a line.  Used for line-based
-    brace counting without miscounting braces inside strings or
-    comments."""
     out, in_str, i, n = [], None, 0, len(line)
     while i < n:
         c = line[i]
@@ -844,13 +642,10 @@ def _strip_inline_strings(line: str) -> str:
         out.append(c)
         i += 1
     return "".join(out)
+
+
 def _find_matching_close_char_linebased(content: str,
                                         open_brace_idx: int) -> int:
-    """Line-based brace matcher for Python files with embedded JS.
-
-    Robust against triple-quoted string delimiters by
-    processing each line independently — no cross-line string state.
-    """
     line_idx_start = content.count("\n", 0, open_brace_idx)
     lines = content.split("\n")
     if line_idx_start >= len(lines):
@@ -873,10 +668,6 @@ def _find_matching_close_char_linebased(content: str,
 
 def _find_matching_close_char(content: str, open_brace_idx: int,
                               is_python: bool = False) -> int:
-    """Return the char index of the `}` matching the `{` at
-    `open_brace_idx`, or -1 if unbalanced.  Strings and comments are
-    skipped (a `}` inside a string or comment does not close the
-    block)."""
     if open_brace_idx >= len(content) or content[open_brace_idx] != "{":
         return -1
     if is_python:
@@ -919,7 +710,6 @@ def _find_matching_close_char(content: str, open_brace_idx: int,
 
 
 def _has_obvious_duplicates(content: str) -> bool:
-    """Cheap pre-check: any duplicate `const NAME` or `if (COND)`?"""
     seen_consts = set()
     for m in _MODULE_CONST_RE.finditer(content):
         name = m.group(1)
@@ -933,7 +723,6 @@ def _has_obvious_duplicates(content: str) -> bool:
         if key in seen_ifs:
             return True
         seen_ifs.add(key)
-    # Class C: function/class name duplicates at column 0
     seen_funcs = set()
     for m in _FUNC_DECL_RE.finditer(content):
         if (content.rfind(chr(10), 0, m.start()) + 1
@@ -955,19 +744,12 @@ def _has_obvious_duplicates(content: str) -> bool:
     return False
 
 
-# DEDUP-v2: file-type guard + same-string check for .py
-
 _DEDUP_SAFE_EXTENSIONS = frozenset({
     ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".py",
 })
 
 
 def _python_string_spans(content: str) -> list:
-    """Return (start, end) spans of every triple-quoted string literal.
-
-    Used to verify that duplicate blocks in embedded JS are inside the
-    SAME Python string (a pipeline artifact) rather than in different
-    strings (likely documentation examples)."""
     spans = []
     TRIPLE_D = chr(34) * 3
     TRIPLE_S = chr(39) * 3
@@ -984,7 +766,6 @@ def _python_string_spans(content: str) -> list:
 
 
 def _same_python_string(pos_a: int, pos_b: int, spans: list) -> bool:
-    """True iff both positions are inside the same triple-quoted string."""
     for start, end in spans:
         if start <= pos_a < end and start <= pos_b < end:
             return True
@@ -992,31 +773,7 @@ def _same_python_string(pos_a: int, pos_b: int, spans: list) -> bool:
 
 
 def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
-    """Remove duplicate-applied blocks.  Returns (new_content, n_removed).
-
-    File-type guard: dedup runs only on code files (.js/.mjs/.cjs/
-    .jsx/.ts/.tsx/.py).  For documentation-style files (.md, .html,
-    .css, .yaml, .json, .toml, .sh, ...) duplicate const/if lines are
-    almost always author-written examples, not pipeline artifacts;
-    removing them would corrupt the file.  Skipping those extensions
-    trades coverage for safety, which is the correct trade-off.
-
-    Within code files:
-
-      A. Duplicate if-blocks (if (COND) { ... }) with identical
-         normalized bodies in the same scope, within
-         _DEDUP_WINDOW_CHARS.
-
-      B. Duplicate module-scope const declarations (const NAME = ...),
-         plus their trailing if (NAME) { ... } blocks, within
-         _DEDUP_WINDOW_CHARS.
-
-    For Python files with embedded JS, "same scope" is approximated
-    by "same triple-quoted string literal": a duplicate in a different
-    string is treated as an author-written example, not a pipeline
-    artifact.  This is a heuristic; a same-string before/after example
-    would still be collapsed, but cross-string examples are protected.
-    """
+    """Remove duplicate-applied blocks.  Returns (new_content, n_removed)."""
     ext = Path(path).suffix.lower()
     if ext not in _DEDUP_SAFE_EXTENSIONS:
         return content, 0
@@ -1028,15 +785,11 @@ def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
 
     removals = []
 
-    # ---- Class A: duplicate if-blocks with same condition ----
     seen_cond = {}
     for m in _IF_OPENER_RE.finditer(content):
         cond = re.sub(r"\s+", " ", m.group(2)).strip()
         if not cond:
             continue
-        # m.start(3) is the `{` the regex captured directly — robust
-        # against trailing `// comment` on the opener line, where
-        # m.end() - 1 would point into the comment.
         open_char = m.start(3)
         close_char = _find_matching_close_char(
             content, open_char, is_python=is_python)
@@ -1068,7 +821,6 @@ def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
             continue
         seen_cond[key] = (m.start(), end_char)
 
-    # ---- Class B: duplicate module-scope const NAME = ----
     seen_const = {}
     for m in _MODULE_CONST_RE.finditer(content):
         if m.start() != content.rfind("\n", 0, m.start()) + 1:
@@ -1107,14 +859,6 @@ def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
             continue
         seen_const[name] = (m.start(), end_char)
 
-    # ---- Class C: duplicate function/class declarations ----
-    # Two identical `function NAME(...) { body }` (or `class
-    # NAME { body }`) in the same enclosing scope within the
-    # window: remove the later one.  Body comparison includes
-    # the header line, so different parameter lists are not
-    # considered identical.  Column-0 only -- indented
-    # declarations are anonymous or nested, and their scope is
-    # meaningful even if the header text matches.
     for _pat, _kind in (
             (_FUNC_DECL_RE, "function"),
             (_CLASS_DECL_RE, "class")):
@@ -1151,10 +895,6 @@ def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
                             content, _m.start())):
                     _seen_decl[_key] = (_m.start(), _end)
                     continue
-                # Same-string guard: identical functions inside two
-                # DIFFERENT embedded string literals of a .py file are
-                # author-written duplication (per-string), not a
-                # pipeline artifact.  Preserve both.
                 if is_python:
                     if not _same_python_string(
                             _prev_start, _m.start(), py_spans):
@@ -1168,9 +908,6 @@ def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
     if not removals:
         return content, 0
 
-    # Merge overlapping removals (Class A and B can both flag the same
-    # block; applying overlapping removals in reverse order corrupts
-    # the content because positions shift after each removal).
     removals.sort(key=lambda r: r[0])
     merged = [removals[0]]
     for r in removals[1:]:
@@ -1198,25 +935,7 @@ def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
 
 def _dedup_repeated_statements(content, path, base=None,
                                 patch_bodies=None, window=15):
-    """Remove duplicate single-line statements under tight conditions:
-
-      1. Code file (not documentation, not CSS-in-py).
-      2. Line does NOT appear in `base` -- i.e. it is genuinely new,
-         added by the patches, not inherited from the pre-existing
-         file.  A legitimate duplicate (e.g. `resetView();` appearing
-         in both `setImage` and `clearImage`) is in `base` and is
-         therefore skipped.
-      3. Line appears in at least one `patch_bodies` entry.  A
-         user-authored duplication with no patch provenance is left
-         alone.
-      4. Exactly two occurrences in the result.
-      5. Both in the same enclosing scope (by innermost `{` position).
-      6. Within `window` lines of each other.
-
-    Removing one copy of a line that is byte-identical, at the same
-    indent, in the same scope, and that the patches added twice yields
-    the single-application result the patch text intended.
-    """
+    """Remove duplicate single-line statements under tight conditions."""
     from pathlib import Path as _P
     ext = _P(path).suffix.lower()
     if ext not in frozenset({
