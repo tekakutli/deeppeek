@@ -460,7 +460,7 @@ def run(cfg: RecoverConfig) -> int:
           f"other: {n_other}  recovered-meta: {n_meta}"
           + (f"  preexisting: {n_pre_full}" if n_pre_full else ""))
 
-    # ---- pass 2.5 (wrapped) ----
+    # ---- pass 2.5 ----
     print("[pass 2.5] resolving output paths...")
     resolutions = _run_pass(
         "2.5 (resolve)", resolve_paths, [],
@@ -471,6 +471,26 @@ def run(cfg: RecoverConfig) -> int:
     n_unresolved = sum(1 for r in resolutions
                        if r["reason"].startswith("unresolved"))
     print(f"  {n_resolved} resolved, {n_unresolved} unresolved")
+
+    # NEW: after resolution, prune pre-existing baselines that no
+    # conversation block touched.  On a real target tree this drops
+    # the pre-existing set from the whole tree (~571 files here) to
+    # just the files the conversation actually references (~30).
+    # Everything downstream — cross-validate, verify, the manifest's
+    # "files" section, per-pass stderr — is scoped to touched files.
+    if cfg.apply_to is not None:
+        touched = {b.output_path for b in blocks
+                   if b.classified_by != "preexisting" and b.output_path}
+        before = len(blocks)
+        blocks = [b for b in blocks
+                  if b.classified_by != "preexisting"
+                  or b.output_path in touched]
+        for i, b in enumerate(blocks):
+            b.idx = i
+        n_pruned = before - len(blocks)
+        if n_pruned:
+            print(f"  pruned {n_pruned} untouched pre-existing "
+                  f"baseline(s)", file=sys.stderr)
 
     # ---- pass 3 (NOT wrapped: grouping failure is fatal) ----
     print("[pass 3] grouping by file...")

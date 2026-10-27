@@ -343,8 +343,6 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
             continue
         if rec.is_deleted:
             continue
-        if getattr(rec, "sanity_rejected", False):
-            continue
         if not (rec.patches or rec.pairs):
             continue
 
@@ -431,6 +429,9 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
                 continue
 
         rec.trust = _trust_cap(rec)
+        rec.trust = _trust_cap(rec)
+        rec.sanity_rejected = False
+        rec.verification.pop("sanity_reason", None)
         rec.verification["reconciled"] = {
             "excluded": [
                 {"kind": k[0], **(

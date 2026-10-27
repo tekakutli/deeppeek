@@ -44,6 +44,27 @@ literal conversation text and the actual filesystem, and the scoring
 function is the only one with any heuristics that resemble "AI
 judgement".  Keeping it out of classify / dedup / write lets each of
 those stay purely structural.
+
+SIBLING-DIRECTORY VOTING (2026-11-03)
+=====================================
+`pg_base.py` appears seven times in the playground tree:
+`playgrounds/board/`, `playgrounds/cable/`, `playgrounds/cone/`,
+`playgrounds/inpaint/`, `playgrounds/pair/`, `playgrounds/room/`,
+`playgrounds/sam3_segment/`.  A conversation that names the file
+without a directory path but is otherwise about the inpaint
+playground still had to guess, and content-similarity scoring alone
+could not discriminate because all seven files are structurally
+similar (each is `PG_PANEL_BODY = r\"\"\"...\"\"\"` plus
+`PG_CSS = r\"\"\"...\"\"\"`).
+
+The resolver now tallies directories from its *unambiguous*
+resolutions in a first pass, then uses the most-voted directory as
+a tie-breaker during the second pass.  A conversation whose
+`inpaint_server.py` resolves to `playgrounds/inpaint/` and whose
+`inpaint_html.py` resolves to `playgrounds/inpaint/` votes for that
+directory; the ambiguous `pg_base.py` then resolves to
+`playgrounds/inpaint/pg_base.py`.  This is the same "sibling
+context" signal a human uses to disambiguate.
 """
 import os
 import re
@@ -64,6 +85,14 @@ def resolve_paths(blocks: list[Block],
     Returns a list of `{idx, header_path, resolved_to, reason}` records
     for the manifest — one per resolved block, useful for auditing
     which decisions were made.
+
+    Two-pass:
+      · First pass resolves only blocks whose match is unambiguous
+        (exact, unique suffix, unique basename).  Each resolution
+        votes for the directory of the resolved path.
+      · Second pass resolves the rest, using the directory votes as
+        a tie-breaking hint before falling back to content-similarity
+        scoring.
     """
     resolutions: list[dict] = []
 
@@ -88,7 +117,25 @@ def resolve_paths(blocks: list[Block],
         base = os.path.basename(full)
         preexisting_by_basename.setdefault(base, []).append(full)
 
-    # ---- resolve each block ----
+    # ---- first pass: resolve unambiguous blocks, tally directories ----
+    from collections import Counter
+    dir_votes: Counter = Counter()
+    unambiguous: dict[int, tuple[str, str]] = {}
+    for b in blocks:
+        if b.classified_by == "preexisting" or b.is_orphan:
+            continue
+        hp = b.header_path
+        if not hp:
+            continue
+        resolved, reason = _resolve_one(
+            b, preexisting_by_full, preexisting_by_basename, verbose,
+            dir_votes={})
+        if resolved is not None and reason in (
+                "exact", "suffix", "basename"):
+            unambiguous[b.idx] = (resolved, reason)
+            dir_votes[os.path.dirname(resolved)] += 1
+
+    # ---- second pass: resolve the rest, using dir_votes as a hint ----
     for b in blocks:
         if b.classified_by == "preexisting":
             b.output_path = b.canonical_path
@@ -102,8 +149,20 @@ def resolve_paths(blocks: list[Block],
             b.output_path = b.canonical_path or f"unknown_{b.idx}"
             continue
 
-        resolved, reason = _resolve_one(b, preexisting_by_full,
-                                        preexisting_by_basename, verbose)
+        if b.idx in unambiguous:
+            resolved, reason = unambiguous[b.idx]
+            b.output_path = resolved
+            resolutions.append({
+                "idx": b.idx,
+                "header_path": hp,
+                "resolved_to": resolved,
+                "reason": reason,
+            })
+            continue
+
+        resolved, reason = _resolve_one(
+            b, preexisting_by_full, preexisting_by_basename, verbose,
+            dir_votes=dir_votes)
         if resolved is not None:
             b.output_path = resolved
             resolutions.append({
@@ -130,7 +189,8 @@ def resolve_paths(blocks: list[Block],
 def _resolve_one(block: Block,
                  preexisting_by_full: dict[str, Block],
                  preexisting_by_basename: dict[str, list[str]],
-                 verbose: bool) -> tuple[Optional[str], str]:
+                 verbose: bool,
+                 dir_votes=None) -> tuple[Optional[str], str]:
     hp = block.header_path or ""
     if not hp:
         return None, "no header_path"
@@ -157,7 +217,8 @@ def _resolve_one(block: Block,
         if len(suffix_matches) > 1:
             return _discriminate(block, suffix_matches,
                                  preexisting_by_full, verbose,
-                                 "suffix-ambiguous")
+                                 "suffix-ambiguous",
+                                 dir_votes=dir_votes)
 
     # 3. Basename
     candidates = preexisting_by_basename.get(hp_base, [])
@@ -168,7 +229,8 @@ def _resolve_one(block: Block,
         return candidates[0], "basename"
     if len(candidates) > 1:
         return _discriminate(block, candidates, preexisting_by_full,
-                             verbose, "basename-ambiguous")
+                             verbose, "basename-ambiguous",
+                             dir_votes=dir_votes)
 
     return None, "no match"
 
@@ -176,31 +238,51 @@ def _resolve_one(block: Block,
 def _discriminate(block: Block, candidates: list[str],
                   preexisting_by_full: dict[str, Block],
                   verbose: bool,
-                  reason_tag: str) -> tuple[Optional[str], str]:
-    scores = [
-        (full, _score(block, full, preexisting_by_full[full]))
-        for full in candidates
-    ]
-    scores.sort(key=lambda x: x[1], reverse=True)
+                  reason_tag: str,
+                  dir_votes=None) -> tuple[Optional[str], str]:
+    # Directory votes are a BONUS, not a filter.  The pre-existing
+    # implementation used `dir_votes.most_common(1)[0][0]` as an
+    # exclusive match — which does nothing when the conversation is
+    # about a directory that isn't the single most-voted one.  Here
+    # every candidate gets +15 per unambiguous sibling that resolved
+    # to its directory, so a `pg_base.py` candidate in
+    # `playgrounds/inpaint/` gets +30 from the 2 `inpaint_server.py`
+    # blocks, while the sam3_segment candidate gets 0.  Content
+    # similarity decides when the bonus is tied; the bonus breaks
+    # ties the same way a human would ("the conversation already
+    # agreed on this directory twice").
+    scored = []
+    for full in candidates:
+        content_score = _score(block, full, preexisting_by_full[full])
+        dir_bonus = 0.0
+        if dir_votes:
+            d = os.path.dirname(full)
+            dir_bonus = float(dir_votes.get(d, 0)) * 15.0
+        scored.append((full, content_score, dir_bonus,
+                       content_score + dir_bonus))
 
-    if len(scores) == 1:
-        return scores[0][0], reason_tag
+    scored.sort(key=lambda x: x[3], reverse=True)
 
-    (best_path, best_score), (second_path, second_score) = scores[0], scores[1]
-    absolute_gap = best_score - second_score
+    if len(scored) == 1:
+        return scored[0][0], reason_tag
 
-    if best_score >= 20.0 and absolute_gap >= 10.0:
+    (best, _bc, _bd, best_total) = scored[0]
+    (_sb, _sc, _sd, second_total) = scored[1]
+    gap = best_total - second_total
+
+    if best_total >= 20.0 and gap >= 10.0:
         if verbose:
-            print(f"  [resolve] idx={block.idx} {block.header_path!r} "
-                  f"{reason_tag}: chose {best_path} "
-                  f"(score {best_score:.1f} vs {second_score:.1f})",
-                  file=sys.stderr)
-        return best_path, f"{reason_tag} (gap {absolute_gap:.1f})"
+            print(f"  [resolve] idx={block.idx} "
+                  f"{block.header_path!r} {reason_tag}: chose "
+                  f"{best} (score {best_total:.1f} vs "
+                  f"{second_total:.1f})", file=sys.stderr)
+        return best, f"{reason_tag} (score {best_total:.1f})"
 
     if verbose:
-        print(f"  [resolve] idx={block.idx} {block.header_path!r} "
-              f"{reason_tag}: no confident choice among "
-              f"{[(p, round(s, 1)) for p, s in scores]}",
+        print(f"  [resolve] idx={block.idx} "
+              f"{block.header_path!r} {reason_tag}: no confident "
+              f"choice among "
+              f"{[(p, round(s, 1)) for p, _, _, s in scored]}",
               file=sys.stderr)
     return None, f"{reason_tag}: insufficient confidence"
 

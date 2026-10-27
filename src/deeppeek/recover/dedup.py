@@ -61,6 +61,29 @@ The code-signal check only excludes genuinely prose-y blocks
 sentences).  Those would have been mis-classified as `partial` by
 the heuristic classifier; the code-signal check filters them before
 they reach the patcher.
+
+SUBSET-DEMOTE POLICY (2026-11-03)
+=================================
+A conversation "full" print that is a strict substring of a
+preexisting file is not a full replacement — it is a function (or
+a cluster of functions) extracted from the preexisting.  The
+pg_state.py case is the canonical example: the preexisting file is
+`STATE_JS = r\"\"\"...\"\"\"` with a 17-line docstring above it, and
+the conversation reprints just `STATE_JS = r\"\"\"...\"\"\"` (no
+docstring, no surrounding module-level code).
+
+When a record has BOTH a preexisting full and a conversation
+"full" and the conversation body is a substring of the preexisting
+body, demote the conversation block to a patch and keep the
+preexisting as the base.  Without this, the patcher writes the
+fragment + subsequent patches against an incomplete base, and the
+resulting file is missing imports and sibling helpers.  The
+specific failure observed in the wild: `kritomatic_daemon/utils/
+comfyui_krita.py` where the conversation printed only
+`paste_image` as `full`, the preexisting full was discarded, and
+`paste_batch_as_layers` was applied to a base with no imports or
+`_decode_png` — resulting in a file that fail-closes on first
+`ast.parse`.
 """
 
 import re
@@ -184,10 +207,10 @@ def _has_code_signal(body: str) -> bool:
 # predicate and every gate that uses it pick up the change together.
 # A prior version had an inline `_STRONG_BQ_ATTR` check in one gate
 # (`orphan_patches`) and a predicate call in the other
-# (`_is_real_patch`); a tightening of the predicate silently
-# diverged from the inline check, producing two contradictory
-# policies within the same function — that drift is the bug this
-# comment exists to prevent.
+# (`_is_real_patch`); a tightening of the predicate silently diverged
+# from the inline check, producing two contradictory policies within
+# the same function — that drift is the bug this comment exists to
+# prevent.
 
 _STRONG_BQ_ATTR = frozenset({"prose"})
 
@@ -316,6 +339,38 @@ def _already_in_other_file(block: Block,
     return None
 
 
+def _is_covered_by_headed(block: Block, path: str, all_blocks) -> bool:
+    """True iff `block`'s body is already contained in a headed
+    (non-blockquoted) block attributed to `path`.
+
+    Used to drop blockquoted thinking fragments whose payload is
+    duplicated by a headed patch on the same file.  The headed patch
+    is the strong channel; the blockquoted fragment is redundancy
+    that only produces warning noise if it fails to anchor.
+
+    Deliberately strict: requires verbatim substring containment.
+    A near-miss (reformatted, reworded) is NOT considered covered,
+    because the two blocks might implement subtly different shapes
+    and neither is strictly redundant.  Let the blockquoted one
+    attempt to apply; if it fails, warnings.txt names it.
+    """
+    body = (block.body or "").strip()
+    if len(body) < 10:
+        return False
+    for other in all_blocks:
+        if other is block:
+            continue
+        if other.in_blockquote:
+            continue
+        if not other.header_path:
+            continue
+        if other.output_path != path:
+            continue
+        if body in (other.body or ""):
+            return True
+    return False
+
+
 def pass5_deduplicate(records: dict,
                       blocks_by_idx: dict,
                       verbose: bool) -> None:
@@ -366,15 +421,41 @@ def pass5_deduplicate(records: dict,
         pre_fulls = [i for i in all_fulls
                      if blocks_by_idx[i].classified_by == "preexisting"]
 
-        if real_fulls:
+        # Subset-demote: a conversation "full" that is a strict
+        # substring of a preexisting full is not a replacement of
+        # the whole file — it is a partial extraction.  Demote it
+        # to a patch and keep the preexisting as the base.
+        if real_fulls and pre_fulls:
+            pre_bodies = {i: blocks_by_idx[i].body for i in pre_fulls}
+            all_subset = True
+            for i in real_fulls:
+                real_body = (blocks_by_idx[i].body or "").strip()
+                if not real_body:
+                    all_subset = False
+                    break
+                if not any(real_body in pb for pb in pre_bodies.values()):
+                    all_subset = False
+                    break
+            if all_subset:
+                fulls = pre_fulls
+                rec.preexisting_base = True
+                rec._demoted_reals = set(real_fulls)
+            else:
+                fulls = real_fulls
+                rec.preexisting_base = False
+                rec._demoted_reals = set()
+        elif real_fulls:
             fulls = real_fulls
             rec.preexisting_base = False
+            rec._demoted_reals = set()
         elif pre_fulls:
             fulls = pre_fulls
             rec.preexisting_base = True
+            rec._demoted_reals = set()
         else:
             fulls = []
             rec.preexisting_base = False
+            rec._demoted_reals = set()
 
         # ---- pick chosen_full_idx BEFORE building pairs ----
         # The pair validation (see next block) needs the base body
@@ -461,6 +542,12 @@ def pass5_deduplicate(records: dict,
                     if blocks_by_idx[i].kind == "partial"
                     and i not in pair_idxs_for_this_file
                     and block_owner.get(i) == path]
+        # Demoted reals from the subset check above also need to run
+        # as patches — they are scoped replacements of functions
+        # against a preexisting base.
+        for _i in getattr(rec, "_demoted_reals", set()):
+            if _i not in partials:
+                partials.append(_i)
         # Orphan blocks inside a blockquote come from AI thinking.
         # Apply them only when attribution is strong enough to
         # override the blockquote-is-thinking convention — see
@@ -476,6 +563,13 @@ def pass5_deduplicate(records: dict,
         # attribution that happens to name a filename does not
         # override this — the AI's own source already proves where
         # the fragment lives.  pg_inpaint.py failure case.
+        #
+        # Covered-by-headed: an orphan blockquoted block whose body
+        # is a verbatim substring of a headed patch on the same
+        # file is redundancy.  The headed patch is the strong
+        # channel; the blockquoted fragment only produces warning
+        # noise if it fails to anchor.  comfyui.py blockquoted
+        # `--output_rotation` arg fragment vs headed block 655.
         orphan_patches = []
         for _b in blocks_by_idx.values():
             if not (_b.is_orphan and _b.attributed_to == path
@@ -486,6 +580,13 @@ def pass5_deduplicate(records: dict,
                          or _has_strong_blockquote_attribution(_b))):
                 continue
             if _b.in_blockquote:
+                if _is_covered_by_headed(
+                        _b, path, blocks_by_idx.values()):
+                    if verbose:
+                        print(f"  [pass 5] {path}: skipping orphan "
+                              f"idx={_b.idx} — covered by a headed "
+                              f"block", file=sys.stderr)
+                    continue
                 other = _already_in_other_file(
                     _b, path, records, blocks_by_idx)
                 if other is not None:
@@ -516,6 +617,8 @@ def pass5_deduplicate(records: dict,
         def _is_real_patch(p_idx: int) -> bool:
             if p_idx in pair_idxs_for_this_file:
                 return False
+            if p_idx in getattr(rec, "_demoted_reals", set()):
+                return True
             b = blocks_by_idx[p_idx]
             if b.override_reason == "recovered-meta listing":
                 return False

@@ -81,6 +81,37 @@ would.  The two are mutually exclusive in practice: `_BEFORE_
 PROSE_RE` requires the word "before", `_BETWEEN_RE` requires
 "between", and neither prose form contains the other.
 
+PYTHON COMPLETENESS GATE (pre-dispatch)
+=======================================
+An incomplete Python block — a bare `try:` with no `except`/
+`finally`, a bare `with` with no body, a `def` with no statements
+— can be inserted at column 0 by the AST anchor or by the
+structural-append path (before FIX 7 fires) and produce
+unparseable Python.  The block applied, the record's content
+diverges from base, `pass8_verify` raises `SyntaxError at line N`,
+and the *whole record* fail-closes — even when every other patch
+in the record was clean.
+
+The gate rejects incomplete blocks at the top of
+`_try_deterministic_patch_inner`.  The rejection becomes
+`applied_by="failed"`, which reconciliation then excludes,
+letting the remaining patches promote.  The gate is deliberately
+narrow: it fires only when the block's leading keyword names a
+Python construct that is complete on its own (`try`, `with`,
+`if`, `for`, `while`, `def`, `class`, `async`, `match`) AND the
+body fails `ast.parse` after `textwrap.dedent`.
+
+Two categories are exempted:
+
+  · Continuation keywords (`except`, `finally`, `else`, `elif`,
+    `case`) — these are inherently fragments and always need a
+    preceding block.  `ast.parse` would reject them on their own,
+    so the gate must not attempt it.
+
+  · JS lines — a `.py` file with an embedded JS block beginning
+    `if (`, `try {`, `=>`, etc.  `_looks_like_js_line` catches
+    these before the Python check fires.
+
 Also exports `attribute_sanity_failure`, the helper that names the
 patch responsible for a sanity-gate rejection.  It lives here
 because it needs both `_try_deterministic_patch` (for the replay)
@@ -198,6 +229,132 @@ def _try_import_replace(base, raw_body):
 
 
 # ===========================================================================
+#  Python-completeness gate
+# ===========================================================================
+#
+# See the module docstring's PYTHON COMPLETENESS GATE section for the
+# failure class this exists to eliminate.  The gate fires once, at the
+# top of `_try_deterministic_patch_inner`, before any heuristic can
+# place the block.  Rejection means `applied_by="failed"`, which
+# reconciliation handles by exclusion.
+
+# Python block-openers that are complete on their own IF their body
+# parses.  A `try:` without `except`/`finally`, a `with` without a
+# body, a `for` without a body — these all fail `ast.parse` and mean
+# the block is truncated.
+_PY_COMPLETE_VERBS = frozenset({
+    "try", "with", "for", "while", "if", "def", "class",
+    "async", "match",
+})
+
+# Continuation keywords are inherently fragments: they always need a
+# preceding block to attach to.  `ast.parse` rejects them on their
+# own, so the gate must skip them and let the insert heuristics place
+# them.
+_PY_FRAGMENT_VERBS = frozenset({
+    "except", "finally", "else", "elif", "case",
+})
+
+
+# JS signal patterns for `_looks_like_js_line`.  These catch the
+# block-leading shapes that would falsely trip the Python check when
+# the block is JS embedded in a .py file (`if (x) { ... }`,
+# `try { ... }`, `const x = ... => ...`, etc.).
+_JS_LINE_PREFIXES = (
+    "if (", "for (", "while (", "switch (",
+    "try {", "catch (", "finally {",
+    "function ", "const ", "let ", "var ",
+    "export ", "async function ", "await ", "import {", "import *",
+)
+
+
+def _looks_like_js_line(line):
+    """True if `line` reads as JavaScript, so a Python syntax check
+    on a .py destination does not reject valid JS-in-Python content.
+    """
+    s = line.strip()
+    if not s:
+        return False
+    if s.startswith(_JS_LINE_PREFIXES):
+        return True
+    if "=>" in s:
+        return True
+    if s.endswith("{") and s.count("{") > s.count("}"):
+        return True
+    return False
+
+
+def _first_word_of(s):
+    """Return the leading alphabetic word of `s`, lowercased."""
+    out = []
+    for ch in s.strip():
+        if ch.isalpha() or ch == "_":
+            out.append(ch)
+        else:
+            break
+    return "".join(out).lower()
+
+
+def _is_syntactically_complete_python(body, path):
+    """Refuse to insert an incomplete Python block.
+
+    The motivating failure: a bare `try: foo()` with no
+    `except`/`finally` was appended at column 0 by the AST anchor.
+    The block applied, `pass8_verify` raised `SyntaxError at line
+    N`, and the whole record fail-closed — even though every other
+    patch in the record was clean.
+
+    Returns True (block OK) when:
+
+      · the destination is not a `.py` file (JS check is N/A);
+      · the block is empty;
+      · the block's first non-blank line reads as JS;
+      · the first word is a continuation keyword (`except`, etc.) —
+        fragments pass through, insert heuristics place them;
+      · the first word is not a Python block keyword at all;
+      · `ast.parse(dedent(body))` succeeds.
+
+    Returns False only when the first word names a Python construct
+    that is complete on its own AND `ast.parse` fails — the
+    truncated-`try`, body-less-`with`, and `def`-no-statements
+    shape.
+
+    IMPLEMENTATION NOTE: the `ast.parse` step MUST dedent the RAW
+    body, not a stripped body.  `raw_body.strip()` removes leading
+    whitespace from only the FIRST line, leaving subsequent lines
+    at their original indent — which `textwrap.dedent` cannot
+    reconcile (it computes the common prefix as empty), and which
+    `ast.parse` therefore rejects with "unindent does not match any
+    outer indentation level".  A block that is a perfectly valid
+    indented fragment (`    try:` ... `    except:`) would be
+    rejected by that bug.
+    """
+    if not path.endswith(".py"):
+        return True
+    stripped = body.strip()
+    if not stripped:
+        return True
+    first = next(
+        (ln for ln in stripped.splitlines() if ln.strip()), "")
+    if not first:
+        return True
+    if _looks_like_js_line(first):
+        return True
+    w = _first_word_of(first.strip())
+    if w in _PY_FRAGMENT_VERBS:
+        return True
+    if w not in _PY_COMPLETE_VERBS:
+        return True
+    import ast as _ast
+    import textwrap as _tw
+    try:
+        _ast.parse(_tw.dedent(body))
+    except SyntaxError:
+        return False
+    return True
+
+
+# ===========================================================================
 #  Dispatcher
 # ===========================================================================
 
@@ -222,6 +379,15 @@ def _try_deterministic_patch_inner(base, patch, path=""):
     raw_body = patch["body"]
     body_stripped = raw_body.strip()
     if not body_stripped:
+        return None
+
+    # Python-completeness gate.  See module docstring.  Fires before
+    # any heuristic can place the block, so no heuristic (AST anchor
+    # included) can insert truncated Python at column 0 and take the
+    # whole record down with it.  The rejection is `applied_by=
+    # "failed"`, which reconciliation excludes, letting the
+    # remaining patches promote.
+    if not _is_syntactically_complete_python(raw_body, path):
         return None
 
     context_before = patch.get("context_before", "")
@@ -403,12 +569,38 @@ def attribute_sanity_failure(rec, blocks_by_idx, validate_fn=None):
     """Return the idx of the first patch whose application causes
     validation to fail, or None if attribution isn't possible.
 
-    Returns None when:
+    Returns None only when:
       - rec.patches is empty;
       - rec.last_full_idx is unset or not in blocks_by_idx;
-      - a patch was applied by LLM (no faithful replay);
-      - a patch cannot be replayed deterministically;
-      - the base itself already fails validation (nothing to blame).
+      - a patch was applied by LLM (no faithful replay available);
+      - the base itself already fails validation.
+
+    Skips over patches that fail to *replay* (return None from
+    `_try_deterministic_patch` when run against the current content
+    state).  A patch that applied deterministically at pass-6 time
+    but cannot be replayed now is a cascade victim: its anchor
+    moved because an *earlier* patch changed the base in a way that
+    invalidated its context.  Such a patch is not the culprit; the
+    earlier patch that moved the anchor was.  Attribution keeps
+    walking so the actual culprit is named rather than the first
+    cascade victim.
+
+    Note: with the Python-completeness gate at the top of
+    `_try_deterministic_patch_inner`, a patch that is syntactically
+    incomplete now returns None at *apply* time (it never becomes
+    `applied_by="deterministic"`), so this function's replay path
+    sees the same state at attribution time as at apply time.
+    The two views stay consistent.
+
+    `rec.patches` may be a mix of deterministic and already-present
+    entries.  already-present entries are skipped (they were no-ops
+    at apply time).  Deterministic entries are replayed in order
+    against the accumulating content.  The first replay whose
+    output fails `validate_fn` is the culprit.
+
+    A `failed` entry (patch that never applied) is also skipped —
+    its mutation was never performed, so it cannot be the cause of
+    a downstream validation failure.
     """
     if validate_fn is None:
         from .validate_output import validate_content as validate_fn
@@ -428,11 +620,26 @@ def attribute_sanity_failure(rec, blocks_by_idx, validate_fn=None):
         applied_by = patch_dict.get("applied_by")
         if applied_by == "already-present":
             continue
+        if applied_by == "failed":
+            # A patch that failed at apply time was reverted, so
+            # it cannot be the cause of a downstream validation
+            # failure.  Skip it.
+            continue
         if applied_by != "deterministic":
+            # LLM-applied patches cannot be faithfully replayed.
+            # Stop trying to attribute; caller sees the general
+            # verification error instead.
             return None
         result = _try_deterministic_patch(current, patch_dict, rec.path)
         if result is None:
-            return None
+            # This patch cannot be replayed against the current
+            # content.  Since it applied deterministically at
+            # pass-6 time, its anchor must have moved under an
+            # earlier patch in this chain.  That earlier patch is
+            # the culprit, not this one.  Skip and keep walking so
+            # the next deterministic patch (or the earlier patch
+            # we already validated) gets blamed.
+            continue
         if result == current:
             continue
         current = result

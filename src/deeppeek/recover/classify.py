@@ -311,10 +311,27 @@ def _looks_like_full_file(body: str, path: str) -> bool:
 
     if path.endswith(".py"):
         try:
-            ast.parse(body)
-            return True
+            tree = ast.parse(body)
         except SyntaxError:
             return _looks_like_python_module_top_level(body)
+
+        # A single top-level def/class is a function print, not a
+        # full-file print. The heuristic classifier cannot tell the
+        # difference from `ast.parse` alone — `def foo(): ...` parses
+        # fine and *looks* like a valid module. Gate on the AST shape:
+        # a full module has either an import / docstring / assignment
+        # at top level, or multiple top-level declarations.
+        non_doc = [
+            n for n in tree.body
+            if not (isinstance(n, ast.Expr)
+                    and isinstance(n.value, ast.Constant)
+                    and isinstance(n.value.value, str))
+        ]
+        if len(non_doc) == 1 and isinstance(
+                non_doc[0],
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return False
+        return True
 
     return True
 
