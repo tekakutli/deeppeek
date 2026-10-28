@@ -4,262 +4,190 @@ patch_dispatch — the deterministic-patch dispatcher.
 `_try_deterministic_patch` is the single entry point the pass-6 main
 loop calls for each patch.  It dispatches, in order:
 
-   0. signature-only replacement (before the completeness gate —
-      a bare `def foo():` fails `ast.parse` and would otherwise be
-      rejected before any heuristic can run)
-   0a. already-present pre-check (2026-10-28f — see below)
-   0b. multi-statement apply (2026-10-28g — see below)
-   1. placeholder-marker gate (refuse or merge — see below)
+   0. signature-only replacement
+   0a. already-present pre-check
+   0b. multi-statement apply
+   1. placeholder-marker gate
    2. Python-completeness gate
    3. deletions
    4. raw diffs
    5. import replaces
    6. single-line replaces
-   6a. indented def/class replaces (2026-10-28g — see below)
+   6a. indented def/class replaces
+   6b. decorated-def scope insert (2026-11-02) — see below
    7. scoped replaces
    8. ellipsis splices, with fallback
    9. object-literal splices (with trailing-content refusal)
-  10. named-dict inserts (multi-line entry into a variable-named dict)
+   9a. region replaces (2026-10-29) — see below
+  10. named-dict inserts
   11. context inserts
-  12. object-entry inserts (function-anchored)
-  13. insert-into-named-scope        (FIX 8 + anchor-derived scope)
-  14. insert-before-anchor           (FIX 3)
-  15. insert-between-anchors         (FIX 3)
-  16. insert-after-anchor            (with `prior_insertions` fallback
-                                      + `prior_scopes` disambiguation)
-  17. AST anchor (optional dependency)
+  12. object-entry inserts
+  13. insert-into-named-scope
+  14. insert-before-anchor
+  15. insert-between-anchors
+  16. insert-after-anchor
+  17. AST anchor
   18. structural append
 
 MULTI-STATEMENT APPLY (2026-10-28g)
 ===================================
-A body that contains two or more adjacent top-level statements — e.g.
-a new assignment followed by a new function declaration — can't be
-handled by any single heuristic.  The object-literal splice would
-silently drop the function (only the assignment's object literal
-would be merged into base); the insert heuristics reject bodies that
-carry their own scope declarations; and the completeness gate passes
-the whole body as a single unit.
-
-Concrete motivating shape (Fix 3 in the 2026-10-28 comfyui.py
-recovery):
-
-    captured = {"image_b64": None, "message": "", "errors": []}
-
-    def on_progress(index, result):
-        cmd = result.get("command")
-        ...
-
-The pre-fix behaviour: `_OBJECT_LITERAL_ASSIGNMENT_RE` matched the
-`captured = {` prefix, `_try_object_literal_splice` consumed the whole
-body (silently truncating at the object literal's closer), the
-resulting spliced base was missing the new `errors` key AND missing
-the new `on_progress` body, and pass6 either applied that corrupt
-result or failed closed depending on whether the truncation happened
-to be valid Python.
-
-Fix: `_try_multi_statement_apply` splits the body into individual
-top-level statements and applies each one through the normal
-dispatcher.  A sub-statement that fails to place causes the whole
-multi-statement attempt to bail (fail-closed — no partial mutations).
+A body that contains two or more adjacent top-level statements can't
+be handled by any single heuristic.  `_try_multi_statement_apply`
+splits the body into individual top-level statements and applies each
+one through the normal dispatcher.  A sub-statement that fails to
+place causes the whole multi-statement attempt to bail (fail-closed).
 
 Recursion is prevented by the module-level `_in_multi_statement`
-flag: sub-statements do NOT recursively attempt multi-statement
-apply.  Assumes single-threaded execution — true of the pipeline's
-pass6 loop, but flagged here for future readers.
+flag.  Assumes single-threaded execution.
 
 INDENTED DEF/CLASS REPLACE (2026-10-28g)
 ========================================
-A body that starts with a `def name(...)` / `async def` / `class`
-declaration at column 0 is normally routed to scoped-replace
-(`_apply_scoped`), which requires the name to appear as a
-column-0 declaration in base.  When the name exists only *indented*
-inside another function (a nested def), scoped-replace declines and
-the insert heuristics would append the new definition inside the
-enclosing function — producing TWO copies of the same-named def.
-
-Concrete motivating shape (again Fix 3): the base has
-`def on_progress(...)` nested inside `def handle_inpaint(...)`, and
-the body is a full column-0 reprint of `def on_progress(...)`.
-Without indented-def-replace, AST-anchor picks `handle_inpaint` as
-the container and inserts the new `on_progress` at its end —
-duplicating the function.
-
-Fix: `_try_indented_def_replace` finds the unique indented match,
-computes the line range, and replaces it in place.  Fires only
-when the name has no column-0 declaration (scoped-replace owns
-the top-level case) and exactly one indented match exists.
+`_try_indented_def_replace` finds the unique indented match of a
+`def name(...)` in base and replaces it in place.  Fires only when
+the name has no column-0 declaration (scoped-replace owns the
+top-level case) and exactly one indented match exists.
 
 INDENTED-DEF REINDENT BUG (2026-11-01)
 ======================================
-The pre-2026-11-01 dispatcher called
-`_try_indented_def_replace(base, body_stripped)` — body_stripped
-being the raw body with the first line's leading whitespace removed
-(and the rest of the body still carrying its fence-level indent).
+`body_stripped` used to be `raw_body.strip()`, which only removed
+the first line's indent.  Passing `raw_body` (with original indent)
+to `_try_indented_def_replace` fixes `_reindent_body`'s
+`orig_indent_len` computation.
 
-`_try_indented_def_replace` then calls
-`_reindent_body(indent_str, body)`.  Inside `_reindent_body`:
+MULTI-STATEMENT DEDENT (2026-11-01b)
+====================================
+`_try_deterministic_patch_inner` calls
+`textwrap.dedent(raw_body).strip()` for `body_stripped`.  The prior
+`.strip()` only removed leading whitespace from the first line, so
+a body indented at 4 spaces on every line produced a hybrid where
+the first line was at column 0 and subsequent lines were at 8
+spaces.  `_split_python_statements` then saw no top-level split
+point.
 
-    orig_indent_len = len(first) - len(first.lstrip(" \t"))
-    adjusted[0]     = base_indent + first.lstrip(" \t")
-    adjusted[i>0]   = base_indent + " " * (ln_indent - orig_indent_len) + ...
+`textwrap.dedent` removes the *common* leading whitespace across
+all lines.  `inpaint_server.py`'s motivating shape — `captured =
+{...}` followed by `def on_progress(...)` — now splits into two
+statements cleanly.
 
-When `body` is `body_stripped`, the first line is column 0, so
-`orig_indent_len = 0`.  Subsequent lines carry the fence's original
-indent (e.g. 8 spaces inside a `def` at 4-space indent), so
-`ln_indent - orig_indent_len = 8`, and `adjusted` puts each line at
-`base_indent + 8 spaces` — 12 spaces at base_indent = 4, where 8 is
-correct.
+DECORATOR MERGE (2026-11-02)
+============================
+`_split_python_statements` now merges a `@decorator` line with the
+`def`/`class` line that follows it.  Without this, a body like
+`@command(name="new")\ndef new_cmd(...)` was split into TWO
+statements: a bare decorator (which no heuristic can place) and the
+def.  Multi-statement apply would attempt the decorator first, it
+would fail (as it should — a bare decorator has no meaning), and
+the whole multi-statement attempt would bail.  The intended
+dispatch (scope-insert into the prose-named class) was never
+reached.
 
-Passing `raw_body` (which preserves the fence's original indentation
-in the first line) makes `orig_indent_len` match the body's natural
-indent, so `_reindent_body` correctly offsets the internal lines.
+With the merge, `_split_python_statements` returns ONE statement
+for a decorator + def/class unit.  Multi-statement doesn't fire;
+`_try_insert_into_named_scope` receives the decorated body intact
+and places it correctly.
 
-The motivating case (comfyui.py, `comfy_set_layer_pixels`): the
-body's first line is `    def comfy_set_layer_pixels(self, params):`
-and subsequent lines are at 8-space indent.  With `body_stripped` the
-reindented result has the def at 4 spaces and its body at 12 spaces;
-Python parses that (12 > 4 = valid indentation), so the bug is
-silent — the output looks structurally correct but the code is
-2× overindented.  With `raw_body` the reindented def and its body
-land at the intended 4 and 8 spaces.
+LANGUAGE-AWARE STRUCTURAL CHECK (2026-11-01b)
+=============================================
+`_try_indented_def_replace`'s structural gate now calls
+`structural.check_balance(body, path)` instead of `_js_balance`.
+`.py` destinations route through `ast.parse`; JS bodies fall back
+to `_js_balance`.
 
-OBJECT-LITERAL TRAILING-CONTENT REFUSAL (2026-10-28g, refined 2026-10-28h)
-===========================================================================
-`_try_object_literal_splice` consumes a body's `x = {...}` prefix.
-When the body has additional *statements* after the object literal,
-the splice silently truncates.  A pre-check refuses the body when it
-has non-comment content after the object literal's closer, falling
-through so `_try_multi_statement_apply` (which runs earlier and
-would have already split this shape) — or an honest failure —
-handles it.
+DECORATED-SCOPE ROUTING (2026-11-02)
+====================================
+A body whose first non-blank line starts with `@` is a decorated
+def/class.  Such bodies MUST be placed inside their prose-named
+scope (a class or module); the `named_dict`, `context`, and
+`object_entry` heuristics do not know how to place a decorated
+definition and will misplace it (context-insert inserts at the
+anchor line's indent — 8 spaces inside a method — producing a
+nested def with wrong semantics).
 
-REFINEMENT (2026-10-28h): a bare trailing `;` is the JS/C-family
-statement terminator, not "trailing content".  The initial version
-of the refusal treated `export const foo = {...};` as having trailing
-content (`;`) and refused it — regressing fixture 02
-(`02_subsection_patches`), fixture 04 (`04_prose_override`), and
-fixture 35 (`35_object_literal_replace`), all of which use
-`export const NAME = {...};` or `NAME = {...};` bodies.
+New in the chain: before those heuristics, if the body starts with
+`@`, try `_try_insert_into_named_scope` directly.  This is a narrow
+routing that only affects decorated bodies.
 
-The refined check strips a single leading `;` from the tail before
-running the comment check, so:
+REGION REPLACE (2026-10-29)
+===========================
+The class of edit that neither the specific replacement heuristics
+(scoped, object-literal, signature, indented-def) nor the insert
+family handles correctly: a body that is a *modified version* of an
+existing multi-declaration region but does not declare a scope and
+is not a pure object-literal assignment.
 
-    x = {...}                        → splice fires
-    x = {...};                       → splice fires (trailing `;`)
-    x = {...};  # note               → splice fires (comment)
-    x = {...};\ndef foo(): ...       → refused (trailing def)
-    x = {...}\ndef foo(): ...        → refused (trailing def)
+Canonical shape (from the 2026-10-28 run):
 
-DEFERRED PREDICATES (2026-10-28f hotfix)
-========================================
-The already-present pre-check is *skipped* for two patch shapes:
+    base:
+        const rotationEl = document.getElementById("viewRotation");
+        const rotationValueEl = document.getElementById("viewRotationValue");
 
-  · Deletion instructions (`_is_deletion_instruction(body, ctx)`):
-    the body IS the content that should disappear.  It's trivially
-    "already present" — because it's the thing being removed.  Letting
-    the pre-check fire here treats the deletion as a no-op and the
-    block is never deleted.  Regression observed in
-    `tests/recover/test_recover.py::test_07` (deletion shapes):
-    every deletion patch became `already-present`, the `.panelState`
-    declaration stayed in the file, and `_function_presence_check`
-    then sanity-rejected the record because the record's body didn't
-    remove it (the sanity path's `allow_missing` is populated only
-    from `applied_by == "deterministic"` patches, and `already-present`
-    patches don't count).
+        if (rotationEl) { rotationEl.addEventListener(...); }
 
-  · Diff bodies (`_looks_like_diff_body(body)`): a diff represents
-    "transform base into something else" via `-`/`+`/` ` prefixes.
-    The literal diff text (including `-` prefixed lines) is never
-    present in base as-is, so the multi-line token check would pass
-    by accident on the bare content — but the pre-check's *intent*
-    ("skip if applied") is already covered by `_diff_already_applied`
-    downstream, which correctly distinguishes "the additions are
-    present, the deletions are gone" from "the additions are present
-    but the deletions still exist".
+        pgkitRegisterField("view.rotation", { ... });
 
-Deletions and diffs have their own already-applied predicates
-(`_deletion_already_applied`, `_diff_already_applied`); those run at
-the appropriate point in the dispatcher and produce the correct
-`already-present` outcome without blocking the deletion/diff from
-firing in the first place.
+    body:
+        const rotationEl = document.getElementById("viewRotation");
+        const rotationInputEl = document.getElementById("viewRotationInput");
+        const rotationValueEl = document.getElementById("viewRotationValue");
 
-ALREADY-PRESENT PRE-CHECK (2026-10-28f)
-=======================================
-An early check that runs after signature replace and before any
-heuristic fires.  If the patch's content is already present in base,
-returning base (no change) lets the outer loop mark the patch
-`already-present` instead of letting a heuristic re-apply it and
-duplicate content.
+        if (rotationEl) { rotationEl.addEventListener(...); }
+        if (rotationInputEl) { rotationInputEl.addEventListener(...); }
 
-Two tiers, per `patch_already.py`'s module docstring:
-  · Short bodies (< 3 lines): `_exact_lines_present` (sliding-window
-    only; token fallback false-positives on single-line import changes)
-  · Multi-line bodies (>= 3 lines): `_max_contiguous_run >= 95% of
-    body lines` AND `_patch_already_present` (85% token presence).
-    The contiguity gate keeps comfyui.py's `idx=97` try/except — which
-    introduces `output_rotation` (new tokens) but whose tokens are
-    otherwise dispersed in base — from being falsely skipped.
+        pgkitRegisterField("view.rotation", { ... });
 
-The pre-check can be fooled by prose that names the same identifiers
-without the same structure.  When it fires wrongly, the patch is
-marked `already-present` and the dispatcher's caller (pass 6)
-records it as a no-op.  Pass 8.7d (consistency.py) re-verifies every
-such claim against the final file content; false positives are
-flipped back to `failed` and the record is demoted.  See that
-module's docstring for the motivating comfyui.py case.
+Before this heuristic: every replacement path returns None (no
+scope to replace, not a `def`/`class` signature, not an object-
+literal assignment), the body falls through to `_try_structural_append`
+or `_ast_insert`, and the resulting file has both the old region
+AND the new region — duplicate `const` declarations, duplicate
+`if` blocks, dead code.
 
-PLACEHOLDER-MARKER GATE
-=======================
-An AI block often contains parenthetical placeholders —
-`... (docstring unchanged) ...`, `// ... (rest unchanged)` — that
-are instructions to the patcher, not literal code.  Applying them
-verbatim replaces the target's content with the marker string.
+Region-replace fires when:
+  · The body's first non-blank line has the same opening word as
+    the candidate base window (e.g. `const` matches `const`).
+  · At least 40% of the window's stripped lines appear verbatim in
+    the body.
+  · The window and body are at least 55% line-similar under
+    `SequenceMatcher`.
+  · AND the surrounding prose does NOT name a scope ("in `X`",
+    "to `X`", "find the `X` command", etc.).  When prose names a
+    scope, `_try_insert_into_named_scope` is the correct route —
+    the target is explicit and region-replace must not override
+    it.  The prose gate is what keeps `test_40` (try/except
+    inside a named function) correct: without it, region-replace
+    would fire on the try/except body *before* insert-into-scope
+    runs, replacing the wrong block.
 
-The gate runs *after* the signature-only check and *before* any other
-heuristic.  It attempts to merge:
+The two overlap measures reject the failure modes that would
+otherwise let region-replace clobber real code:
 
-  · If the body declares a scope (via `_extract_scope_from_body`)
-    AND that scope exists in `base`, call
-    `patch_scope._try_merge_placeholder_in_scope` to replace the
-    marker with the base scope's corresponding content (currently:
-    docstring-only merge).  If the merge consumes the placeholder,
-    the merged body flows through the rest of the dispatcher as if
-    the AI had printed the complete block.
+  · Pure insertion — body's `if (condC) { doC(); }` shares `if`
+    and `}` with base's `if (condA) { doA(); doA2(); }`, but the
+    verbatim-overlap is zero.  Rejected by the 40% check.
 
-  · Otherwise refuse the block.  A placeholder with no scope to
-    merge into (or a placeholder outside a docstring, which the
-    current merge does not handle) is not safely applicable.
+  · Unrelated same-construct — body's rewritten `function foo()`
+    is entirely new content but starts with `function`.  The
+    overlap is 2/4 = 50% (matches `function foo() {` and `}`
+    only) but the similarity is 44% — under 55%.  Rejected by the
+    similarity check.
 
-Prior-insertions threading
-==========================
-`_try_deterministic_patch` and `_try_deterministic_patch_inner` both
-accept a `prior_insertions=None` keyword that is a set of stripped
-lines previously inserted by earlier patches in the same pass-6
-batch, and a `prior_scopes=None` keyword that is a dict mapping each
-such line to the scope name extracted from its Find-block prose.
+Region-replace sits after scoped-replace in the chain so it never
+overrides a more specific replacement.  It sits before the insert
+family so a modified region *replaces* rather than being appended
+after itself.
 
-`prior_insertions` is threaded to `_try_insert_after_anchor`, which
-uses it as a fallback anchor source when the prose has no backticked
-anchor.  `prior_scopes` lets that fallback disambiguate an anchor
-that appears multiple times in the base: when `base.count(stripped)`
-is greater than 1, the fallback calls
-`patch_anchor_insert._anchor_within_scope` / `_anchor_within_callee`
-with the recorded scope name (see that module's PRIOR-INSERTIONS
-SCOPE CONTEXT section, and the 2026-10-28f correction there for
-scope-first ordering).
-
-SIGNATURE-ONLY REPLACEMENT
-==========================
-Runs *first*, before the already-present pre-check and completeness
-gate.  A signature-only block (`def foo(x) -> int:` with no body)
-fails `ast.parse` and would be rejected before any heuristic had a
-chance.  `_try_signature_replace` handles it directly.  Because a
-signature-only body is a *fragment* (its body lives in base), the
-already-present pre-check would be a false positive on it — hence
-signature replace must run before it.
+A tree-sitter based variant (matching by declaration name instead
+of line-similarity) can be added later as `recover/js_scope.py`
+once a `js_scope_index` module exists; the text heuristic above is
+sufficient for the shapes the 2026-10-28 run produced.  The two
+SKIP cases in `tests/recover/test_region_replace.py` are that
+future-work marker.
 """
 
+import difflib
 import re
+import textwrap
+from typing import Optional
 
 from .core import _is_deletion_instruction, _looks_like_diff_body
 from .patch_text import (
@@ -294,31 +222,68 @@ from .patch_already import (
 from .prose import _extract_scope_from_body
 
 
-# ===========================================================================
-#  Multi-statement apply (2026-10-28g)
-# ===========================================================================
-#
-# Module-level flag to prevent infinite recursion.  Assumes single-
-# threaded execution — true of the pass6 loop, false of a hypothetical
-# concurrent caller.  If threading ever becomes a concern, replace
-# with a `threading.local`.
 _in_multi_statement = False
+
+
+# ============================================================================
+#  Prose-scope detection (used to gate region-replace)
+# ============================================================================
+#
+# Every shape below is a way for the surrounding prose to say "put
+# this inside scope X".  When any of them match, `_try_insert_into_
+# named_scope` is the correct handler and region-replace must not
+# compete — the prose has already named the destination.
+#
+# Kept as a compiled set of alternatives rather than reaching into
+# `patch_scope_insert._extract_scope_name_from_prose` so this gate
+# stays local: if the scope extractor changes its patterns, this
+# gate can still answer the simpler "does prose name any scope?"
+# question without breaking.
+_PROSE_NAMES_SCOPE_RE = re.compile(
+    r'\b(?:in|inside|within|to|for)\s+`[A-Za-z_][\w$]*`'
+    r'|\bfind\s+the\s+`[A-Za-z_][\w$]*`'
+    r'|\bthe\s+`[A-Za-z_][\w$]*`\s+'
+    r'(?:command|method|function|class|handler|endpoint|'
+    r'decorator|implementation)\b'
+    r'|\badd\s+(?:the\s+following\s+)?(?:method|function|command|'
+    r'class)\s+to\s+`[A-Za-z_][\w$]*`',
+    re.IGNORECASE,
+)
+
+
+def _prose_names_scope(prose: str) -> bool:
+    """True iff the prose names a scope for this block to go into.
+
+    Prose that names a scope is an instruction: the block belongs
+    inside that scope.  Insert-into-scope handles it; region-replace
+    must not run — a body that *could* look like a replacement of
+    some existing region (e.g. a `try:`/`except:` fragment under a
+    function whose body already has one) is being inserted as a
+    second sibling, not as a rewrite.
+
+    The motivating shape that motivated the gate:
+    `test_40`'s try/except body, prose "In `handle_thing`, after
+    the existing `payload.get` reads:".  Without the gate,
+    region-replace fires on the try/except fragment because it
+    structurally resembles the existing try/except block, replacing
+    it and losing the `timeout` bindings the function still returns.
+    """
+    if not prose:
+        return False
+    return bool(_PROSE_NAMES_SCOPE_RE.search(prose))
 
 
 def _split_python_statements(body: str) -> list:
     """Split Python source into top-level statements.
 
-    A "statement" starts at column 0 and is a def/class, an assignment,
-    a decorated function, or a bare import/expression.  Blank lines
-    between statements are separators, not content.  Comment-only
-    chunks are merged into the next statement (a leading comment
-    belongs with the statement it annotates).
-
     Refuses bodies containing triple-quoted strings: the regex-based
     splitter can't tell a top-level `def` inside a string literal from
-    a real one, so `PYCODE = r\"\"\"...def foo():...\"\"\"` would falsely
-    split.  Those bodies fall through to the single-statement
-    heuristics (or fail closed).
+    a real one.
+
+    DECORATOR MERGE (2026-11-02): a `@decorator` line followed by a
+    `def`/`class` line is ONE statement (the decorator belongs with
+    its def).  Splitting them leaves the decorator orphaned, which
+    no heuristic can place.
     """
     if '"""' in body or "'''" in body:
         return []
@@ -326,6 +291,7 @@ def _split_python_statements(body: str) -> list:
     lines = body.split("\n")
     stmts: list = []
     current: list = []
+
     for line in lines:
         stripped = line.strip()
         if not stripped:
@@ -341,11 +307,24 @@ def _split_python_statements(body: str) -> list:
             )
         )
         if starts_new and current:
+            # Decorator merge: if the previous non-blank line in
+            # `current` is a decorator (`@...`), keep the current
+            # line attached — whether it's another decorator or the
+            # def/class the decorators apply to.
+            last_non_blank = ""
+            for ln in reversed(current):
+                if ln.strip():
+                    last_non_blank = ln
+                    break
+            if last_non_blank.lstrip().startswith("@"):
+                current.append(line)
+                continue
             while current and not current[-1]:
                 current.pop()
             stmts.append("\n".join(current))
             current = []
         current.append(line)
+
     if current:
         while current and not current[-1]:
             current.pop()
@@ -374,7 +353,6 @@ def _split_python_statements(body: str) -> list:
         else:
             merged = pending
 
-    # If everything is comment-only, no real statements.
     if not merged:
         return []
     has_real = any(
@@ -393,10 +371,6 @@ def _split_python_statements(body: str) -> list:
 def _try_multi_statement_apply(base, body, path,
                                 prior_insertions=None,
                                 prior_scopes=None):
-    """Apply a body that contains two or more adjacent statements.
-
-    See module docstring, MULTI-STATEMENT APPLY section.
-    """
     global _in_multi_statement
     if _in_multi_statement:
         return None
@@ -431,22 +405,17 @@ def _try_multi_statement_apply(base, body, path,
     return current if current != base else None
 
 
-# ===========================================================================
-#  Indented def/class replace (2026-10-28g)
-# ===========================================================================
-
-def _try_indented_def_replace(base: str, body: str):
+def _try_indented_def_replace(base: str, body: str, path: str = ""):
     """Replace an *indented* `def name(...)` / `async def` / `class`
     declaration in base with the body's version.
 
     `body` MUST preserve its original indentation.  Pass `raw_body`
-    from the caller — NOT `body_stripped`.  See the module docstring,
-    INDENTED-DEF REINDENT BUG section, for why `body_stripped` breaks
-    the internal reindent computation.
+    from the caller.
 
-    See also module docstring, INDENTED DEF/CLASS REPLACE section.
+    `path` routes `structural.check_balance` to `ast.parse` for `.py`
+    bodies.
     """
-    from .validate_output import _js_balance
+    from .structural import check_balance
 
     m = re.match(
         r"^(?:@\w[\w.]*\s*\n)*\s*(?:async\s+)?(?:def|class)\s+(\w+)",
@@ -456,19 +425,15 @@ def _try_indented_def_replace(base: str, body: str):
         return None
     name = m.group(1)
 
-    # Top-level declaration with the same name?  Leave it to scoped-
-    # replace.
     if re.search(
             rf"^(?:async\s+)?(?:def|class)\s+{re.escape(name)}\b",
             base, re.MULTILINE):
         return None
 
-    # Structural sanity.
-    b, p, k, u = _js_balance(body)
-    if b != 0 or p != 0 or k != 0 or u:
+    balance_err = check_balance(body, path)
+    if balance_err is not None:
         return None
 
-    # Find indented matches.
     base_lines = base.split("\n")
     indented_re = re.compile(
         rf"^([ \t]+)(?:async\s+)?(?:def|class)\s+{re.escape(name)}\b"
@@ -502,10 +467,6 @@ def _try_indented_def_replace(base: str, body: str):
     return result if result != base else None
 
 
-# ===========================================================================
-#  Import replace
-# ===========================================================================
-
 _IMPORT_JOIN_RE = re.compile(
     r'import\s+\{([^}]*)\}\s*from\s*["\']([^"\']+)["\']\s*;?',
     re.DOTALL,
@@ -515,9 +476,6 @@ _CONTINUATION_ENDINGS = (",", "{", "(", "\\")
 
 
 def _join_continuations(body: str) -> str:
-    """Join lines that are syntactic continuations of a single
-    logical line.
-    """
     if not body:
         return body
     lines = body.split("\n")
@@ -535,22 +493,10 @@ def _join_continuations(body: str) -> str:
 
 
 def _try_import_replace(base, raw_body):
-    """If body is an import statement and base has an import from the
-    same module, replace the base's import with the body.
-
-    Refuses when the body is not *only* an import statement — a body
-    like `import { foo } from "x";\n\nconst bar = ...` would
-    otherwise replace the base's import line with the whole body,
-    misplacing the trailing content at the import's position.
-
-    Returns `base` (not None) when the base already has an identical
-    import — the outer loop then marks the patch `already-present`.
-    """
     joined = _join_continuations(raw_body)
     m = _IMPORT_JOIN_RE.search(joined)
     if not m:
         return None
-    # Refuse multi-line bodies that are not pure imports.
     body_stripped = joined.strip()
     tail = body_stripped[m.end():].strip() if m.end() < len(body_stripped) else ""
     if tail:
@@ -564,7 +510,6 @@ def _try_import_replace(base, raw_body):
             continue
         if lm.group(2) != module:
             continue
-        # NEW: already-present short-circuit for identical imports.
         if stripped == body_stripped:
             return base
         indent = line[:len(line) - len(line.lstrip())]
@@ -573,10 +518,6 @@ def _try_import_replace(base, raw_body):
         return result if result != base else None
     return None
 
-
-# ===========================================================================
-#  Python-completeness gate
-# ===========================================================================
 
 _PY_COMPLETE_VERBS = frozenset({
     "try", "with", "for", "while", "if", "def", "class",
@@ -644,29 +585,7 @@ def _is_syntactically_complete_python(body, path):
     return True
 
 
-# ===========================================================================
-#  Already-present pre-check helpers (2026-10-28f)
-# ===========================================================================
-
 def _is_already_applied(body_stripped, base):
-    """True iff the body is already present in base well enough that
-    applying it again would duplicate content.
-
-    Two tiers (see patch_already.py module docstring and the module-
-    level ALREADY-PRESENT PRE-CHECK section above):
-
-      · Short bodies (< 3 lines): strict contiguous-window match.
-        Token fallback would false-positive on single-line import
-        changes.
-
-      · Multi-line bodies (>= 3 lines): require a long contiguous
-        run AND token presence.  The contiguity gate is what
-        distinguishes a reprint (content genuinely already there)
-        from a new block whose tokens happen to be dispersed in
-        base (comfyui.py idx=97: a try/except that introduces
-        `output_rotation` — new tokens — but whose remaining
-        vocabulary is otherwise common in base).
-    """
     body_lines = [ln for ln in body_stripped.splitlines() if ln.strip()]
     if len(body_lines) < 3:
         return _exact_lines_present(body_stripped, base)
@@ -678,19 +597,139 @@ def _is_already_applied(body_stripped, base):
     return _patch_already_present(body_stripped, base)
 
 
-# ===========================================================================
-#  Dispatcher
-# ===========================================================================
+# ============================================================================
+#  Region replace (2026-10-29)
+# ============================================================================
+
+def _try_region_replace(base: str, body_stripped: str,
+                        path: str = "",
+                        context_before: str = "",
+                        min_ratio: float = 0.55,
+                        min_overlap: float = 0.4,
+                        ) -> Optional[str]:
+    """Replace a region of `base` with `body_stripped` when the body
+    is a modified version of that region.
+
+    See the module docstring, REGION REPLACE section, for the
+    motivating shape and the acceptance criteria.
+
+    Gated on `context_before`: when the surrounding prose names a
+    scope ("in `X`", "to `X`", "find the `X` command", "add the
+    following method to `X`", etc.), the block is being inserted
+    into a specific scope and `_try_insert_into_named_scope` will
+    place it correctly.  Region-replace must not run in that case
+    — a fragment that structurally resembles some existing region
+    (e.g. a `try:`/`except:` inside a function that already has one)
+    is a *second* sibling, not a rewrite.  Without this gate,
+    `test_40`'s try/except fragment replaces the existing try/except
+    and drops the `timeout` bindings the function still returns.
+
+    Returns the modified content, or None when no region qualifies,
+    when the prose names a scope, or when firing would risk
+    clobbering unrelated content.
+    """
+    if not body_stripped or not base:
+        return None
+
+    if _prose_names_scope(context_before):
+        return None
+
+    body_lines = body_stripped.splitlines()
+    if len(body_lines) < 3:
+        return None
+
+    # Exact-substring already-applied check: if the whole body is
+    # already in base, the caller's `_is_already_applied` should
+    # have fired; guard anyway so a direct call does not produce a
+    # redundant region-replace.
+    if body_stripped in base:
+        return None
+
+    base_lines = base.splitlines()
+    if not base_lines:
+        return None
+
+    def _stripped_nonblank(lines):
+        return [ln.strip() for ln in lines if ln.strip()]
+
+    body_stripped_list = _stripped_nonblank(body_lines)
+    if len(body_stripped_list) < 3:
+        return None
+
+    body_set = set(body_stripped_list)
+    first_body = body_stripped_list[0]
+    first_body_word = first_body.split(None, 1)[0] if first_body else ""
+
+    best: Optional[tuple] = None
+    # The factor sweep covers both directions: bodies that are
+    # larger than their base region (typical expansion) and bodies
+    # that are smaller than their region (typical contraction).
+    # `max(3, …)` keeps a floor so tiny bodies do not produce
+    # degenerate one-line windows.
+    for factor in (0.3, 0.4, 0.5, 0.6, 0.7, 0.85, 1.0,
+                   1.15, 1.3, 1.5, 1.8, 2.2):
+        window_size = max(3, int(len(body_lines) * factor))
+        if window_size > len(base_lines):
+            continue
+        for start in range(len(base_lines) - window_size + 1):
+            window = base_lines[start:start + window_size]
+            window_stripped_list = _stripped_nonblank(window)
+            if len(window_stripped_list) < 3:
+                continue
+
+            first_window = window_stripped_list[0]
+            first_window_word = (
+                first_window.split(None, 1)[0] if first_window else ""
+            )
+            # Same opening construct only.
+            if first_window_word != first_body_word:
+                continue
+
+            # Criterion 1: verbatim line overlap.
+            window_set = set(window_stripped_list)
+            if not window_set:
+                continue
+            overlap = len(window_set & body_set)
+            if overlap / len(window_set) < min_overlap:
+                continue
+
+            # Criterion 2: line-similarity.
+            sm = difflib.SequenceMatcher(
+                None, window_stripped_list, body_stripped_list,
+                autojunk=False,
+            )
+            ratio = sm.ratio()
+            if ratio < min_ratio:
+                continue
+
+            score = (overlap / len(window_set)) + ratio
+            if best is None or score > best[0]:
+                best = (score, start, start + window_size, ratio)
+
+    if best is None:
+        return None
+
+    _score, start, end, _ratio = best
+
+    new_lines = base_lines[:start] + body_lines + base_lines[end:]
+    result = "\n".join(new_lines)
+
+    # Preserve base's trailing-newline behaviour.
+    if base.endswith("\n") and not result.endswith("\n"):
+        result += "\n"
+
+    if result == base:
+        return None
+
+    # Aggressive-replace guard: don't lose more than half the file.
+    if len(new_lines) < len(base_lines) * 0.5:
+        return None
+
+    return result
+
 
 def _try_deterministic_patch(base, patch, path="",
                               prior_insertions=None, prior_scopes=None):
-    """Crash-isolated entry point.
-
-    `prior_scopes` is an optional `dict[stripped_line -> scope_name]`
-    that disambiguates a repeated prior-insertion anchor.  See
-    `apply_patches._record_single_line_anchor` and the module
-    docstring, Prior-insertions threading section.
-    """
     try:
         return _try_deterministic_patch_inner(
             base, patch, path,
@@ -708,49 +747,22 @@ def _try_deterministic_patch_inner(base, patch, path="",
                                     prior_insertions=None,
                                     prior_scopes=None):
     raw_body = patch["body"]
-    body_stripped = raw_body.strip()
+    body_stripped = textwrap.dedent(raw_body).strip()
     if not body_stripped:
         return None
 
     context_before = patch.get("context_before", "")
 
-    # Signature-only replacement.  Runs BEFORE the already-present
-    # pre-check: a signature-only body is a fragment whose body is
-    # in base, so the pre-check would false-positive on it.
     signature_replace = _try_signature_replace(base, raw_body)
     if signature_replace is not None:
         return signature_replace
 
-    # NEW (2026-10-28f): already-present pre-check.
-    # Skipped for deletion instructions and diff bodies — their bodies
-    # are "content to disappear" and "content to transform", not
-    # "content to insert".  Both have their own already-applied
-    # predicates downstream (`_deletion_already_applied`,
-    # `_diff_already_applied`).  Firing `_is_already_applied` on them
-    # would treat the content-to-delete as content-already-present and
-    # skip the deletion entirely — the exact cause of the test_07
-    # regression.
-    #
-    # NOTE (2026-11-01): `_is_deletion_instruction` was narrowed
-    # (core.py) so prose like "Delete-and-recreate the layer" no
-    # longer fires it.  Before that narrowing, the comfyui.py
-    # `comfy_set_layer_pixels` patch was marked deletion, which
-    # bypassed the pre-check entirely; the misclassification happened
-    # elsewhere.  Post-narrowing, the pre-check runs on that patch
-    # and correctly identifies it as not-already-present.  Pass 8.7d
-    # (consistency.py) is the backstop for any remaining false
-    # positives that DO slip through.
     _is_deletion = _is_deletion_instruction(raw_body, context_before)
     _is_diff = _looks_like_diff_body(raw_body)
     if not _is_deletion and not _is_diff:
         if _is_already_applied(body_stripped, base):
             return base
 
-    # NEW (2026-10-28g): multi-statement apply.  Fires for bodies that
-    # split into 2+ top-level statements.  Runs BEFORE the placeholder
-    # gate so sub-statements that individually carry placeholders get
-    # their normal handling.  See module docstring, MULTI-STATEMENT
-    # APPLY section.
     if (not _in_multi_statement
             and not _is_deletion
             and not _is_diff):
@@ -762,7 +774,6 @@ def _try_deterministic_patch_inner(base, patch, path="",
         if _ms_result is not None:
             return _ms_result
 
-    # Placeholder gate.  See module docstring.
     if _has_placeholder_marker(raw_body):
         scope_name, _kind = _extract_scope_from_body(body_stripped)
         if scope_name:
@@ -792,7 +803,6 @@ def _try_deterministic_patch_inner(base, patch, path="",
             )
             return None
 
-    # Python-completeness gate.
     if not _is_syntactically_complete_python(raw_body, path):
         return None
 
@@ -815,23 +825,20 @@ def _try_deterministic_patch_inner(base, patch, path="",
     if single_line is not None:
         return single_line
 
-    # NEW (2026-10-28g): indented def/class replace.  A nested
-    # `def name(...)` — e.g. `def on_progress(...)` inside
-    # `handle_inpaint` — is not reachable by scoped-replace (which
-    # requires column-0 declarations) and not by any insert heuristic
-    # (which would put the new function *inside* the enclosing
-    # function, duplicating the name).  See module docstring,
-    # INDENTED DEF/CLASS REPLACE section.
-    #
-    # FIX (2026-11-01): pass raw_body, NOT body_stripped.  See module
-    # docstring, INDENTED-DEF REINDENT BUG section.  body_stripped
-    # zeroes the first line's indent, which makes `_reindent_body`
-    # compute a wrong `orig_indent_len` and over-indent every
-    # subsequent line by the fence's original indent.
     if body_stripped.startswith(("def ", "async def ", "class ")):
-        _indented_result = _try_indented_def_replace(base, raw_body)
+        _indented_result = _try_indented_def_replace(
+            base, raw_body, path=path)
         if _indented_result is not None:
             return _indented_result
+
+    # NEW (2026-11-02): decorated-def scope routing.
+    _first_stripped = next(
+        (ln.lstrip() for ln in raw_body.splitlines() if ln.strip()), "")
+    if _first_stripped.startswith("@"):
+        _decorated_scope_result = _try_insert_into_named_scope(
+            base, raw_body, context_before, path)
+        if _decorated_scope_result is not None:
+            return _decorated_scope_result
 
     _body_is_obj_lit = bool(
         _OBJECT_LITERAL_ASSIGNMENT_RE.match(body_stripped))
@@ -884,26 +891,6 @@ def _try_deterministic_patch_inner(base, patch, path="",
             m.group("prefix").rstrip(),
         )
         if id_m:
-            # NEW (2026-10-28g, refined 2026-10-28h): refuse when the
-            # body has substantial *trailing content* after the object
-            # literal.  A body like
-            #   x = { ... }
-            #   def foo(): ...
-            # is NOT a pure object-literal splice — the splice would
-            # silently drop the def (the historical bug that lost
-            # Fix 3's on_progress).
-            #
-            # A bare trailing `;` is the JS/C-family statement
-            # terminator, not trailing content.  The initial version
-            # of this refusal treated `export const foo = {...};` as
-            # trailing content and regressed fixtures 02, 04, and 35.
-            # The tail check strips a single leading `;` before
-            # checking for non-comment content, so:
-            #   x = {...}                       → splice fires
-            #   x = {...};                      → splice fires
-            #   x = {...};  # note              → splice fires
-            #   x = {...};\ndef foo(): ...      → refused
-            #   x = {...}\ndef foo(): ...       → refused
             _patch_open = body_stripped.index("{", m.start())
             _is_py = _looks_like_python_fragment(body_stripped)
             _patch_close = _find_matching_brace(
@@ -924,6 +911,21 @@ def _try_deterministic_patch_inner(base, patch, path="",
             return _try_object_literal_splice(
                 base, body_stripped, id_m.group(1))
         return None
+
+    # NEW (2026-10-29): region-replace.  For bodies that are a
+    # modified version of an existing base region but don't match
+    # any of the more specific replacement heuristics.  Gated on
+    # prose not naming a scope (see `_prose_names_scope`): when the
+    # prose already tells us where the block goes,
+    # `_try_insert_into_named_scope` is the correct route and
+    # region-replace must not override it.
+    _region_result = _try_region_replace(
+        base, body_stripped, path, context_before)
+    if _region_result is not None:
+        patch["region_replace_evidence"] = (
+            "opening-word match + bidirectional line overlap"
+        )
+        return _region_result
 
     named_dict = _try_named_dict_insert(base, raw_body, context_before)
     if named_dict is not None:
@@ -993,14 +995,7 @@ def _try_deterministic_patch_inner(base, patch, path="",
     return None
 
 
-# ===========================================================================
-#  Sanity failure attribution
-# ===========================================================================
-
 def attribute_sanity_failure(rec, blocks_by_idx, validate_fn=None):
-    """Return the idx of the first patch whose application causes
-    validation to fail, or None if attribution isn't possible.
-    """
     if validate_fn is None:
         from .validate_output import validate_content as validate_fn
 

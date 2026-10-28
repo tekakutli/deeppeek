@@ -44,6 +44,17 @@ The fix: trust the FIRST TOKEN.  `def ` / `async def ` / `class ` /
 `var ` / `async function ` → JavaScript.  The keyword-count scoring
 remains as a fallback for ambiguous bodies whose first token names
 neither (e.g. a bare assignment).
+
+LANGUAGE-AWARE STRUCTURAL CHECK (2026-11-01b)
+=============================================
+`_try_structural_append` previously used `_js_balance` for its
+structural gate.  That misclassifies Python bodies with `#` comments
+containing apostrophes (`# ComfyUI's`) as having an unclosed string
+and refuses to append.  The gate now calls
+`structural.check_balance(body, path)`, which routes `.py`
+destinations through `ast.parse` and falls back to `_js_balance`
+only for non-Python bodies.  See `structural.py`'s module docstring
+for the full rationale and the comfyui.py motivating case.
 """
 
 import os
@@ -120,6 +131,8 @@ def _infer_body_lang(body):
 
 def _try_structural_append(base, body, path):
     """Insert `body` into `base` at a structurally-inferred point."""
+    from .structural import check_balance
+
     if not body or not body.strip():
         return None
     body_lines = body.rstrip().split("\n")
@@ -140,13 +153,11 @@ def _try_structural_append(base, body, path):
     if body_lang is None:
         return None
 
-    from .validate_output import _js_balance
-    braces, parens, brackets, unclosed = _js_balance(body)
-    if braces != 0 or parens != 0 or brackets != 0 or unclosed:
+    balance_err = check_balance(body, path)
+    if balance_err is not None:
         print(f"  [structural] {path}: refusing to append "
-              f"structurally-unbalanced block "
-              f"(braces={braces:+d} parens={parens:+d} "
-              f"brackets={brackets:+d})", file=sys.stderr)
+              f"structurally-unbalanced block ({balance_err})",
+              file=sys.stderr)
         return None
 
     ext = os.path.splitext(path)[1].lower()
@@ -182,6 +193,7 @@ def _find_matching_decl_block(content, block_first_line):
         block_first_line)
     if not m:
         return None
+    block_ident = m.group(1)
     block_rhs = m.group(2)
 
     def abstract(s):
@@ -193,22 +205,25 @@ def _find_matching_decl_block(content, block_first_line):
     lines = content.split("\n")
     matches = []
     for i, line in enumerate(lines):
-        if not line.strip():
-            continue
-        if line[0] in (" ", "\t"):
+        if not line.strip() or line[0] in (" ", "\t"):
             continue
         lm = re.match(
             r'(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(.+?)\s*;?\s*$',
             line.strip())
         if not lm:
             continue
+        existing_ident = lm.group(1)
         existing_rhs = lm.group(2)
+
+        if existing_ident != block_ident:
+            continue
         if abstract(existing_rhs) != block_pattern:
             continue
-        existing_ident = lm.group(1)
+
         end = _find_identifier_block_end_line(content, existing_ident)
         if end is not None:
             matches.append(end + 1)
+
     if not matches:
         return None
     return matches[-1]

@@ -36,6 +36,7 @@ def register(sub: argparse._SubParsersAction) -> None:
         evolve, new, last_thought, heredoc, reprint_markdown, review,
         refine_deeppeek, delete, attachments, retry,
         reprint,
+        snippet,
     )
     evolve.register(psub)
     new.register(psub)
@@ -48,6 +49,7 @@ def register(sub: argparse._SubParsersAction) -> None:
     attachments.register(psub)
     retry.register(psub)
     reprint.register(psub)
+    snippet.register(psub)
 
     p.set_defaults(func=run)
 

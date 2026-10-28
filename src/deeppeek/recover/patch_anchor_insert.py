@@ -13,138 +13,72 @@ Four heuristics that place a body at a *position* named by prose
 DEF-ANCHOR (2026-10-28)
 =======================
 `_try_insert_after_anchor` gained a branch for backticked identifiers
-that name a def/class/function.  Prose like "Add two helpers near
-`_decode_png`:" had no anchor before this branch.
-
-The branch inserts at the *sibling* indent of the named definition:
-a `def`/`class`/`function` body inserted "near" another declaration
-belongs next to it, not inside it.  A body that is *not* a
-declaration is refused — inner statements are the
-`_try_insert_into_named_scope` path's job.
+that name a def/class/function.
 
 Multi-line signatures (`def foo(\n a,\n b,\n):`) are handled by
-`_find_python_sig_end`: it scans forward from the `def` keyword,
-tracking paren/bracket/brace depth and string state, and returns the
-position of the first `:` at depth 0 — the colon that terminates the
-signature.
+`_find_python_sig_end`.
 
 PRIOR-INSERTIONS FALLBACK (2026-10-28)
 ======================================
 When the prose names no backtick anchor at all, but an earlier patch
 in the same batch already inserted a line that appears (uniquely) in
-the current base, insert after that line.  This covers the
-"Find: X / Add just after: Y" pattern where X is pre-existing and Y's
-only anchor is X's line in the (unchanged) base.
-
-The prior-insertion fallback is the *only* branch that accepts a
-single-line body.  The backtick-anchored branches (call, identifier,
-statement) require 2+ lines — they are meant for blocks, not single
-statements.
-
-PRIOR-INSERTIONS SCOPE CONTEXT (2026-10-28e)
-============================================
-The prior-insertion fallback accepts an optional `prior_scopes` dict,
-keyed by the prior line, mapping to the scope name extracted from
-the Find block's broader prose. When the anchor appears more than
-once in the base, the fallback uses `_anchor_within_scope` to find
-the unique occurrence inside the recorded scope.  When the recorded
-scope doesn't itself contain the anchor (but does call a helper
-that does), `_anchor_within_callee` walks the scope's direct
-`self.X(...)` callees to find the unique occurrence inside one of
-them.
+the current base, insert after that line.
 
 SCOPE-FIRST ORDERING (2026-10-28f)
 ==================================
-The prior-insertion fallback now partitions `prior_insertions` into
-**scoped** (lines with a `prior_scopes` entry) and **unscoped**, and
-tries all scoped candidates before any unscoped one.
-
-Motivating shape (comfyui.py idx=97 in production):
-  · idx=95 landed a `"--output_rotation": {...}` entry inside
-    `@command(args={...})`.
-  · idx=96 was the Find block for `output_name = params.get(...)`;
-    its broader prose ("find the `comfy_generate` command decorator")
-    names `comfy_generate`, so `prior_scopes[output_name] =
-    "comfy_generate"`.
-  · idx=97 (try/except) tried to place.
-
-Without scope-first ordering, the fallback iterates
-`prior_insertions` in set order.  The args entry's `"help": "...}"}`
-line is "safe" per `_anchor_line_is_safe` (closes but doesn't open),
-so inserting after it puts the try/except INSIDE the args dict —
-invalid Python.
-
-With scope-first ordering, the scoped `output_name` candidate is
-tried first: `_anchor_within_scope(base, output_name, comfy_generate)`
-returns -1 (not in the method's own body), then
-`_anchor_within_callee` walks `comfy_generate`'s callees and finds
-`output_name` inside `_comfy_generate_impl`.  The try/except lands
-correctly, and the args-entry lines are never tried as anchors.
+Prior-insertion fallback partitions `prior_insertions` into **scoped**
+(lines with a `prior_scopes` entry) and **unscoped**, tries all
+scoped candidates before any unscoped one.
 
 SAFETY GATES ON PRIOR-INSERTION ANCHORS
 =======================================
-Two safety gates apply to every prior-insertion candidate:
-
-  · `_anchor_line_is_safe` (from patch_predicates): refuse a line
-    whose own text opens more brackets than it closes (e.g.,
-    `"--output_rotation": {"type": "float", ...` — an unclosed
-    dict opener).
-
-  · `_anchor_is_in_expression_context` (NEW 2026-10-28f): for `.py`
-    files, refuse a line whose position lies inside any unclosed
-    `(`/`[`/`{`.  This catches the args-dict *closer* line
-    (`"help": "..."},`) — safe per the opener check (closes, doesn't
-    open), but still inside the args dict literal.
-
-Together these gates make an args-dict line unusable as a prior-
-insertion anchor regardless of which line the set-iteration order
-picks first.
+Two gates:
+  · `_anchor_line_is_safe`: refuse a line whose own text opens more
+    brackets than it closes.
+  · `_anchor_is_in_expression_context`: for `.py` files, refuse a
+    line whose position lies inside any unclosed `(`/`[`/`{`.
 
 ANCHOR-LINE SAFETY (Fix 4)
 ==========================
-Inserting AFTER a line that opens an unclosed block lands the body
-*inside* that block.  `_anchor_line_is_safe` refuses such anchors;
-the before-anchor heuristic (which has no such constraint) is what
-places those bodies.
+`_anchor_line_is_safe` refuses anchors that open an unclosed block.
 
 MULTI-OCCURRENCE ANCHORS (Fix 5)
 ================================
-An anchor identifier may appear more than once — most commonly, once
-in a docstring and once in the actual code.
-`_try_insert_before_anchor` collects ALL occurrences, tries them
-right-to-left (bottom-of-file first), and skips each one that (a) is
-a closer-only line, or (b) has no strong code signal.  Fail-closed
-if no occurrence passes both checks.
+`_try_insert_before_anchor` tries occurrences right-to-left, skipping
+closers-only lines and non-code lines.
 
 SCOPE-AWARE ANCHOR SELECTION (2026-10-28b)
 ==========================================
-`_try_insert_after_anchor`'s statement branch used to require a
-unique anchor.  When the anchor text appeared more than once, the
-branch gave up and the patch failed.
-
-The fix: when the anchor is non-unique, look for a *unique* occurrence
-inside the scope named by the prose.  `_anchor_within_named_scope`
-locates the scope via `patch_scope_insert._find_scope_body_range`,
-finds all occurrences of the anchor inside it, and returns the single
-one if exactly one exists.
+When an anchor is non-unique, look for a unique occurrence inside the
+prose-named scope.
 
 CALL-ONLY ANCHORS FALL THROUGH (2026-10-28c)
 ============================================
-The statement branch used to skip any anchor matching
-`_CALL_ONLY_RE` (`func(`), assuming the earlier call-arg branch
-handled it.  But the call-arg branch requires a *string literal*
-argument (`func("x")`); a bare `func()` or `func(arg)` with no
-literal falls through every branch and the patch fails.
-
-The skip is removed.  `func()` shapes are now attempted by the
-statement branch.
+`func()` shapes fall through to the statement branch.
 
 COMMENT-AWARE ANCHORS (2026-10-28d)
 ===================================
-An anchor match that falls inside a comment is never a valid
-insertion point.  Every anchor branch consults
-`patch_comments.get_comment_spans(base, path)` and skips any
-candidate position that falls inside a comment.
+Every anchor branch consults `patch_comments.get_comment_spans(base,
+path)` and skips any candidate position inside a comment.
+
+CLASS-TARGET + DECORATED-BODY (2026-11-02)
+==========================================
+`_try_insert_after_def` refuses a `@`-decorated body when `ident`
+names a `class` in base.  Inserting after a class places the
+decorated def at module level — semantically wrong (the def is a
+method, not a module-level function).  The scope-insert heuristic
+(`_try_insert_into_named_scope`) is the correct handler for
+class+decorated-body; if it declines for some reason, this branch
+declining lets the pipeline fall through to structural-append (which
+also declines class+decorated), and finally to fail-closed — a
+strictly better outcome than placing the method at module level.
+
+Motivating failure (test_40, comfyui.py method-insert): the body
+`@command(name="new")\ndef new_cmd(self, params): ...` was being
+placed AFTER `class MyHandler:` at module level via this branch
+when the scope-insert heuristic declined.  The method was valid
+Python (module-level def) but semantically misplaced.  The
+class-target check eliminates that fallback.
 """
 
 import re
@@ -164,10 +98,6 @@ from .patch_text import (
 from .patch_comments import get_comment_spans, is_inside_comment
 
 
-# ===========================================================================
-#  Insert-before-anchor (FIX 3 + FIX 5 + comment-aware)
-# ===========================================================================
-
 _BEFORE_PROSE_RE = re.compile(
     r'\bbefore\b[^.\n]{0,120}?`([^`\n]+)`',
     re.IGNORECASE,
@@ -175,9 +105,6 @@ _BEFORE_PROSE_RE = re.compile(
 
 
 def _try_insert_before_anchor(base, body, context_before, path=""):
-    """Insert `body` before the line named by the most recent
-    "before `X`" phrase in the prose.
-    """
     if not body or not body.strip():
         return None
     body_stripped = body.strip()
@@ -229,10 +156,6 @@ def _try_insert_before_anchor(base, body, context_before, path=""):
     return None
 
 
-# ===========================================================================
-#  Insert-between-anchors (FIX 3 + comment-aware)
-# ===========================================================================
-
 _BETWEEN_RE = re.compile(
     r'\bbetween\b[^.\n]{0,120}?'
     r'(?:the\s+)?([A-Za-z][\w ]{1,50}?)\s+(?:and|&)\s+'
@@ -243,8 +166,6 @@ _BETWEEN_RE = re.compile(
 
 
 def _find_named_block_end(base, name):
-    """Return (start_char, end_char) of the block named `name`, or
-    None.  Handles `<details>`, object literals, function/class defs."""
     if not name:
         return None
 
@@ -289,9 +210,6 @@ def _find_named_block_end(base, name):
 
 
 def _try_insert_between_anchors(base, body, context_before, path=""):
-    """Insert `body` between the two blocks named in a
-    "between X and Y <what>" phrase in the prose.
-    """
     if not body or not body.strip():
         return None
     body_stripped = body.strip()
@@ -337,14 +255,7 @@ def _try_insert_between_anchors(base, body, context_before, path=""):
     return result if result != base else None
 
 
-# ===========================================================================
-#  Python signature-end detection
-# ===========================================================================
-
 def _find_python_sig_end(base, start_pos):
-    """Return the position just after the `:` that closes the
-    signature of a Python def/class starting at `start_pos`.
-    """
     i = start_pos
     n = len(base)
     depth = 0
@@ -377,10 +288,6 @@ def _find_python_sig_end(base, start_pos):
     return -1
 
 
-# ===========================================================================
-#  Insert-after-def
-# ===========================================================================
-
 _DECL_START_PREFIXES = (
     "def ", "async def ", "class ",
     "function ", "async function ", "export ",
@@ -391,6 +298,11 @@ _DECL_START_PREFIXES = (
 def _try_insert_after_def(base, ident, body):
     """If `ident` names a def/class/function in `base`, insert `body`
     AFTER the definition's whole body — at the def's own indent.
+
+    Refuses when the body is `@`-decorated and `ident` names a
+    `class` in base: the intent is to add a method inside the class,
+    not a module-level function after it.  See module docstring,
+    CLASS-TARGET + DECORATED-BODY.
     """
     if not ident or not body or not body.strip():
         return None
@@ -402,7 +314,15 @@ def _try_insert_after_def(base, ident, body):
     if not first_stripped.startswith(_DECL_START_PREFIXES):
         return None
 
-    # ---- Python ----
+    # Class + decorated body → refuse.  Scope-insert is the correct
+    # handler; if it declines, fail-closed beats module-level
+    # placement.
+    if first_stripped.startswith("@"):
+        _class_re = re.compile(
+            r'(?m)^[ \t]*class\s+' + re.escape(ident) + r'\b')
+        if _class_re.search(base):
+            return None
+
     py_re = re.compile(
         r'(?m)^([ \t]*)(?:async\s+)?(?:def|class)\s+'
         + re.escape(ident) + r'\b'
@@ -434,7 +354,6 @@ def _try_insert_after_def(base, ident, body):
         result = base[:insert_at] + insertion + base[insert_at:]
         return result if result != base else None
 
-    # ---- JS function / class ----
     js_re = re.compile(
         r'(?m)^([ \t]*)(?:export\s+)?(?:async\s+)?'
         r'(?:function|class)\s+' + re.escape(ident) + r'\b'
@@ -462,18 +381,7 @@ def _try_insert_after_def(base, ident, body):
     return None
 
 
-# ===========================================================================
-#  Scope-aware anchor helpers (2026-10-28b/c/d/e/f)
-# ===========================================================================
-
 def _anchor_within_scope(base, anchor_text, scope_name, spans=None):
-    """Char position of `anchor_text` when it appears exactly once
-    *in code* inside `scope_name`'s body; -1 otherwise.
-
-    Fail-closed: if `scope_name` is empty, or the scope cannot be
-    located, or the anchor appears zero or more than one time inside
-    the scope *in code*, returns -1.
-    """
     if not scope_name:
         return -1
     from .patch_scope_insert import _find_scope_body_range
@@ -498,9 +406,6 @@ def _anchor_within_scope(base, anchor_text, scope_name, spans=None):
 
 def _anchor_within_named_scope(base, anchor_text, context_before,
                                 spans=None):
-    """Char position of `anchor_text` when it appears exactly once
-    inside the scope named by the prose; -1 otherwise.
-    """
     from .patch_scope_insert import _extract_scope_name_from_prose
     named_scope = _extract_scope_name_from_prose(context_before or "")
     return _anchor_within_scope(
@@ -511,26 +416,6 @@ _CALLEE_CALL_RE = re.compile(r'self\.([A-Za-z_]\w*)\s*\(')
 
 
 def _anchor_within_callee(base, anchor_text, scope_name, spans=None):
-    """Char position of `anchor_text` when it appears exactly once
-    *in code* inside one of `scope_name`'s direct `self.X(...)`
-    callees; -1 otherwise.
-
-    Motivating shape (comfyui.py idx=97): the prose names
-    `comfy_generate` (the public @command method), but the anchor
-    `output_name = params.get("output_name") or None` lives in
-    `_comfy_generate_impl` — a private helper that `comfy_generate`
-    delegates to.  `_anchor_within_scope` returns -1; this walks the
-    callee graph one level deep and finds the anchor in
-    `_comfy_generate_impl`.
-
-    One level only — nested-callee traversal would risk finding an
-    unrelated occurrence in a transitive callee.  If the anchor isn't
-    in a direct callee's body, returns -1 and the caller falls
-    through.
-
-    Fail-closed on ambiguous placement (multiple callees with the
-    anchor, or a single callee with multiple occurrences).
-    """
     if not scope_name:
         return -1
     from .patch_scope_insert import _find_scope_body_range
@@ -567,32 +452,7 @@ def _anchor_within_callee(base, anchor_text, scope_name, spans=None):
     return -1
 
 
-# ===========================================================================
-#  Expression-context refusal (2026-10-28f)
-# ===========================================================================
-
 def _anchor_is_in_expression_context(base, pos, path):
-    """True if `pos` is inside an unclosed bracket group in a file
-    where brackets denote *expressions* rather than *blocks*.
-
-    For `.py` files: any unclosed `(` / `[` / `{` at `pos` means the
-    anchor is inside an expression — function-call args, dict literal,
-    list literal — rather than at a statement boundary.  Inserting a
-    statement there produces invalid Python.
-
-    Motivating incident (comfyui.py idx=97, production): a prior
-    insertion landed `"--output_rotation": {...}` inside
-    `@command(args={...})`.  `_anchor_line_is_safe` correctly refused
-    the args-opener line, but the entry's `"help": "..."},` closer is
-    "safe" (opens nothing, closes one) — inserting after it puts the
-    try/except INSIDE the args dict, producing invalid syntax.  The
-    expression-context check refuses the closer too (the closer is
-    still inside an unclosed `(`/`{`).
-
-    For `.js` / `.ts` / etc.: returns False.  Block braces and object
-    braces are indistinguishable without a proper parser; the existing
-    `_anchor_line_is_safe` check is what protects those cases.
-    """
     ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
     if ext not in ("py", "pyi"):
         return False
@@ -645,10 +505,6 @@ def _anchor_is_in_expression_context(base, pos, path):
     return parens > 0 or braces > 0 or brackets > 0
 
 
-# ===========================================================================
-#  Insert-after-anchor
-# ===========================================================================
-
 _PROSE_BACKTICK_IDENT_RE = re.compile(r'`([A-Za-z_$][\w$]*)`')
 _PROSE_CALL_ARG_RE = re.compile(
     r'`([A-Za-z_$][\w$]*)\s*\(\s*["\']([^"\']+)["\']')
@@ -660,15 +516,6 @@ _CALL_ONLY_RE = re.compile(r'^[A-Za-z_$][\w$]*\s*\(')
 def _try_insert_after_anchor(base, body, context_before,
                               prior_insertions=None, path="",
                               prior_scopes=None):
-    """Insert `body` after the most specific anchor the prose (or the
-    prior insertions) supplies.
-
-    `prior_insertions` is an optional set of stripped lines that
-    earlier patches in the same batch inserted.  `prior_scopes`
-    (optional) is `dict[stripped_line -> scope_name]` that
-    disambiguates a repeated anchor.  See the module docstring,
-    PRIOR-INSERTIONS SCOPE CONTEXT and SCOPE-FIRST ORDERING sections.
-    """
     body_stripped = body.strip()
     if not body_stripped:
         return None
@@ -680,9 +527,7 @@ def _try_insert_after_anchor(base, body, context_before,
 
     spans = get_comment_spans(base, path)
 
-    # ---- Primary branches: 2+ line bodies only ----
     if len(body_lines) >= 2:
-        # Call form: `func("arg")`.
         call_matches = _PROSE_CALL_ARG_RE.findall(context_before or "")
         for func_name, arg_str in reversed(call_matches):
             pattern_str = func_name + '("' + arg_str
@@ -707,8 +552,6 @@ def _try_insert_after_anchor(base, body, context_before,
             if result != base:
                 return result
 
-        # Identifier-only anchor: names a def/class/function, or a
-        # const/if pair.
         ident_matches = _PROSE_BACKTICK_IDENT_RE.findall(
             context_before or "")
         for ident in reversed(ident_matches):
@@ -767,7 +610,6 @@ def _try_insert_after_anchor(base, body, context_before,
                 if result != base:
                     return result
 
-        # Statement anchor: a backticked statement line.
         statement_matches = _BACKTICK_CONTENT_RE.findall(
             context_before or "")
         for raw in reversed(statement_matches):
@@ -820,7 +662,6 @@ def _try_insert_after_anchor(base, body, context_before,
             if result != base:
                 return result
 
-    # ---- Prior-insertion fallback: SCOPE-FIRST ORDERING (2026-10-28f) ----
     if prior_insertions:
         scoped_priors: list = []
         unscoped_priors: list = []
@@ -833,10 +674,6 @@ def _try_insert_after_anchor(base, body, context_before,
             else:
                 unscoped_priors.append(stripped)
 
-        # Pass 1: scoped candidates.  Deterministic order so repeated
-        # runs produce identical output.  Resolves the anchor via the
-        # recorded scope's body, then (if not found there) via its
-        # direct `self.X(...)` callees.
         for stripped in sorted(scoped_priors):
             scope = prior_scopes[stripped]
             idx = _anchor_within_scope(base, stripped, scope, spans=spans)
@@ -863,17 +700,6 @@ def _try_insert_after_anchor(base, body, context_before,
             if result != base:
                 return result
 
-        # Pass 2: unscoped candidates.  Only unique anchors are
-        # considered (`n == 1`); ambiguous ones are skipped (nothing
-        # tells us which occurrence to prefer).  Every candidate must
-        # pass BOTH safety gates:
-        #   · `_anchor_line_is_safe`: the line doesn't open more
-        #     brackets than it closes.
-        #   · `_anchor_is_in_expression_context`: for .py files, the
-        #     position isn't inside any unclosed `(`/`[`/`{`.
-        # The second gate is what prevents the args-dict *closer*
-        # line (`"help": "..."},`) from being a prior-insertion
-        # anchor.
         for stripped in sorted(unscoped_priors):
             if base.count(stripped) != 1:
                 continue

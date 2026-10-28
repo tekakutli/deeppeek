@@ -21,284 +21,50 @@ run overwrites the previous one.  In-memory inputs (`capture`
 without `-o`) do not trigger the save: there is nothing on disk to
 round-trip.  See `recover/last_conversation.py`.
 
-ROBUSTNESS: PER-PASS EXCEPTION BOUNDARIES
+CONVERSATION TOPIC INFERENCE (2026-11-05)
 =========================================
+After classification, before path resolution, the pipeline computes
+`topic_weights = infer_topic_weights(dump_text, blocks,
+existing_dirs)` — a `{relative_dir: weight}` dict derived from the
+whole dump's directory and file mentions.  Both `resolve_paths` and
+`pass4_attribute_orphans` accept it and use it as a bonus when
+breaking ambiguous-content-score ties (see `resolve._discriminate`
+and `attribute._pick_by_content`).
+
+Motivating case: the whole "inpaint-playground" conversation names
+that playground eight ways (inpaint_server.py, inpaint_prompt,
+context rectangle, …), but 3 of the patch blocks target ambiguous
+basenames (pg_state.py, pg_base.py, pg_panel_bindings.py) whose
+sibling files are only mentioned in `kritomatic_daemon/`.  Without
+topic inference, `dir_votes` has no entry for `playgrounds/inpaint`
+and the resolver falls back to the literal header, losing the
+pre-existing baseline.  With it, the tie is broken toward the
+correct directory.
+
+TOPIC INFERENCE IS O(N) IN TARGET-TREE SIZE, O(M) IN BLOCK COUNT.
+One `rglob` for `_existing_dirs_for`, one pass over blocks for
+unique-basename votes, one dict lookup per candidate in
+`_discriminate`.  No deep text scanning at resolve time.
+
+PER-PASS EXCEPTION BOUNDARIES
+=============================
 Every pass from 2.5 onward runs inside `_run_pass`, which catches
 exceptions, logs them with a traceback to stderr, records them in
-`run_errors`, and returns a safe default.  The consequence:
+`run_errors`, and returns a safe default.
 
-  · A crash in ANY pass does not abort the pipeline.
-  · `pass9_write` ALWAYS runs when `records` is non-empty.
-  · The manifest ALWAYS gets written, with the crashed pass named
-    in `run.errors` and `warnings.txt`.
-  · Files that were successfully recovered before the crash still
-    land on disk (or in `low_trust/`).
+Pass 1 (parsing) and pass 3 (grouping) are NOT wrapped — a crash
+there means the input is truly unusable and the right answer is to
+abort.
 
-`pass1_extract` (parsing) and `pass3_group` (grouping) are NOT
-wrapped — a crash there means the input is truly unusable, and the
-right answer is to abort with a clear error, not to write an empty
-manifest.  These two passes are also the simplest in the pipeline;
-their absence of exception handling is a deliberate trade-off, not
-an oversight.
+`pass9_write` is wrapped in its own try/except so a bug in the
+writer never produces a silent no-op.
 
-`pass9_write` itself is wrapped in a top-level try/except that
-catches a crash and prints a message, so a bug in the writer never
-produces a silent no-op.
-
-PRE-EXISTING BASELINE PRUNING (2026-10-28 fix)
-==============================================
-`--apply-to` mode loads a pre-existing baseline for every source file
-in the target tree.  After `pass2.5` (path resolution), the pipeline
-was pruning baselines whose `output_path` was not claimed by any
-*headed* conversation block, on the theory that untouched pre-existing
-files need not be processed.
-
-The prune ran **before** `pass4_attribute_orphans`, and `touched` was
-built only from `b.output_path` — which is populated exclusively for
-headed blocks.  A conversation whose code blocks are orphans (their
-`## Fix N — description (\`filename\`)`-style headers do not carry a
-`File: ` prefix, so `_parse_file_header` returns None and the blocks
-become orphans) ends up with `touched = {}`.  The prune then drops
-**every** pre-existing baseline, `records` becomes `{}`, `pass3` has
-nothing to group, and `pass4` sees `existing_paths = []` and marks
-every block `attributed_by = "no_candidates"`.  The whole pipeline
-then writes nothing, but `residual.md` reports success because
-`no_candidates` was in the residual's skip set.
-
-The fix is two-part:
-
-  1. Move the prune **after** `pass4_attribute_orphans`, so
-     `existing_paths` is populated from the unpruned `records`.
-     Extend `touched` to include `b.attributed_to` for every
-     attributed orphan.
-
-  2. Guard against empty `records` at the end (see `residual.py`'s
-     `_build_residual`) so a run that produces zero records reports
-     the unplaced blocks honestly.
-
-Record entries for pruned baselines are also filtered out, and
-`source_blocks` / `last_full_idx` / `chosen_full_idx` / `all_full_idxs`
-are cleaned of pruned block indices so downstream passes do not raise
-`KeyError` on stale references.  Block `idx` values keep their
-original assignment (gaps are cosmetic in `_debug.blocks`); this
-avoids a re-index cascade through every record's fields.
-
-CROSS-VALIDATE TRUST DEMOTION (FIX 2)
-=====================================
-Pass 7 (Python imports/exports) and pass 7.5 (JS imports/exports)
-both emit problems into `run.cross_validate.problems`.  Historically
-those findings were informational: they set the exit code and
-appeared in the manifest, but the affected records were still
-written at their original trust.  That is how a broken
-`pg_state.py` (declared `_rotateMask` but didn't export it, while
-`pg_masks.py` imported it) got written at HIGH trust and blanked
-the playground on load.
-
-Pass 7.7 (`pass7_7_repair_js_imports`) attempts a mechanical repair
-first: when the target declares the symbol but does not export it,
-it rewrites the declaration to add `export`.  If repair succeeds
-the problem is removed from the list and the target stays at its
-original trust.
-
-Pass 7.6 (`pass7_6_demote_on_missing_export`) is the fallback: it
-demotes both sides of an unrepairable finding so the target file
-isn't written broken.  Under default `--min-trust MEDIUM` neither
-is written; the target tree is preserved and `warnings.txt` tells
-the user exactly which `export` is missing.
-
-Pass 7.6b (NEW) does the same for Python exports.  The
-`comfyui_krita.py` failure in the wild: `handlers/comfyui.py`
-imports `build_krita_resources` from a target that was truncated
-to two functions; both records shipped at HIGH trust and the
-daemon crashed on reload.  Pass 7.6b demotes both sides so the
-target tree survives intact and the manifest names the missing
-symbol.
-
-Pass 7.8 (NEW) is the universal safety net.  Any `missing_export`
-or `missing_js_export` finding that survives the specific passes
-above still demotes both sides.  When cross-validate gains a new
-finding type in a future change, 7.8 is the pass that makes it a
-trust signal even if no specific handler was added.
-
-SHIELD (PASS 8.8, NEW)
-======================
-Even after dedup, cross-validate demotion, and reconcile, a bug in
-any of those layers could let a record through whose content is
-provably incomplete.  Pass 8.8 compares the recovered content
-against what is *actually on disk* in the target tree, and refuses
-to write a file that would delete substantive top-level
-declarations.  The `comfyui_krita.py` truncation is the motivating
-case — twenty of twenty-two top-level functions would have been
-deleted.  See `shield.py` for the full account.
-
-RE-VERIFY RECONCILED (PASS 8.7b, 2026-10-28b)
-=============================================
-The verify-reconcile-verify invariant:
-
-    every pass that can demote a record must be re-run after every
-    pass that can promote it, on the promoted content, before the
-    promotion is committed.
-
-Pass 8.4 (lint) and pass 8.5 (symbols) both used to demote.  Pass
-8.7 (reconcile) promotes.  Reconcile's own replay is lint-aware
-(see `reconcile.py`) so the specific `--output_rotation` case is
-caught inside 8.7.  But that fix relies on `_count_failures` being
-kept in sync with every demoting pass; adding a future demoting
-pass would require updating that function.  Pass 8.7b makes the
-invariant mechanical: `reverify.reverify_reconciled` re-runs every
-demoting pass on every promoted record.  A reconciled record that
-still fails a demoting check is demoted again; it does not ship.
-
-Post-2026-10-28 alignment: lint is now warn-only, so the only
-demoting pass re-run by reverify is `pass8_5` (symbols).  Lint is
-still called for warning parity so promoted records' warnings
-match a fresh run.
-
-VERIFY-APPLIED (PASS 8.7c, 2026-10-28)
-=====================================
-The manifest can claim a patch was `deterministic` while the final
-file's bytes for that patch are gone — superseded by a later patch,
-or reverted by a scoped replacement.  Pass 8.7c compares each
-applied patch's added lines against the final content and *warns*
-when they are missing.  It does not demote.  The motivating case
-(`comfyui.py` in the wild): patch 62's `--output_rotation` arg
-entry was superseded by patch 95's larger args-dict replacement, so
-its exact bytes were gone even though the feature declared in the
-final file is correct.  The warning tells the user which patches
-were superseded; the file is written.  See `verify_applied.py`.
-
-VERIFY-ALREADY-PRESENT (PASS 8.7d, 2026-11-01)
-=============================================
-The complement of 8.7c: verify that patches marked `already-present`
-are actually already-present.  When the dispatcher's
-`_is_already_applied` / `_patch_already_present` pre-checks fire on a
-token-equivalence match (rather than a genuine reprint), the patch
-gets marked `already-present` even though its actual bytes are not in
-base.  `write.preexisting_unmodified` then sees only no-op patches
-and skips the file.  The manifest reports `patches_applied: 0` (post
-2026-11-01 taxonomy) but the record had a substantive contribution
-that never landed, and the residual doesn't include it (because
-`already-present` is not a "did not reach placement" status — until
-8.7d flips it).
-
-The motivating case (`comfyui.py`, 2026-10-28 run): a false-positive
-already-present mark on the layer-recreation fix; the file was
-silently skipped.  Pass 8.7d verifies each `already-present` claim
-against `rec.content` at 95% line equivalence; false positives are
-flipped to `failed` and the record is demoted.  Reconcile (8.7) then
-sees a failed patch and either excludes it (leaving the rest of the
-record intact) or leaves the record LOW (target preserved, residual
-surfaces the block).  See `consistency.py`.
-
-ADDED-PARAMETER LINT (PASS 8.4b, 2026-10-28)
-============================================
-Companion to `verify-applied` at the function-signature level.  Any
-function that gained a parameter (via a patch) whose body never
-references the parameter is *reported* (warn-only).  The
-`_paste_result(output_rotation=...)` case in the 2026-10-28 run is
-the motivating example: the parameter is accepted and discarded, and
-the warning names the exact function and parameter.
-
-PROSE-PROMISE ADVISORY (PASS 8.9, NEW)
-======================================
-Pass 8.9 warns when a patch's prose promises call-site updates
-that its fence body doesn't include.
-
-Advisory only: emits a warning, never demotes.  Detecting "prose
-promised more than the fence delivered" reliably requires reading
-prose as instructions, and false positives would block legitimate
-runs.  The warning names the missing work; whether that blocks a
-merge is a human decision.
-
-WHAT DEMOTES TODAY
-==================
-Only `pass8_5` (symbol resolution: unresolved calls and signature
-mismatches) and `pass8_8` (shield: refusing to truncate the target
-tree's substantive declarations) can still demote a record after
-the 2026-10-28 alignment.  Pass 8.7d (2026-11-01) also demotes when
-an `already-present` claim is contradicted by the file content.
-Every other pass that reports something about the conversation's
-completeness (lint, added-param, verify-applied, prose-promise) is
-warn-only.
-
-The contract is: deeppeek applies patches.  If the conversation
-is incomplete, warn — do not refuse to write.
-
-RESIDUAL EMISSION
-=================
-After pass 9 writes its output and returns cleanly, a residual
-markdown file is emitted alongside the manifest: a smaller
-`conversation.md` containing only the blocks that did NOT reach a
-successful placement.  The residual is intended as the input to a
-subsequent `deeppeek recover` run once the user has edited the
-failed blocks (or the target).  It never affects the primary run's
-output — it is purely additive.  See `residual.py`.
-
-RESIDUAL FILE LIST ON STDOUT
-============================
-At the very end of `run()`, the list of files the residual
-references — the SAME list `deeppeek prompt reprint` consumes — is
-printed to stdout, delimited by:
-
-    === files not fully recovered (see residual.md) ===
-    <path>
-    <path>
-    === N file(s) not fully recovered ===
-
-The two `===` header lines exist so the machine-readable block
-is trivially distinguishable from the rest of the run's
-chatter, which is on stderr anyway.  A script that wants only
-the paths can `sed -n '/^=== files for deeppeek/,/^=== [0-9]* file/p'`
-or, more simply, read stdout between the two markers.
-
-Two further deliberate details:
-
-  · `unique_residual_paths` is imported from `residual.py` (not
-    re-implemented) so the STDOUT list and `deeppeek prompt
-    reprint`'s file list are guaranteed to match — one parser,
-    one answer.
-
-  · When `--emit-residual -` is set, `emit_residual` writes the
-    residual body itself to stdout; the file list (and its
-    header/footer) is suppressed in that case so the two
-    outputs don't concatenate and break both the residual and
-    the list.
-
-CRASH REPORTING
-===============
-A crashed pass reports:
-
-    [!] pass 2.5 (resolve) raised: <one-line error>
-    <traceback>
-    [!] continuing with a safe default; downstream passes will see
-        the pre-pass state
-
-The safe defaults per pass:
-
-    pass 2.5   → [] (no resolutions)
-    pass 4     → (no-op; orphans stay unattributed)
-    pass 5     → (no-op; records keep whatever state pass 3 gave them)
-    pass 6     → records keep base content (no patches applied)
-    pass 7     → {"exports": {}, "imports": {}, "problems": []}
-    pass 7.5   → [] (no JS problems)
-    pass 7.6   → 0 (no demotions)
-    pass 7.6b  → 0 (no demotions)
-    pass 7.7   → (original problem list unchanged)
-    pass 7.8   → 0 (no demotions)
-    pass 8     → (no-op; no per-file verification)
-    pass 8.5   → (no-op; no symbol demotions)
-    pass 8.4   → 0 (no lint warnings)
-    pass 8.4b  → 0 (no added-param warnings)
-    pass 8.9   → 0 (no prose-promise advisories)
-    pass 8.7   → 0 (no reconciliations)
-    pass 8.7b  → 0 (no re-demotions)
-    pass 8.7c  → 0 (no verify-applied warnings)
-    pass 8.7d  → 0 (no already-present verifications)
-    pass 8.8   → 0 (no shield demotions)
-    pass 9     → caught by the writer's own try/except
-
-These defaults are conservative: a crashed pass cannot accidentally
-make the result WORSE than "do nothing for that pass".
+See the pre-fix module docstring for the rest of the pass
+descriptions, ROBUSTNESS, PRE-EXISTING BASELINE PRUNING, CROSS-
+VALIDATE TRUST DEMOTION, SHIELD, RE-VERIFY, VERIFY-APPLIED,
+VERIFY-ALREADY-PRESENT, ADDED-PARAMETER LINT, PROSE-PROMISE,
+WHAT DEMOTES TODAY, RESIDUAL EMISSION, RESIDUAL FILE LIST ON
+STDOUT, and CRASH REPORTING sections.
 """
 import hashlib
 import shutil
@@ -333,6 +99,7 @@ from .reconcile import pass8_7_reconcile
 from .reverify import reverify_reconciled
 from .shield import pass8_8_shield_preexisting
 from .write import pass9_write
+from .topic import infer_topic_weights
 
 
 @dataclass
@@ -353,15 +120,7 @@ class RecoverConfig:
     verbose: bool = False
     trace: bool = False
     llm_verbose: bool = False
-    # Residual output.  None → reports_dir/residual.md (the default
-    # location, next to manifest.json and warnings.txt).  Path("-") →
-    # stdout, for shell pipelines.  Any other path → that file.
     residual_path: Optional[Path] = None
-    # Pass 8.8 shield: refuse to overwrite a target-tree file with
-    # recovered content that would delete substantive top-level
-    # declarations.  On by default; escape hatch is `--min-trust LOW`
-    # (which lets LOW records write), or explicit
-    # shield_preexisting=False for programmatic callers.
     shield_preexisting: bool = True
 
 
@@ -403,8 +162,7 @@ def _run_pass_no_return(pass_name: str,
                         errors: list,
                         *args,
                         **kwargs) -> None:
-    """Same as `_run_pass` but for no-op passes (mutate in place).
-    Records the crash and returns None; no default needed."""
+    """Same as `_run_pass` but for no-op passes (mutate in place)."""
     try:
         pass_fn(*args, **kwargs)
     except Exception as e:
@@ -471,6 +229,33 @@ def _wipe_deeppeek_dir(aux_base: Path) -> None:
             pass
 
 
+# NEW (2026-11-05): topic-inference helper.
+def _existing_dirs_for(apply_to: Optional[Path]) -> set:
+    """Return the set of relative directory paths under `apply_to`.
+
+    Used by `topic.infer_topic_weights` to filter its output to
+    directories that actually exist in the target tree.  Returns
+    the empty set when `apply_to` is None or missing.
+    """
+    if apply_to is None or not apply_to.is_dir():
+        return set()
+    out: set = set()
+    for p in apply_to.rglob("*"):
+        if not p.is_dir():
+            continue
+        try:
+            rel = p.relative_to(apply_to)
+        except ValueError:
+            continue
+        parts = rel.parts
+        if any(part.startswith(".") for part in parts):
+            continue
+        if any(part in _PREEXISTING_EXCLUDE_DIRS for part in parts):
+            continue
+        out.add("/".join(parts))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Pre-existing baseline loader
 # ---------------------------------------------------------------------------
@@ -483,14 +268,6 @@ _PREEXISTING_EXCLUDE_DIRS = {
 }
 _PREEXISTING_MAX_FILE_SIZE = 1_048_576  # 1 MiB
 
-# Documentation extensions are NOT loaded as pre-existing baselines.
-# Rationale: baseline loading exists to give patches something to
-# apply *against*; a `.md` file is documentation, not code, and
-# loading a 500 KB `project_dump_*.md` as a baseline wastes memory,
-# inflates the manifest, and — as observed in the 2026-10-28 run —
-# causes stray blockquoted fragments from the dump to be attributed
-# to the dump file itself.  Recover a `.md` explicitly if a workflow
-# requires patching one; do not silently load every `.md` in the tree.
 _PREEXISTING_EXCLUDE_EXTENSIONS = frozenset({".md", ".rst", ".txt"})
 
 
@@ -514,8 +291,6 @@ def _load_preexisting_blocks(apply_to: Path) -> list[Block]:
             continue
         if p.suffix.lower() not in SOURCE_EXTENSIONS:
             continue
-        # NEW (2026-11-01): skip documentation files.  See
-        # `_PREEXISTING_EXCLUDE_EXTENSIONS` above.
         if p.suffix.lower() in _PREEXISTING_EXCLUDE_EXTENSIONS:
             continue
         try:
@@ -658,16 +433,42 @@ def run(cfg: RecoverConfig) -> int:
           f"other: {n_other}  recovered-meta: {n_meta}"
           + (f"  preexisting: {n_pre_full}" if n_pre_full else ""))
 
+    # NEW (2026-11-05): topic inference.  Computed once, before path
+    # resolution, so both `resolve_paths` and `pass4_attribute_orphans`
+    # see the same weights.  In standard (--out) mode there is no
+    # target tree to filter against, and `_existing_dirs_for` returns
+    # the empty set — `infer_topic_weights` then returns `{}` and the
+    # weighting is a no-op.
+    topic_weights: dict = {}
+    if cfg.apply_to is not None:
+        print("[pass 2.1] inferring conversation topic weights...")
+        _existing_dirs = _existing_dirs_for(cfg.apply_to)
+        topic_weights = _run_pass(
+            "2.1 (topic)", infer_topic_weights, {},
+            run_errors, dump_text, blocks, _existing_dirs,
+        ) or {}
+        if topic_weights:
+            _top = sorted(topic_weights.items(),
+                          key=lambda kv: -kv[1])[:5]
+            print(f"  {len(topic_weights)} candidate dir(s); top: "
+                  + ", ".join(f"{d} ({w:.1f})" for d, w in _top))
+        else:
+            print("  no topic signal")
+
     print("[pass 2.5] resolving output paths...")
     resolutions = _run_pass(
         "2.5 (resolve)", resolve_paths, [],
         run_errors, blocks, cfg.apply_to, cfg.trace,
+        topic_weights=topic_weights,
     )
     n_resolved = sum(1 for r in resolutions
                      if not r["reason"].startswith("unresolved"))
     n_unresolved = sum(1 for r in resolutions
                        if r["reason"].startswith("unresolved"))
-    print(f"  {n_resolved} resolved, {n_unresolved} unresolved")
+    n_topic_aided = sum(1 for r in resolutions
+                        if "topic-aided" in r.get("reason", ""))
+    print(f"  {n_resolved} resolved, {n_unresolved} unresolved"
+          + (f" ({n_topic_aided} topic-aided)" if n_topic_aided else ""))
 
     print("[pass 3] grouping by file...")
     records = pass3_group(blocks, deleted_files)
@@ -682,17 +483,13 @@ def run(cfg: RecoverConfig) -> int:
         _run_pass_no_return(
             "4 (attribute)", pass4_attribute_orphans, run_errors,
             blocks, blocks_by_idx_all, records, cfg.trace,
+            topic_weights=topic_weights,
         )
         attributed = sum(1 for b in blocks if b.is_orphan and b.attributed_to)
         print(f"  {attributed}/{n_orphans} orphans attributed")
 
-    # MOVED (2026-10-28 fix, was before pass 3): prune untouched
-    # pre-existing baselines now that orphan attribution has run and
-    # can contribute to `touched`.  Pruning before pass 4 left
-    # `records` empty of pre-existing files whenever no headed block
-    # resolved to one — which is exactly the failure mode for
-    # conversations using natural-language headers like
-    # `## Fix 1 — mask encoding (`utils/comfyui_krita.py`)`.
+    # Prune untouched pre-existing baselines now that orphan
+    # attribution has run and can contribute to `touched`.
     if cfg.apply_to is not None:
         touched = {b.output_path for b in blocks
                    if b.classified_by != "preexisting" and b.output_path}
@@ -706,11 +503,6 @@ def run(cfg: RecoverConfig) -> int:
             or b.output_path in touched
         }
         blocks = [b for b in blocks if b.idx in kept_indices]
-        # Filter out records whose pre-existing baseline was pruned;
-        # for records that survive, drop any source_block references
-        # to pruned blocks (they cannot be resolved and would raise
-        # KeyError downstream — pass5_deduplicate does
-        # `blocks_by_idx[i].kind` which fails on missing i).
         for path in list(records.keys()):
             rec = records[path]
             if rec.preexisting_base and path not in touched:
@@ -811,7 +603,6 @@ def run(cfg: RecoverConfig) -> int:
     else:
         print("  clean")
 
-    # ---- pass 7.7 (wrapped) — repair JS export findings ----
     if js_problems:
         _repaired, _remaining = _run_pass(
             "7.7 (repair)", pass7_7_repair_js_imports,
@@ -835,7 +626,6 @@ def run(cfg: RecoverConfig) -> int:
             print(f"  {len(_repaired)} JS problem(s) auto-repaired",
                   file=sys.stderr)
 
-    # ---- pass 7.6 (wrapped) — demote on missing JS export ----
     if js_problems:
         n_export_demoted = _run_pass(
             "7.6 (missing-export)",
@@ -846,7 +636,6 @@ def run(cfg: RecoverConfig) -> int:
             print(f"  {n_export_demoted} record(s) demoted to LOW "
                   f"for missing JS export(s)", file=sys.stderr)
 
-    # ---- pass 7.6b (wrapped) — demote on missing Python export ----
     if cross_validate.get("problems"):
         n_py_export_demoted = _run_pass(
             "7.6b (missing-python-export)",
@@ -857,7 +646,6 @@ def run(cfg: RecoverConfig) -> int:
             print(f"  {n_py_export_demoted} record(s) demoted to LOW "
                   f"for missing Python export(s)", file=sys.stderr)
 
-    # ---- pass 7.8 (wrapped) — universal finding demotion ----
     if cross_validate.get("problems"):
         n_universal_demoted = _run_pass(
             "7.8 (universal-demote)",
@@ -892,7 +680,6 @@ def run(cfg: RecoverConfig) -> int:
     else:
         print("  all declared args are read")
 
-    # ---- pass 8.4b (NEW) — added-parameter forwarding lint ----
     print("[pass 8.4b] linting added parameters for dead forwarding...")
     from .lint import pass8_4b_check_added_unused_params
     n_param_warned = _run_pass(
@@ -906,7 +693,6 @@ def run(cfg: RecoverConfig) -> int:
     else:
         print("  no added-parameter gaps")
 
-    # ---- pass 8.9 (NEW) — prose-promise advisory ----
     print("[pass 8.9] checking prose-promise coverage...")
     from .prose_promise import pass8_9_check_prose_promises
     n_promise_warned = _run_pass(
@@ -919,20 +705,6 @@ def run(cfg: RecoverConfig) -> int:
     else:
         print("  no promise gaps detected")
 
-    # ---- pass 8.7d (NEW 2026-11-01) — verify already-present ----
-    #
-    # Runs BEFORE pass 8.7 so reconcile sees the corrected statuses.
-    # A false-positive `already-present` flipped to `failed` here
-    # either:
-    #   · gets excluded by 8.7 (the rest of the record applies
-    #     cleanly), or
-    #   · stays LOW and the target file is preserved (residual
-    #     surfaces the block).
-    #
-    # Either outcome is strictly better than the pre-2026-11-01
-    # behaviour, where the false positive was treated as "no change"
-    # by write.preexisting_unmodified and the file was skipped while
-    # the manifest reported `patches_applied: 1, written: false`.
     print("[pass 8.7d] verifying already-present patches...")
     from .consistency import pass8_7d_verify_already_present
     n_already_unverified = _run_pass(
@@ -957,7 +729,6 @@ def run(cfg: RecoverConfig) -> int:
               f"(excluded misattributed/unplaceable items)",
               file=sys.stderr)
 
-    # ---- pass 8.7b (NEW) — re-verify reconciled records ----
     print("[pass 8.7b] re-verifying reconciled records...")
     n_reverified = _run_pass(
         "8.7b (re-verify)", reverify_reconciled, 0,
@@ -969,7 +740,6 @@ def run(cfg: RecoverConfig) -> int:
     else:
         print("  no re-demotions")
 
-    # ---- pass 8.7c (NEW) — verify applied patches landed ----
     print("[pass 8.7c] verifying applied patches landed...")
     from .verify_applied import pass8_7c_verify_applied_patches
     n_verify_warned = _run_pass(
@@ -982,7 +752,6 @@ def run(cfg: RecoverConfig) -> int:
     else:
         print("  all applied patches present in final content")
 
-    # ---- pass 8.8 (wrapped) — shield pre-existing overwrites ----
     if cfg.apply_to is not None and cfg.shield_preexisting:
         print("[pass 8.8] shielding target-tree overwrites...")
         n_shielded = _run_pass(
@@ -1039,7 +808,6 @@ def run(cfg: RecoverConfig) -> int:
                   f"{cfg.out_dir}/", file=sys.stderr)
         return 1
 
-    # ---- residual emission + file-list printout ----
     _residual_paths_for_stdout: Optional[list] = None
     try:
         from .residual import emit_residual, unique_residual_paths

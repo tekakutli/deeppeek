@@ -274,10 +274,45 @@ def _diagnose_patch_failure_inner(patch, content, base):
     if _looks_like_diff_body(stripped):
         return ("looks like a diff but could not be applied to base "
                 "(context mismatch or already applied elsewhere)")
+
+    # Object-literal diagnostic (refined 2026-11-01b): distinguish
+    # "the variable was never declared" from "the declaration exists
+    # but the body could not complete the splice".  Motivating case:
+    # `inpaint_server.py`'s `captured = {...}` + `def on_progress(...)`
+    # body was reported as "no matching base declaration" even though
+    # `captured` IS declared — the real issue was trailing content
+    # after the object literal (fixed by the dedent + multi-statement
+    # apply; the diagnostic is now accurate for future cases).
     if _OBJECT_LITERAL_ASSIGNMENT_RE.match(stripped):
-        return ("looks like an object-literal assignment splice but "
-                "no matching base declaration was found for the "
-                "variable")
+        m = _OBJECT_LITERAL_ASSIGNMENT_RE.match(stripped)
+        id_m = re.search(
+            r'([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*=\s*$',
+            m.group("prefix").rstrip(),
+        )
+        if id_m:
+            varname = id_m.group(1)
+            decl_re = re.compile(
+                r'^[ \t]*(?:(?:export\s+)?(?:const|let|var)\s+)?'
+                + re.escape(varname)
+                + r'\s*[=:]\s*\{',
+                re.MULTILINE,
+            )
+            if not decl_re.search(content):
+                return (
+                    f"object-literal splice: no declaration of "
+                    f"{varname!r} exists in base; the variable this "
+                    f"block assigns to was never declared."
+                )
+            return (
+                f"object-literal splice for {varname!r}: the base "
+                f"declaration exists, but the splice could not "
+                f"complete — the body likely has trailing content "
+                f"after the object literal (statements after the "
+                f"closing `}}`), or the object's internal shape "
+                f"could not be matched."
+            )
+        return ("object-literal assignment shape, but could not "
+                "extract the variable name from the prefix")
 
     count_full = content.count(stripped)
     if count_full > 1:
@@ -301,9 +336,39 @@ def _diagnose_patch_failure_inner(patch, content, base):
         r"^(?:export\s+)?(?:async\s+)?(?:function|def|class)\s+(\w+)",
         stripped)
     if m_def:
-        return (f"body looks like a scope-replace for "
-                f"{m_def.group(1)!r}, but no matching scope was found "
-                f"in base")
+        name = m_def.group(1)
+        # Check both top-level and indented declarations in base to
+        # give a truthful diagnostic.  Motivating case (comfyui.py
+        # 2026-10-28): `_try_indented_def_replace` bailed on a
+        # structural check and reported "no matching scope", which was
+        # misleading — the indented scope WAS present.
+        top_level_re = re.compile(
+            rf"^(?:async\s+)?(?:def|class)\s+{re.escape(name)}\b",
+            re.MULTILINE,
+        )
+        indented_re = re.compile(
+            rf"^([ \t]+)(?:async\s+)?(?:def|class)\s+{re.escape(name)}\b",
+            re.MULTILINE,
+        )
+        if top_level_re.search(content):
+            return (
+                f"scope-replace for {name!r}: a top-level "
+                f"declaration IS present in base, but the scope "
+                f"heuristic refused to replace it (the body likely "
+                f"fails the structural gate — see structural.py — or "
+                f"has content the splice path could not place)."
+            )
+        if indented_re.search(content):
+            return (
+                f"scope-replace for {name!r}: an indented "
+                f"declaration IS present in base, but the "
+                f"indented-def heuristic refused to replace it "
+                f"(likely a structural gate failure — see structural.py)."
+            )
+        return (
+            f"body looks like a scope-replace for {name!r}, but "
+            f"no matching scope was found in base"
+        )
 
     if 2 <= len(body_lines) <= 30:
         last = body_lines[-1].strip()

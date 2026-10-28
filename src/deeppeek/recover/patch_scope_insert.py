@@ -39,32 +39,41 @@ class/function declaration whose span contains the anchor.  This
 covers the comfyui.py `try/except` fragment, whose prose pointed at
 a position but not a container.
 
-The derived scope is only trusted when the anchor occurs at least
-once (otherwise there's nothing to derive from); a derived scope
-that can't be located falls through to the same fail-closed return
-the named-scope path uses.
+STRUCTURAL VALIDATION (2026-11-02)
+==================================
+After building the candidate result, `_verify_scope_insertion`
+parses both `base` and `result` and verifies that any declaration
+in the inserted body landed as a DIRECT member of the target scope.
+
+Motivating failure (test_40, comfyui.py method-insert): the
+inserter once produced a valid-Python but semantically wrong result
+— the new method nested inside an existing sibling method at
+class-body indent.  It parses cleanly (nested def with its own
+body) but is dead code.  The AST check catches it: a `def new_cmd`
+that isn't a direct child of the class is rejected.
+
+Fail-closed: if the AST check fails, `_try_insert_into_named_scope`
+returns None and the pipeline falls through to other heuristics
+(or fail-closed at the record level).
 
 SCOPE PROSE EXTENSION (2026-10-28e)
 ===================================
-`_extract_scope_name_from_prose` now also matches "find the `X`
+`_extract_scope_name_from_prose` also matches "find the `X`
 command/method/function/..." and "the `X` command/method/function/..."
 shapes.  Motivating case: `kritomatic_daemon/handlers/comfyui.py`
 prose reads "In `handlers/comfyui.py`, find the `comfy_generate`
-command decorator. Add:" — the current patterns (in/to/for/the-X-
-function) didn't catch any of these.  With the extension, the
-extractor returns `comfy_generate`, which
+command decorator. Add:" — with the extension, the extractor
+returns `comfy_generate`, which
 `patch_anchor_insert._anchor_within_callee` then resolves to
-`_comfy_generate_impl` (the callee that actually contains the
-anchor).
+`_comfy_generate_impl`.
 
-HIGH CHURN: this is the newest heuristic (FIX 8).  It picks up new
-prose patterns, new container shapes, and new anchor idioms as they
-surface in the wild.  Isolating it means iterating on it does not
-require reading the ~800 lines of anchor / replace / structural code
-in the sibling modules.
+HIGH CHURN: this is the newest heuristic (FIX 8).
 """
 
+import ast
 import re
+import sys
+import textwrap
 
 from .patch_text import (
     _find_matching_brace,
@@ -73,22 +82,13 @@ from .patch_text import (
 
 
 _SCOPE_NAME_FROM_PROSE_RES = (
-    # "in `Name`", "inside `Name`", "within `Name`"
     re.compile(r'\b(?:in|inside|within)\s+`([A-Za-z_][\w$]*)`',
                re.IGNORECASE),
-    # "to `Name`", "add … to `Name`"
     re.compile(r'\bto\s+`([A-Za-z_][\w$]*)`', re.IGNORECASE),
-    # "for `Name`"
     re.compile(r'\bfor\s+`([A-Za-z_][\w$]*)`', re.IGNORECASE),
-    # "the `Name` function/class/method/..." (extended below)
     re.compile(r'\bthe\s+`([A-Za-z_][\w$]*)`\s+'
                r'(?:function|class|method|block|section)\b',
                re.IGNORECASE),
-    # NEW (2026-10-28e): "find the `Name` command/method/function/..."
-    # and bare "the `Name` command/method/function/...".  Covers the
-    # comfyui.py prose shape ("find the `comfy_generate` command
-    # decorator").  Kept after the more specific patterns so they
-    # take precedence.
     re.compile(r'\bfind\s+the\s+`([A-Za-z_][\w$]*)`\s+'
                r'(?:command|method|function|class|handler|endpoint|'
                r'decorator|implementation)\b',
@@ -139,20 +139,6 @@ def _extract_after_anchor(prose):
 
 
 def _find_enclosing_scope_name(base: str, anchor: str) -> "str | None":
-    """Return the innermost class/function name containing `anchor`'s
-    last occurrence in `base`, or None.
-
-    "Last occurrence" — not first — because docstring mentions of the
-    anchor appear near the top of the file, while the code that
-    actually uses it is much lower.  Taking the last occurrence lands
-    on the code, not the docstring.
-
-    "Innermost" — not outermost — because a class method inside a
-    class is a more useful container for an inserted statement than
-    the class itself.  Walk top-level declarations top-down and keep
-    the last one whose start precedes the anchor; that gives the
-    innermost enclosing class/function.
-    """
     if not base or not anchor:
         return None
 
@@ -179,12 +165,8 @@ def _find_enclosing_scope_name(base: str, anchor: str) -> "str | None":
     for m in decl_re.finditer(base):
         if m.start() >= target_pos:
             break
-        # If this declaration's body extends past target_pos, it's a
-        # candidate container.
         body_open = base.find("{", m.end())
         if body_open == -1:
-            # Python `def`: body extends to the next line at-or-below
-            # this indent.  Use the enclosing-decl heuristic directly.
             if _python_decl_contains(base, m.start(), m.group(1),
                                      target_pos):
                 innermost = m.group(2)
@@ -195,8 +177,6 @@ def _find_enclosing_scope_name(base: str, anchor: str) -> "str | None":
             if body_close != -1 and m.start() <= target_pos < body_close:
                 innermost = m.group(2)
                 continue
-            # Python `def foo():` may still have a `:` before any `{`;
-            # check the Python case as a fallback.
             if _python_decl_contains(base, m.start(), m.group(1),
                                      target_pos):
                 innermost = m.group(2)
@@ -205,13 +185,6 @@ def _find_enclosing_scope_name(base: str, anchor: str) -> "str | None":
 
 def _python_decl_contains(base: str, decl_start: int, decl_indent: str,
                           target_pos: int) -> bool:
-    """True iff a Python-style def/class at `decl_start` with indent
-    `decl_indent` has a body extending past `target_pos`.
-
-    The declaration's body ends at the next non-blank line whose indent
-    is <= `decl_indent`.  A target within that range is inside the
-    declaration.
-    """
     if target_pos <= decl_start:
         return False
     end_of_line = base.find("\n", decl_start)
@@ -227,7 +200,6 @@ def _python_decl_contains(base: str, decl_start: int, decl_indent: str,
         if line.strip():
             line_indent_len = len(line) - len(line.lstrip())
             if line_indent_len <= decl_indent_len:
-                # Declaration body ends before target_pos?
                 return target_pos < scan
         if scan > target_pos:
             return True
@@ -236,36 +208,24 @@ def _python_decl_contains(base: str, decl_start: int, decl_indent: str,
 
 
 def _find_scope_body_range(base, scope_name):
-    """Return (scope_start, scope_end, body_indent_str) for a named
-    class or function, or None.
-
-    `scope_end` is the character index just AFTER the scope's closing
-    brace (JS) or at the first line at-or-below the declaration's
-    indent (Python).  `body_indent_str` is the leading whitespace of
-    the body's first content line.
-    """
     esc = re.escape(scope_name)
 
-    # ---- Python class ----
     m = re.search(r'(?m)^([ \t]*)class\s+' + esc + r'\b', base)
     if m:
         return _python_scope_range(base, m, m.group(1))
 
-    # ---- Python def / async def ----
     m = re.search(
         r'(?m)^([ \t]*)(?:async\s+)?def\s+' + esc + r'\s*\(',
         base)
     if m:
         return _python_scope_range(base, m, m.group(1))
 
-    # ---- JS class ----
     m = re.search(
         r'(?m)^([ \t]*)(?:export\s+)?(?:async\s+)?class\s+'
         + esc + r'\b', base)
     if m:
         return _js_scope_range(base, m)
 
-    # ---- JS function ----
     m = re.search(
         r'(?m)^([ \t]*)(?:export\s+)?(?:async\s+)?function\s+'
         + esc + r'\s*\(', base)
@@ -322,17 +282,10 @@ def _js_scope_range(base, decl_match):
 
 
 def _find_after_anchor_end(base, anchor, scope_start, scope_end):
-    """Find where to insert AFTER the anchor's enclosing block, within
-    the scope.  Returns char index or None.
-    """
     if not anchor:
         return None
     scope_text = base[scope_start:scope_end]
 
-    # Locate the anchor within the scope.  Prefer `anchor(` call form
-    # (the "existing payload reads" case reads as a noun — the code
-    # reality is `payload.get(` / `payload[` — but `payload` alone is
-    # also fine; rfind finds the last).
     positions = []
     ident = anchor.strip()
     for pat in (
@@ -359,8 +312,6 @@ def _find_after_anchor_end(base, anchor, scope_start, scope_end):
         return None
     line_indent = len(line_text) - len(line_text.lstrip())
 
-    # Scan forward for the end of the enclosing block.  `except:`,
-    # `finally:`, `else:` continue a try block — skip past them.
     continuation_re = re.compile(r'^(?:except|finally|else|elif)\b')
     scan = line_end + 1
     while scan < len(scope_text):
@@ -380,6 +331,73 @@ def _find_after_anchor_end(base, anchor, scope_start, scope_end):
     return scope_end
 
 
+def _verify_scope_insertion(base: str, result: str,
+                              scope_name: str,
+                              inserted_body: str,
+                              path: str = "") -> bool:
+    """Return True iff `result` correctly placed the inserted body
+    into `scope_name`'s body.
+
+    For `.py` destinations only.  Returns True for non-`.py` (no
+    check).  Fails closed on parse errors.
+
+    Conditions:
+      1. Both `base` and `result` parse as Python.
+      2. `scope_name` exists in both ASTs (its body may have changed).
+      3. Any FunctionDef/ClassDef in `inserted_body` appears as a
+         DIRECT child of `scope_name` in `result`.
+
+    Motivating failure (test_40, `comfyui.py` method-insert): a
+    `@command`-decorated method inserted at the wrong indent lands
+    nested inside a sibling method.  Valid Python, dead code.  The
+    direct-child check catches this: `def new_cmd` nested inside
+    `def existing_cmd` is not a direct child of the class.
+    """
+    if not path.endswith(".py"):
+        return True
+
+    try:
+        base_tree = ast.parse(base)
+        result_tree = ast.parse(result)
+    except SyntaxError:
+        return False
+
+    def _find_scope(tree, name):
+        for node in ast.walk(tree):
+            if isinstance(
+                    node,
+                    (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name == name:
+                    return node
+        return None
+
+    result_scope = _find_scope(result_tree, scope_name)
+    if result_scope is None:
+        return False
+
+    try:
+        body_tree = ast.parse(textwrap.dedent(inserted_body))
+    except SyntaxError:
+        return False
+
+    new_decls = {
+        n.name for n in body_tree.body
+        if isinstance(
+            n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    if not new_decls:
+        # Non-decl insertion (e.g., try/except).  `ast.parse` already
+        # passed; no direct-membership check applies.
+        return True
+
+    direct_member_names = {
+        n.name for n in result_scope.body
+        if isinstance(
+            n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    return new_decls.issubset(direct_member_names)
+
+
 def _try_insert_into_named_scope(base, body, context_before, path=""):
     """Insert a scope-shaped body (nested statement or decorated method)
     into a named class/function from the prose.
@@ -389,10 +407,10 @@ def _try_insert_into_named_scope(base, body, context_before, path=""):
       · body does NOT start with a top-level declaration keyword;
       · prose names the target scope with a structural pattern, OR
         the prose has an anchor whose enclosing scope can be derived;
-      · the scope exists in base.
-
-    Never crashes the dispatcher: any raise inside scope detection is
-    caught by `_try_deterministic_patch`'s outer wrapper.
+      · the scope exists in base;
+      · for `.py` destinations, the AST check
+        (`_verify_scope_insertion`) confirms the inserted body's
+        declarations are direct children of the target scope.
     """
     if not body or not body.strip():
         return None
@@ -404,31 +422,21 @@ def _try_insert_into_named_scope(base, body, context_before, path=""):
         return None
     first_indent = len(first_content) - len(first_content.lstrip())
     if first_indent < 2:
-        return None  # top-level, not scope-shaped
+        return None
 
     for ln in body_lines:
         if not ln.strip():
             continue
         ln_indent = len(ln) - len(ln.lstrip())
         if ln_indent < first_indent:
-            return None  # body has a column-0 line: not scope-shaped
+            return None
 
     first_stripped = first_content.lstrip()
     if _SCOPE_DECL_HEAD_RE.match(first_stripped):
-        return None  # carries its own declaration → scope-replace territory
-    if not _STMT_KEYWORD_HEAD_RE.match(first_stripped) \
-            and not first_stripped.startswith("@"):
-        # Not a statement keyword, not a decorator — could be a
-        # method continuation?  Let it through only if the prose
-        # names a scope; the guard below decides.  But we want to
-        # avoid firing on arbitrary indented prose.
-        pass
+        return None
 
     scope_name = _extract_scope_name_from_prose(context_before)
     if not scope_name:
-        # Anchor-derived scope: the prose names a *position* but not
-        # a container.  Find the container by locating the anchor in
-        # base and walking up to its enclosing class/function.
         anchor = _extract_after_anchor(context_before)
         if anchor:
             scope_name = _find_enclosing_scope_name(base, anchor)
@@ -450,14 +458,34 @@ def _try_insert_into_named_scope(base, body, context_before, path=""):
         insert_pos = scope_end
 
     reindented = _reindent_body(body_indent, body_stripped)
+
+    # Verify the reindent produced the expected first-line indent.
+    # `_reindent_body` guarantees this, but the check documents the
+    # invariant and would catch a future regression in `_reindent_body`
+    # before the bug propagates.
+    if reindented:
+        _first_reindented = reindented.split("\n")[0]
+        _actual_indent = _first_reindented[
+            :len(_first_reindented) - len(_first_reindented.lstrip())
+        ]
+        if _actual_indent != body_indent:
+            return None
+
     prefix = base[:insert_pos]
     suffix = base[insert_pos:]
     if prefix and not prefix.endswith("\n"):
         prefix += "\n"
-    # `reindented + "\n"` already provides a trailing newline; adding
-    # a separator on top produced a spurious blank line before the
-    # following content.  Suffix either starts with `\n` (a blank
-    # line the caller meant to preserve) or with content (joins
-    # directly after the trailing newline).
     result = prefix + reindented + "\n" + suffix
-    return result if result != base else None
+
+    if result == base:
+        return None
+
+    if not _verify_scope_insertion(
+            base, result, scope_name, reindented, path):
+        print(f"  [named-scope] {path}: insertion into "
+              f"{scope_name!r} rejected by AST structural check "
+              f"(member not a direct child of the scope)",
+              file=sys.stderr)
+        return None
+
+    return result

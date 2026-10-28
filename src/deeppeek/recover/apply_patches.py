@@ -6,96 +6,35 @@ This module is the *orchestrator*: it owns `pass6_apply_patches`
 per-record insertion filter.  The actual heuristics live in their
 own modules.
 
-See the module docstring in the pre-fix version for the split
-rationale, broader-context retry, and the blockquoted structural
-check.  This version additionally:
+REPLACE-INTENT DETECTION (2026-11-05)
+=====================================
+The duplicate-line filter (`_filter_body_by_blocks`) drops body
+lines that already appear in the base, on the theory that they are
+context, not content.  That is correct when the patch is *inserting*
+new content.  It is wrong when the patch is a *modification* of a
+base block: the filter strips the anchor lines (the identical
+prefix), leaving a body that starts with the new content, which the
+dispatcher then treats as a fresh insertion and appends after a
+plausible anchor.
 
-  · Preserves the pre-existing file's preamble (leading docstring /
-    comment block) when a FULL block replaces a pre-existing file and
-    the block omits it (pg_state.py failure — block 94 discarded the
-    module docstring).
+Motivating failure (2026-10-29 pg_panel_scrubs.py run): the
+rotation-wiring patch's first two lines were identical to base, so
+they were filtered out.  The residue began with `const
+rotationInputEl`, which the AST anchor heuristic placed after the
+existing `pgkitRegisterField("status.running", …)` call — leaving
+the old `if (rotationEl) { … }` block, the old
+`pgkitRegisterField("view.rotation", …)`, and the (now unused)
+`_syncRotationWidget` in the file.  Duplicate registrations,
+duplicate event listeners, dead code.
 
-  · Does NOT emit the "file not written to target under default
-    --min-trust" warning.  That warning is misleading when pass 8.7
-    reconciliation later promotes the record; `pass9_write` already
-    emits the accurate "trust=LOW below --min-trust" line for records
-    that stay LOW.
-
-  · FIXED-POINT PATCH LOOP (2026-10-28).  The single-pass loop missed
-    the case where a patch's anchor was supplied by a *later* patch in
-    the same batch.  The loop now iterates over the pending set until
-    a full pass adds nothing, then marks the survivors as `failed`.
-
-  · DUPLICATE-INSERTION GATE (2026-10-28).  Every successful patch
-    is post-checked against the pre-application content via
-    `_verify_no_duplicate_insertion`.  A patch whose application
-    added a duplicate copy of a **pre-existing** line outside its own
-    body is reverted and marked `skipped_duplicate_insertion`.
-
-  · STRUCTURAL-SANITY GATE (2026-10-28).  Every successful patch on a
-    `.py` destination is post-checked via `_check_structural_sanity`.
-    A patch whose application introduces a Python syntax error OR a
-    module-level statement injection is reverted and marked
-    `skipped_structural_damage`.
-
-  · TERMINAL-STATUS PRESERVATION (2026-10-28).  Surviving `pending`
-    patches with a terminal `applied_by` status are not relabelled
-    `failed` by the follow-up loop.
-
-  · PRIOR-INSERTIONS THREADING (2026-10-28).  `_try_deterministic_
-    patch` (in `patch_dispatch.py`), `_try_blockquoted_patch`, and
-    the fixed-point loop accept a `prior_insertions` set of stripped
-    lines previously inserted this batch.  The anchor-after heuristic
-    uses it as a fallback when the prose has no backtick anchor.
-
-  · ALREADY-PRESENT ANCHORING (2026-10-28).  When a single-line body
-    is `already-present` in base, the body line is added to
-    `prior_insertions` so a subsequent "Add just after:" block can
-    anchor to a pre-existing line.
-
-  · PRE-GATE FOR DUPLICATE ASSIGNMENTS (2026-10-28b).  Before any
-    heuristic runs, a patch whose body is a single `var = expr` line
-    that already appears verbatim in the current content is marked
-    `already-present` and skipped.
-
-  · PRIOR-INSERTIONS SCOPE CONTEXT (2026-10-28e).  `_mark_already_
-    present` and the duplicate-assignment pre-gate now also record
-    the scope named by the Find block's *broader* prose (via
-    `_broader_context_for`, which pulls the last two preceding
-    blocks' `context_before`), keyed by the already-present line, in
-    a `prior_scopes` dict that threads alongside `prior_insertions`
-    into `_try_deterministic_patch`.
-
-  · UNIFIED PATCH-STATUS TAXONOMY (2026-11-01).  `rec.verification`
-    now reports three counters instead of one:
-      patches_applied — deterministic or LLM patches that actually
-                        wrote new bytes
-      patches_noop    — already-present, skipped misattributed,
-                        skipped structural damage, etc.
-      patches_failed  — status `failed`
-
-    Before this, `patches_applied` counted every status that wasn't
-    in a "not applied" blacklist, which *included* `already-present`.
-    A pre-existing file whose only patch was already-present reported
-    `patches_applied: 1, written: false` — a manifest that claims
-    applied work the file doesn't contain.  The 2026-10-28 comfyui.py
-    run showed this exactly: a false-positive already-present claim
-    was counted as success, the file was skipped by write.py, and
-    neither the manifest nor the residual named the omission.
-
-    The statuses themselves now live in `core.py` as
-    `APPLIED_STATUSES` / `NO_CHANGE_STATUSES` / `FAILED_STATUSES`,
-    imported here and consumed identically by `consistency.py`'s
-    pass 8.7d verifier.  See `consistency.py`'s module docstring for
-    why every `already-present` claim is now re-verified against the
-    file content.
-
-DEPENDENCY: `_try_deterministic_patch` (in `patch_dispatch.py`) must
-accept the same `prior_insertions=None` and `prior_scopes=None`
-keywords that this module passes into it.  `_try_blockquoted_patch`
-below threads both kwargs through unchanged.
+`patch_replace_intent.detect_replace_intent` runs BEFORE the filter.
+If the unfiltered body diffs against the best-matching base window
+with at least one `replace` or `delete` opcode AND has enough
+contiguous matched lines to be a genuine subsequence, the patch is
+a replacement: the full body replaces the matched region, the
+filter is skipped, and the extractor is applied to the exact region
+that matched.
 """
-
 import re
 from collections import Counter
 from pathlib import Path
@@ -111,6 +50,7 @@ from .core import (
     FAILED_STATUSES,
 )
 from .llm import LLMClient
+from .patch_replace_intent import detect_replace_intent
 
 from . import patch_text, patch_scope, patch_llm, patch_heuristics
 from . import patch_pairs, patch_diag, patch_dispatch
@@ -312,20 +252,6 @@ def _check_structural_sanity(old_content, new_content, path):
 
 def _record_single_line_anchor(patch, body, record_inserted,
                                 prior_scopes=None, broader_ctx=None):
-    """Record the body's single line (if any) as already-present.
-
-    Also records the scope named by the patch's prose — or, when the
-    narrow `context_before` doesn't name one, by the *broader* prose
-    (`broader_ctx`, supplied by the caller via `_broader_context_for`).
-
-    Broader-context recording is the load-bearing piece for the
-    comfyui.py shape (blocks idx=96/97): the Find block's own prose
-    is just `"Find:"`, but the two preceding blocks' prose names
-    `comfy_generate` as the wider context.  With broader context,
-    `prior_scopes[anchor]` carries that scope, which
-    `patch_anchor_insert._anchor_within_callee` then resolves to
-    `_comfy_generate_impl`.
-    """
     if not isinstance(patch, dict):
         return
     body_lines = [ln for ln in body.splitlines() if ln.strip()]
@@ -355,14 +281,6 @@ def _record_single_line_anchor(patch, body, record_inserted,
 
 def _mark_already_present(patch, body, record_inserted,
                           prior_scopes=None, broader_ctx=None):
-    """Mark a patch `already-present` and record its single line as
-    an anchor for subsequent "Add just after:" blocks.
-
-    `broader_ctx` (optional) is passed to `_record_single_line_anchor`
-    as the fallback scope source when the narrow `context_before`
-    doesn't name a scope.  See the module docstring, PRIOR-INSERTIONS
-    SCOPE CONTEXT section.
-    """
     patch["applied_by"] = "already-present"
     _record_single_line_anchor(patch, body, record_inserted,
                                 prior_scopes=prior_scopes,
@@ -382,9 +300,6 @@ _CONTINUATION_ENDINGS = (
 
 
 def _is_duplicate_assignment_insert(old_content, patch):
-    """True iff `patch` is a single-line assignment that already
-    exists verbatim in `old_content`.
-    """
     body = patch.get("body") or ""
     body_lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
     if len(body_lines) != 1:
@@ -395,6 +310,63 @@ def _is_duplicate_assignment_insert(old_content, patch):
     if line.endswith(_CONTINUATION_ENDINGS):
         return False
     return any(ln.strip() == line for ln in old_content.splitlines())
+
+
+# ===========================================================================
+#  Replace-intent application (NEW 2026-11-05)
+# ===========================================================================
+
+def _try_replace_intent(content: str, patch, path: str,
+                        record_inserted: set):
+    """Attempt to apply `patch` as a region replacement.
+
+    Returns the new content (bytes) on success, `content` unchanged
+    (already applied) if the replacement produces no diff, or None
+    if the replace-intent detection did not fire or its result
+    failed one of the sanity gates.
+
+    The three sanity gates mirror the ones the normal patch path
+    uses: no duplicate pre-existing lines introduced, structural
+    sanity on Python destinations, and — implicitly — the resulting
+    content must actually differ from `content`.
+    """
+    body = patch.get("body") or ""
+    intent = detect_replace_intent(content, body)
+    if intent is None:
+        return None
+
+    start_line, end_line, replacement_body = intent
+    base_lines = content.split("\n")
+
+    if start_line < 0 or end_line > len(base_lines):
+        return None
+    if start_line >= end_line:
+        return None
+
+    new_lines = (base_lines[:start_line]
+                 + replacement_body.split("\n")
+                 + base_lines[end_line:])
+    new_content = "\n".join(new_lines)
+
+    if new_content == content:
+        return content
+
+    if not _verify_no_duplicate_insertion(
+            content, new_content, patch, path):
+        return None
+    struct_err = _check_structural_sanity(content, new_content, path)
+    if struct_err is not None:
+        patch["failure_reason"] = struct_err
+        patch["replace_intent_rejected"] = True
+        return None
+
+    patch["replace_intent"] = {
+        "start_line": start_line,
+        "end_line": end_line,
+        "replaced_lines": end_line - start_line,
+    }
+    record_inserted |= _collect_inserted_lines(content, new_content)
+    return new_content
 
 
 # ===========================================================================
@@ -433,11 +405,6 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
             line.strip() for line in base.split("\n") if line.strip()
         }
         record_inserted = set()
-        # NEW (2026-10-28e): prior-insertion scope context.  Maps a
-        # stripped line to the scope name extracted from the Find
-        # block's broader prose.  Consumed by
-        # `_try_insert_after_anchor`'s prior-insertion fallback when
-        # the anchor is repeated in the base.
         prior_scopes: dict = {}
 
         trust_cap = "MEDIUM" if rec.dedup_reason == "last_full" else "HIGH"
@@ -470,8 +437,6 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                         f"skipping",
                         file=sys.stderr,
                     )
-                    # Anchor the (already-present) line for subsequent
-                    # "Add just after:" blocks.  See _record_single_line_anchor.
                     _body = patch.get("body") or ""
                     _record_single_line_anchor(
                         patch, _body, record_inserted,
@@ -481,6 +446,33 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                     continue
 
                 original_body = patch["body"]
+
+                # NEW (2026-11-05): replace-intent detection runs
+                # BEFORE the duplicate-line filter, because the filter
+                # strips the anchor lines that prove this is a
+                # replacement rather than an insertion.
+                _ri_result = _try_replace_intent(
+                    content, patch, path, record_inserted)
+                if _ri_result is not None:
+                    if _ri_result == content:
+                        _mark_already_present(
+                            patch, original_body, record_inserted,
+                            prior_scopes=prior_scopes,
+                            broader_ctx=_broader_for(patch),
+                        )
+                        continue
+                    content = _ri_result
+                    patch["applied_by"] = "deterministic"
+                    applied_this_pass += 1
+                    print(
+                        f"  [replace-intent] {path} idx={patch['idx']}: "
+                        f"replaced lines "
+                        f"{patch['replace_intent']['start_line']}.."
+                        f"{patch['replace_intent']['end_line']}",
+                        file=sys.stderr,
+                    )
+                    continue
+
                 filtered_body, was_filtered = _filter_body_by_blocks(
                     original_body, base_stripped_set, record_inserted,
                 )
@@ -697,7 +689,6 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                 break
             pending = still_pending
 
-        # Mark surviving pending patches as failed with diagnostics.
         for patch in pending:
             if patch.get("applied_by") in (
                 "already-present",
@@ -731,22 +722,6 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
             else:
                 all_ok = False
 
-        # NEW (2026-11-01): split the verification counters into
-        # applied / noop / failed using the unified status sets from
-        # core.py.  See the module docstring's UNIFIED PATCH-STATUS
-        # TAXONOMY section — before this, `patches_applied` counted
-        # every status not in a blacklist, which silently included
-        # `already-present`.  A pre-existing file whose only patch
-        # was a false-positive already-present reported
-        # `patches_applied: 1, written: false`; a manifest that
-        # claims applied work the file doesn't contain.
-        #
-        # The three counters are the honest breakdown.  Consumers
-        # that only care "was the file touched" should look at
-        # `written` in the manifest (set by pass 9), not at
-        # `patches_applied`.  Passes that gate on "did anything
-        # land" (write.preexisting_unmodified, dedup, shield) all
-        # consult `NO_CHANGE_STATUSES` membership, not these counts.
         rec.verification["patches_applied"] = sum(
             1 for p in rec.patches
             if p.get("applied_by") in APPLIED_STATUSES)

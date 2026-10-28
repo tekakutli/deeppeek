@@ -61,6 +61,24 @@ New in 2026-10-28e: centralised placement-failure reporting.
 gate refused and which therefore never landed — is reported alongside
 `failed` and `skipped_unplaceable` instead of silently dropping out
 of both lists.  The FAIL-CLOSED summary loop uses the same set.
+
+MISSING-FILES SCOPE (2026-11-01b)
+=================================
+`_scan_mentioned_files` now scopes to source extensions
+(`_MENTION_EXTENSIONS`) rather than all recoverable extensions
+(`SOURCE_EXTENSIONS`).  Data files (`.json`, `.yaml`, `.toml`), docs
+(`.md`, `.rst`), and scripts (`.sh`, `.bash`) are excluded from the
+"referenced but never recovered" report: they are config or output,
+not code dependencies, and their appearance in a conversation dump
+(a `project_dump_*.md` that embeds every history record, for
+instance) fills `MISSING_FILES.txt` with noise.
+
+Shell scripts are a borderline case — `.sh` appears in the
+`SOURCE_EXTENSIONS` set because deeppeek recovers them as source
+files, but they are excluded from the MISSING report because they
+are almost always invoked rather than imported.  An imported-from
+shell script is not a thing; if you want to recover a specific one,
+name it explicitly in the conversation.
 """
 
 import hashlib
@@ -89,14 +107,34 @@ _NO_OP_STATUSES = frozenset({
 })
 
 
+# "Referenced but never recovered" is scoped to source-code extensions
+# only.  Data files, docs, and shell scripts are excluded from the
+# MISSING report because they are almost never imported — their
+# appearance in a conversation dump is incidental, not a dependency
+# signal.  See module docstring, MISSING-FILES SCOPE section.
+_MENTION_EXTENSIONS = frozenset({
+    ".py", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx",
+    ".rs", ".go", ".c", ".cc", ".cpp", ".h", ".hpp",
+    ".java", ".rb", ".php",
+})
+
+
 def _scan_mentioned_files(dump_text: str) -> set:
+    """Return basenames of source files referenced anywhere in
+    `dump_text`.
+
+    Scoped to `_MENTION_EXTENSIONS` (source code only).  Data files,
+    docs, and shells are excluded — they are not code dependencies
+    and are the main source of MISSING_FILES.txt noise.
+    """
     mentioned: set = set()
     for m in re.finditer(r'[A-Za-z0-9_./\-]+', dump_text):
         tok = m.group(0)
-        if any(tok.endswith(ext) for ext in SOURCE_EXTENSIONS):
-            base = os.path.basename(tok)
-            if base and len(base) > 3:
-                mentioned.add(base)
+        if not any(tok.endswith(ext) for ext in _MENTION_EXTENSIONS):
+            continue
+        base = os.path.basename(tok)
+        if base and len(base) > 3:
+            mentioned.add(base)
     return mentioned
 
 

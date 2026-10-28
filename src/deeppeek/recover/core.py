@@ -50,6 +50,12 @@ APPLIED_STATUSES = frozenset({
     # The patcher's deterministic or LLM heuristics produced a change.
     "deterministic",
     "llm",
+    # Region-replace (2026-10-29): the body replaced an existing
+    # region because it was a structurally-modified version of it.
+    # Treated as applied: `validate_content` gates the write, and
+    # `patch_presence` deliberately skips the per-line check for
+    # structural transforms (see the note there).
+    "region-replace",
 })
 
 NO_CHANGE_STATUSES = frozenset({

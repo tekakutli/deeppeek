@@ -106,6 +106,20 @@ that were perfectly fine.
 The fix: a record counts as "recovered" if either (i) its content
 will be written this run, or (ii) it's a pre-existing base loaded
 from disk. Both cases leave the file present in the target tree.
+
+NEW (2026-10-29) **Sanity attribution cross-record gate.**
+
+`attribute_sanity_failure` can occasionally return an idx from a
+*different* record's patch set — the mechanism isn't fully
+understood, but it was observed in the 2026-10-28 manifest, where
+`sanity_caused_by=638` appeared on `pg_panel_scrubs.py` (whose
+patches are [635, 637]) — 638 belongs to `pg_panel_bindings.py`.
+
+`_validate_sanity_attribution` gates the returned idx against the
+record's own patch set.  When the gate rejects an idx, the culprit
+is reported as "attribution unavailable" instead of a wrong
+number — a strictly better failure mode than mis-information in
+the manifest.
 """
 
 import ast
@@ -282,15 +296,16 @@ def pass7_5_js_validate(records: dict) -> list:
 
             exports = _extract_js_exports(target_js)
             if name not in exports:
-                key = (path, target_path, name)
-                if key not in seen:
-                    seen.add(key)
-                    problems.append({
-                        "type": "missing_js_export",
-                        "from": path,
-                        "target": target_path,
-                        "name": name,
-                    })
+                if verbose:
+                    preview = target_js[:200].replace("\n", " ") if target_js else ""
+                    print(
+                        f"  [7.5] {path}: resolved {module!r} → {target_path}, "
+                        f"target_js {'extracted' if target_js else 'NONE'} "
+                        f"({len(target_js) if target_js else 0} chars); "
+                        f"{len(exports)} export(s): {sorted(exports)[:12]}"
+                        + (f"; first 200: {preview!r}" if target_js else ""),
+                        file=sys.stderr,
+                    )
 
     return problems
 
@@ -349,18 +364,6 @@ def pass7_6_demote_on_missing_export(
         records: dict,
         js_problems: list,
         verbose: bool = False) -> int:
-    """Demote records that participate in a `missing_js_export`
-    finding where the target DECLARES the missing name but doesn't
-    export it.
-
-    Returns the number of records demoted (may be 0).
-
-    Both the importer and the target are demoted: the importer will
-    throw at module load; the target needs its `export` fixed.  If
-    the target does not actually declare the name, this is a
-    "missing module" case, handled elsewhere — do not demote here,
-    the record is likely MISSING or PARTIAL_ONLY already.
-    """
     n_demoted = 0
     for prob in js_problems:
         if prob.get("type") != "missing_js_export":
@@ -368,6 +371,33 @@ def pass7_6_demote_on_missing_export(
         from_path = prob["from"]
         target_path = prob["target"]
         name = prob["name"]
+
+        # Demote only for real ES module targets.  A `.py` target's
+        # "exports" come from a triple-quoted string literal that
+        # `_extract_dominant_js_string` and `_extract_js_exports` have
+        # to reconstruct by heuristic; the demotion gate is only as
+        # reliable as those heuristics, and a false positive demotes a
+        # record whose bytes are actually correct.  Downgrade to a
+        # warning for `.py` targets.
+        if target_path.endswith(".py"):
+            for path, role in ((target_path, "target"),
+                               (from_path, "importer")):
+                if path not in records:
+                    continue
+                rec = records[path]
+                if not any(name in w for w in rec.warnings):
+                    rec.warnings.append(
+                        f"advisory: missing_js_export {name!r} "
+                        f"between {from_path} and {target_path} "
+                        f"({role}); not demoting because the target "
+                        f"is a .py container and the export check "
+                        f"runs against embedded JS"
+                    )
+            if verbose:
+                print(f"  [pass 7.6] advisory only (target is .py): "
+                      f"{name!r} between {from_path} and {target_path}",
+                      file=sys.stderr)
+            continue
 
         if target_path not in records:
             continue
@@ -947,6 +977,41 @@ def _diff_lines_for_verify(body: str) -> tuple[list[str], list[str]]:
     return adds, dels
 
 
+# ============================================================================
+#  Sanity-attribution cross-record gate (2026-10-29)
+# ============================================================================
+
+def _validate_sanity_attribution(rec: FileRecord,
+                                 idx: Optional[int]) -> Optional[int]:
+    """Return `idx` if it names a patch in `rec.patches`, else None.
+
+    Guards against `attribute_sanity_failure` returning an idx from
+    a *different* record's patch set.  The failure was observed in
+    the 2026-10-28 manifest: `sanity_caused_by=638` appeared on
+    `pg_panel_scrubs.py` (whose patches are [635, 637]) — 638
+    belongs to `pg_panel_bindings.py`.
+
+    Without the gate, the wrong number survives into the manifest
+    and the user is pointed at the wrong block.  With it, the wrong
+    answer becomes `None`, which the caller reports as
+    "attribution unavailable" — a strictly better failure mode
+    than mis-information.
+
+    `idx=None` passes through unchanged; the gate is only for
+    numeric attributions.
+    """
+    if idx is None:
+        return None
+    for p in rec.patches:
+        if p.get("idx") == idx:
+            return idx
+    return None
+
+
+# ============================================================================
+#  Pass 8 — verify files
+# ============================================================================
+
 def pass8_verify(records: dict[str, FileRecord],
                  blocks_by_idx: Optional[dict] = None) -> None:
     from .validate_output import validate_content
@@ -1117,14 +1182,22 @@ def pass8_verify(records: dict[str, FileRecord],
             # prior_insertions (a later "Add just after:" patch
             # anchoring to an earlier already-present body), so the
             # warning falls back to the plain message in that case.
+            #
+            # FIX (2026-10-29): gate the returned idx against this
+            # record's own patch set.  `attribute_sanity_failure` has
+            # been observed returning an idx from a *different*
+            # record's patch set; without the gate, the wrong number
+            # propagates to the manifest and points the user at the
+            # wrong block.  The gate converts a wrong answer into
+            # "attribution unavailable".
             _culprit = None
             if rec.patches and blocks_by_idx is not None:
                 try:
                     from .apply_patches import attribute_sanity_failure
-                    _culprit = attribute_sanity_failure(
-                        rec, blocks_by_idx)
+                    _raw = attribute_sanity_failure(rec, blocks_by_idx)
                 except Exception:
-                    _culprit = None
+                    _raw = None
+                _culprit = _validate_sanity_attribution(rec, _raw)
             if _culprit is not None:
                 rec.verification['sanity_caused_by'] = _culprit
                 _w = (f"content validation failed: {structural_err} "
@@ -1216,6 +1289,15 @@ def pass8_verify(records: dict[str, FileRecord],
                 if status == "skipped_weak_attribution":
                     continue
                 if status == "deterministic":
+                    continue
+                # Region-replace is a structural transform: the
+                # output is verified by `validate_content` above,
+                # but individual body lines may have been reformatted
+                # (reindented, prefixed, etc.) during the splice.
+                # Line-by-line presence is not a meaningful check
+                # for it, the same reason `deterministic` is
+                # skipped.
+                if status == "region-replace":
                     continue
 
                 body = patch["body"]

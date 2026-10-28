@@ -108,6 +108,25 @@ For the two motivating cases:
 
 For a legitimate full-file rewrite that preserves most functions:
 coverage ≥0.5 → keep as full replacement (existing behaviour).
+
+EMBEDDED-FRAGMENT RECLASSIFICATION (2026-11-01b)
+================================================
+Pass 2's heuristic classifier falls back to
+`_looks_like_full_file(body, "unknown_N")` when no header path is
+present.  The non-`.py` branch of `_looks_like_full_file` returns
+`True` on any non-empty body, so a headerless JS/HTML/CSS fragment
+arrives at pass 5 marked `kind = "full"`.  That label is meaningless
+once pass 4 has attributed the block to a pre-existing file — a `.py`
+file cannot become a `js` body, so the fragment is a partial to be
+inserted or spliced, not a replacement.
+
+`pass5_deduplicate` now demotes `full`-kind orphans whose fence
+language is JS/HTML/CSS and whose attributed target is a pre-existing
+`.py` file.  Combined with the parallel change that allows `full`-kind
+orphans into the `orphan_patches` collection, this is what makes
+`pg_base.py`, `pg_panel_scrubs.py`, and `pg_panel_bindings.py` fixes
+actually apply after attribution.  Before this, the `full` label
+caused them to be silently dropped from the patch pipeline.
 """
 
 import re
@@ -126,6 +145,23 @@ from .patch_scope import _scope_in_base
 _EXPORT_CONST_OBJECT_RE = re.compile(
     r'^export\s+(?:const|let|var)\s+\w+\s*=\s*\{'
 )
+
+
+# ===========================================================================
+#  Embedded-fragment language set (2026-11-01b)
+# ===========================================================================
+#
+# Languages whose fragments are commonly embedded inside a `.py`
+# file's string literal (playgrounds, template systems).  A `full`-
+# kind orphan with one of these fence languages, attributed to a
+# pre-existing `.py` file, is demoted to `partial` in
+# `pass5_deduplicate`.  See the module docstring, EMBEDDED-FRAGMENT
+# RECLASSIFICATION section.
+
+_EMBEDDED_BLOCK_LANGS = frozenset({
+    "js", "mjs", "jsx", "ts", "tsx",
+    "html", "css", "scss",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -486,9 +522,62 @@ def _is_covered_by_headed(block: Block, path: str, all_blocks) -> bool:
     return False
 
 
+def _is_preexisting_target(rec: FileRecord,
+                           blocks_by_idx: dict) -> bool:
+    """True iff any of `rec`'s source blocks is a pre-existing
+    baseline.
+
+    `rec.preexisting_base` is not set until `pass5_deduplicate`'s
+    per-record loop has run; the reclassification step needs the
+    same information *before* that point.  Inspecting each source
+    block's `classified_by` (set by `_load_preexisting_blocks`
+    during pipeline input assembly) gives the answer at any time
+    after pass 3.
+    """
+    for idx in rec.source_blocks:
+        b = blocks_by_idx.get(idx)
+        if b is not None and b.classified_by == "preexisting":
+            return True
+    return False
+
+
 def pass5_deduplicate(records: dict,
                       blocks_by_idx: dict,
                       verbose: bool) -> None:
+    # ---- embedded-fragment reclassification (2026-11-01b) ----
+    #
+    # A `full`-kind orphan attributed to a pre-existing `.py` file
+    # whose fence language is JS/HTML/CSS is an embedded fragment,
+    # not a full replacement.  Pass 2's classification fell back to
+    # `_looks_like_full_file(body, "unknown_N")` (target extension
+    # unknown at that point); the non-`.py` fallback returned `True`.
+    # Once attribution resolves the target, the label is provably
+    # wrong: a `.py` file cannot become a `js` body.
+    #
+    # See module docstring, EMBEDDED-FRAGMENT RECLASSIFICATION
+    # section, for the motivating case (pg_panel_scrubs.py's
+    # `_clearImageAction` fragment, block idx=72 in the 2026-10-28
+    # run).
+    for _b in blocks_by_idx.values():
+        if not _b.is_orphan or _b.kind != "full" or not _b.attributed_to:
+            continue
+        _target = records.get(_b.attributed_to)
+        if _target is None:
+            continue
+        if not _is_preexisting_target(_target, blocks_by_idx):
+            continue
+        _dest_ext = (_b.attributed_to.rsplit(".", 1)[-1].lower()
+                     if "." in _b.attributed_to else "")
+        _block_lang = (_b.fence_lang or "").lower()
+        if _dest_ext == "py" and _block_lang in _EMBEDDED_BLOCK_LANGS:
+            if verbose:
+                print(f"  [pass 5] reclassifying full orphan "
+                      f"idx={_b.idx} -> partial "
+                      f"(embedded {_block_lang} in .py)",
+                      file=sys.stderr)
+            _b.kind = "partial"
+            _b.heuristic_kind = "partial"
+
     # ---- detect replace / scoped pairs first ----
     detect_all(list(blocks_by_idx.values()), blocks_by_idx)
     global_pairs = build_pairs(blocks_by_idx)
@@ -721,10 +810,24 @@ def pass5_deduplicate(records: dict,
         # channel; the blockquoted fragment only produces warning
         # noise if it fails to anchor.  comfyui.py blockquoted
         # `--output_rotation` arg fragment vs headed block 655.
+        #
+        # FIX (2026-11-01b): `kind != "full"` is gone from the filter
+        # below.  A `full` label on an attributed orphan is unreliable
+        # (pass 2's classification fell back to a non-`.py` heuristic
+        # that returns True for any multi-line body when the target's
+        # extension is unknown).  Once attribution resolves the target,
+        # the label is meaningless — the block is a fragment to be
+        # inserted or spliced, not a replacement for the whole file.
+        # `_is_real_patch` still applies its code-signal and blockquote
+        # filters, so this does not admit prose.  The reclassification
+        # loop at the top of this function handles the language-
+        # mismatch case cleanly; this allowance covers everything else
+        # (e.g. an HTML body attributed to a `.html` pre-existing
+        # file — the reclassification skips it because there is no
+        # language mismatch, but the block still must be a patch).
         orphan_patches = []
         for _b in blocks_by_idx.values():
             if not (_b.is_orphan and _b.attributed_to == path
-                    and _b.kind != "full"
                     and _b.idx not in pair_idxs_for_this_file
                     and block_owner.get(_b.idx) == path
                     and (not _b.in_blockquote
@@ -811,8 +914,29 @@ def pass5_deduplicate(records: dict,
             # are strictly worse than fail-closed rejections.
             return _has_code_signal(body)
 
-        trailing = [p for p in partials
-                    if p > chosen_idx and _is_real_patch(p)]
+        # Trailing filter.
+        #
+        # Historically `p > chosen_idx`: a partial appearing BEFORE
+        # the chosen full print is treated as a superseded draft.
+        # That rule is correct for headed blocks (the AI printed a
+        # draft, then re-printed the full file).
+        #
+        # It is NOT correct for orphans.  Orphans have no header and
+        # no print-order relationship to the base.  Their position in
+        # the index list is an artefact of `_load_preexisting_blocks`
+        # prepending the pre-existing tree ahead of the conversation
+        # blocks — the orphan's idx is high in the usual case, but
+        # that is coincidental, not semantic.  Including every
+        # attributed orphan regardless of position is the correct
+        # filter; `_is_real_patch` already rejects thinking fragments
+        # and prose.
+        trailing = [
+            p for p in partials
+            if _is_real_patch(p) and (
+                p > chosen_idx
+                or blocks_by_idx[p].is_orphan
+            )
+        ]
 
         if trailing:
             rec.state = "FULL_PLUS_PATCH"

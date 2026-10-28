@@ -31,21 +31,67 @@ detects the failure classes that matter for those projects:
      `.py` strings.
 
   5. JavaScript parse validation — when tree-sitter + a matching
-     grammar is available (the `[ast]` extra).
+     grammar are available (the `[ast]` extra).  Runs FIRST: a
+     tree-sitter error carries a line/col location, which is what
+     the user actually needs; `_js_balance`'s "unclosed string
+     literal" is a last-resort fallback when tree-sitter is
+     unavailable.
 
   6. Module-level statement regression - for Python files.
 
-All checks return None on success, or a one-line string describing
-the failure.  Any non-None return means the file must be fail-closed
-(LOW trust -> low_trust/) so the target tree is preserved.
+TREE-SITTER-FIRST WITH BALANCE HINT (2026-10-29)
+================================================
+A pure tree-sitter-first reorder regressed `try_repair`, which gates
+on the diagnostic text `unbalanced braces (+N)` to decide whether to
+suggest a missing-closer repair.  Tree-sitter reports a parse error
+with a location but no brace count, so `_BRACE_FAILURE_RE` inside
+`repair.py` stopped matching and the repair suggestion stopped being
+produced (fixture 28).
 
-PARSE-METHOD TRACKING
-=====================
-`validate_content` sets the module-level `_LAST_PARSE_METHOD` to one
-of: "none" / "balance" / "parse".  Callers that want to record the
-verification method in the manifest read this after the call returns.
+The fix: when tree-sitter reports an error, still compute
+`_js_balance` and append the balance diagnosis as a parenthetical
+hint.  Both properties hold simultaneously:
+
+  · The primary diagnostic is a tree-sitter error with a location
+    ("parse error at line N, col M"), which is what the user needs
+    to see for a general structural failure.
+
+  · The balance hint (`unbalanced braces (+1)`) is a substring of
+    the message, so downstream consumers that gate on the balance
+    shape — `repair.try_repair`, and any future consumer that keys
+    on the same signal — continue to work.
+
+DUPLICATE STRING-LITERAL REGISTRATION DEDUP (2026-11-05)
+========================================================
+`_dedup_duplicate_blocks` catches duplicate `if (cond) { … }`
+blocks with identical bodies, and duplicate `const X = …` at column
+0.  It does NOT catch duplicate function CALLS that follow the
+common registration pattern:
+
+    pgkitRegisterField("view.rotation", { … });
+    pgkitRegisterField("view.rotation", { … });  // second copy
+
+    pgkitRegisterAction("action.inpaint", { … });
+    pgkitRegisterAction("action.inpaint", { … });
+
+The first registration installs a listener; the second overwrites
+the registry entry but does NOT remove the first listener's side
+effects.  Both fire.  Result: duplicate events, doubled work,
+diagnostic noise.
+
+Motivating failure (2026-10-29 pg_panel_scrubs.py run): a
+replace-intent patch that should have REPLACED the rotation section
+was instead APPENDED after `pgkitRegisterField("status.running", …)`
+(because the anchor lines were filtered).  The result contained two
+`pgkitRegisterField("view.rotation", …)` calls, two
+`if (rotationEl) { … }` blocks, and an unused `_syncRotationWidget`.
+
+`_find_duplicate_string_calls` catches the registration pattern
+generically: any top-level call `name("string", …)` that appears
+twice with the same `name` and same `"string"` key, within the same
+enclosing Python string (for `.py` destinations — the playground
+pattern), or anywhere in the file (for `.js` destinations).
 """
-
 import ast
 import re
 import sys
@@ -318,26 +364,65 @@ def _js_structural_check(text: str, label: str,
                          ) -> Optional[str]:
     """Structural validation for JS content.
 
+    Runs tree-sitter FIRST when a grammar is available: it returns a
+    parse error with a location, which is strictly more useful than
+    `_js_balance`'s "unclosed string literal" for a general structural
+    failure.  The balance diagnosis is appended as a parenthetical
+    hint so that downstream consumers that gate on
+    `unbalanced braces (+N)` (`repair.try_repair`) still see the
+    signal they depend on.
+
+    Falls back to balance-only when tree-sitter is unavailable, and
+    always runs the duplicate-declaration and indented-export checks
+    on parseable files.
+
     Mutates the module-level `_LAST_PARSE_METHOD`.
     """
     global _LAST_PARSE_METHOD
 
-    braces, parens, brackets, unclosed = _js_balance(text)
-    if braces != 0:
-        return f"{label}: unbalanced braces ({braces:+d})"
-    if parens != 0:
-        return f"{label}: unbalanced parens ({parens:+d})"
-    if brackets != 0:
-        return f"{label}: unbalanced brackets ({brackets:+d})"
-    if unclosed:
-        return f"{label}: unclosed string literal"
+    # 1. tree-sitter first (parse validation with location).
+    parse_attempted = False
+    if parse_lang is not None:
+        parse_attempted = True
+        parser = _get_js_parser(parse_lang)
+        if parser is None:
+            sub_err = _js_parse_check_subprocess(text, parse_lang)
+            if sub_err is not None:
+                _hint = _balance_hint(text)
+                return (f"{label}: JavaScript {sub_err} "
+                        f"(via venv tree-sitter){_hint} — likely a "
+                        f"patch was inserted where its statement "
+                        f"shape does not fit")
+            if _LAST_PARSE_METHOD == "none":
+                _LAST_PARSE_METHOD = "balance"
+        else:
+            try:
+                tree = parser.parse(text.encode("utf-8"))
+                if tree is not None and tree.root_node.has_error:
+                    loc = _first_error_location(tree)
+                    _hint = _balance_hint(text)
+                    if loc is not None:
+                        line, col = loc
+                        return (f"{label}: JavaScript parse error at "
+                                f"line {line}, col {col} (invalid "
+                                f"syntax){_hint} — likely a patch was "
+                                f"inserted where its statement shape "
+                                f"does not fit")
+                    return (f"{label}: JavaScript parse error (invalid "
+                            f"syntax){_hint} — likely a patch was "
+                            f"inserted where its statement shape does "
+                            f"not fit")
+                _LAST_PARSE_METHOD = "parse"
+            except Exception:
+                if _LAST_PARSE_METHOD == "none":
+                    _LAST_PARSE_METHOD = "balance"
+    else:
+        if _LAST_PARSE_METHOD == "none":
+            _LAST_PARSE_METHOD = "balance"
 
-    _ie = _INDENTED_EXPORT_RE.search(text)
-    if _ie:
-        _line_no = text.count("\n", 0, _ie.start()) + 1
-        return (f"{label}: line {_line_no}: indented `export` "
-                f"(invalid ESM — export must be top-level)")
-
+    # 2. duplicate top-level declarations (valid only on parseable
+    #    files; a parse error above already returned).
+    #
     # Column-0 declarations only.  JS `const` is block-scoped, so
     # `const res = ...` inside `uploadImageFile` and another
     # `const res = ...` inside `fetchStatus` are distinct bindings,
@@ -357,41 +442,49 @@ def _js_structural_check(text: str, label: str,
             return f"{label}: duplicate top-level declaration '{d}'"
         seen[d] = True
 
-    if parse_lang is not None:
-        parser = _get_js_parser(parse_lang)
-        if parser is None:
-            sub_err = _js_parse_check_subprocess(text, parse_lang)
-            if sub_err is not None:
-                return (f"{label}: JavaScript {sub_err} "
-                        f"(via venv tree-sitter) — likely a patch was "
-                        f"inserted where its statement shape does not "
-                        f"fit")
-            if _LAST_PARSE_METHOD == "none":
-                _LAST_PARSE_METHOD = "balance"
-        else:
-            try:
-                tree = parser.parse(text.encode("utf-8"))
-                if tree is not None and tree.root_node.has_error:
-                    loc = _first_error_location(tree)
-                    if loc is not None:
-                        line, col = loc
-                        return (f"{label}: JavaScript parse error at "
-                                f"line {line}, col {col} (invalid "
-                                f"syntax) — likely a patch was "
-                                f"inserted where its statement shape "
-                                f"does not fit")
-                    return (f"{label}: JavaScript parse error (invalid "
-                            f"syntax) — likely a patch was inserted "
-                            f"where its statement shape does not fit")
-                _LAST_PARSE_METHOD = "parse"
-            except Exception:
-                if _LAST_PARSE_METHOD == "none":
-                    _LAST_PARSE_METHOD = "balance"
-    else:
-        if _LAST_PARSE_METHOD == "none":
-            _LAST_PARSE_METHOD = "balance"
+    # 3. indented `export` (invalid ESM).
+    _ie = _INDENTED_EXPORT_RE.search(text)
+    if _ie:
+        _line_no = text.count("\n", 0, _ie.start()) + 1
+        return (f"{label}: line {_line_no}: indented `export` "
+                f"(invalid ESM — export must be top-level)")
+
+    # 4. balance check (last resort; skipped when tree-sitter
+    #    parsed cleanly and no declarations were duplicated).
+    braces, parens, brackets, unclosed = _js_balance(text)
+    if braces != 0:
+        return f"{label}: unbalanced braces ({braces:+d})"
+    if parens != 0:
+        return f"{label}: unbalanced parens ({parens:+d})"
+    if brackets != 0:
+        return f"{label}: unbalanced brackets ({brackets:+d})"
+    if unclosed:
+        return f"{label}: unclosed string literal"
 
     return None
+
+
+def _balance_hint(text: str) -> str:
+    """Return ` (also: …)` with any balance discrepancies, or `""`.
+
+    Appended to tree-sitter parse errors so that consumers which gate
+    on `unbalanced braces (+N)` (notably `repair.try_repair`) keep
+    seeing that signal even when the primary diagnosis is a
+    tree-sitter error.
+    """
+    b, p, k, u = _js_balance(text)
+    parts = []
+    if b != 0:
+        parts.append(f"unbalanced braces ({b:+d})")
+    if p != 0:
+        parts.append(f"unbalanced parens ({p:+d})")
+    if k != 0:
+        parts.append(f"unbalanced brackets ({k:+d})")
+    if u:
+        parts.append("unclosed string literal")
+    if not parts:
+        return ""
+    return " (also: " + ", ".join(parts) + ")"
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +661,17 @@ _CLASS_DECL_RE = re.compile(
     r"^((?:export\s+)?class\s+([A-Za-z_$][\w$]*)\b)",
     re.MULTILINE)
 
+# NEW (2026-11-05): top-level `name("string-key", { … })` registrations.
+# Common patterns: pgkitRegisterField, pgkitRegisterAction, addEventListener
+# with a named handler object, custom element registration, etc.
+_STRING_LITERAL_CALL_RE = re.compile(
+    r'^(?P<indent>[ \t]*)'
+    r'(?P<name>[A-Za-z_$][\w$.]*)\s*\(\s*'
+    r'(?P<quote>["\'])(?P<key>[^"\']+)(?P=quote)\s*[,\{]',
+    re.MULTILINE,
+)
+
+
 _DEDUP_WINDOW_CHARS = 1500
 
 
@@ -709,6 +813,47 @@ def _find_matching_close_char(content: str, open_brace_idx: int,
     return -1
 
 
+# NEW (2026-11-05): paren matcher for string-literal-call dedup.
+def _find_matching_paren(content: str, open_paren_idx: int) -> int:
+    if open_paren_idx >= len(content) or content[open_paren_idx] != "(":
+        return -1
+    depth = 1
+    i = open_paren_idx + 1
+    n = len(content)
+    in_str = None
+    while i < n:
+        c = content[i]
+        if in_str:
+            if c == "\\":
+                i += 2
+                continue
+            if c == in_str:
+                in_str = None
+            i += 1
+            continue
+        if c in ('"', "'", chr(96)):
+            in_str = c
+            i += 1
+            continue
+        if c == "/" and i + 1 < n:
+            if content[i + 1] == "/":
+                j = content.find("\n", i + 2)
+                i = n if j == -1 else j
+                continue
+            if content[i + 1] == "*":
+                j = content.find("*/", i + 2)
+                i = n if j == -1 else j + 2
+                continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
 def _has_obvious_duplicates(content: str) -> bool:
     seen_consts = set()
     for m in _MODULE_CONST_RE.finditer(content):
@@ -741,6 +886,13 @@ def _has_obvious_duplicates(content: str) -> bool:
         if name in seen_classes:
             return True
         seen_classes.add(name)
+    # NEW (2026-11-05): string-literal-call registration pattern.
+    seen_calls = set()
+    for m in _STRING_LITERAL_CALL_RE.finditer(content):
+        key = (len(m.group("indent")), m.group("name"), m.group("key"))
+        if key in seen_calls:
+            return True
+        seen_calls.add(key)
     return False
 
 
@@ -770,6 +922,78 @@ def _same_python_string(pos_a: int, pos_b: int, spans: list) -> bool:
         if start <= pos_a < end and start <= pos_b < end:
             return True
     return False
+
+
+# NEW (2026-11-05): find duplicate top-level string-literal registrations.
+def _find_duplicate_string_calls(
+        content: str,
+        is_python: bool,
+        py_spans: list) -> list[tuple[int, int, str]]:
+    """Return [(start_char, end_char, desc)] for duplicate
+    `name("key", …)` registrations.
+
+    For `.py` destinations, both occurrences must be inside the SAME
+    enclosing triple-quoted string; a duplicate across two different
+    embedded-JS strings is an intentional example, not a bug.
+
+    For `.js` destinations, both occurrences must be in the same
+    enclosing scope (per `_enclosing_scope_depth`).
+    """
+    seen: dict[tuple, tuple[int, int]] = {}
+    removals: list[tuple[int, int, str]] = []
+
+    for m in _STRING_LITERAL_CALL_RE.finditer(content):
+        # Determine enclosing Python string, if relevant.
+        enclosing_span = None
+        if is_python:
+            for span_start, span_end in py_spans or []:
+                if span_start <= m.start() < span_end:
+                    enclosing_span = (span_start, span_end)
+                    break
+            if enclosing_span is None:
+                # Not inside any Python string literal — the
+                # registration pattern is JS-specific, so skip
+                # anything outside the embedded JS.
+                continue
+
+        open_paren = content.find("(", m.start())
+        if open_paren < 0:
+            continue
+        close_paren = _find_matching_paren(content, open_paren)
+        if close_paren < 0:
+            continue
+        end = close_paren + 1
+        if end < len(content) and content[end] == ";":
+            end += 1
+        if end < len(content) and content[end] == "\n":
+            end += 1
+
+        # For non-Python, the scope (enclosing function/block) must
+        # match — same as the if-block dedup.
+        if is_python:
+            scope_key = enclosing_span
+        else:
+            _d, scope_open = _enclosing_scope_depth(content, m.start())
+            scope_key = scope_open
+
+        key = (len(m.group("indent")),
+               m.group("name"),
+               m.group("key"),
+               scope_key)
+
+        if key in seen:
+            prev_start, _prev_end = seen[key]
+            if m.start() - prev_start > 4000:
+                # Far-apart re-registration; treat as intentional.
+                seen[key] = (m.start(), end)
+                continue
+            removals.append((
+                m.start(), end,
+                f"{m.group('name')}(\"{m.group('key')}\")",
+            ))
+            continue
+        seen[key] = (m.start(), end)
+    return removals
 
 
 def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
@@ -904,6 +1128,10 @@ def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
                                  _kind + " " + _name))
                 continue
             _seen_decl[_key] = (_m.start(), _end)
+
+    # NEW (2026-11-05): string-literal-call registration dedup.
+    removals.extend(
+        _find_duplicate_string_calls(content, is_python, py_spans))
 
     if not removals:
         return content, 0
@@ -1040,19 +1268,7 @@ def _extract_object_literal_occurrences(content):
 
 def verify_object_keys_preserved(base, result, path):
     """Return an error string iff a pre-existing top-level object
-    literal lost keys in `result`, else None.
-
-    A record's pre-existing baseline declares `args = {--host, --port,
-    --check, --watch, --subscribe_timeout}`.  A patch that splices a
-    replacement object literal into the wrong `args=` occurrence
-    silently removes those keys.  Every downstream check still sees
-    a syntactically-valid file; only this check names the specific
-    key set that vanished.
-
-    Matching is per occurrence, not per variable name: two `args={}`
-    blocks both exist; the check requires *some* resulting occurrence
-    to still cover the base's keys.
-    """
+    literal lost keys in `result`, else None."""
     base_occs   = _extract_object_literal_occurrences(base)
     result_occs = _extract_object_literal_occurrences(result)
     missing = []
@@ -1061,8 +1277,6 @@ def verify_object_keys_preserved(base, result, path):
         for result_name, _, _, result_keys in result_occs:
             if result_name != base_name:
                 continue
-            # Cover at least 80% of base's keys — allows a single
-            # legitimate removal, catches a wholesale replacement.
             if len(base_keys & result_keys) >= 0.8 * len(base_keys):
                 found = True
                 break

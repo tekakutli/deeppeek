@@ -31,6 +31,25 @@ attributed as headed partials against `pg_state.py` and driven to
 H3+ subsections do NOT reset — `## File: foo.js` followed by
 `### (a) Add a field` should keep the file header (fixture 02
 relies on this).
+
+H2 SCOPE PROPAGATION (2026-10-29)
+=================================
+Pass 1 also extracts a *scope hint* from non-file H1/H2 headings —
+"in `handle_inpaint`", "find the `comfy_generate` command", etc. —
+and attaches it to every subsequent fence in that section as
+`Block.scope_hint`.  Attribution (pass 4) falls back to this hint
+when the fence's own prose does not name a scope.
+
+Motivating case: block idx 634 in the 2026-10-28 run.  Its prose
+was "And in every failure return:" — no scope named.  The enclosing
+H2 was "## Fix 3 — surface per-command errors in `handle_inpaint`".
+Before this fix, the hint was lost: the block orphaned, went to the
+residual as `orphan_unattributed`, and the `errors` return never
+landed in `inpaint_server.py`.
+
+The hint is a *fallback*, not an override: a fence whose own prose
+names a different scope uses the prose's scope.  Only when the
+fence's prose is silent does the section's scope hint apply.
 """
 
 import re
@@ -59,6 +78,47 @@ _SINGLE_FILENAME_RE = re.compile(
     r'(?:py|js|mjs|cjs|jsx|ts|tsx|md|json|yaml|yml|toml|sh|bash|'
     r'html|css|scss|rs|go|rb|php|java|kt|c|cc|cpp|h|hpp))\b',
 )
+
+
+# NEW (2026-10-29): scope hint from section headings.
+#
+# Matches the two most common shapes the assistant uses to introduce
+# a code block whose target is a function/class, when that
+# introduction happens in a section heading rather than in the
+# fence's own prose:
+#
+#   "## Fix 3 — surface per-command errors in `handle_inpaint`"
+#   "## Rewrite of `runInpaint`"
+#   "### (a) Add a field to `MyHandler`"
+#
+# Only H1/H2 headings are scanned (H3+ subsections are too narrow to
+# carry a section-wide hint).  A heading that names no scope returns
+# "" and does not override an earlier hint in the enclosing section.
+_SCOPE_IN_HEADING_RE = re.compile(
+    r'\b(?:in|inside|within|to)\s+`([A-Za-z_][\w$]*)`'
+    r'|\bfind\s+the\s+`([A-Za-z_][\w$]*)`'
+    r'|\bof\s+`([A-Za-z_][\w$]*)`',
+    re.IGNORECASE,
+)
+
+
+def _extract_scope_hint(heading_text: str) -> str:
+    """Return a scope name mentioned in a section heading, or "".
+
+    The three alternatives in `_SCOPE_IN_HEADING_RE` cover:
+
+      · "in `X`", "inside `X`", "within `X`", "to `X`" — the
+        standard "this section is about X" form.
+      · "find the `X`" — the imperative form.
+      · "of `X`" — the descriptive form ("Rewrite of `runInpaint`").
+
+    First match wins; a heading that names multiple scopes returns
+    the first.  Returns "" when no scope is named.
+    """
+    m = _SCOPE_IN_HEADING_RE.search(heading_text or "")
+    if not m:
+        return ""
+    return (m.group(1) or m.group(2) or m.group(3) or "").strip()
 
 
 def _parse_file_header(text: str) -> Optional[tuple[str, Optional[str]]]:
@@ -178,10 +238,15 @@ def pass1_extract(dump_text: str) -> tuple[list[Block], list[str]]:
 
     blocks: list[Block] = []
     current_header: Optional[tuple[str, Optional[str]]] = None
+    # NEW (2026-10-29): scope hint from the enclosing H1/H2 heading.
+    # Reset only when a new non-file H1/H2 appears; H3+ subsections
+    # inherit the enclosing H2's hint.
+    current_scope: str = ""
     current_context_lines: list[str] = []
 
-    def _make_block(header, lang, body, line_start, line_end, ctx, bq):
-        return Block(
+    def _make_block(header, lang, body, line_start, line_end, ctx, bq,
+                    scope_hint=""):
+        b = Block(
             idx=len(blocks),
             header_path=header[0] if header else None,
             modifier=header[1] if header else None,
@@ -194,6 +259,14 @@ def pass1_extract(dump_text: str) -> tuple[list[Block], list[str]]:
             is_orphan=header is None,
             in_blockquote=bq,
         )
+        # Attach the section heading's scope hint only to orphan
+        # blocks.  Headed blocks carry their own attribution signal
+        # (the header_path) — the scope hint is a fallback for blocks
+        # whose only attribution route is prose.
+        if scope_hint and not header:
+            b.scope_hint = scope_hint
+            b.scope_name = scope_hint
+        return b
 
     all_tokens = list(_walk_block_tokens(tokens))
     blockquote_depth = 0
@@ -247,6 +320,14 @@ def pass1_extract(dump_text: str) -> tuple[list[Block], list[str]]:
                     # tests/recover/fixtures/02_subsection_patches.md.
                     if tok.tag in ("h1", "h2"):
                         current_header = None
+                        # NEW: pick up a scope hint from this
+                        # section heading, e.g.
+                        # "## Fix 3 — surface errors in `handle_inpaint`"
+                        # yields "handle_inpaint", which later
+                        # orphans in this section fall back on.
+                        _hint = _extract_scope_hint(raw)
+                        if _hint:
+                            current_scope = _hint
                     current_context_lines.append(raw)
                     if len(current_context_lines) > 40:
                         current_context_lines = current_context_lines[-40:]
@@ -276,6 +357,7 @@ def pass1_extract(dump_text: str) -> tuple[list[Block], list[str]]:
             blocks.append(_make_block(
                 current_header, lang, body, m[0], m[1], ctx,
                 bq=(blockquote_depth > 0),
+                scope_hint=current_scope,
             ))
             current_context_lines = []
             i += 1
