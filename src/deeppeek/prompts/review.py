@@ -117,44 +117,47 @@ _RECOVER_EXIT_GLOSS = {
 }
 
 
+# DEFAULT_PROMPT_TEMPLATE = """\
+# I just ran `cd {target} && deeppeek recover {conversation} --apply-here`,
+# on the clean original pre-applied state, and this is the aftermath.
+# The recover run exited with code {recover_rc} ({recover_rc_gloss}).
+# Exit codes are accumulated via `max()`, so a higher number can
+# mask a lower one — read the reports for the full picture rather
+# than assuming the run was all-or-nothing.
+
+# Attached:
+
+#   1. `diff.txt` — a `git status`-style view of {target} after the
+#      apply (unstaged hunks + untracked files).  This is exactly what
+#      deeppeek changed on disk, taken at {target}.
+#   2. The top-level files under {meta_name}/ — the metadata artifacts
+#      this run wrote alongside the target tree:
+#        · `manifest.json` — per-file state, trust, patches applied or
+#          failed, sanity rejections, escalations
+#        · `warnings.txt` — everything deeppeek flagged during the run
+#        · `deleted.txt` — files marked [DEL] and whether they were
+#          actually removed from the target tree
+#        · `MISSING_FILES.txt` — files referenced in the transcript but
+#          never recovered
+
+# Please review what deeppeek actually did at {target}:
+
+#   · Did the patch extraction succeed?  Were the right files, blocks,
+#     and edits identified?
+#   · Did the apply produce correct, minimal changes?  Anything
+#     over-deleted, silently dropped, or applied to the wrong file?
+#   · What should deeppeek improve — in extraction, classification,
+#     pairing, patching, or the sanity gate — so the next
+#     `--apply-to` run needs less manual repair?
+
+# Be concrete: name the pass, the file, the pattern.
+
+# If you need the post-patch body of a specific file that sanity-gate
+# rejected or that fell below --min-trust, ask me to attach it from
+# `{meta_name}/low_trust/`.
+# """
 DEFAULT_PROMPT_TEMPLATE = """\
-I just ran `cd {target} && deeppeek recover {conversation} --apply-here`,
-on the clean original pre-applied state, and this is the aftermath.
-The recover run exited with code {recover_rc} ({recover_rc_gloss}).
-Exit codes are accumulated via `max()`, so a higher number can
-mask a lower one — read the reports for the full picture rather
-than assuming the run was all-or-nothing.
-
-Attached:
-
-  1. `diff.txt` — a `git status`-style view of {target} after the
-     apply (unstaged hunks + untracked files).  This is exactly what
-     deeppeek changed on disk, taken at {target}.
-  2. The top-level files under {meta_name}/ — the metadata artifacts
-     this run wrote alongside the target tree:
-       · `manifest.json` — per-file state, trust, patches applied or
-         failed, sanity rejections, escalations
-       · `warnings.txt` — everything deeppeek flagged during the run
-       · `deleted.txt` — files marked [DEL] and whether they were
-         actually removed from the target tree
-       · `MISSING_FILES.txt` — files referenced in the transcript but
-         never recovered
-
-Please review what deeppeek actually did at {target}:
-
-  · Did the patch extraction succeed?  Were the right files, blocks,
-    and edits identified?
-  · Did the apply produce correct, minimal changes?  Anything
-    over-deleted, silently dropped, or applied to the wrong file?
-  · What should deeppeek improve — in extraction, classification,
-    pairing, patching, or the sanity gate — so the next
-    `--apply-to` run needs less manual repair?
-
-Be concrete: name the pass, the file, the pattern.
-
-If you need the post-patch body of a specific file that sanity-gate
-rejected or that fell below --min-trust, ask me to attach it from
-`{meta_name}/low_trust/`.
+results
 """
 
 

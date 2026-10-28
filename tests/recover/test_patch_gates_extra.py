@@ -1,37 +1,29 @@
 """Regression tests for the apply-heuristics fixes added alongside
 reconciliation pass 8.7b.
 
-  · Fix 1 (2026-10-28b): dict-key grammar widened to accept
-    `--flag` / `-f` / `dotted.key` keys.
+See the pre-fix module docstring for the full inventory.  The
+2026-10-28f additions are:
 
-  · Fix 3 (2026-10-28b): duplicate-assignment pre-gate.
+  · Scope-first prior-insertion ordering + expression-context refusal
+    in `_try_insert_after_anchor`: refuses anchors inside unclosed
+    brackets in `.py` files, prefers scoped candidates over unscoped
+    ones.  Fixes the args-dict mid-file insertion shape.
 
-  · Fix 5 (2026-10-28b): scope-aware anchor selection.
+  · Already-present pre-check at the top of
+    `_try_deterministic_patch_inner` and `_apply_scoped_single`:
+    skips reprints of content that is already in base.  Fixes the
+    comfyui_krita.py docstring duplication, the inpaint_server.py
+    try/except duplication, the pg_base.py whitespace-drift
+    scoped-replace, and the pg_panel_scrubs.py import mid-file
+    duplication.  Skips deletion instructions and diffs, whose bodies
+    are "content to disappear" / "content to transform" and have
+    their own already-applied predicates.
 
-  · Call-only-anchor fallthrough (2026-10-28c).
-
-  · Prior-insertions scope context (2026-10-28e).
-
-  · Prior-insertions safety gate (2026-10-28e): the prior-insertion
-    fallback refuses anchors that open unclosed blocks.
-
-  · Callee walk for scope disambiguation (2026-10-28e).
-
-  · Scope-first ordering + expression-context refusal (2026-10-28f):
-    the prior-insertion fallback tries scoped anchors first, and
-    refuses unscoped anchors inside unclosed brackets in `.py` files.
-    Motivating: comfyui.py idx=97 in production — the fallback
-    tried an args-dict `"help": "..."},` closer (safe per
-    `_anchor_line_is_safe`) and put the try/except inside
-    `@command(args={...})`.
-
-  · Already-present pre-check (2026-10-28f):
-    `_try_deterministic_patch_inner` and `_apply_scoped_single` refuse
-    patches whose body is substantially already in base — the fix for
-    the four re-run-duplication bugs (docstring paragraph doubled in
-    comfyui_krita.py, try/except doubled in inpaint_server.py,
-    whitespace drift on the View `<details>` in pg_base.py, import
-    line moved mid-file in pg_panel_scrubs.py).
+  · Scope-aware `_try_named_dict_insert` (2026-10-28f):
+    when prose names a specific function, prefer the `@command(args=
+    {...})` decorator of that function over the first `args={...}`
+    in the file.  Fixes patch 62 landing in `comfy_connect` instead
+    of `comfy_generate` in the comfyui.py run.
 """
 import sys
 from pathlib import Path
@@ -151,6 +143,88 @@ def test_dict_entry_dashed_key_skipped_when_already_present():
     body = '"--output_rotation": {"type": "float", "default": 0.0},\n'
     result = _try_named_dict_insert(base, body, "Add to the args dict:")
     assert result is None
+
+
+def test_dict_entry_scopes_to_prose_function():
+    """`--output_rotation` entry with prose naming `comfy_generate`
+    lands in `comfy_generate`'s args dict, not the first `args={}` in
+    the file (`comfy_connect`'s).
+
+    Motivating incident: patch 62 in the comfyui.py conversation.
+    """
+    base = (
+        'class Handler:\n'
+        '    @command(\n'
+        '        args={\n'
+        '            "--host": {"type": "str"},\n'
+        '        },\n'
+        '    )\n'
+        '    def comfy_connect(self, params):\n'
+        '        return params.get("host")\n'
+        '\n'
+        '    @command(\n'
+        '        args={\n'
+        '            "--timeout": {"type": "float", "default": 55.0},\n'
+        '        },\n'
+        '    )\n'
+        '    def comfy_generate(self, params):\n'
+        '        return params.get("timeout")\n'
+    )
+    body = '            "--output_rotation": {"type": "float"},\n'
+    context = (
+        "In handlers/comfyui.py, find the `comfy_generate` command "
+        "decorator. Add:"
+    )
+    result = _try_named_dict_insert(base, body, context)
+    assert result is not None, "expected placement"
+    connect_pos = result.index("def comfy_connect")
+    generate_pos = result.index("def comfy_generate")
+    rot_pos = result.index('"--output_rotation"')
+    assert connect_pos < rot_pos < generate_pos, (
+        f"--output_rotation not in comfy_generate's decorator:\n{result}"
+    )
+    # And NOT in comfy_connect's args (which is before def comfy_connect)
+    connect_args_start = result.index('"--host"')
+    connect_args_end = connect_pos
+    connect_args = result[connect_args_start:connect_args_end]
+    assert '"--output_rotation"' not in connect_args, (
+        f"--output_rotation leaked into comfy_connect's args:\n{result}"
+    )
+
+
+def test_dict_entry_scoped_already_present_returns_base():
+    """When the prose-named function already has the entry, return
+    base (no-op).  Prevents a second run from re-targeting a
+    different function's args dict."""
+    base = (
+        'class Handler:\n'
+        '    @command(\n'
+        '        args={\n'
+        '            "--host": {"type": "str"},\n'
+        '        },\n'
+        '    )\n'
+        '    def comfy_connect(self, params):\n'
+        '        return params.get("host")\n'
+        '\n'
+        '    @command(\n'
+        '        args={\n'
+        '            "--timeout": {"type": "float", "default": 55.0},\n'
+        '            "--output_rotation": {"type": "float"},\n'
+        '        },\n'
+        '    )\n'
+        '    def comfy_generate(self, params):\n'
+        '        return params.get("timeout")\n'
+    )
+    body = '            "--output_rotation": {"type": "float"},\n'
+    context = (
+        "In handlers/comfyui.py, find the `comfy_generate` command "
+        "decorator. Add:"
+    )
+    result = _try_named_dict_insert(base, body, context)
+    assert result is base, (
+        f"expected no-op (already present in comfy_generate); "
+        f"got:\n{result}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -418,9 +492,6 @@ def test_placeholder_marker_merged_into_docstring():
 # ---------------------------------------------------------------------------
 
 def test_prior_insertion_with_scope_context():
-    """`Find:` block already-present in 3 functions + `Add just after:`
-    block placed into the correct scope by prior-line scope context.
-    """
     base_body = (
         'def _comfy_generate_impl(self, params):\n'
         '    output_name = params.get("output_name") or None\n'
@@ -485,10 +556,6 @@ def test_prior_insertion_with_scope_context():
 
 
 def test_prior_insertion_without_scope_still_refuses():
-    """Sanity: without a scope in the Find block's prose (and no
-    callee to walk), the prior-insertion fallback correctly refuses a
-    repeated anchor.
-    """
     base_body = (
         'def a():\n'
         '    target_line()\n'
@@ -535,9 +602,6 @@ def test_prior_insertion_without_scope_still_refuses():
 # ---------------------------------------------------------------------------
 
 def test_prior_insertion_safety_rejects_opener_anchor():
-    """A prior line that opens an unclosed block must not be used as
-    an anchor.
-    """
     base_body = (
         'class Handler:\n'
         '\n'
@@ -604,19 +668,6 @@ def test_prior_insertion_safety_rejects_opener_anchor():
 # ---------------------------------------------------------------------------
 
 def test_prior_insertion_scope_first_over_args_dict():
-    """When both a scoped anchor (the Find line) and unscoped anchors
-    (args-dict entries from a previous patch) are in `prior_insertions`,
-    the scoped anchor must be tried first.
-
-    Motivating (comfyui.py idx=97, production): idx=95 landed an args
-    entry inside `@command(args={...})`.  Without scope-first ordering,
-    the fallback might pick the entry's `"help": "..."}` closer (safe
-    per `_anchor_line_is_safe` but still inside the args dict) as the
-    anchor.  With scope-first + expression-context refusal, the scoped
-    `output_name` (recorded with `comfy_generate`) resolves via
-    `_anchor_within_callee` to `_comfy_generate_impl`, which is the
-    correct target.
-    """
     base = (
         "class Handler:\n"
         "\n"
@@ -642,8 +693,6 @@ def test_prior_insertion_scope_first_over_args_dict():
         "    output_rotation = 0.0"
     )
 
-    # The scoped anchor (from the Find block's broader prose) and
-    # the unscoped args-dict entry lines (from the prior patch).
     prior_insertions = {
         'output_name = params.get("output_name") or None',
         '"--output_rotation": {"type": "float", "default": 0.0,',
@@ -665,7 +714,6 @@ def test_prior_insertion_scope_first_over_args_dict():
     assert impl_pos >= 0 and impl_pos < try_pos, (
         f"try block not placed inside _comfy_generate_impl:\n{result}"
     )
-    # Not inside the args dict
     args_start = result.find("args={")
     if args_start >= 0:
         args_end = result.find("        },", args_start)
@@ -677,16 +725,6 @@ def test_prior_insertion_scope_first_over_args_dict():
 
 
 def test_prior_insertion_expression_context_refuses_closer():
-    """An unscoped prior anchor whose position is inside an unclosed
-    bracket group must be refused, even when the anchor line itself is
-    "safe" (closes but doesn't open).
-
-    Motivating: comfyui.py idx=97 in production — a `"help": "..."},`
-    closer inside `@command(args={...})` is safe per
-    `_anchor_line_is_safe` (opens=0, closes=1) but inserting after it
-    lands inside the args dict.  The expression-context refusal in
-    `_try_insert_after_anchor` catches this.
-    """
     base = (
         "class Handler:\n"
         "\n"
@@ -707,7 +745,6 @@ def test_prior_insertion_expression_context_refuses_closer():
         "except (TypeError, ValueError):\n"
         "    output_rotation = 0.0"
     )
-    # Only unscoped candidates (no scope in prior_scopes).
     prior_insertions = {
         '"--output_rotation": {"type": "float", "default": 0.0,',
         '"help": "Degrees to rotate."},',
@@ -721,7 +758,6 @@ def test_prior_insertion_expression_context_refuses_closer():
         path="x.py",
     )
     if result is not None:
-        # If a placement was found, it must NOT be inside args={...}.
         args_start = result.find("args={")
         if args_start >= 0:
             args_end = result.find("        },", args_start)
@@ -737,13 +773,6 @@ def test_prior_insertion_expression_context_refuses_closer():
 # ---------------------------------------------------------------------------
 
 def test_reprint_of_existing_block_skipped():
-    """Re-applying a body that is already fully present in base
-    returns base (no change) — the outer loop marks it already-present.
-
-    Motivating: bugs 1-3 in the wild (docstring paragraph duplicated
-    in comfyui_krita.py, try/except duplicated in inpaint_server.py,
-    whitespace drift on View `<details>` in pg_base.py).
-    """
     base = (
         "def paste_image(doc, png, x, y):\n"
         '    """Decode a PNG and write it as a new layer.\n'
@@ -774,9 +803,6 @@ def test_reprint_of_existing_block_skipped():
 
 
 def test_try_except_block_reprint_skipped():
-    """The inpaint_server.py shape: `try: output_rotation = ...`
-    re-applied on a base that already has it.
-    """
     base = (
         "def handle_inpaint(payload):\n"
         "    try:\n"
@@ -804,9 +830,6 @@ def test_try_except_block_reprint_skipped():
 
 
 def test_whitespace_drift_scoped_replace_skipped():
-    """The pg_base.py View `<details>` shape: a scoped-replace whose
-    reindented body is token-equivalent to the existing scope.
-    """
     from deeppeek.recover.patch_scope import _apply_scoped
     base = (
         "<html>\n"
@@ -820,8 +843,6 @@ def test_whitespace_drift_scoped_replace_skipped():
         "</body>\n"
         "</html>\n"
     )
-    # Body has 6-space indent vs base's 10-space — the reindented
-    # body is token-equivalent to the base scope.
     body = (
         "    <details class=\"section\" open>\n"
         "      <summary>View</summary>\n"
@@ -838,9 +859,6 @@ def test_whitespace_drift_scoped_replace_skipped():
 
 
 def test_scoped_replace_still_applies_when_scope_differs():
-    """Sanity: a legitimate scoped-replace (real content change) still
-    applies — the 0.99 token threshold isn't too aggressive.
-    """
     from deeppeek.recover.patch_scope import _apply_scoped
     base = (
         "<details class=\"section\" open>\n"
@@ -861,13 +879,6 @@ def test_scoped_replace_still_applies_when_scope_differs():
 
 
 def test_short_import_already_present_returns_base():
-    """Short-body branch: a 1-line import already in base returns
-    base (already-present), not a duplicate.
-
-    Motivating (pg_panel_scrubs.py, production): the `import
-    { board, view, _applyRotation } from "./pg_state.js"` line was
-    re-applied mid-file.
-    """
     base = (
         '"""Module."""\n'
         "import { board } from \"./pg_state.js\";\n"
@@ -892,9 +903,6 @@ def test_short_import_already_present_returns_base():
 # ---------------------------------------------------------------------------
 
 def test_prior_insertion_callee_walk_lands_in_delegate():
-    """`Find:` block already-present twice + scope names the public
-    method; the anchor lives in a helper the public method calls.
-    """
     base_body = (
         'class Handler:\n'
         '    def comfy_generate(self, params):\n'
@@ -951,9 +959,7 @@ def test_prior_insertion_callee_walk_lands_in_delegate():
     impl_pos = content.index("def _comfy_generate_impl")
     wait_pos = content.index("def comfy_wait")
     rotation_pos = content.index("output_rotation = float(")
-    assert impl_pos < rotation_pos < wait_pos, (
-        f"expected try/except inside _comfy_generate_impl, got:\n{content}"
-    )
+    assert impl_pos < rotation_pos < wait_pos
     assert content.count("output_rotation = float(") == 1
     assert content.count("output_name = params.get(") == 2
 
@@ -973,6 +979,10 @@ def main():
          test_dict_entry_dotted_key_placed),
         ("dict entry dashed key skipped when already present",
          test_dict_entry_dashed_key_skipped_when_already_present),
+        ("dict entry scopes to prose function",
+         test_dict_entry_scopes_to_prose_function),
+        ("dict entry scoped already present returns base",
+         test_dict_entry_scoped_already_present_returns_base),
         # Fix 3 — duplicate-assignment pre-gate
         ("duplicate assignment gate catches single line",
          test_duplicate_assignment_gate_catches_single_line),

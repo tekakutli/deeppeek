@@ -1451,6 +1451,38 @@
     };
   }
 
+  async function _extractByFilename(pattern, caseSensitive,
+                                     includeForked) {
+    const messages = await _collectIndexedDBMessages(includeForked);
+    if (!messages) {
+      return { success: false, ok: false,
+               reason: "session not found in IndexedDB" };
+    }
+    const needle = caseSensitive ? pattern : pattern.toLowerCase();
+    const files = [];
+    const ids = new Set();
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      const frags = m.fragments || m.content_blocks || [];
+      let any = false;
+      for (const frag of frags) {
+        for (const f of _fragFiles(frag)) {
+          const name = f.file_name || f.fileName || "";
+          const hay = caseSensitive ? name : name.toLowerCase();
+          if (!hay.includes(needle)) continue;
+          files.push(_normalizeFileRecord(f, m, i, "filename"));
+          any = true;
+        }
+      }
+      if (any) ids.add(m.message_id);
+    }
+    return {
+      success: true, mode: "filename",
+      matched_message_ids: Array.from(ids),
+      files,
+    };
+  }
+
   async function doExtractAttachments(args) {
     const mode = args.mode || "focus";
     const listOnly = !!args.list_only;
@@ -1471,6 +1503,9 @@
         Number(args.last), includeForked);
     } else if (mode === "all") {
       result = await _extractAll(includeForked);
+    } else if (mode === "filename") {
+      result = await _extractByFilename(
+        args.pattern, !!args.case_sensitive, includeForked);
     } else {
       return { success: false, ok: false,
                reason: `unknown mode: ${mode}` };

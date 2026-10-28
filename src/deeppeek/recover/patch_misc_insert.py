@@ -23,54 +23,50 @@ heuristics from crowding this code in review.
 DICT-KEY GRAMMAR (2026-10-28)
 =============================
 Earlier versions matched keys as `[A-Za-z_$][\w$]*` — plain
-identifiers only.  That missed every CLI-flag-shaped key
-(`"--output_rotation"`, `"-f"`) and every dotted key
-(`board.inpaintContext`), i.e. exactly the keys programmers write
-in a `@command(args={...})` dict or a config literal.
-
-The shape being placed is most often a `@command` decorator's
-`args` dict entry:
+identifiers only.  The shape being placed is most often a
+`@command` decorator's `args` dict entry:
 
     "--output_rotation": {"type": "float", "default": 0.0,
                           "help": "Degrees to rotate ..."},
 
-`_DICT_ENTRY_START_RE` was refusing this.  The body went through
-every other heuristic in turn, failed them all, and the record
-demoted to LOW trust — for a straightforwardly placeable entry.
-
-Fix: widen the grammar to `[-A-Za-z_$][\w$\-.]*`.  That matches:
-
-    plain            args, params, config
-    CLI flag         --foo, -f, --output_rotation
-    dotted           foo.bar, board.inpaintContext
-
-Quoted-key (`"some key"`) still requires quoting, matching the
-regex's `["\']?` optional prefix.  The `-` leading char is safe
-because dict-key position is determined by the trailing `:`, not
-the leading char — a subtraction like `a - b` inside a value never
-reaches the `:` check on its own line.
+`_DICT_ENTRY_START_RE` was refusing this.  Fixed by widening the
+grammar to `[-A-Za-z_$][\w$\-.]*`.
 
 DICT-VAR-NAME EXTRACTION (2026-10-28d)
 ======================================
 `_extract_dict_var_names` used to look at prose only — backtick-
-wrapped identifiers, then a fallback set (`args`, `kwargs`,
-`params`, `options`).  When the prose named a non-dict variable
-(e.g. the method `comfy_generate`) but not the dict (`args`), the
-heuristic found no candidates and the placement failed.
+wrapped identifiers, then a fallback set.  When the prose named a
+non-dict variable (e.g. the method `comfy_generate`) but not the
+dict (`args`), the heuristic found no candidates and placement
+failed.  Fixed by adding `args` as a fallback when the body's first
+key is a dashed flag.
 
-Motivating case (2026-10-28 comfyui.py, block idx=62): prose said
-"find the `comfy_generate` command decorator.  Add:".  Only
-`comfy_generate` was backtick-wrapped, `args` never appeared, and
-`_extract_dict_var_names` returned `["comfy_generate"]`.  There is
-no `comfy_generate = {` in base, so no candidates matched and the
-`--output_rotation` entry stayed unplaceable.
+SCOPE-AWARE CANDIDATE SELECTION (2026-10-28f)
+=============================================
+`_try_named_dict_insert` used to pick `candidates[0]` — the first
+`args={...}` in the file — regardless of which `@command` method
+the prose named.
 
-Fix: when the body's first line is a dashed key (`--flag`, `-f`),
-the body is almost certainly a `@command(args=...)` decorator
-entry, and `args` is the conventional dict name.  `args` is added
-to the candidate list as a fallback.  This keeps the fix general
-(dashed-key body → try `args`) without special-casing any single
-conversation.
+Motivating incident (`kritomatic_daemon/handlers/comfyui.py`):
+prose said *"In handlers/comfyui.py, find the `comfy_generate`
+command decorator. Add: `--output_rotation`..."*, but the first
+`args={...}` in the file belongs to `comfy_connect`.  Patch 62
+(the `--output_rotation` entry) landed in `comfy_connect` instead
+of `comfy_generate`.  Then patch 95 (the full args replacement)
+correctly targeted `comfy_generate` via `_try_object_literal_splice`
+(the scoring heuristic correctly picked the block whose body shares
+11 of 18 lines).  End state: both functions declared
+`--output_rotation`, but only `comfy_connect` was flagged by lint
+(pass 8.4 records only the first violation via `break`), so the
+diagnostic pointed at the wrong function.
+
+Fix: when `_extract_scope_name_from_prose` names a function AND the
+function has a `@command(args={...})` decorator, prefer that args
+dict over file-order pick.  If the entry already exists in the
+scoped dict, return `base` (already-present); otherwise splice the
+entry in.  Only fall back to file-order pick when no scope is named
+(backward compat: `test_dict_entry_with_leading_dashes_placed` and
+similar tests use prose without a scope).
 """
 
 import re
@@ -86,14 +82,6 @@ from .patch_text import _find_matching_brace
 _CONTEXT_INSERT_MAX_LINES = 30
 _CONTEXT_INSERT_MIN_ANCHOR_CHARS = 8
 
-# A "structural line" is a bare closing delimiter — `}`, `});`, `};`,
-# `]`, `])` etc., optionally followed by `;` or `,`.  These appear in
-# every JS file at the end of every block, so `stripped not in base` is
-# always False for them (base contains `}` somewhere).  Dropping them
-# while keeping the corresponding opener is what silently corrupted the
-# pg_panel_fields.py case: `_filter_new` was treating a `}` from a
-# balanced body as "already present, remove it" — leaving the inserted
-# `if (...) {` with no closer.
 _STRUCTURAL_LINE_RE = re.compile(
     r"^\s*"
     r"[}\])]+"
@@ -117,11 +105,6 @@ def _try_context_insert(base, body):
         return None
     if first_stripped.startswith("<details") or "<summary>" in body[:200]:
         return None
-    # FIX: a scope-shaped decorated method (`@command(...)` at non-zero
-    # indent) must not be context-inserted inline — it wants to land
-    # inside the container named by prose, handled by
-    # `_try_insert_into_named_scope`.  Context insert would otherwise
-    # nest it inside whatever existing block the anchor heuristic finds.
     if first_stripped.startswith("@"):
         first_indent = len(body_lines[0]) - len(body_lines[0].lstrip())
         if first_indent > 0:
@@ -178,13 +161,6 @@ def _try_context_insert(base, body):
                 return result
 
     first_line = body_lines[0]
-    # The "insert body[1:] after a unique first line" strategy only
-    # works when the first line is a STANDALONE statement.  If the
-    # first line is a block opener, body[1:] contains the closer for
-    # that opener — inserting body[1:] after base's matching opener
-    # means the inserted closer closes base's opener, and base's
-    # original closer becomes unmatched (-1 brace).  Refuse and let
-    # the caller fall through to `_try_insert_after_anchor`.
     first_line_opens = first_line.count("{") - first_line.count("}")
     if (first_line_opens <= 0 and _unique(first_line)
             and _context_insert_ok(first_line, body)):
@@ -211,9 +187,6 @@ def _try_context_insert(base, body):
 # ===========================================================================
 #  Object-entry insert (function-anchored)
 # ===========================================================================
-#
-# FIX (2026-10-28): widen the key grammar.  See module docstring,
-# DICT-KEY GRAMMAR section.
 
 _OBJECT_ENTRY_RE = re.compile(
     r'^\s*["\']?[-A-Za-z_$][\w$\-.]*["\']?\s*:\s*.+,?\s*$')
@@ -280,37 +253,13 @@ def _try_object_entry_insert(base, body, context_before):
 # ===========================================================================
 #  Named-dict insert (variable-anchored, multi-line entry)
 # ===========================================================================
-#
-# The pg_panel_scrubs.py / comfyui.py `--output_rotation` shape: the AI
-# prints a single verbose dict entry, spanning multiple lines, and the
-# prose names the dict variable it belongs in (`args`).  The body is
-# not a multi-entry block of single-line `key: value,` items (which
-# `_try_object_entry_insert` handles); it's one entry with a nested
-# multi-line value.
-#
-# This heuristic:
-#   · confirms the body starts with a dict-entry line (`"key": {` or
-#     `key: {` or `"--flag": {`);
-#   · extracts a plausible dict-variable name from the prose —
-#     backtick-wrapped first, then a whitelist of common dict names,
-#     then `args` if the body's first key is a dashed flag;
-#   · finds that variable's `= {` (or `: {`) in base;
-#   · inserts the body before the dict's closing `}` line, at the
-#     indent the existing entries use (detected from the first
-#     existing entry, so a 2-space or 4-space style both work);
-#   · skips any candidate dict that already contains every key in the
-#     body (that would produce a duplicate-key insert).
 
-# FIX (2026-10-28): widened key grammar.  See module docstring.
+# FIX (2026-10-28): widened key grammar.
 _DICT_ENTRY_START_RE = re.compile(
     r'^\s*["\']?[-A-Za-z_$][\w$\-.]*["\']?\s*:\s*')
 
 _PROSE_VAR_RE = re.compile(r'`([A-Za-z_][\w]*)`')
 
-# Fallback dict-variable names when prose doesn't backtick-wrap them.
-# Deliberately narrow: "add to the args dict" is unambiguous; "add to
-# the config" is not (config could be a file path, an object, a
-# method...).  When the prose is clear, the backtick path handles it.
 _COMMON_DICT_NAMES = frozenset({
     "args", "kwargs", "params", "options",
 })
@@ -325,18 +274,6 @@ def _extract_dict_var_names(prose: str,
     """Backtick-wrapped identifiers first (most reliable), then a
     whitelist of common dict names found as bare words in the prose,
     then `args` if the body's first key is a CLI flag.
-
-    The last is a 2026-10-28d fix: a body whose first line starts
-    with `"--flag"` (a dashed key) is almost certainly a
-    `@command(args=...)` decorator entry.  `args` is the conventional
-    dict name; adding it as a fallback closes the shape where the
-    prose names the method (`comfy_generate`) but not the dict
-    (`args`), and no candidate found a dict in base.
-
-    Order matters: backticked identifiers are most reliable and come
-    first; the dashed-key fallback comes after the whitelist so an
-    explicit prose mention of `kwargs` or `params` still takes
-    precedence over the implicit `args` default.
     """
     names = []
     if prose:
@@ -347,7 +284,6 @@ def _extract_dict_var_names(prose: str,
             if cand not in names:
                 names.append(cand)
 
-    # Dashed-key fallback (2026-10-28d): see docstring.
     if body_first_line:
         m = _ENTRY_OUTER_KEY_RE.match(body_first_line)
         if m and m.group(1).startswith("-"):
@@ -367,13 +303,7 @@ def _dict_var_regex(var_name: str) -> "re.Pattern":
 
 def _existing_entry_indent(base: str, open_brace: int,
                             close_brace: int, default_delta: str) -> str:
-    """Detect the indent used by existing entries in a dict, falling
-    back to `close_indent + default_delta` when the dict is empty.
-
-    The first non-close line after `open_brace` decides.  We skip
-    lines whose stripped content is `}` or `},` because those close
-    nested values, not entries.
-    """
+    """Detect the indent used by existing entries in a dict."""
     line_start = base.rfind("\n", 0, close_brace) + 1
     close_indent = base[line_start:close_brace]
     scan = base.find("\n", open_brace)
@@ -414,31 +344,132 @@ def _reindent_entry(body_lines: list, target_indent: str) -> list:
     return out
 
 
+# ===========================================================================
+#  Scope-aware target discovery (2026-10-28f)
+# ===========================================================================
+
+def _find_args_in_command_decorator_of(base, scope_name, var_names):
+    """Return (open_brace, close_brace) for the args dict inside the
+    `@command(...)` decorator that decorates `def <scope_name>`.
+
+    Motivating case (comfyui.py): prose says *"find the
+    `comfy_generate` command decorator. Add: `--output_rotation`..."*.
+    Without this, `_try_named_dict_insert` picks the first `args={...}`
+    in the file, which belongs to `comfy_connect`.  With it, the
+    args dict in `comfy_generate`'s decorator is targeted.
+
+    `var_names` is the candidate dict names (e.g. `["args"]`).  Only
+    keys that appear in `var_names` are considered.  Returns None if
+    `def <scope_name>` doesn't exist, or its decorator has no matching
+    args dict.
+    """
+    if not scope_name or not base:
+        return None
+    def_re = re.compile(
+        r'(?m)^[ \t]*(?:async\s+)?def\s+' + re.escape(scope_name) +
+        r'\s*\(\s*self\b'
+    )
+    def_m = def_re.search(base)
+    if not def_m:
+        return None
+    def_pos = def_m.start()
+
+    # Find the LAST `@command(` before the def line.  Using "last"
+    # because a function may have multiple decorators (`@foo\n@command
+    # (...)\ndef ...`) and only the closest one is the one whose args
+    # dict this is.
+    command_re = re.compile(r'(?m)^[ \t]*@command\s*\(')
+    last_command = None
+    for cm in command_re.finditer(base, 0, def_pos):
+        last_command = cm
+    if last_command is None:
+        return None
+    cmd_start = last_command.start()
+
+    region = base[cmd_start:def_pos]
+    for var_name in var_names:
+        name_re = re.compile(
+            r'(?:^|\n)[ \t]*' + re.escape(var_name) + r'\s*[=:]\s*\{',
+            re.MULTILINE,
+        )
+        for m in name_re.finditer(region):
+            open_brace = cmd_start + m.end() - 1
+            close_brace = _find_matching_brace(
+                base, open_brace, is_python=True)
+            if close_brace == -1 or close_brace >= def_pos:
+                continue
+            return (open_brace, close_brace)
+    return None
+
+
+def _scoped_dict_keys(base, open_brace, close_brace):
+    """Return the top-level keys of a dict literal."""
+    block = base[open_brace:close_brace + 1]
+    return set(re.findall(
+        r'^\s*["\']?([-A-Za-z_$][\w$\-.]*)["\']?\s*:',
+        block, re.MULTILINE))
+
+
+def _splice_dict_entry(base, body, open_brace, close_brace):
+    """Insert `body` as an entry at the end of the dict
+    `{open_brace:close_brace}`, before its closing `}` line.
+    """
+    entry_indent = _existing_entry_indent(
+        base, open_brace, close_brace, default_delta="    ")
+    body_lines = body.strip().split("\n")
+    new_lines = _reindent_entry(body_lines, entry_indent)
+    line_start = base.rfind("\n", 0, close_brace) + 1
+    insertion = "\n".join(new_lines) + "\n"
+    result = base[:line_start] + insertion + base[line_start:]
+    return result if result != base else None
+
+
 def _try_named_dict_insert(base, body, context_before):
+    """Insert a dict entry into a variable-named dict.
+
+    Scope-first target selection (2026-10-28f): when the prose names
+    a function AND that function's `@command(args={...})` decorator
+    exists, prefer that args dict.  If the entry key is already in it,
+    return `base` (already-present).  Fall back to file-order pick
+    when no scope is named, preserving backward compat.
+    """
     stripped = body.strip()
     if not stripped:
         return None
     first_line = stripped.split("\n", 1)[0]
     if not _DICT_ENTRY_START_RE.match(first_line):
         return None
-    # Reject if the body looks like a signature (a `def foo(x) {`):
-    # that's `_try_signature_replace` territory.  The entry-start
-    # regex allows a dict key named `def`, but a `def foo(` in prose
-    # context is much more likely a signature than a dict entry with
-    # a key literally called `def`.
     if re.match(r'^\s*["\']?(?:def|function|class)\b', first_line):
         return None
 
     entry_key_match = _ENTRY_OUTER_KEY_RE.match(first_line)
     entry_key = entry_key_match.group(1) if entry_key_match else None
 
-    # FIX (2026-10-28d): pass the body's first line so
-    # `_extract_dict_var_names` can add `args` as a fallback when the
-    # body is a dashed-key entry (a `@command(args=...)` decorator arg).
     var_names = _extract_dict_var_names(context_before or "", first_line)
     if not var_names:
         return None
 
+    # Scope-aware path.  Only fires when both (a) the prose names a
+    # specific function and (b) that function has a `@command(args={...})`
+    # decorator whose args dict is findable.  Otherwise fall back to
+    # file-order pick (backward compat with tests that use prose
+    # without a scope).
+    try:
+        from .patch_scope_insert import _extract_scope_name_from_prose
+        scope_name = _extract_scope_name_from_prose(context_before or "")
+    except ImportError:
+        scope_name = None
+
+    if scope_name and entry_key is not None:
+        scoped_dict = _find_args_in_command_decorator_of(
+            base, scope_name, var_names)
+        if scoped_dict is not None:
+            open_brace, close_brace = scoped_dict
+            if entry_key in _scoped_dict_keys(base, open_brace, close_brace):
+                return base  # already-present in the scoped dict
+            return _splice_dict_entry(base, body, open_brace, close_brace)
+
+    # Fallback: file-order candidates, first non-conflicting wins.
     for var_name in reversed(var_names):
         pat = _dict_var_regex(var_name)
         candidates = []
@@ -450,35 +481,13 @@ def _try_named_dict_insert(base, body, context_before):
             if close_brace == -1:
                 continue
             if entry_key is not None:
-                block = base[open_brace:close_brace + 1]
-                # FIX (2026-10-28): widened key grammar so a CLI-flag
-                # key like `--output_rotation` is correctly detected as
-                # pre-existing.
-                existing_keys = set(re.findall(
-                    r'^\s*["\']?([-A-Za-z_$][\w$\-.]*)["\']?\s*:',
-                    block, re.MULTILINE))
-                if entry_key in existing_keys:
+                if entry_key in _scoped_dict_keys(
+                        base, open_brace, close_brace):
                     continue
             candidates.append((m, open_brace, close_brace))
         if not candidates:
             continue
-
-        # Prefer the outermost dict whose closing brace comes first.
-        # For `args={...}` inside `@command(...)` this is the only
-        # candidate; when several `args={}` dicts exist we pick the
-        # first one whose key set doesn't already contain the entry.
         m, open_brace, close_brace = candidates[0]
-
-        entry_indent = _existing_entry_indent(
-            base, open_brace, close_brace, default_delta="    ")
-
-        body_lines = stripped.split("\n")
-        new_lines = _reindent_entry(body_lines, entry_indent)
-
-        line_start = base.rfind("\n", 0, close_brace) + 1
-        insertion = "\n".join(new_lines) + "\n"
-        result = base[:line_start] + insertion + base[line_start:]
-        if result != base:
-            return result
+        return _splice_dict_entry(base, body, open_brace, close_brace)
 
     return None

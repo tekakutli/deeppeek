@@ -139,12 +139,48 @@ def test_two_command_methods_checked_independently():
     assert v[0]["unused"] == ["bar"]
 
 
+def test_delegated_reads_count_as_use():
+    """A command that delegates to a helper which reads `params.get`
+    counts as using those args.  Motivating case: comfyui.py
+    `comfy_generate` delegates to `_comfy_generate_impl`; the arg
+    `--output_rotation` is read in the helper, not in the method.
+    """
+    content = (
+        '@command(args={\n'
+        '    "--foo": {"type": "str"},\n'
+        '})\n'
+        'def handle(self, params):\n'
+        '    return self._impl(params)\n'
+        '\n'
+        'def _impl(self, params):\n'
+        '    return params.get("foo")\n'
+    )
+    assert _find_command_violations(content) == []
+
+
+def test_delegated_reads_dont_fix_unrelated_args():
+    """Delegation only counts args actually read in the callee."""
+    content = (
+        '@command(args={\n'
+        '    "--foo": {"type": "str"},\n'
+        '    "--bar": {"type": "int"},\n'
+        '})\n'
+        'def handle(self, params):\n'
+        '    return self._impl(params)\n'
+        '\n'
+        'def _impl(self, params):\n'
+        '    return params.get("foo")\n'
+    )
+    v = _find_command_violations(content)
+    assert len(v) == 1
+    assert v[0]["unused"] == ["bar"]
+
+
 # ---------------------------------------------------------------------------
 # _arg_introduced_by_patch (fixed semantics)
 # ---------------------------------------------------------------------------
 
 def test_arg_introduced_by_declaration():
-    """A patch body with `"--foo":` (dict key) counts as introducing."""
     rec = _rec("x.py", "", patches=[{
         "idx": 1,
         "body": '"--output_rotation": {"type": "float", "default": 0.0},',
@@ -161,8 +197,6 @@ def test_arg_introduced_single_dash():
 
 
 def test_arg_usage_does_not_count_as_introduction():
-    """A patch body that only USES params.get('foo') does NOT introduce
-    the declaration; it fixes the wiring."""
     rec = _rec("x.py", "", patches=[{
         "idx": 1,
         "body": 'rotation = params.get("output_rotation") or 0.0\n',
@@ -171,7 +205,6 @@ def test_arg_usage_does_not_count_as_introduction():
 
 
 def test_arg_substring_not_matched():
-    """`--foo_bar` declaration must not count as `--foo`."""
     rec = _rec("x.py", "", patches=[{
         "idx": 1,
         "body": '"--foo_bar": {"type": "str"},',
@@ -214,7 +247,6 @@ def test_demotes_when_arg_introduced_by_patch():
 
 
 def test_no_demotion_when_arg_preexisting():
-    """Arg present but no patch declares it → warn only, trust unchanged."""
     rec = _rec("x.py",
         '@command(args={"--foo": {"type": "str"}})\n'
         'def handle(self, params):\n'
@@ -232,8 +264,6 @@ def test_no_demotion_when_arg_preexisting():
 
 
 def test_wiring_patch_does_not_trigger_demotion():
-    """Patch adds the FIX (`params.get`) for a pre-existing unused arg —
-    must not be flagged as introducing the arg."""
     rec = _rec("x.py",
         '@command(args={"--foo": {"type": "str"}})\n'
         'def handle(self, params):\n'
@@ -246,6 +276,32 @@ def test_wiring_patch_does_not_trigger_demotion():
     records = {"x.py": rec}
     n = pass8_4_lint_command_args(records)
     assert n == 0
+    assert rec.trust == "HIGH"
+
+
+def test_delegated_reads_prevent_demotion():
+    """The motivating comfyui.py shape: the arg is declared in the
+    @command decorator and read in a helper the method delegates to.
+    Lint must not fire."""
+    rec = _rec("x.py",
+        '@command(args={"--output_rotation": {"type": "float"}})\n'
+        'def comfy_generate(self, params):\n'
+        '    return self._comfy_generate_impl(params)\n'
+        '\n'
+        'def _comfy_generate_impl(self, params):\n'
+        '    output_rotation = float(params.get("output_rotation") or 0.0)\n'
+        '    return output_rotation\n',
+        patches=[{
+            "idx": 1,
+            "body": '"--output_rotation": {"type": "float"},',
+            "applied_by": "deterministic",
+        }])
+    records = {"x.py": rec}
+    n = pass8_4_lint_command_args(records)
+    assert n == 0, (
+        f"expected no demotion (delegated read); "
+        f"got unused={rec.verification.get('unused_command_args')}"
+    )
     assert rec.trust == "HIGH"
 
 
@@ -304,7 +360,6 @@ def test_skips_deleted():
 
 
 def test_crash_in_extractor_does_not_raise():
-    """A bug in _find_command_violations must not take down the pass."""
     import deeppeek.recover.lint as lint_mod
     original = lint_mod._find_command_violations
 
@@ -325,8 +380,6 @@ def test_crash_in_extractor_does_not_raise():
 
 
 def test_one_demotion_per_record():
-    """Two unused args introduced by the same patch → one demotion entry
-    per record, with both args recorded in `unused_command_args`."""
     rec = _rec("x.py",
         '@command(args={\n'
         '    "--foo": {"type": "str"},\n'
@@ -363,6 +416,10 @@ def main():
         ("command with no args", test_command_with_no_args),
         ("two command methods checked independently",
          test_two_command_methods_checked_independently),
+        ("delegated reads count as use",
+         test_delegated_reads_count_as_use),
+        ("delegated reads dont fix unrelated args",
+         test_delegated_reads_dont_fix_unrelated_args),
         ("arg introduced by declaration",
          test_arg_introduced_by_declaration),
         ("arg introduced single dash",
@@ -377,6 +434,8 @@ def main():
          test_no_demotion_when_arg_preexisting),
         ("wiring patch does not trigger demotion",
          test_wiring_patch_does_not_trigger_demotion),
+        ("delegated reads prevent demotion",
+         test_delegated_reads_prevent_demotion),
         ("skips non-python", test_skips_non_python),
         ("skips already low", test_skips_already_low),
         ("skips none content", test_skips_none_content),

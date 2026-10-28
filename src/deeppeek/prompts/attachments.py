@@ -28,6 +28,14 @@ Supporting modes for completeness:
   --last N             attachments from the last N sent messages
                        that had files
   --all                every attachment in the conversation
+  --filename PATTERN   attachments whose filename contains
+                       PATTERN (case-insensitive substring match
+                       by default; --case-sensitive overrides).
+                       Scans every message in the conversation,
+                       or active-path only without
+                       --include-forked.  Useful for "give me
+                       the file X" when you don't remember which
+                       message it was attached to.
 
 MECHANISM
 =========
@@ -108,6 +116,8 @@ def _human_size(n: Optional[int]) -> str:
 def _resolve_mode(args: argparse.Namespace) -> str:
     if args.prompt_regex is not None:
         return "prompt-regex"
+    if args.filename is not None:
+        return "filename"
     if args.message_id is not None:
         return "message-id"
     if args.last is not None:
@@ -127,6 +137,9 @@ def _build_opts(args: argparse.Namespace, mode: str) -> dict:
         opts["pattern"] = args.prompt_regex
         opts["flags"] = "" if args.case_sensitive else "i"
         opts["all_matches"] = bool(args.all_matches)
+    elif mode == "filename":
+        opts["pattern"] = args.filename
+        opts["case_sensitive"] = bool(args.case_sensitive)
     elif mode == "message-id":
         opts["message_id"] = int(args.message_id)
     elif mode == "last-N":
@@ -145,9 +158,9 @@ def run(args: argparse.Namespace) -> int:
         print("error: --all-matches is only meaningful with "
               "--prompt-regex", file=sys.stderr)
         return 3
-    if args.case_sensitive and mode != "prompt-regex":
+    if args.case_sensitive and mode not in ("prompt-regex", "filename"):
         print("error: --case-sensitive is only meaningful with "
-              "--prompt-regex", file=sys.stderr)
+              "--prompt-regex or --filename", file=sys.stderr)
         return 3
 
     opts = _build_opts(args, mode)
@@ -161,6 +174,7 @@ def run(args: argparse.Namespace) -> int:
 
         print(f"[extract] mode={mode}"
               + (f"  pattern={args.prompt_regex!r}" if mode == "prompt-regex" else "")
+              + (f"  filename={args.filename!r}" if mode == "filename" else "")
               + (f"  message_id={args.message_id}" if mode == "message-id" else "")
               + (f"  last={args.last}" if mode == "last-N" else "")
               + ("  (list only)" if args.list_only else ""),
@@ -264,7 +278,7 @@ def register(sub: argparse._SubParsersAction) -> None:
         help="Download files attached to the current conversation "
              "to your browser's download directory "
              "(composer draft/edit, prompt regex, message id, "
-             "last N, or all)",
+             "last N, filename, or all)",
     )
 
     g = p.add_mutually_exclusive_group(required=False)
@@ -301,6 +315,15 @@ def register(sub: argparse._SubParsersAction) -> None:
         help="download attachments from every message in the "
              "conversation.",
     )
+    g.add_argument(
+        "--filename", metavar="PATTERN",
+        help="download attachments whose filename contains PATTERN "
+             "(case-insensitive substring match; --case-sensitive "
+             "to override).  Scans every message in the "
+             "conversation, or active-path only without "
+             "--include-forked.  Use --list-only to preview "
+             "matches before downloading.",
+    )
 
     p.add_argument(
         "--all-matches", action="store_true",
@@ -309,15 +332,15 @@ def register(sub: argparse._SubParsersAction) -> None:
     )
     p.add_argument(
         "--case-sensitive", action="store_true",
-        help="with --prompt-regex: match case-sensitively "
-             "(default: case-insensitive).",
+        help="with --prompt-regex or --filename: match "
+             "case-sensitively (default: case-insensitive).",
     )
     p.add_argument(
         "--include-forked", action="store_true",
         help="include attachments from forked-away branches "
              "(edited or regenerated messages hidden from the UI).  "
-             "Only meaningful with --prompt-regex, --message-id, "
-             "--last, or --all.",
+             "Only meaningful with --prompt-regex, --filename, "
+             "--message-id, --last, or --all.",
     )
     p.add_argument(
         "--list-only", action="store_true",
