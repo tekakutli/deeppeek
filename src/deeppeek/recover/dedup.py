@@ -84,6 +84,30 @@ comfyui_krita.py` where the conversation printed only
 `paste_batch_as_layers` was applied to a base with no imports or
 `_decode_png` — resulting in a file that fail-closes on first
 `ast.parse`.
+
+COVERAGE-DEMOTE POLICY (2026-11-05)
+===================================
+Subset-demote only fires when the real body is literally contained
+in (or token-equivalent to) the preexisting body.  That misses the
+case where a conversation "full" print is a *rewrite* of a small
+subset of the preexisting file's declarations — the `paste_image`
+block in `comfyui_krita.py` (1 function of 22) is a rewrite of
+`paste_image`, not a substring of it (it adds `rotation`,
+`_rotate_about_center`, `_center_crop`).
+
+The fix: count how many of the pre-existing file's top-level
+declarations the conversation body declares.  If the conversation
+body declares <50% of them, it cannot be a full-file replacement;
+demote to a patch and use the preexisting as the base.  Scope-aware
+replacement then handles each function individually, and the
+preexisting declaration set survives intact.
+
+For the two motivating cases:
+  · pg_state.py:     1 of ~5 declarations = 0.2  → demote
+  · comfyui_krita.py: 1 of 22     = 0.045 → demote
+
+For a legitimate full-file rewrite that preserves most functions:
+coverage ≥0.5 → keep as full replacement (existing behaviour).
 """
 
 import re
@@ -191,6 +215,40 @@ def _token_subset(real_body, pre_body):
     if not real_tokens or not real_tokens.issubset(pre_tokens):
         return False
     return bool(_top_level_decls(real_body) & _top_level_decls(pre_body))
+
+
+def _covers_preexisting(real_body, pre_body, threshold=0.5):
+    """True iff the real body declares at least `threshold` fraction of
+    the preexisting body's top-level declarations.
+
+    This is the second guard against "full" prints that are actually
+    fragments.  Subset-demote (`_token_subset`) catches fragments that
+    are literally contained in base.  Coverage-demote catches fragments
+    that are *rewrites* of a subset — new imports, new helper functions,
+    or renamed parameters make a fragment not-a-substring, but the
+    fragment still declares only a small fraction of the file's
+    top-level names.
+
+    The 0.5 threshold:
+      · pg_state.py:     1/5  = 0.20  → demote
+      · comfyui_krita.py: 1/22 = 0.045 → demote
+      · full-file rewrite: 22/22 = 1.0 → keep
+      · "rewrite most of it": >= 11/22 → keep
+
+    A body with zero top-level declarations (e.g. an HTML fragment,
+    a JSON dump) returns False — it can't cover a file with any
+    declarations.  A preexisting body with zero declarations returns
+    True (nothing to preserve, so nothing to fail coverage against).
+    """
+    pre_decls = _top_level_decls(pre_body)
+    if not pre_decls:
+        return True
+    real_decls = _top_level_decls(real_body)
+    if not real_decls:
+        return False
+    overlap = len(pre_decls & real_decls)
+    return overlap / len(pre_decls) >= threshold
+
 
 def _has_code_signal(body: str) -> bool:
     """True iff `body` looks like code rather than prose.
@@ -333,55 +391,64 @@ def _already_in_other_file(block: Block,
                            current_path: str,
                            records: dict,
                            blocks_by_idx: dict) -> Optional[str]:
-    """Return the path of another record whose base contains the
+    """Return the path of another record whose content (committed
+    content, or chosen-full base if content is None) contains the
     block's body, or None.
 
     Two match modes:
-
       · Exact substring — the block's body is contiguous in the
-        other file's base.  This is the original behaviour.
-
+        other file's content.
       · Fuzzy line match — at least 85% of the block's lines are
-        present in the other file's base (exact or token-
-        equivalent).  This catches inline fragments of longer
-        functions: block 86 in the inpaint conversation is
-        `_clearImageAction`'s prefix (six lines, closed by a bare
-        `}`), while the base it references in `pg_panel_bindings.py`
-        is those same six lines followed by
-        `import("./pg_dispatch.js").then(...)` and a different `}`
-        line.  Exact substring fails because the closing brace is
-        not contiguous; per-line fuzzy succeeds.
+        present in the other file's content.
 
-    Threshold 0.85 is deliberately conservative.  A block whose
-    content is fully shadowed by another file's base is very
-    unlikely to be a legitimate edit of the current file — the
-    prose attribution guessed wrong.  Failing closed here costs
-    one manual copy; a false negative (applying the block anyway)
-    corrupts the wrong file, whose content then diverges from the
-    intended shape.
+    EXTENDED (2026-10-28): also considers records that are not
+    `preexisting_base`.  A blockquoted fragment duplicated verbatim
+    by a conversation-authored record elsewhere is a duplicate
+    regardless of whether the destination record came from a
+    preexisting file or from a conversation full-print.  The
+    motivating cases:
 
-    Only checks *preexisting* records: a block that IS the base of
-    the current file is already handled by the chosen-full filter
-    in `pass5_deduplicate`.
+      · `pg_panel_scrubs.py` blockquoted `_clearImageAction`
+        fragment, verbatim prefix of `pg_panel_bindings.py`'s
+        pre-existing base (which was itself authored by an earlier
+        conversation).
+
+      · `pg_panel_bindings.py` blockquoted `inpaintEnabledEl`
+        fragment, verbatim of `pg_panel_scrubs.py`'s
+        conversation-authored content.
+
+    Both were misattributed by the current attribution and would
+    have been applied to the wrong file if not caught.  Neither
+    was caught by the previous preexisting-only guard.
+
+    When `rec.content` is None (pass 5 runs before pass 6), falls
+    back to the record's chosen-full block's body.  For
+    conversation-authored records this is the correct content
+    reference — it is the block the record would be based on
+    before patches.
     """
     from .patch_text import _content_present_in_base
 
     body = block.body.strip()
     if not body or len(body) < 20:
         return None
+
     for other_path, other_rec in records.items():
         if other_path == current_path:
             continue
-        if not other_rec.preexisting_base:
+
+        other_content = other_rec.content
+        if other_content is None and other_rec.last_full_idx is not None:
+            base_block = blocks_by_idx.get(other_rec.last_full_idx)
+            if base_block is not None:
+                other_content = base_block.body
+
+        if other_content is None:
             continue
-        if other_rec.last_full_idx is None:
-            continue
-        other_base = blocks_by_idx.get(other_rec.last_full_idx)
-        if other_base is None:
-            continue
-        if body in other_base.body:
+
+        if body in other_content:
             return other_path
-        if _content_present_in_base(other_base.body, body,
+        if _content_present_in_base(other_content, body,
                                     threshold=0.85):
             return other_path
     return None
@@ -469,37 +536,65 @@ def pass5_deduplicate(records: dict,
         pre_fulls = [i for i in all_fulls
                      if blocks_by_idx[i].classified_by == "preexisting"]
 
-        # Subset-demote: a conversation "full" that is a strict
-        # substring of a preexisting full is not a replacement of
-        # the whole file — it is a partial extraction.  Demote it
+        # Subset-demote OR coverage-demote: a conversation "full"
+        # that is a strict substring of a preexisting full, or that
+        # declares too few of the preexisting file's top-level
+        # declarations, is not a replacement of the whole file — it
+        # is a partial extraction or a scoped rewrite.  Demote it
         # to a patch and keep the preexisting as the base.
+        #
+        # A real block that passes BOTH checks (not a subset AND
+        # covers >=50% of pre's declarations) is a genuine full
+        # replacement; the preexisting base is discarded in favour
+        # of the real body.
+        #
+        # See module docstring: SUBSET-DEMOTE POLICY and
+        # COVERAGE-DEMOTE POLICY.
         if real_fulls and pre_fulls:
             pre_bodies = {i: blocks_by_idx[i].body for i in pre_fulls}
-            all_subset = True
+            all_reals_cover = True
             for i in real_fulls:
                 real_body = (blocks_by_idx[i].body or "").strip()
                 if not real_body:
-                    all_subset = False
+                    all_reals_cover = False
                     break
-                is_subset = False
-                for pb in pre_bodies.values():
-                    if real_body in pb:
-                        is_subset = True
-                        break
-                    if _token_subset(real_body, pb):
-                        is_subset = True
-                        break
-                if not is_subset:
-                    all_subset = False
+                is_subset = any(
+                    real_body in pb or _token_subset(real_body, pb)
+                    for pb in pre_bodies.values()
+                )
+                covers_pre = any(
+                    _covers_preexisting(real_body, pb)
+                    for pb in pre_bodies.values()
+                )
+                if is_subset or not covers_pre:
+                    all_reals_cover = False
                     break
-            if all_subset:
-                fulls = pre_fulls
-                rec.preexisting_base = True
-                rec._demoted_reals = set(real_fulls)
-            else:
+            if all_reals_cover:
                 fulls = real_fulls
                 rec.preexisting_base = False
                 rec._demoted_reals = set()
+            else:
+                fulls = pre_fulls
+                rec.preexisting_base = True
+                rec._demoted_reals = set(real_fulls)
+                if verbose:
+                    for i in real_fulls:
+                        real_body = (blocks_by_idx[i].body or "").strip()
+                        for pb in pre_bodies.values():
+                            if (real_body in pb
+                                    or _token_subset(real_body, pb)):
+                                print(f"  [pass 5] {path}: demoting "
+                                      f"idx={i} (subset of preexisting)",
+                                      file=sys.stderr)
+                                break
+                            if not _covers_preexisting(real_body, pb):
+                                pre_n = len(_top_level_decls(pb))
+                                real_n = len(_top_level_decls(real_body))
+                                print(f"  [pass 5] {path}: demoting "
+                                      f"idx={i} (declares {real_n}/"
+                                      f"{pre_n} of preexisting "
+                                      f"declarations)", file=sys.stderr)
+                                break
         elif real_fulls:
             fulls = real_fulls
             rec.preexisting_base = False
@@ -598,9 +693,9 @@ def pass5_deduplicate(records: dict,
                     if blocks_by_idx[i].kind == "partial"
                     and i not in pair_idxs_for_this_file
                     and block_owner.get(i) == path]
-        # Demoted reals from the subset check above also need to run
-        # as patches — they are scoped replacements of functions
-        # against a preexisting base.
+        # Demoted reals from the subset/coverage check above also
+        # need to run as patches — they are scoped replacements of
+        # functions against a preexisting base.
         for _i in getattr(rec, "_demoted_reals", set()):
             if _i not in partials:
                 partials.append(_i)

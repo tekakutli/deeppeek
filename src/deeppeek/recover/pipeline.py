@@ -93,6 +93,24 @@ declarations.  The `comfyui_krita.py` truncation is the motivating
 case — twenty of twenty-two top-level functions would have been
 deleted.  See `shield.py` for the full account.
 
+RE-VERIFY RECONCILED (PASS 8.7b, 2026-10-28b)
+=============================================
+The verify-reconcile-verify invariant:
+
+    every pass that can demote a record must be re-run after every
+    pass that can promote it, on the promoted content, before the
+    promotion is committed.
+
+Pass 8.4 (lint) and pass 8.5 (symbols) both demote.  Pass 8.7
+(reconcile) promotes.  Reconcile's own replay is now lint-aware
+(see `reconcile.py`), so the specific `--output_rotation` case is
+caught inside 8.7.  But that fix relies on `_count_failures` being
+kept in sync with every demoting pass; adding a future demoting
+pass would require updating that function.  Pass 8.7b makes the
+invariant mechanical: `reverify.reverify_reconciled` re-runs every
+demoting pass on every promoted record.  A reconciled record that
+still fails a demoting check is demoted again; it does not ship.
+
 RESIDUAL EMISSION
 =================
 After pass 9 writes its output and returns cleanly, a residual
@@ -127,6 +145,7 @@ The safe defaults per pass:
     pass 8     → (no-op; no per-file verification)
     pass 8.5   → (no-op; no symbol demotions)
     pass 8.7   → 0 (no reconciliations)
+    pass 8.7b  → 0 (no re-demotions)
     pass 8.8   → 0 (no shield demotions)
     pass 9     → caught by the writer's own try/except
 
@@ -163,6 +182,7 @@ from .validate import (
     pass8_verify, pass8_5_check_symbols,
 )
 from .reconcile import pass8_7_reconcile
+from .reverify import reverify_reconciled
 from .shield import pass8_8_shield_preexisting
 from .write import pass9_write
 
@@ -667,6 +687,16 @@ def run(cfg: RecoverConfig) -> int:
         records, blocks_by_idx=blocks_by_idx,
     )
 
+    print("[pass 8.4] linting @command decorator args...")
+    from .lint import pass8_4_lint_command_args
+    n_lint_demoted = _run_pass(
+        "8.4 (lint)", pass8_4_lint_command_args, 0,
+        run_errors, records,
+    ) or 0
+    if n_lint_demoted:
+        print(f"  {n_lint_demoted} record(s) demoted to LOW for "
+              f"unused @command args", file=sys.stderr)
+
     print("[pass 8.7] reconciling fail-closed records...")
     n_reconciled = _run_pass(
         "8.7 (reconcile)", pass8_7_reconcile, 0,
@@ -676,6 +706,21 @@ def run(cfg: RecoverConfig) -> int:
         print(f"  {n_reconciled} record(s) reconciled "
               f"(excluded misattributed/unplaceable items)",
               file=sys.stderr)
+
+    # ---- pass 8.7b (NEW) — re-verify reconciled records ----
+    # See the module docstring, RE-VERIFY RECONCILED section, and
+    # `reverify.py`.  Runs immediately after reconcile so a promotion
+    # cannot commit content that a demoting pass would still reject.
+    print("[pass 8.7b] re-verifying reconciled records...")
+    n_reverified = _run_pass(
+        "8.7b (re-verify)", reverify_reconciled, 0,
+        run_errors, records, blocks_by_idx,
+    ) or 0
+    if n_reverified:
+        print(f"  {n_reverified} reconciled record(s) re-demoted "
+              f"by post-reconcile verification", file=sys.stderr)
+    else:
+        print("  no re-demotions")
 
     # ---- pass 8.8 (wrapped) — shield pre-existing overwrites ----
     if cfg.apply_to is not None and cfg.shield_preexisting:

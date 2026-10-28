@@ -1,7 +1,8 @@
 """
-patch_replace — single-line replace, object-literal splice, fuzzy.
+patch_replace — single-line replace, object-literal splice, fuzzy,
+                signature replace.
 
-Three heuristics that transform existing content in place:
+Four heuristics that transform existing content in place:
 
   _try_single_line_replace      one-line body matched by identifier
                                 to one line in base
@@ -10,8 +11,12 @@ Three heuristics that transform existing content in place:
                                 `X.y = {`); preserves the base prefix
   _try_fuzzy_replace            replace-pair whose old_body is a
                                 token-subset of a base window
+  _try_signature_replace        body is a signature only (a `def`/
+                                `function`/`class` header ending with
+                                `:`); replace the matching signature
+                                in base
 
-MEDIUM-STABLE: these three encode "replace one thing with another".
+MEDIUM-STABLE: these four encode "replace one thing with another".
 Their contract is stable — the shape of the transform doesn't change
 as new conversations surface.  Regex patterns for detecting what
 *can* be replaced may evolve, but the mechanics of the transform
@@ -20,6 +25,34 @@ don't.
 `_OBJECT_LITERAL_ASSIGNMENT_RE` is exported because `patch_dispatch`
 and `patch_pairs` both consult it (for routing decisions and for the
 pair-splice branch).
+
+SIGNATURE-ONLY REPLACEMENT (2026-11-05)
+=======================================
+When the AI prints only the new signature of an existing method — a
+common "add a parameter" edit — the block is a `def foo(...) -> ...:`
+with no body statements.  Without this heuristic the block is either
+(a) rejected by the Python completeness gate (a bare `def foo():` is
+a SyntaxError), or (b) routed through `_apply_scoped` (which would
+replace the whole function body with just a signature — data loss).
+
+`_try_signature_replace` runs *before* the completeness gate in the
+dispatcher, so a signature-only block never reaches it.  It finds the
+matching signature in base (by name and by indentation) and replaces
+just the signature lines, leaving the body untouched.
+
+INDENTATION IS LOAD-BEARING (2026-10-28 fix)
+============================================
+The pre-fix `_try_signature_replace` called `body.strip()`, which
+strips leading whitespace from the first line.  For an indented
+method (`    def _paste_result(...)`), the extracted `base_indent`
+was therefore `""`, and the signature search only matched
+top-level definitions.  The signature-only block for
+`_paste_result` in the comfyui.py conversation never matched; it
+fell through to the completeness gate and failed.
+
+The fix uses `body.strip("\n")` — strip only surrounding newlines,
+not spaces.  Indentation of the signature line determines which
+definition the heuristic targets.
 """
 
 import re
@@ -28,6 +61,7 @@ from .patch_text import (
     _first_identifier,
     _line_token_jaccard,
     _find_matching_brace,
+    _find_matching_paren,
     _looks_like_python_fragment,
 )
 
@@ -57,15 +91,6 @@ _ONE_LINE_MIN_GAP = 0.20
 
 def _try_single_line_replace(base, raw_body, context_before=""):
     """Replace exactly one base line with a one-line body.
-
-    Fires only when:
-      · the body has exactly one non-blank line;
-      · the line is not a block opener/closer;
-      · the prose does not signal an addition;
-      · the line has an identifier that matches a base line's
-        identifier;
-      · the token-Jaccard similarity to that base line is
-        unambiguous (best - second-best ≥ _ONE_LINE_MIN_GAP).
     """
     lines = [ln for ln in raw_body.split("\n") if ln.strip()]
     if len(lines) != 1:
@@ -132,17 +157,7 @@ def _try_object_literal_splice(base, body_stripped, varname):
     if not matches:
         return None
 
-    # FIX A: a common identifier like `args` or `config` can appear
-    # multiple times in the same file.  Searching for the first match
-    # and splicing there silently corrupts the wrong scope — the
-    # comfy_connect/comfy_generate `args=` failure.  Use the body's
-    # own content to disambiguate: the correct candidate is the one
-    # that already contains the most of the body's distinctive lines.
-    # If two candidates tie, fail-closed: no anchor is safe enough.
     if len(matches) > 1:
-        # Meaningful body lines — drop short lines (single-char
-        # punctuation) and blank lines so a match isn't gamed by
-        # generic `}` / `},` lines.
         body_lines = [
             ln.strip() for ln in body_stripped.split("\n")
             if ln.strip() and len(ln.strip()) >= 8
@@ -223,12 +238,6 @@ def _try_object_literal_splice(base, body_stripped, varname):
 
 def _try_fuzzy_replace(base, old_body, new_body, threshold=0.75):
     """Similarity-based replace-pair fallback.
-
-    Fires only when byte-exact and whitespace-normalized matching
-    both fail.  Accepts a base window as a candidate only if, for
-    every line pair, the base line is a strict token superset of the
-    old_body line (or token-equivalent, meaning whitespace-only
-    drift) AND the length ratio is at most 2x.
     """
     import re as _re
     from collections import Counter
@@ -295,3 +304,100 @@ def _try_fuzzy_replace(base, old_body, new_body, threshold=0.75):
     result_lines = base_lines[:best_idx] + new_lines + base_lines[best_idx+n:]
     trailing = "\n" if base.endswith("\n") else ""
     return "\n".join(result_lines) + trailing
+
+
+# ===========================================================================
+#  Signature-only replace
+# ===========================================================================
+#
+# A common AI edit shape: "here is the new signature of X, add the new
+# parameter".  The block is a `def` header — possibly multi-line —
+# ending in the closing `:` (or `-> type:`), with no body statements.
+
+_SIG_FIRST_RE = re.compile(
+    r'(?P<indent>[ \t]*)(?:async\s+)?(?:def|function|class)\s+'
+    r'(?P<name>[A-Za-z_$][\w$]*)'
+)
+
+
+def _try_signature_replace(base, body):
+    """Replace a matching signature in base with the body's signature.
+
+    Fires only when the body is a signature-only fragment: the first
+    line names a def/function/class, and the last line is the
+    signature terminator (ends with `:`).
+
+    FIX (2026-10-28): indentation is preserved.  `body.strip("\n")`
+    keeps leading spaces, so `base_indent` correctly captures an
+    indented method signature and the search only matches the
+    matching-indent declaration in base.  `body.strip()` (the
+    pre-fix call) discarded the indent and produced a spurious
+    top-level match for indented methods.
+
+    Returns the patched base, or None.
+    """
+    if not body:
+        return None
+    stripped = body.strip("\n")
+    if not stripped.strip():
+        return None
+
+    body_lines = stripped.split("\n")
+    first_line = body_lines[0]
+    last_line = body_lines[-1].rstrip()
+
+    first_m = _SIG_FIRST_RE.match(first_line)
+    if not first_m:
+        return None
+
+    if not last_line.endswith(":"):
+        return None
+
+    name = first_m.group("name")
+    base_indent = first_m.group("indent")
+
+    sig_search = re.compile(
+        r'(?m)^(' + re.escape(base_indent) + r')'
+        r'(?:async\s+)?(?:def|function|class)\s+'
+        + re.escape(name) + r'\b'
+    )
+    m2 = sig_search.search(base)
+    if not m2:
+        return None
+
+    paren = base.find("(", m2.start())
+    if paren == -1:
+        return None
+    close_paren = _find_matching_paren(base, paren)
+    if close_paren == -1:
+        return None
+
+    tail = base[close_paren + 1:]
+    tail_stripped = tail.lstrip()
+    sig_end = close_paren + 1 + (len(tail) - len(tail_stripped))
+
+    if tail_stripped.startswith("->"):
+        colon = tail_stripped.find(":")
+        if colon == -1:
+            return None
+        sig_end = (close_paren + 1) + (len(tail) - len(tail_stripped)) + colon
+    elif not tail_stripped.startswith(":"):
+        return None
+
+    line_end = base.find("\n", sig_end)
+    if line_end == -1:
+        line_end = len(base)
+
+    body_first_indent = len(body_lines[0]) - len(body_lines[0].lstrip(" \t"))
+    normalized_lines = []
+    for ln in body_lines:
+        if not ln.strip():
+            normalized_lines.append("")
+            continue
+        rel = len(ln) - len(ln.lstrip(" \t")) - body_first_indent
+        normalized_lines.append(
+            base_indent + " " * max(0, rel) + ln.lstrip(" \t"))
+    normalized = "\n".join(normalized_lines)
+
+    result = base[:m2.start()] + normalized + base[line_end:]
+    return result if result != base else None

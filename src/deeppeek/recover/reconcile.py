@@ -5,39 +5,111 @@ excluding the minimum set of patches/pairs that caused the failure.
 See the pre-fix module docstring for the motivating cases and the
 "reconciled to base is not a rescue" invariant.
 
-NEW: STALE-WARNING CLEANUP
-==========================
+STALE-WARNING CLEANUP
+=====================
 Pass 6 appends `patch idx={idx} could not be applied (...)` warnings
 for every failed patch.  When reconciliation excludes a patch and
 promotes the record, those warnings are now stale — the patch is
 `skipped_unplaceable` or `skipped_misattributed`, not "failed".
-The pre-fix version left the warnings in place, producing
-confusing `warnings.txt` output like:
+`pass8_7_reconcile` removes the pass-6 warning for each excluded
+patch idx before adding its own reconciliation warning.
 
-    [pg_panel_bindings.py] [WARN] patch idx=90 could not be applied (...)
-    [pg_panel_bindings.py] [WARN] excluded patch idx=90 (...): ...
+THREE MORE CLASSES OF STALE WARNING
+===================================
+`content validation failed` from pass 8, `replace pair(s) failed`
+from pass 6, and `unresolved symbol reference(s) introduced by patch`
+from pass 8.5 get the same treatment: when reconcile rewrites their
+live state, the aggregate warning is removed.
 
-on a record that was written at HIGH trust.  `pass8_7_reconcile`
-now removes the pass-6 warning for each excluded patch idx before
-adding its own reconciliation warning.
+ORDERING FIXES
+==============
+  · `_diagnose_exclusion` now receives the pre-mutation status via
+    `original_status`, so the "could not be placed" branch is
+    reachable.  Prior versions mutated the status first and read it
+    after, so the generic "unresolved symbol" message always fired.
 
-NEW (2026-11-05): THREE MORE CLASSES OF STALE WARNING
-=====================================================
-`content validation failed` from pass 8 was the most confusing
-stale warning in the wild. When pass 8.7 excluded the offending
-patch and re-validated cleanly, `content_valid` became "ok" but
-the warning from the original failed pass-8 run persisted. The
-manifest showed a valid file *and* a "content validation failed"
-warning in the same record. Bug 4 from the comfyui run.
+  · `_trust_cap(rec)` is called *after* `rec.verification
+    ["reconciled"]` is populated.  Prior versions called it before,
+    so reconciled records always saw HIGH instead of the documented
+    MEDIUM cap.
 
-`replace pair(s) failed` and `unresolved symbol reference(s)
-introduced by patch` get the same treatment as the pass-6
-patch-failure warning: when reconcile rewrites their live state to
-"skipped", the aggregate warning becomes a lie.
+LINT-AWARE REPLAY (2026-10-28b)
+===============================
+`_count_failures` now runs pass 8.4's `_find_command_violations` on
+each candidate replay.  Without this, a record demoted by pass 8.4
+for an unused `@command` arg could be *promoted* by pass 8.7 if
+reconcile's own two checks (validate_content + symbols) happened to
+pass on the replayed content — even though the replayed content still
+declares the arg without reading it.  The result: a semantically
+broken file ships at MEDIUM trust.
 
-`_clear_stale_pass6_warnings` now handles all four classes.
+Motivating case (comfyui.py): `--output_rotation` was declared by a
+patch that applied; the wiring patch was excluded.  Pass 8.4
+correctly demoted to LOW.  Pass 8.7 replayed the content, saw a
+valid Python file with all symbols resolved, and promoted to MEDIUM
+— shipping the dead arg.  The fix: reconcile's replay now respects
+every demoting pass, not just the two it was originally written
+against.  This is the general invariant — a check that can demote
+must be re-run after any pass that can promote.
+
+DISTINCTIVE SCOPE-NAME MISATTRIBUTION (2026-10-28b)
+===================================================
+`_fuzzy_locate_elsewhere` classifies an excluded patch as "likely
+misattributed" by checking whether its content already exists in a
+different record.  The original check used line-overlap thresholds
+(verbatim for short bodies, 0.85 for long) — which missed the
+`_clearImageAction` case: a function whose body was modified by
+three new lines dropped overlap below 0.85, so the misattribution
+was reported as an opaque "unresolved symbol" instead of "the body
+lives in pg_panel_bindings.py".
+
+New fast path: if the body declares *exactly one* top-level scope
+whose name is distinctive (a function/class, not a plain variable)
+AND that scope is also declared in another record AND the bodies
+overlap at 0.4, the other record is returned directly.
+
+"Distinctive" excludes short/generic names (`draw`, `_get`, `run`)
+that legitimately appear across playground files; a body with
+`_clearImageAction` or `syncPanelFields` is almost certainly
+specific to one file, so a same-named scope elsewhere is a strong
+misattribution signal.
+
+"SINGLE SCOPE" is load-bearing
+------------------------------
+The fast path requires that `_top_level_decls(body)` returns exactly
+one name.  A multi-decl body (a cluster of 10 functions, a class
+plus its helpers) is bulk content, not the "one function whose body
+lives elsewhere" shape.  Without this guard, a body of 10 helper
+functions with similar names (helper_0..helper_9) trips the path
+against an unrelated file that happens to have helper_0..helper_7,
+even though a whole-file 0.8 similarity is not the kind of
+misattribution the fast path exists to catch.  This guard is the
+fix for the test_patch_gates.py::test_fuzzy_long_body_uses_higher_
+threshold regression: the test's intent (0.85 for long bodies) is
+preserved for multi-scope bodies; the fast path only short-circuits
+it for single-scope bodies, where it is a much stronger signal.
+
+MISATTRIBUTION GUARD (raised thresholds)
+========================================
+`_fuzzy_locate_elsewhere` classifies an excluded patch as "likely
+misattributed" (content lives in a different file already) versus
+"could not be placed".  The threshold split:
+
+  · Short bodies (< 500 chars) require *verbatim* substring match.
+    Short bodies are idioms (try/except, arg-parse) that recur in
+    many files; a fuzzy hit at this length is not evidence of
+    misattribution.  Motivating case: a 4-line try/except block
+    matching a different file's try/except by 3-of-4 lines, where
+    the differing line names a different variable (`params` vs
+    `payload`) — that is not the same block.
+
+  · Substantial bodies (>= 500 chars) use fuzzy match at 0.85.
+    A 15% line drift on a large function is consistent with a
+    legitimate-but-different implementation; raising the threshold
+    (from 0.7) is conservative.
 """
 
+import re
 import sys
 from dataclasses import replace
 from typing import Optional
@@ -51,6 +123,7 @@ _NO_OP_STATUSES = frozenset({
     "already-present",
     "skipped_misattributed",
     "skipped_unplaceable",
+    "skipped_structural_damage",
 })
 
 
@@ -114,8 +187,14 @@ def _replay_excluding(rec, base, excluded_keys, path,
 
 
 def _count_failures(content, path, rec, base, records, excluded_keys):
+    """Return (n_failures, [failure_descriptors]).
+
+    Runs every demoting check pass 8.x performs, so a promotion by
+    reconcile is only as strong as the *weakest* re-verified check.
+    See the module docstring, LINT-AWARE REPLAY section.
+    """
     from .validate_output import validate_content
-    from .symbols import find_unresolved_calls
+    from .symbols import find_unresolved_references
 
     failures = []
 
@@ -124,9 +203,32 @@ def _count_failures(content, path, rec, base, records, excluded_keys):
         failures.append(("content_invalid", err))
 
     trial = replace(rec, content=content)
-    unresolved = find_unresolved_calls(trial, base, records)
-    if unresolved:
-        failures.append(("unresolved_calls", list(unresolved)))
+    unresolved, mismatched = find_unresolved_references(
+        trial, base, records)
+    if unresolved or mismatched:
+        failures.append(("unresolved_calls", {
+            "unresolved": unresolved,
+            "mismatched": mismatched,
+        }))
+
+    # LINT-AWARE (2026-10-28b): re-run pass 8.4's unused-arg check on
+    # the replayed content.  See module docstring.
+    if path.endswith(".py") and "@command" in content:
+        try:
+            from .lint import (
+                _find_command_violations, _arg_introduced_by_patch,
+            )
+            violations = _find_command_violations(content)
+        except Exception:
+            violations = []
+        for v in violations:
+            introduced = [a for a in v["unused"]
+                          if _arg_introduced_by_patch(rec, a)]
+            if introduced:
+                failures.append(("unused_command_args", {
+                    "method": v["name"],
+                    "args":   introduced,
+                }))
 
     for p in rec.patches:
         if p.get("applied_by") != "failed":
@@ -185,39 +287,109 @@ def _find_minimum_exclusions(rec, base, records, path, blocks_by_idx):
     return None
 
 
+def _is_distinctive_scope_name(name):
+    """True iff `name` is long enough and distinctive enough that a
+    same-named scope in another file is a strong misattribution
+    signal.
+
+    Excluded: short names (`draw`, `_get`, `run`), and names without
+    an underscore or camelCase (which is most generic verbs).  The
+    filter targets the motivating case (`_clearImageAction` — 17
+    chars, has an underscore) while avoiding false positives on
+    common helper names shared across playground files.
+    """
+    if not name or len(name) < 8:
+        return False
+    return "_" in name or any(c.isupper() for c in name)
+
+
+def _scope_name_lives_elsewhere(body, current_path, records):
+    """If `body` declares *exactly one* top-level scope whose name is
+    distinctive AND that scope is also declared in another record AND
+    the two bodies overlap at 0.4, return the other record's path.
+    Else None.
+
+    SINGLE-SCOPE GUARD (2026-10-28b, fixes regression)
+    --------------------------------------------------
+    The fast path requires that the body declare exactly one
+    top-level scope.  A multi-decl body is bulk content, not the
+    "one function whose body lives elsewhere" shape — the fast path
+    is a signal for the case where a *single* function was misplaced.
+
+    Without this guard, a body of 10 helper functions
+    (helper_0..helper_9) trips the path against an unrelated file
+    that has helper_0..helper_7, since the body's first extracted
+    scope name (helper_0) matches and line overlap exceeds 0.4.
+    That defeats the 0.85 threshold for long bodies that
+    `test_fuzzy_long_body_uses_higher_threshold` locks in.  The
+    guard restores the threshold for multi-scope bodies while
+    keeping the fast path for single-scope bodies where it is
+    genuinely diagnostic.
+
+    Overlap threshold 0.4 — the `_clearImageAction` shape has 5 of 7
+    lines in common (0.71), so 0.4 is comfortable.  `syncPanelFields`
+    across two playgrounds (two different sets of element wiring)
+    overlaps under 0.4 and correctly fails the fast path, falling
+    through to the general 0.85 check.
+    """
+    from .prose import _extract_scope_from_body
+    from .patch_text import _content_present_in_base
+    from .dedup import _top_level_decls
+
+    scope_name, _ = _extract_scope_from_body(body)
+    if not _is_distinctive_scope_name(scope_name):
+        return None
+
+    # Single-scope guard: a multi-decl body is not a misattribution
+    # signal for any one of its scopes.  See the docstring above.
+    if len(_top_level_decls(body)) != 1:
+        return None
+
+    decl_pat = re.compile(
+        r'(?:function|def|class|const|let|var)\s+'
+        + re.escape(scope_name) + r'\b'
+        r'|<summary>\s*' + re.escape(scope_name) + r'\s*</summary>')
+
+    for other_path, other_rec in records.items():
+        if other_path == current_path:
+            continue
+        if other_rec.content is None:
+            continue
+        if not decl_pat.search(other_rec.content):
+            continue
+        if _content_present_in_base(other_rec.content, body,
+                                     threshold=0.4):
+            return other_path
+    return None
+
+
 def _fuzzy_locate_elsewhere(body, current_path, records):
     """If `body` matches another record's content, return that
     record's path; else None.
 
-    Used to label an excluded patch as "likely misattributed" (its
-    content lives in a different file already).
+    Order of checks:
 
-    Two thresholds, calibrated in response to the
-    `output_rotation` misattribution:
+      1. Distinctive-scope-name match (2026-10-28b): the body declares
+         a single distinctive function/class/<details> whose same-
+         named scope also lives in another record AND the two bodies
+         overlap meaningfully.  See module docstring, DISTINCTIVE
+         SCOPE-NAME MISATTRIBUTION section.
 
-      · Very short bodies (< ~200 chars) must match *verbatim*.
-        Boilerplate fragments — a try/except pair, a small helper —
-        legitimately appear in multiple files. Matching one elsewhere
-        is not evidence of misattribution; it is evidence of
-        duplicated shapes. The `output_rotation` try/except is a
-        3-line fragment that appears both in `inpaint_server.py`
-        (where it is applied) and in `comfyui.py` (where it should
-        also apply); the loose fuzzy match wrongly excluded it from
-        `comfyui.py` and broke the feature chain silently. Requiring
-        verbatim match for short bodies prevents that.
-
-      · Larger bodies (>= ~200 chars) use the fuzzy match. A
-        substantial function that also exists elsewhere is genuinely
-        redundant — the AI pasted it into the wrong file.
+      2. Existing verbatim / threshold logic: short bodies require
+         verbatim substring; substantial bodies use fuzzy match at
+         0.85.  See module docstring, MISATTRIBUTION GUARD section.
     """
     from .patch_text import _content_present_in_base
     body = (body or "").strip()
     if not body or len(body) < 40:
         return None
 
-    if len(body) < 200:
-        # Strict mode for short bodies: exact substring only, no
-        # fuzzy matching. See docstring.
+    # NEW (2026-10-28b): distinctive scope-name fast path.
+    scope_match = _scope_name_lives_elsewhere(body, current_path, records)
+    if scope_match is not None:
+        return scope_match
+
+    if len(body) < 500:
         best = None
         for other_path, other_rec in records.items():
             if other_path == current_path:
@@ -229,7 +401,6 @@ def _fuzzy_locate_elsewhere(body, current_path, records):
                     best = (other_path, len(other_rec.content))
         return best[0] if best else None
 
-    # Fuzzy mode for substantial bodies.
     best = None
     for other_path, other_rec in records.items():
         if other_path == current_path:
@@ -237,7 +408,7 @@ def _fuzzy_locate_elsewhere(body, current_path, records):
         if other_rec.content is None:
             continue
         if _content_present_in_base(other_rec.content, body,
-                                     threshold=0.7):
+                                     threshold=0.85):
             if best is None or len(other_rec.content) < best[1]:
                 best = (other_path, len(other_rec.content))
     return best[0] if best else None
@@ -252,14 +423,22 @@ def _patch_first_line(patch):
     return ""
 
 
-def _diagnose_exclusion(key, rec, records):
+def _diagnose_exclusion(key, rec, records, original_status=None):
+    """Produce a human-readable exclusion message.
+
+    `original_status` overrides `patch.get("applied_by")` when the
+    caller has already mutated the patch status.  Without this, the
+    "could not be placed" branch never fires because the status is
+    already "skipped_unplaceable" by the time we read it.
+    """
     if key[0] == "patch":
         idx = key[1]
         patch = next(
             (p for p in rec.patches if p.get("idx") == idx), None)
         if patch is None:
             return f"excluded patch idx={idx}"
-        status = patch.get("applied_by")
+        status = (original_status if original_status is not None
+                  else patch.get("applied_by"))
         first = _patch_first_line(patch)
         if status == "failed":
             return (f"excluded patch idx={idx} ({first!r}): "
@@ -284,24 +463,13 @@ def _diagnose_exclusion(key, rec, records):
 def _trust_cap(rec):
     """Trust ceiling for a record after reconciliation.
 
-    A record that reached HIGH *by excluding patches* is a
-    fixed-up record, not a clean one. Reconciliation excluded the
-    evidence of a problem; it did not verify that the remaining
-    content is what the conversation intended.
+    A reconciled record caps at MEDIUM: reconciliation excluded the
+    evidence of a problem, not the problem itself.  MEDIUM (not LOW)
+    so the file still writes under default `--min-trust MEDIUM`, but
+    the exclusion is visible in the manifest.
 
-    The `comfyui` run's `_trust_cap` returned HIGH for reconciled
-    records, meaning the final manifest showed a record with three
-    excluded patches sitting at the same trust as a record where
-    every patch applied. That is the wrong signal. Cap reconciled
-    records at MEDIUM so the exclusion is visible in the manifest
-    and the user is nudged to inspect before shipping.
-
-    MEDIUM (not LOW) is the right ceiling: under default
-    `--min-trust MEDIUM`, MEDIUM records are still written, so the
-    file lands. LOW would fail-close, which is too aggressive for
-    the routine "one misattributed patch" case. Users who want
-    maximum safety can pass `--min-trust HIGH`, which then fail-closes
-    MEDIUM records too.
+    The precondition — that `rec.verification["reconciled"]` is set
+    before this function is called — is the caller's job.
     """
     if rec.verification.get("reconciled"):
         return "MEDIUM"
@@ -323,39 +491,8 @@ _PASS6_PATCH_WARN_PREFIX = "patch idx="
 
 
 def _clear_stale_pass6_warnings(rec, excluded_keys):
-    """Remove warnings that are stale after reconciliation.
-
-    Four warning classes are cleaned up:
-
-    1. `patch idx=N could not be applied (...)` — emitted by pass 6
-       for each failed patch. When reconcile excludes patch N, the
-       patch is `skipped_unplaceable`/`skipped_misattributed`, not
-       "failed". The per-patch warning is stale.
-
-    2. `N/M replace pair(s) failed: ...` — emitted by pass 6 when one
-       or more pairs fail. After reconcile excludes the failing
-       pair(s), the record's live `pair_records` may have no
-       `applied_by == "failed"` entries. The aggregate warning is
-       stale.
-
-    3. `unresolved symbol reference(s) introduced by patch: ...` —
-       emitted by pass 8.5 for records whose patches introduce
-       unresolved calls. Reconcile pop's `rec.verification[
-       "unresolved_calls"]` after re-verifying the record is clean.
-       The pass-8.5 warning is stale.
-
-    4. `content validation failed: ...` (NEW) — emitted by pass 8
-       when `validate_content` rejected the record. After reconcile
-       re-validates cleanly, `content_valid` becomes "ok" and the
-       original failure no longer describes the current content.
-       This was the comfyui.py case: the manifest showed
-       `content_valid: "ok"` alongside a `content validation
-       failed` warning in the same record. Keeping that warning is
-       worse than useless — the user sees a failure the run has
-       already fixed.
-
-    Idempotent: calling twice does nothing the second time.
-    """
+    """Remove warnings that are stale after reconciliation.  See the
+    module docstring for the four warning classes cleaned up."""
     excluded_patch_idxs = set()
     for key in excluded_keys:
         if key[0] == "patch":
@@ -363,7 +500,6 @@ def _clear_stale_pass6_warnings(rec, excluded_keys):
 
     filtered = []
     for w in rec.warnings:
-        # Class 1: per-patch "could not be applied" warnings.
         if w.startswith("patch idx="):
             try:
                 after = w[len("patch idx="):]
@@ -377,7 +513,6 @@ def _clear_stale_pass6_warnings(rec, excluded_keys):
             filtered.append(w)
             continue
 
-        # Class 2: pair-failure aggregate warning.
         if "replace pair(s) failed" in w:
             live_failed = sum(
                 1 for r in rec.verification.get("pair_records", [])
@@ -388,7 +523,6 @@ def _clear_stale_pass6_warnings(rec, excluded_keys):
             filtered.append(w)
             continue
 
-        # Class 3: unresolved-symbol warning from pass 8.5.
         if w.startswith(
                 "unresolved symbol reference(s) introduced by patch:"):
             if not rec.verification.get("unresolved_calls"):
@@ -396,10 +530,6 @@ def _clear_stale_pass6_warnings(rec, excluded_keys):
             filtered.append(w)
             continue
 
-        # Class 4: content validation failure from pass 8. If the
-        # final content_valid is "ok", the failure was fixed by
-        # reconciliation. The warning describes a state that no
-        # longer exists.
         if w.startswith("content validation failed:"):
             if rec.verification.get("content_valid") == "ok":
                 continue
@@ -425,10 +555,6 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
         if not (rec.patches or rec.pairs):
             continue
 
-        # Refuse to promote a partial reprint. The content is
-        # provably incomplete; reconcile can exclude evidence, not
-        # the defect. Demoting via exclusion would say "we fixed
-        # the file" when the file was never right.
         if rec.verification.get("partial_reprint"):
             if verbose:
                 print(f"  [reconcile] {path}: skipping — partial "
@@ -460,6 +586,9 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
                       file=sys.stderr)
             continue
 
+        # Capture original statuses before mutation so the
+        # diagnostic still knows which patches genuinely failed.
+        original_statuses = {}
         for key in excluded_keys:
             if key[0] == "patch":
                 idx = key[1]
@@ -468,6 +597,7 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
                     None)
                 if patch is None:
                     continue
+                original_statuses[idx] = patch.get("applied_by")
                 if patch.get("applied_by") == "failed":
                     patch["applied_by"] = "skipped_unplaceable"
                 else:
@@ -488,9 +618,11 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
         err = validate_content(new_content, path, base=base)
         if err is not None:
             continue
-        from .symbols import find_unresolved_calls
+        from .symbols import find_unresolved_references
         trial = replace(rec, content=new_content)
-        if find_unresolved_calls(trial, base, records):
+        unresolved, mismatched = find_unresolved_references(
+            trial, base, records)
+        if unresolved or mismatched:
             continue
 
         rec.content = new_content
@@ -507,6 +639,7 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
         rec.verification.pop("patches_incomplete", None)
         rec.verification.pop("pairs_incomplete", None)
         rec.verification.pop("unresolved_calls", None)
+        rec.verification.pop("signature_mismatches", None)
         rec.verification["content_valid"] = "ok"
 
         if path.endswith(".py"):
@@ -517,7 +650,6 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
             except SyntaxError:
                 continue
 
-        rec.trust = _trust_cap(rec)
         rec.sanity_rejected = False
         rec.verification.pop("sanity_reason", None)
         rec.verification["reconciled"] = {
@@ -528,13 +660,16 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
                 )} for k in excluded_keys
             ],
         }
+        rec.trust = _trust_cap(rec)
 
-        # NEW: clear stale warnings before adding reconcile-specific
-        # ones.
         _clear_stale_pass6_warnings(rec, excluded_keys)
 
         for key in excluded_keys:
-            diag = _diagnose_exclusion(key, rec, records)
+            original_status = None
+            if key[0] == "patch":
+                original_status = original_statuses.get(key[1])
+            diag = _diagnose_exclusion(
+                key, rec, records, original_status=original_status)
             rec.warnings.append(diag)
             if verbose:
                 print(f"  [reconcile] {path}: {diag}", file=sys.stderr)

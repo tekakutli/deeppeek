@@ -43,16 +43,25 @@ Coverage
         calls (method calls excluded by negative lookbehind on
         `.`, `?.`, `!.`).
 
-    .py  (pure Python)
-        AST-based extraction: Import, ImportFrom, FunctionDef,
-        AsyncFunctionDef, ClassDef, Assign, AnnAssign, Call.
+    .py
+        ALWAYS analysed as Python first.  When the file is a JS
+        container (few top-level defs, one dominant triple-quoted
+        JS string), the embedded JS is ALSO analysed and the two
+        results are unioned.  This catches both a missing Python
+        helper (a `.py` file that lost a top-level `def`) and a
+        missing JS import inside an embedded string.
 
-    .py  (JS embedded inside a triple-quoted string)
-        The dominant triple-quoted string is extracted and analysed
-        as JS.  This is the playground pattern
-        (`PANEL_BINDINGS_JS = r\"\"\"...\"\"\"`).  Python-level imports
-        and the JS-level imports are kept separate — a JS call must
-        resolve against the JS scope, not the Python scope.
+        A previous version treated the branches as exclusive —
+        "if embedded JS is present, analyse as JS only".  That
+        missed every Python-level unresolved call in files that
+        hold both.  The motivating failure: `comfyui_krita.py`
+        imported `_rotate_about_center` and `_center_crop` in its
+        `paste_image` body but the blocks that would have defined
+        them never applied.  `_looks_like_python_module` now skips
+        the embedded-JS heuristic for files with substantial
+        Python structure, so `comfyui_krita.py` (22 top-level
+        defs) is analysed as Python and the missing calls are
+        flagged.
 
 False positives
 ===============
@@ -64,6 +73,12 @@ recursive self-calls, closures, and arrow-function parameters
 are all considered resolved.  Only *bare, statement-position,
 top-of-file-scope-unresolved* calls are flagged, which is the
 narrow class the check exists to catch.
+
+Signature-mismatch is NOT covered by this pass.  A patch that
+correctly defines `foo(a)` but is called as `foo(a, b)` does not
+produce an unresolved call — the call resolves, the invocation
+fails.  That is a separate class (call-arity / keyword-arg
+checking) and would be a distinct pass.
 """
 from __future__ import annotations
 
@@ -78,69 +93,70 @@ from .core import FileRecord
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def find_unresolved_calls(record: FileRecord,
-                          base_content: Optional[str],
-                          all_records: dict) -> list[str]:
-    """Return the sorted list of unresolved bare-call names.
+def find_unresolved_references(record: FileRecord,
+                               base_content: Optional[str],
+                               all_records: dict) -> tuple[list, list]:
+    """Return (unresolved_bare_calls, signature_mismatches).
 
-    Empty list means every newly-introduced call resolves.
-    Non-empty means the record fail-closes.
+    `unresolved_bare_calls` is the sorted list of new call names that
+    no import / decl / builtin / cross-file export resolves.
 
-    For .py files, patched and base content MUST be analysed via the
-    same code path.  If the patched content extracts as embedded JS,
-    base is forced to extract the same way (skipping the
-    strong-signal threshold for short bodies) so `call_p - call_b`
-    is a meaningful set difference.  Without this, a patched .py
-    whose embedded JS crossed the length threshold while base's JS
-    did not would be analysed as JS on the patched side and as
-    Python on the base side — producing false unresolved calls for
-    every call that was already in the base JS.  That is the exact
-    shape of the pg_panel_fields.py and pg_panel_scrubs.py fixtures,
-    where a small base JS string grew past _MIN_LONG_JS_BODY only
-    after the patch landed.
+    `signature_mismatches` is a list of `(call_name, description)`
+    for calls whose args are incompatible with the resolved
+    definition's signature.  Populated only for Python files whose
+    callee is declared in the same content (not imported).
+
+    Empty lists mean the record is clean.
     """
     if record.content is None or not record.content.strip():
-        return []
+        return [], []
     if not record.patches and not record.pairs:
-        return []
+        return [], []
 
     is_js_content = False
 
     if _is_js_lang(record.path):
         is_js_content = True
         imp_p, decl_p, call_p = _analyze_js(record.content)
+        sigs_p = {}  # JS signature checking not implemented
         if base_content:
             imp_b, decl_b, call_b = _analyze_js(base_content)
         else:
             imp_b, decl_b, call_b = set(), set(), set()
     elif record.path.endswith(".py"):
-        embedded_p = _extract_dominant_js_string(record.content)
-        if embedded_p is not None:
-            is_js_content = True
-            embedded_b = (
-                _extract_dominant_js_string(base_content, force=True)
-                if base_content else None
-            )
-            imp_p, decl_p, call_p = _analyze_js(embedded_p)
-            if embedded_b is not None:
-                imp_b, decl_b, call_b = _analyze_js(embedded_b)
-            else:
-                imp_b, decl_b, call_b = set(), set(), set()
+        imp_p, decl_p, call_map_p, sigs_p = _analyze_python_with_sigs(
+            record.content)
+        call_p = set(call_map_p.keys())
+        if base_content:
+            imp_b, decl_b, call_map_b, sigs_b = \
+                _analyze_python_with_sigs(base_content)
         else:
-            imp_p, decl_p, call_p = _analyze_python(record.content)
-            if base_content:
-                imp_b, decl_b, call_b = _analyze_python(base_content)
-            else:
-                imp_b, decl_b, call_b = set(), set(), set()
+            imp_b, decl_b, call_map_b, sigs_b = set(), set(), {}, {}
+        call_b = set(call_map_b.keys())
+
+        if not _looks_like_python_module(record.content):
+            embedded_p = _extract_dominant_js_string(record.content)
+            if embedded_p is not None:
+                is_js_content = True
+                jimp_p, jdecl_p, jcall_p = _analyze_js(embedded_p)
+                imp_p = imp_p | jimp_p
+                decl_p = decl_p | jdecl_p
+                call_p = call_p | jcall_p
+                embedded_b = (
+                    _extract_dominant_js_string(base_content, force=True)
+                    if base_content else None
+                )
+                if embedded_b is not None:
+                    jimp_b, jdecl_b, jcall_b = _analyze_js(embedded_b)
+                    imp_b = imp_b | jimp_b
+                    decl_b = decl_b | jdecl_b
+                    call_b = call_b | jcall_b
     else:
-        return []
+        return [], []
 
     new_calls = call_p - call_b - imp_p - decl_p
-
     resolvable = imp_p | decl_p | imp_b | decl_b
 
-    # Cross-file resolution: names exported by any other recovered
-    # record resolve as if imported.
     for other_path, other_rec in all_records.items():
         if other_path == record.path:
             continue
@@ -148,16 +164,84 @@ def find_unresolved_calls(record: FileRecord,
             continue
         resolvable |= _extract_exported(other_rec.content, other_path)
 
-    # Builtin sets are language-specific.  Embedded-JS .py files use
-    # JS builtins (document, window, parseInt, ...) because that is
-    # what the JS body actually sees at runtime.
     if is_js_content:
         resolvable |= _JS_BUILTINS
     else:
         resolvable |= _PY_BUILTINS
 
-    return sorted(new_calls - resolvable)
+    unresolved = sorted(new_calls - resolvable)
 
+    mismatched = []
+    if not is_js_content and sigs_p:
+        # Compute patch-introduced call *sites* via multiset diff.
+        # The old `touched = new_calls & sigs_p.keys()` filtered
+        # against `new_calls`, which had already had `decl_p`
+        # (declared names) subtracted — so a call to a function
+        # declared in the same file never got signature-checked.
+        #
+        # We want call sites that appeared in `content` but not in
+        # `base`, regardless of whether the callee is declared
+        # (resolved) or not (unresolved).  `unresolved` handles the
+        # latter; this handles the former.
+        from collections import Counter
+        touched_calls = {}
+        touched_sigs = {}
+        for name in sigs_p:
+            sites_p = call_map_p.get(name, [])
+            sites_b = call_map_b.get(name, [])
+            diff = Counter(sites_p) - Counter(sites_b)
+            if diff:
+                touched_calls[name] = list(diff.elements())
+                touched_sigs[name] = sigs_p[name]
+        mismatched = _check_signature_mismatches(
+            touched_calls, touched_sigs)
+
+    return unresolved, mismatched
+
+
+# Backwards-compatible alias — the old name is used in tests.
+def find_unresolved_calls(record, base_content, all_records):
+    unresolved, _ = find_unresolved_references(
+        record, base_content, all_records)
+    return unresolved
+
+
+# ---------------------------------------------------------------------------
+# Module-vs-container discrimination
+# ---------------------------------------------------------------------------
+
+def _looks_like_python_module(py_content: str) -> bool:
+    """True iff the file has substantial top-level Python structure.
+
+    A file with 3+ top-level def/class declarations is a real Python
+    module, not a JS container.  Used by `find_unresolved_calls` and
+    `validate.pass7_5_js_validate` to skip the "extract embedded JS
+    string" heuristic for files that are obviously Python-first.
+    That heuristic is meant for playground .py files that are
+    essentially one big raw JS string; running it on
+    `comfyui_krita.py` would analyse its docstrings as JS and miss
+    every Python call in the file.
+
+    The threshold of 3 is calibrated against the actual tree:
+      · comfyui_krita.py:     22 top-level defs   → module
+      · pg_panel_bindings.py: 0 top-level defs, 1 big JS constant → container
+      · pg_state.py:          0 top-level defs, 1 big JS constant → container
+    Any file that reaches 3+ Python defs is code, not a container.
+
+    Files that fail to parse as Python (should not happen post-
+    verify) return False so the old behaviour is preserved.
+    """
+    if not py_content:
+        return False
+    try:
+        tree = ast.parse(py_content)
+    except SyntaxError:
+        return False
+    return sum(
+        1 for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef))
+    ) >= 3
 
 
 # ---------------------------------------------------------------------------
@@ -192,17 +276,6 @@ _JS_STRONG_SIGNALS = (
 # _JS_STRONG_SIGNALS marker to be trusted.  Above this
 # length, any _JS_SIGNALS marker suffices.
 _MIN_LONG_JS_BODY = 200
-
-
-def _analyze(content: str, path: str):
-    if _is_js_lang(path):
-        return _analyze_js(content)
-    if path.endswith(".py"):
-        embedded = _extract_dominant_js_string(content)
-        if embedded is not None:
-            return _analyze_js(embedded)
-        return _analyze_python(content)
-    return set(), set(), set()
 
 
 def _extract_dominant_js_string(py_content: str,
@@ -255,7 +328,6 @@ def _extract_dominant_js_string(py_content: str,
         if best is None or len(body) > len(best):
             best = body
     return best
-
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +608,102 @@ _PY_BUILTINS = frozenset({
     "SystemExit", "None", "True", "False", "self", "cls",
 })
 
+def _analyze_python_with_sigs(content: str):
+    """Return (imports, decls, calls_by_name, sigs_by_name).
+
+    `calls_by_name[name]` = list of (pos_arg_count, frozenset(kw_names)).
+    `sigs_by_name[name]` = (pos_arity, frozenset(kwonly_names),
+                            has_vararg, has_kwarg).
+
+    Enables signature-level checking: a call `foo(1, k=2)` is
+    compatible with `def foo(x, k):` but not with `def foo(x):`.
+    """
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return set(), set(), {}, {}
+
+    imports, decls = set(), set()
+    calls: dict = {}
+    sigs: dict = {}
+
+    def _record_sig(node):
+        args = node.args
+        pos_arity = len(args.posonlyargs) + len(args.args)
+        pos_names = frozenset(
+            a.arg for a in (args.posonlyargs + args.args)
+        )
+        kwonly = frozenset(a.arg for a in args.kwonlyargs)
+        sigs[node.name] = (
+            pos_arity, pos_names, kwonly,
+            args.vararg is not None,
+            args.kwarg is not None,
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imports.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "*":
+                    imports.add(alias.asname or alias.name)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            decls.add(node.name)
+            _record_sig(node)
+        elif isinstance(node, ast.ClassDef):
+            decls.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = (node.targets if isinstance(node, ast.Assign)
+                       else [node.target])
+            for tgt in targets:
+                if isinstance(tgt, ast.Name):
+                    decls.add(tgt.id)
+        elif (isinstance(node, ast.Call)
+              and isinstance(node.func, ast.Name)):
+            kw = frozenset(kw.arg for kw in node.keywords if kw.arg)
+            calls.setdefault(node.func.id, []).append(
+                (len(node.args), kw))
+
+    return imports, decls, calls, sigs
+
+
+def _check_signature_mismatches(calls: dict, sigs: dict) -> list:
+    """Return [(name, description)] for calls whose arguments are
+    incompatible with the resolved definition.
+
+    Python's calling convention: a positional-or-keyword parameter
+    accepts either a positional argument or a keyword argument with
+    its name.  Only *kw-only* parameters (`def foo(*, x)`) reject
+    positional arguments.  So a call `foo(a=1, b=2)` is legal for
+    `def foo(a, b)`.  The `allowed` set is `pos_names | kwonly`,
+    not `kwonly` alone.
+
+    Conservative otherwise: only flags when the callee's signature
+    definitively rejects the call — arity overflow beyond a non-
+    vararg signature, or keyword args the signature cannot bind.
+    """
+    problems = []
+    for name, sites in calls.items():
+        sig = sigs.get(name)
+        if sig is None:
+            continue  # class, imported, or from an outer scope
+        pos_arity, pos_names, kwonly, has_vararg, has_kwarg = sig
+        for n_args, kw in sites:
+            if not has_vararg and n_args > pos_arity:
+                problems.append(
+                    (name, f"called with {n_args} positional arg(s) "
+                           f"but declares at most {pos_arity}"))
+                continue
+            if not has_kwarg:
+                allowed = pos_names | kwonly
+                extra = kw - allowed
+                if extra:
+                    problems.append(
+                        (name, f"called with unexpected keyword "
+                               f"argument(s) {sorted(extra)}; "
+                               f"declares {sorted(allowed) or 'none'}"))
+    return problems
 
 def _analyze_python(content: str):
     try:
@@ -622,11 +790,26 @@ def _extract_python_exports(content: str) -> set:
 
 
 def _extract_exported(content: str, path: str) -> set:
+    """Return the names exported by `content` interpreted as `path`'s
+    language.
+
+    For a `.py` file: always Python exports, PLUS JS exports from
+    any embedded JS string when the file is genuinely a container.
+    A Python module (3+ top-level defs) exports its Python names;
+    the docstring-derived "embedded JS" is not trusted.
+
+    Guarded by `_looks_like_python_module` for the same reason
+    `find_unresolved_calls` is: a Python docstring mentioning
+    "import" or "function" must not be treated as a JS export
+    surface.
+    """
     if _is_js_lang(path):
         return _extract_js_exports(content)
     if path.endswith(".py"):
-        embedded = _extract_dominant_js_string(content)
-        if embedded is not None:
-            return _extract_js_exports(embedded)
-        return _extract_python_exports(content)
+        exports = _extract_python_exports(content)
+        if not _looks_like_python_module(content):
+            embedded = _extract_dominant_js_string(content)
+            if embedded is not None:
+                exports |= _extract_js_exports(embedded)
+        return exports
     return set()

@@ -327,6 +327,8 @@ def _compute_block_disposition(b, records):
             return "block_skipped_misattributed"
         if status == "skipped_unplaceable":
             return "block_skipped_unplaceable"
+        if status == "skipped_structural_damage":
+            return "block_skipped_structural_damage"
         if status == "failed":
             return "block_failed" if rec.trust == "LOW" else "applied"
 
@@ -485,7 +487,15 @@ def pass9_write(records: dict,
                     f"(old={oi}, new={ni}, scope={scope}): {reason}")
 
         for p in rec.patches:
-            if p.get("applied_by") != "failed":
+            if p.get("applied_by") not in (
+                    "failed", "skipped_structural_damage"):
+                continue
+            if p.get("applied_by") == "skipped_structural_damage":
+                first_line = _patch_first_line(p, limit=70)
+                reason = p.get("failure_reason", "unknown")
+                warnings_lines.append(
+                    f"[{path}] [STRUCT_DAMAGE] idx={p['idx']} "
+                    f"(first line: {first_line!r}): {reason}")
                 continue
             first_line = _patch_first_line(p, limit=70)
             reason = p.get("failure_reason", "unknown")

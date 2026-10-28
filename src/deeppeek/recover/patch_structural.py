@@ -26,6 +26,24 @@ broken at runtime.  This is the inpaint_server.py `output_rotation`
 corruption shape: the try/except was appended after `RAW_ROUTES` at
 module level.  `validate_output`'s module-level check catches it
 post-write; refusing here is fail-closed earlier.
+
+FIRST-TOKEN LANGUAGE DETECTION (2026-11-05)
+===========================================
+`_infer_body_lang` previously relied on keyword-count scoring, which
+was fragile: a `def _rotate_about_center(...) -> QImage:` block
+whose body didn't happen to contain "import " or "self." scored
+`py = 2, js = 0` (still Python, but by a thin margin), and a
+`function foo(...) {` block scored `js = 1, py = 0` and returned
+None because `js >= 2` was required.  The comfyui_krita.py failure
+was this: the two helper defs scored below the threshold and
+`_try_structural_append` bailed, leaving `paste_image`'s calls to
+undefined names.
+
+The fix: trust the FIRST TOKEN.  `def ` / `async def ` / `class ` /
+`@` → Python.  `function ` / `export ` / `const ` / `let ` /
+`var ` / `async function ` → JavaScript.  The keyword-count scoring
+remains as a fallback for ambiguous bodies whose first token names
+neither (e.g. a bare assignment).
 """
 
 import os
@@ -48,8 +66,32 @@ _JS_LANGS        = frozenset({"javascript", "typescript", "tsx"})
 
 
 def _infer_body_lang(body):
-    """Best-effort language ID without tree-sitter."""
+    """Best-effort language ID without tree-sitter.
+
+    First-token detection comes first: a body whose first non-blank
+    line starts with `def ` / `async def ` / `class ` / `@` is
+    Python; `function ` / `export ` / `const ` / `let ` / `var ` /
+    `async function ` is JavaScript.  This is more reliable than
+    counting keywords in the body, and it is what
+    `_try_structural_append` needs to route a top-level `def` block
+    to `_append_decl_after_last`.
+
+    Fall back to keyword scoring for bodies whose first token is
+    ambiguous (an assignment, a bare `if`, etc.).
+    """
     text = body[:800]
+    first_line = text.lstrip().split("\n", 1)[0].strip()
+
+    # Direct first-token detection: highest confidence.
+    if first_line.startswith(("def ", "async def ", "class ", "@")):
+        return "python"
+    if first_line.startswith(("function ", "async function ",
+                              "export ", "export function ",
+                              "export default ", "export class ",
+                              "const ", "let ", "var ")):
+        return "javascript"
+
+    # Fall back to heuristic scoring for ambiguous shapes.
     js = 0
     py = 0
     if "=>" in text:
@@ -61,13 +103,14 @@ def _infer_body_lang(body):
         js += 1
     if "document." in text or "window." in text or "board." in text:
         js += 1
-    if "def " in text or text.lstrip().startswith(("class ", "@")):
+    if "def " in text:
         py += 2
     if "self." in text:
         py += 1
     if "import " in text and ("\n" in text):
         if "import {" not in text and "import *" not in text:
             py += 1
+
     if js > py and js >= 2:
         return "javascript"
     if py > js and py >= 2:

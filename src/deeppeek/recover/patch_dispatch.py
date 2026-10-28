@@ -4,121 +4,70 @@ patch_dispatch — the deterministic-patch dispatcher.
 `_try_deterministic_patch` is the single entry point the pass-6 main
 loop calls for each patch.  It dispatches, in order:
 
-  1. deletions (if the body / prose is a deletion instruction)
-  2. raw diffs
-  3. import replaces (multi-line import -> single-line import and
-     vice versa)
-  4. single-line replaces
-  5. scoped replaces (if the body declares a scope that exists in base)
-  6. ellipsis splices, with fallback
-  7. object-literal splices
-  8. context inserts
-  9. object-entry inserts
- 10. insert-into-named-scope        (FIX 8)
- 11. insert-before-anchor           (FIX 3)
- 12. insert-between-anchors         (FIX 3)
- 13. insert-after-anchor
- 14. AST anchor (optional dependency)
- 15. structural append
+   0. signature-only replacement (before the completeness gate —
+      a bare `def foo():` fails `ast.parse` and would otherwise be
+      rejected before any heuristic can run)
+   1. placeholder-marker gate (refuse or merge — see below)
+   2. Python-completeness gate
+   3. deletions
+   4. raw diffs
+   5. import replaces
+   6. single-line replaces
+   7. scoped replaces
+   8. ellipsis splices, with fallback
+   9. object-literal splices
+  10. named-dict inserts (multi-line entry into a variable-named dict)
+  11. context inserts
+  12. object-entry inserts (function-anchored)
+  13. insert-into-named-scope        (FIX 8 + anchor-derived scope)
+  14. insert-before-anchor           (FIX 3)
+  15. insert-between-anchors         (FIX 3)
+  16. insert-after-anchor            (with `prior_insertions` fallback)
+  17. AST anchor (optional dependency)
+  18. structural append
 
-IMPORT REPLACE
-==============
-A multi-line import body whose module matches a single-line import
-in base would previously fall through every heuristic:
+PLACEHOLDER-MARKER GATE
+=======================
+An AI block often contains parenthetical placeholders —
+`... (docstring unchanged) ...`, `// ... (rest unchanged)` — that
+are instructions to the patcher, not literal code.  Applying them
+verbatim replaces the target's content with the marker string.
 
-  · `_try_single_line_replace` requires exactly one non-blank line.
-  · `_try_context_insert` needs a unique first or last line — but
-    both lines in a multi-line import are continuations, not lines
-    that appear in base.
+The gate runs *after* the signature-only check (a signature block
+carries no body, so no placeholder) and *before* any other
+heuristic.  It attempts to merge:
 
-`_try_import_replace` joins continuation lines, parses the import,
-finds the same-module import in base, and reindents the original
-body to match.  It intentionally ignores the "add"/"insert" prose
-blocklist that `_try_single_line_replace` respects — adding a name
-to an import list IS a replacement of the import statement.
+  · If the body declares a scope (via `_extract_scope_from_body`)
+    AND that scope exists in `base`, call
+    `patch_scope._try_merge_placeholder_in_scope` to replace the
+    marker with the base scope's corresponding content (currently:
+    docstring-only merge).  If the merge consumes the placeholder,
+    the merged body flows through the rest of the dispatcher as if
+    the AI had printed the complete block.
 
-INSERT-INTO-NAMED-SCOPE (FIX 8)
-===============================
-An indented body whose prose names its containing class/function
-("In `handle_thing`, after X" / "add to `MyHandler`") has no
-self-declared scope and no anchor line, so it fell through every
-earlier heuristic and the structural-append fallback refused it
-(module-level `try:` / decorated method).  The new heuristic finds
-the named scope in base, optionally walks past the anchor inside
-it, and inserts at end-of-block.  See `patch_heuristics.
-_try_insert_into_named_scope`.
+  · Otherwise refuse the block.  A placeholder with no scope to
+    merge into (or a placeholder outside a docstring, which the
+    current merge does not handle) is not safely applicable.
 
-BEFORE-ANCHOR AND BETWEEN-ANCHORS (FIX 3)
-=========================================
-Two gaps closed at once:
+Prior-insertions threading
+==========================
+`_try_deterministic_patch` and `_try_deterministic_patch_inner` both
+accept a `prior_insertions=None` keyword that is a set of stripped
+lines previously inserted by earlier patches in the same pass-6
+batch.  It is threaded to `_try_insert_after_anchor`, which uses it
+as a fallback anchor source when the prose has no backticked anchor.
+Additionally, the pass-6 loop feeds single-line already-present
+bodies into `prior_insertions` (see `_mark_already_present` in
+`apply_patches.py`), so a bare `output_name = params.get(...)`
+that's already in base becomes an anchor for the following
+`"Add just after:"` block.
 
-  · "before the `status.running` field" — the prose names an
-    existing line; the block should be inserted *before* it, not
-    after.  `_try_insert_after_anchor` only knows how to insert
-    after; the pg_panel_scrubs.py `viewRotation` block needed
-    `_try_insert_before_anchor`.
-
-  · "between the Image and Masks `<details>` blocks" — the prose
-    names two existing blocks; the block should be inserted
-    between them.  Neither `_try_context_insert` (needs a unique
-    body line) nor `_try_insert_after_anchor` (needs a backtick
-    identifier) can express this.  The pg_base.py `View` block
-    needed `_try_insert_between_anchors`.
-
-Both new heuristics share an `_anchor_line_is_safe` predicate:
-the anchor line must not open a brace/paren/bracket that closes
-later, because inserting after it would land *inside* the
-enclosing block.  Anchors like
-`pgkitRegisterField("status.running", {` are unsafe; the insert
-must walk forward to the end of the enclosing block and insert
-there.
-
-Both new heuristics are tried BEFORE `_try_insert_after_anchor`
-because their prose forms ("before X", "between X and Y") are
-more specific than the generic "after X" case; if they match,
-they produce a tighter result than the after-anchor heuristic
-would.  The two are mutually exclusive in practice: `_BEFORE_
-PROSE_RE` requires the word "before", `_BETWEEN_RE` requires
-"between", and neither prose form contains the other.
-
-PYTHON COMPLETENESS GATE (pre-dispatch)
-=======================================
-An incomplete Python block — a bare `try:` with no `except`/
-`finally`, a bare `with` with no body, a `def` with no statements
-— can be inserted at column 0 by the AST anchor or by the
-structural-append path (before FIX 7 fires) and produce
-unparseable Python.  The block applied, the record's content
-diverges from base, `pass8_verify` raises `SyntaxError at line N`,
-and the *whole record* fail-closes — even when every other patch
-in the record was clean.
-
-The gate rejects incomplete blocks at the top of
-`_try_deterministic_patch_inner`.  The rejection becomes
-`applied_by="failed"`, which reconciliation then excludes,
-letting the remaining patches promote.  The gate is deliberately
-narrow: it fires only when the block's leading keyword names a
-Python construct that is complete on its own (`try`, `with`,
-`if`, `for`, `while`, `def`, `class`, `async`, `match`) AND the
-body fails `ast.parse` after `textwrap.dedent`.
-
-Two categories are exempted:
-
-  · Continuation keywords (`except`, `finally`, `else`, `elif`,
-    `case`) — these are inherently fragments and always need a
-    preceding block.  `ast.parse` would reject them on their own,
-    so the gate must not attempt it.
-
-  · JS lines — a `.py` file with an embedded JS block beginning
-    `if (`, `try {`, `=>`, etc.  `_looks_like_js_line` catches
-    these before the Python check fires.
-
-Also exports `attribute_sanity_failure`, the helper that names the
-patch responsible for a sanity-gate rejection.  It lives here
-because it needs both `_try_deterministic_patch` (for the replay)
-and the block/record shapes.
-
-Imports from patch_text, patch_scope, patch_heuristics, patch_diag,
-and ast_anchor (lazy, optional).
+SIGNATURE-ONLY REPLACEMENT
+==========================
+Runs *first*, before the placeholder gate and completeness gate.
+A signature-only block (`def foo(x) -> int:` with no body) fails
+`ast.parse` and would be rejected before any heuristic had a
+chance.  `_try_signature_replace` handles it directly.
 """
 
 import re
@@ -126,12 +75,14 @@ import re
 from .core import _is_deletion_instruction, _looks_like_diff_body
 from .patch_text import (
     _has_ellipsis_marker, _strip_ellipsis_lines,
+    _has_placeholder_marker,
     _would_introduce_empty_block,
     _content_present_in_base,
     _reindent_body,
 )
 from .patch_scope import (
     _scope_in_base, _apply_scoped, _try_ellipsis_splice,
+    _try_merge_placeholder_in_scope,
 )
 from .patch_heuristics import (
     _try_single_line_replace, _try_context_insert,
@@ -141,6 +92,8 @@ from .patch_heuristics import (
     _try_structural_append, _delete_exact_block,
     _OBJECT_LITERAL_ASSIGNMENT_RE,
     _try_insert_into_named_scope,
+    _try_signature_replace,
+    _try_named_dict_insert,
 )
 from .prose import _extract_scope_from_body
 
@@ -149,28 +102,17 @@ from .prose import _extract_scope_from_body
 #  Import replace
 # ===========================================================================
 
-# A single import statement.  `[^}]*` for the names inside `{}` (no
-# nested braces in an import list — an import alias is `A as B`, no
-# expression syntax).  `[^"']+` for the module path (no quotes inside
-# a module path).  `;?` because some projects omit the semicolon.
 _IMPORT_JOIN_RE = re.compile(
     r'import\s+\{([^}]*)\}\s*from\s*["\']([^"\']+)["\']\s*;?',
     re.DOTALL,
 )
 
-# Continuations of a single logical line: end with `,`, `{`, `(`,
-# or backslash.  Used by `_join_continuations` so a 2-line import is
-# parsed as 1 logical line.
 _CONTINUATION_ENDINGS = (",", "{", "(", "\\")
 
 
 def _join_continuations(body: str) -> str:
     """Join lines that are syntactic continuations of a single
     logical line.
-
-    A continuation line ends with `,`, `{`, `(`, or `\\`.  The next
-    line is appended to the previous line's right side.  Blank lines
-    start a fresh logical line.
     """
     if not body:
         return body
@@ -191,18 +133,6 @@ def _join_continuations(body: str) -> str:
 def _try_import_replace(base, raw_body):
     """If body is an import statement and base has an import from the
     same module, replace the base's import with the body.
-
-    Intentionally ignores the `add`/`insert` prose blocklist that
-    `_try_single_line_replace` respects: adding a name to an import
-    list IS a replacement of the import statement, regardless of how
-    the prose frames it.
-
-    Returns the patched base, or None.
-
-    The body may be single-line or multi-line — a continuation line
-    (ending with `,`/`{`/`(`/`\\`) is joined to its predecessor for
-    the purposes of parsing.  The ORIGINAL multi-line body is what
-    gets inserted, reindented to the base's import indent.
     """
     joined = _join_continuations(raw_body)
     m = _IMPORT_JOIN_RE.search(joined)
@@ -210,10 +140,6 @@ def _try_import_replace(base, raw_body):
         return None
     module = m.group(2)
 
-    # Locate the matching import in base.  We iterate lines (single-
-    # line import per line) rather than re-running the regex over the
-    # whole base because the base may contain *other* import
-    # statements; we want the one from the same module.
     for line in base.split("\n"):
         stripped = line.strip()
         lm = _IMPORT_JOIN_RE.match(stripped)
@@ -231,35 +157,16 @@ def _try_import_replace(base, raw_body):
 # ===========================================================================
 #  Python-completeness gate
 # ===========================================================================
-#
-# See the module docstring's PYTHON COMPLETENESS GATE section for the
-# failure class this exists to eliminate.  The gate fires once, at the
-# top of `_try_deterministic_patch_inner`, before any heuristic can
-# place the block.  Rejection means `applied_by="failed"`, which
-# reconciliation handles by exclusion.
 
-# Python block-openers that are complete on their own IF their body
-# parses.  A `try:` without `except`/`finally`, a `with` without a
-# body, a `for` without a body — these all fail `ast.parse` and mean
-# the block is truncated.
 _PY_COMPLETE_VERBS = frozenset({
     "try", "with", "for", "while", "if", "def", "class",
     "async", "match",
 })
 
-# Continuation keywords are inherently fragments: they always need a
-# preceding block to attach to.  `ast.parse` rejects them on their
-# own, so the gate must skip them and let the insert heuristics place
-# them.
 _PY_FRAGMENT_VERBS = frozenset({
     "except", "finally", "else", "elif", "case",
 })
 
-
-# JS signal patterns for `_looks_like_js_line`.  These catch the
-# block-leading shapes that would falsely trip the Python check when
-# the block is JS embedded in a .py file (`if (x) { ... }`,
-# `try { ... }`, `const x = ... => ...`, etc.).
 _JS_LINE_PREFIXES = (
     "if (", "for (", "while (", "switch (",
     "try {", "catch (", "finally {",
@@ -269,9 +176,6 @@ _JS_LINE_PREFIXES = (
 
 
 def _looks_like_js_line(line):
-    """True if `line` reads as JavaScript, so a Python syntax check
-    on a .py destination does not reject valid JS-in-Python content.
-    """
     s = line.strip()
     if not s:
         return False
@@ -285,7 +189,6 @@ def _looks_like_js_line(line):
 
 
 def _first_word_of(s):
-    """Return the leading alphabetic word of `s`, lowercased."""
     out = []
     for ch in s.strip():
         if ch.isalpha() or ch == "_":
@@ -296,39 +199,6 @@ def _first_word_of(s):
 
 
 def _is_syntactically_complete_python(body, path):
-    """Refuse to insert an incomplete Python block.
-
-    The motivating failure: a bare `try: foo()` with no
-    `except`/`finally` was appended at column 0 by the AST anchor.
-    The block applied, `pass8_verify` raised `SyntaxError at line
-    N`, and the whole record fail-closed — even though every other
-    patch in the record was clean.
-
-    Returns True (block OK) when:
-
-      · the destination is not a `.py` file (JS check is N/A);
-      · the block is empty;
-      · the block's first non-blank line reads as JS;
-      · the first word is a continuation keyword (`except`, etc.) —
-        fragments pass through, insert heuristics place them;
-      · the first word is not a Python block keyword at all;
-      · `ast.parse(dedent(body))` succeeds.
-
-    Returns False only when the first word names a Python construct
-    that is complete on its own AND `ast.parse` fails — the
-    truncated-`try`, body-less-`with`, and `def`-no-statements
-    shape.
-
-    IMPLEMENTATION NOTE: the `ast.parse` step MUST dedent the RAW
-    body, not a stripped body.  `raw_body.strip()` removes leading
-    whitespace from only the FIRST line, leaving subsequent lines
-    at their original indent — which `textwrap.dedent` cannot
-    reconcile (it computes the common prefix as empty), and which
-    `ast.parse` therefore rejects with "unindent does not match any
-    outer indentation level".  A block that is a perfectly valid
-    indented fragment (`    try:` ... `    except:`) would be
-    rejected by that bug.
-    """
     if not path.endswith(".py"):
         return True
     stripped = body.strip()
@@ -358,16 +228,15 @@ def _is_syntactically_complete_python(body, path):
 #  Dispatcher
 # ===========================================================================
 
-def _try_deterministic_patch(base, patch, path=""):
+def _try_deterministic_patch(base, patch, path="",
+                              prior_insertions=None):
     """Crash-isolated entry point.
-
-    A crash inside any of the inner heuristics is caught here and
-    turned into a `None` result, which the caller records as a failed
-    patch.  Without this wrapper, one bad block shape can take
-    down the entire pass for every file in the conversation.
     """
     try:
-        return _try_deterministic_patch_inner(base, patch, path)
+        return _try_deterministic_patch_inner(
+            base, patch, path,
+            prior_insertions=prior_insertions,
+        )
     except Exception as e:
         import sys
         print(f"  [patch] deterministic attempt raised: "
@@ -375,18 +244,54 @@ def _try_deterministic_patch(base, patch, path=""):
         return None
 
 
-def _try_deterministic_patch_inner(base, patch, path=""):
+def _try_deterministic_patch_inner(base, patch, path="",
+                                    prior_insertions=None):
     raw_body = patch["body"]
     body_stripped = raw_body.strip()
     if not body_stripped:
         return None
 
-    # Python-completeness gate.  See module docstring.  Fires before
-    # any heuristic can place the block, so no heuristic (AST anchor
-    # included) can insert truncated Python at column 0 and take the
-    # whole record down with it.  The rejection is `applied_by=
-    # "failed"`, which reconciliation excludes, letting the
-    # remaining patches promote.
+    # Signature-only replacement.  Runs BEFORE the placeholder and
+    # completeness gates: a bare `def foo(x):` is not a complete
+    # Python statement, and it contains no placeholder.  This only
+    # cares about matching a signature line in base.
+    signature_replace = _try_signature_replace(base, raw_body)
+    if signature_replace is not None:
+        return signature_replace
+
+    # Placeholder gate.  See module docstring.
+    if _has_placeholder_marker(raw_body):
+        scope_name, _kind = _extract_scope_from_body(body_stripped)
+        if scope_name:
+            merged = _try_merge_placeholder_in_scope(
+                base, scope_name, raw_body)
+            if merged is not None and not _has_placeholder_marker(merged):
+                # Merge succeeded; treat the merged body as if the AI
+                # had written the complete block.
+                raw_body = merged
+                body_stripped = raw_body.strip()
+            else:
+                patch["failure_reason"] = (
+                    "block contains an AI placeholder marker "
+                    "(e.g. `... (docstring unchanged) ...`) inside "
+                    f"scope {scope_name!r}, but the base scope's "
+                    "content could not be merged in (no matching "
+                    "scope in base, or the placeholder is not in a "
+                    "docstring position).  Regenerate the block "
+                    "with the actual content, or apply manually."
+                )
+                return None
+        else:
+            patch["failure_reason"] = (
+                "block contains an AI placeholder marker "
+                "(e.g. `... (docstring unchanged) ...`) but does "
+                "not declare a scope to merge it into.  Regenerate "
+                "the block with the actual content, or apply "
+                "manually."
+            )
+            return None
+
+    # Python-completeness gate.
     if not _is_syntactically_complete_python(raw_body, path):
         return None
 
@@ -401,24 +306,16 @@ def _try_deterministic_patch_inner(base, patch, path=""):
         diffed = _try_raw_diff_patch(base, raw_body)
         if diffed is not None:
             return diffed
-        # A diff body is a diff, not a scope replacement.  If
-        # `_try_raw_diff_patch` failed, fall through to the
-        # already-present / failed classification.
         return None
 
-    # Import replace.  Runs before the generic single-line path
-    # because a multi-line import is not a single line and would
-    # otherwise be blocked by every context-insert check.
     imported = _try_import_replace(base, raw_body)
     if imported is not None:
         return imported
 
-    # Single-line replace
     single_line = _try_single_line_replace(base, raw_body, context_before)
     if single_line is not None:
         return single_line
 
-    # Scope-aware pre-check
     _body_is_obj_lit = bool(
         _OBJECT_LITERAL_ASSIGNMENT_RE.match(body_stripped))
     if _body_is_obj_lit:
@@ -435,7 +332,6 @@ def _try_deterministic_patch_inner(base, patch, path=""):
         )
         return None
 
-    # Ellipsis handling
     if _has_ellipsis_marker(raw_body):
         result = _try_ellipsis_splice(base, raw_body, context_before)
         if result is not None:
@@ -446,30 +342,13 @@ def _try_deterministic_patch_inner(base, patch, path=""):
         if _would_introduce_empty_block(raw_body, stripped_body):
             return None
         fallback_patch = {**patch, "body": stripped_body}
-        result = _try_deterministic_patch_inner(base, fallback_patch, path)
+        result = _try_deterministic_patch_inner(
+            base, fallback_patch, path,
+            prior_insertions=prior_insertions,
+        )
         if result is not None:
             return result
 
-        # DRIFT-FIX: stale-ellipsis detection.
-        #
-        # Enter this branch only when:
-        #   · the block has an ellipsis marker (already true here);
-        #   · the fallback insert also failed (just happened);
-        #   · the block's first content line is gone from base
-        #     (checked below); AND
-        #   · most of the block's other content is still in base.
-        #
-        # Together these describe "the base already contains what this
-        # block was trying to change, in a slightly different form."
-        # The typical cause is a stale ellipsis block from an earlier
-        # turn whose "before" content was superseded by a pair that
-        # ran first in this batch.
-        #
-        # Returning base (unchanged) lets the caller's `result ==
-        # content` check mark the patch `already-present`.  Fail-
-        # closed semantics are preserved: a genuinely new block that
-        # just has no anchor fails the second condition and returns
-        # None as today.
         first_line = next(
             (ln.strip() for ln in stripped_body.splitlines() if ln.strip()),
             "")
@@ -480,7 +359,6 @@ def _try_deterministic_patch_inner(base, patch, path=""):
             return base
         return None
 
-    # Object-literal splice
     m = _OBJECT_LITERAL_ASSIGNMENT_RE.match(body_stripped)
     if m:
         id_m = re.search(
@@ -492,6 +370,10 @@ def _try_deterministic_patch_inner(base, patch, path=""):
                 base, body_stripped, id_m.group(1))
         return None
 
+    named_dict = _try_named_dict_insert(base, raw_body, context_before)
+    if named_dict is not None:
+        return named_dict
+
     inserted = _try_context_insert(base, raw_body)
     if inserted is not None:
         return inserted
@@ -500,34 +382,29 @@ def _try_deterministic_patch_inner(base, patch, path=""):
     if inserted is not None:
         return inserted
 
-    # NEW: "In `SCOPE`, after X" / "add to `SCOPE`" — insert an
-    # indented body into a named class or function.  Runs before
-    # the anchor heuristics because the prose's scope binding is
-    # more specific than a bare "after `X`".
     inserted = _try_insert_into_named_scope(
         base, raw_body, context_before, path)
     if inserted is not None:
         return inserted
 
-    # FIX 3: before-anchor and between-anchors heuristics.
-    # Both run before `_try_insert_after_anchor` because their prose
-    # forms ("before X", "between X and Y") are more specific than
-    # the generic "after X" case.  They are mutually exclusive in
-    # practice: `_BEFORE_PROSE_RE` requires the word "before",
-    # `_BETWEEN_RE` requires "between".
-    inserted = _try_insert_before_anchor(base, raw_body, context_before)
+    inserted = _try_insert_before_anchor(
+        base, raw_body, context_before, path=path)
     if inserted is not None:
         return inserted
 
-    inserted = _try_insert_between_anchors(base, raw_body, context_before)
+    inserted = _try_insert_between_anchors(
+        base, raw_body, context_before, path=path)
     if inserted is not None:
         return inserted
 
-    inserted = _try_insert_after_anchor(base, raw_body, context_before)
+    inserted = _try_insert_after_anchor(
+        base, raw_body, context_before,
+        prior_insertions=prior_insertions,
+        path=path,
+    )
     if inserted is not None:
         return inserted
 
-    # AST anchor
     if path:
         try:
             from .ast_anchor import try_ast_anchor
@@ -547,7 +424,6 @@ def _try_deterministic_patch_inner(base, patch, path=""):
                 if result != base:
                     return result
 
-    # Structural append
     if path:
         structural = _try_structural_append(base, raw_body, path)
         if structural is not None:
@@ -568,39 +444,6 @@ def _try_deterministic_patch_inner(base, patch, path=""):
 def attribute_sanity_failure(rec, blocks_by_idx, validate_fn=None):
     """Return the idx of the first patch whose application causes
     validation to fail, or None if attribution isn't possible.
-
-    Returns None only when:
-      - rec.patches is empty;
-      - rec.last_full_idx is unset or not in blocks_by_idx;
-      - a patch was applied by LLM (no faithful replay available);
-      - the base itself already fails validation.
-
-    Skips over patches that fail to *replay* (return None from
-    `_try_deterministic_patch` when run against the current content
-    state).  A patch that applied deterministically at pass-6 time
-    but cannot be replayed now is a cascade victim: its anchor
-    moved because an *earlier* patch changed the base in a way that
-    invalidated its context.  Such a patch is not the culprit; the
-    earlier patch that moved the anchor was.  Attribution keeps
-    walking so the actual culprit is named rather than the first
-    cascade victim.
-
-    Note: with the Python-completeness gate at the top of
-    `_try_deterministic_patch_inner`, a patch that is syntactically
-    incomplete now returns None at *apply* time (it never becomes
-    `applied_by="deterministic"`), so this function's replay path
-    sees the same state at attribution time as at apply time.
-    The two views stay consistent.
-
-    `rec.patches` may be a mix of deterministic and already-present
-    entries.  already-present entries are skipped (they were no-ops
-    at apply time).  Deterministic entries are replayed in order
-    against the accumulating content.  The first replay whose
-    output fails `validate_fn` is the culprit.
-
-    A `failed` entry (patch that never applied) is also skipped —
-    its mutation was never performed, so it cannot be the cause of
-    a downstream validation failure.
     """
     if validate_fn is None:
         from .validate_output import validate_content as validate_fn
@@ -621,24 +464,11 @@ def attribute_sanity_failure(rec, blocks_by_idx, validate_fn=None):
         if applied_by == "already-present":
             continue
         if applied_by == "failed":
-            # A patch that failed at apply time was reverted, so
-            # it cannot be the cause of a downstream validation
-            # failure.  Skip it.
             continue
         if applied_by != "deterministic":
-            # LLM-applied patches cannot be faithfully replayed.
-            # Stop trying to attribute; caller sees the general
-            # verification error instead.
             return None
         result = _try_deterministic_patch(current, patch_dict, rec.path)
         if result is None:
-            # This patch cannot be replayed against the current
-            # content.  Since it applied deterministically at
-            # pass-6 time, its anchor must have moved under an
-            # earlier patch in this chain.  That earlier patch is
-            # the culprit, not this one.  Skip and keep walking so
-            # the next deterministic patch (or the earlier patch
-            # we already validated) gets blamed.
             continue
         if result == current:
             continue

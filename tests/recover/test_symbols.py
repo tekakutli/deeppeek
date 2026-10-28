@@ -474,6 +474,137 @@ def test_pass8_5_no_false_positive_from_block_comment():
         f"unresolved_calls={rec.verification.get('unresolved_calls')!r}"
     )
 
+# ---------------------------------------------------------------------------
+# Regression (2026-11-05): Python-first dispatch
+# ---------------------------------------------------------------------------
+#
+# Pre-fix, `find_unresolved_calls` skipped Python analysis whenever
+# embedded JS was detected.  A `.py` file with substantial top-level
+# Python structure AND a docstring that happened to contain "import " or
+# "function " would trip `_extract_dominant_js_string`, get analysed as
+# JS only, and miss every Python-level unresolved call in the file.
+#
+# The motivating failure: `comfyui_krita.py` called
+# `_rotate_about_center` and `_center_crop` from `paste_image`.  The
+# patches that would have defined them never applied.  The record was
+# written with `trust: HIGH, ast_parse: ok` because the symbol check
+# was looking at the wrong layer of the file.
+
+def test_python_module_with_docstring_mentioning_import():
+    """A .py file with 3+ top-level defs must be analysed as Python,
+    regardless of what its docstring says."""
+    content = (
+        '"""Helpers.  Import this from .utils, not directly."""\n'
+        "\n"
+        "def helper_a():\n"
+        "    return missing_helper_x()\n"
+        "\n"
+        "def helper_b():\n"
+        "    return 2\n"
+        "\n"
+        "def helper_c():\n"
+        "    return 3\n"
+    )
+    base = (
+        '"""Helpers.  Import this from .utils, not directly."""\n'
+        "\n"
+        "def helper_a():\n"
+        "    return 1\n"
+        "\n"
+        "def helper_b():\n"
+        "    return 2\n"
+        "\n"
+        "def helper_c():\n"
+        "    return 3\n"
+    )
+    rec = _make_rec("helpers.py", content)
+    result = find_unresolved_calls(rec, base, {"helpers.py": rec})
+    assert result == ["missing_helper_x"], (
+        f"expected ['missing_helper_x'], got {result!r}; "
+        f"a Python module was likely treated as a JS container "
+        f"because its docstring mentions 'import'"
+    )
+
+
+def test_comfyui_krita_shape():
+    """Exact shape from the 2026-11-05 run: a Python module whose
+    patched body calls two helpers that were never defined.  Must
+    flag both names (before the fix, returned [])."""
+    content_broken = (
+        '"""Utilities for the comfy handler."""\n'
+        "\n"
+        "def paste_image(doc, png, x, y, rotation=0.0):\n"
+        "    if rotation:\n"
+        "        png = _rotate_about_center(png, rotation)\n"
+        "        png = _center_crop(png, 100, 100)\n"
+        "    return png\n"
+        "\n"
+        "def other_a():\n"
+        "    return 1\n"
+        "\n"
+        "def other_b():\n"
+        "    return 2\n"
+    )
+    rec = _make_rec("comfyui_krita.py", content_broken)
+    result = find_unresolved_calls(rec, "", {"comfyui_krita.py": rec})
+    assert set(result) == {"_rotate_about_center", "_center_crop"}, (
+        f"expected both helpers flagged, got {result!r}"
+    )
+
+    # With the helpers present, the check must return clean.
+    content_fixed = (
+        '"""Utilities for the comfy handler."""\n'
+        "\n"
+        "def paste_image(doc, png, x, y, rotation=0.0):\n"
+        "    if rotation:\n"
+        "        png = _rotate_about_center(png, rotation)\n"
+        "        png = _center_crop(png, 100, 100)\n"
+        "    return png\n"
+        "\n"
+        "def _rotate_about_center(img, angle):\n"
+        "    return img\n"
+        "\n"
+        "def _center_crop(img, w, h):\n"
+        "    return img\n"
+        "\n"
+        "def other_a():\n"
+        "    return 1\n"
+        "\n"
+        "def other_b():\n"
+        "    return 2\n"
+    )
+    rec2 = _make_rec("comfyui_krita.py", content_fixed)
+    result2 = find_unresolved_calls(
+        rec2, "", {"comfyui_krita.py": rec2})
+    assert result2 == [], f"expected [], got {result2!r}"
+
+
+def test_js_container_still_unions_python_and_js():
+    """A JS-container .py file (few top-level defs, big embedded JS)
+    must have BOTH Python analysis AND JS analysis run, not one or
+    the other.  Pre-fix this was an either/or."""
+    Q = chr(34) * 3
+    base = (
+        "PANEL_JS = r" + Q + "\n"
+        'import { foo } from "./kit.js";\n'
+        "foo();\n"
+        + Q + "\n"
+    )
+    # Add a Python helper that calls an undefined name; the JS side
+    # is unchanged and unresolved-free.  Both must be analysed.
+    content = (
+        base
+        + "\ndef py_helper():\n"
+        "    return missing_fn()\n"
+    )
+    rec = _make_rec("panel.py", content)
+    result = find_unresolved_calls(rec, base, {"panel.py": rec})
+    assert "missing_fn" in result, (
+        f"Python analysis was skipped on a JS-container file: "
+        f"result={result!r}; both Python and JS must be analysed "
+        f"when the file is a container"
+    )
+
 def main():
     tests = [
         ("no patches returns empty", test_no_patches_returns_empty),
@@ -512,6 +643,11 @@ def main():
          test_pass8_5_no_false_positive_from_comment),
         ("pass 8.5 no false positive from block comment",
          test_pass8_5_no_false_positive_from_block_comment),
+        ("python module with docstring mentioning import",
+         test_python_module_with_docstring_mentioning_import),
+        ("comfyui_krita shape", test_comfyui_krita_shape),
+        ("js container still unions python and js",
+         test_js_container_still_unions_python_and_js),
     ]
     failed = 0
     for name, fn in tests:

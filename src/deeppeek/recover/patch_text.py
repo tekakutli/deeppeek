@@ -18,6 +18,14 @@ Two structural predicates deserve their own docstrings:
       The `...` marker (or its comment-wrapped equivalents) that an
       AI uses to abbreviate "rest of block unchanged".
 
+  _has_placeholder_marker
+      The parenthetical form, e.g. `... (docstring unchanged) ...`,
+      `// ... (rest unchanged)`, `# ... existing code ...`.  A
+      placeholder is an *instruction* to the patcher — "keep the
+      base's content here" — not literal code.  Applying it verbatim
+      corrupts the target.  See `patch_scope._try_merge_placeholder_in_scope`
+      for the merge path that consumes it.
+
   _content_present_in_base
       Drift-tolerant membership check.  A line "counts as present"
       when it appears in base exactly, or token-equivalently (same
@@ -234,11 +242,51 @@ _TRUNCATION_PATTERNS = [
     re.compile(r'<!--\s*\.\.\.\s*-->'),
 ]
 
+# Parenthetical placeholder: `... (docstring unchanged) ...`,
+# `// ... (rest unchanged)`, `# ... existing code ...`,
+# `/* ... same as before ... */`.  The parenthetical must contain an
+# "unchanged" verb to be recognized — a bare `... (something) ...`
+# is not a placeholder, it's content the AI wrote intentionally.
+_PLACEHOLDER_MARKER_RE = re.compile(
+    r"\.\.\.\s*\(\s*(?:the\s+)?[^)]*?\b"
+    r"(?:unchanged|existing|omitted|same|as\s+before|as-is|as\s-is|"
+    r"kept|preserved|unchanged\s+except|below|above|rest)"
+    r"\b[^)]*\)\s*\.\.\.",
+    re.IGNORECASE,
+)
+
 
 def _has_truncation_marker(text):
     if not text:
         return False
     return any(pat.search(text) for pat in _TRUNCATION_PATTERNS)
+
+
+def _has_placeholder_marker(body):
+    """True iff `body` contains an AI placeholder marker.
+
+    Placeholder markers are the parenthetical form an AI uses to
+    abbreviate unchanged regions:
+
+        ... (docstring unchanged) ...
+        // ... (rest unchanged)
+        # ... existing code ...
+        /* ... same as before ... */
+
+    They are instructions to the patcher, not literal code.
+    Applying them verbatim corrupts the target — the marker text
+    replaces whatever it was supposed to abbreviate.
+
+    The recovery pipeline handles them by attempting a merge against
+    the base scope's content (see
+    `patch_scope._try_merge_placeholder_in_scope`).  If the merge
+    cannot find the target scope, `_try_deterministic_patch_inner`
+    refuses the block outright (see `patch_dispatch.py`), and the
+    record fails closed.
+    """
+    if not body:
+        return False
+    return bool(_PLACEHOLDER_MARKER_RE.search(body))
 
 
 def _is_ellipsis_line(line):

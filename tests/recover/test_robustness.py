@@ -1837,6 +1837,175 @@ def test_reconcile_clears_unresolved_symbol_warning():
         f"stale unresolved-symbol warning not cleared: "
         f"{rec.warnings!r}")
 
+# ============================================================
+# Fix (2026-11-05) — first-token language detection
+# ============================================================
+#
+# `_infer_body_lang` used keyword-count scoring.  A block whose first
+# token is `def ` but whose body contains no `import` or `self.`
+# scored `py = 2, js = 0` (still Python, by a thin margin), and a
+# block whose first token is `function ` scored `js = 1, py = 0` and
+# returned None because `js >= 2` was required.  The comfyui_krita.py
+# failure was this: two `def _helper` blocks scored below the
+# threshold, `_try_structural_append` bailed, and the record was
+# written with calls to undefined names.
+
+def test_infer_body_lang_python_def():
+    """First token `def ` must be Python even with no import/self."""
+    from deeppeek.recover.patch_structural import _infer_body_lang
+    body = (
+        "def _rotate_about_center(img, angle_deg):\n"
+        "    return img\n"
+    )
+    assert _infer_body_lang(body) == "python", (
+        f"expected python, got {_infer_body_lang(body)!r}"
+    )
+
+
+def test_infer_body_lang_async_and_decorated():
+    from deeppeek.recover.patch_structural import _infer_body_lang
+    assert _infer_body_lang("async def foo():\n    pass\n") == "python"
+    assert _infer_body_lang("@decorator\ndef foo():\n    pass\n") == "python"
+    assert _infer_body_lang("class Foo:\n    pass\n") == "python"
+
+
+def test_infer_body_lang_js_first_token():
+    from deeppeek.recover.patch_structural import _infer_body_lang
+    assert _infer_body_lang(
+        "function foo() {\n    return 1;\n}\n") == "javascript"
+    assert _infer_body_lang(
+        "export function foo() {}\n") == "javascript"
+    assert _infer_body_lang(
+        "export const x = 1;\n") == "javascript"
+    assert _infer_body_lang(
+        "const x = 1;\n") == "javascript"
+
+
+def test_structural_append_appends_python_defs():
+    """End-to-end: a top-level `def` block appends at end of a
+    Python module.  Reproduces the comfyui_krita.py failure mode."""
+    from deeppeek.recover.patch_structural import _try_structural_append
+    base = (
+        '"""Utilities."""\n'
+        "\n"
+        "def paste_image(doc, png, x, y, rotation=0.0):\n"
+        "    if rotation:\n"
+        "        png = _rotate_about_center(png, rotation)\n"
+        "    return png\n"
+    )
+    body = (
+        "def _rotate_about_center(img, angle_deg):\n"
+        "    return img\n"
+        "\n"
+        "def _center_crop(img, w, h):\n"
+        "    return img\n"
+    )
+    result = _try_structural_append(base, body, "comfyui_krita.py")
+    assert result is not None, (
+        "_try_structural_append returned None; first-token language "
+        "detection is likely still using the old scoring heuristic"
+    )
+    assert "def _rotate_about_center" in result
+    assert "def _center_crop" in result
+    # Base is preserved intact.
+    assert "def paste_image" in result
+    assert '"""Utilities."""' in result
+
+
+# ============================================================
+# Fix (2026-11-05) — reconcile ordering
+# ============================================================
+#
+# Two ordering bugs in `pass8_7_reconcile`:
+#
+#   1. `_diagnose_exclusion` was called AFTER the patch statuses
+#      had been mutated to `skipped_*`.  The "could not be placed"
+#      branch was unreachable because it checks
+#      `applied_by == "failed"`.
+#
+#   2. `_trust_cap(rec)` was called BEFORE `rec.verification
+#      ["reconciled"]` was populated, so the MEDIUM cap never fired
+#      and reconciled records always reported HIGH.
+
+def test_diagnose_exclusion_uses_original_status():
+    """`_diagnose_exclusion` must honour `original_status` when the
+    caller has already mutated the patch status."""
+    from deeppeek.recover.reconcile import _diagnose_exclusion
+    from deeppeek.recover.core import FileRecord
+    rec = FileRecord(path="x.py", state="FULL_PLUS_PATCH")
+    rec.patches = [{
+        "idx": 62,
+        "body": '"--output_rotation": {"type": "float", "default": 0.0,',
+        "applied_by": "skipped_unplaceable",  # already mutated
+    }]
+    diag = _diagnose_exclusion(
+        ("patch", 62), rec, {}, original_status="failed")
+    assert "could not be placed" in diag, (
+        f"expected 'could not be placed' branch, got: {diag!r}; "
+        f"_diagnose_exclusion is reading the mutated status "
+        f"instead of original_status"
+    )
+    # Without original_status, the mutated skipped_* falls through
+    # to the generic branch (this is what the pre-fix code always
+    # did, which is why the message was wrong).
+    diag2 = _diagnose_exclusion(("patch", 62), rec, {})
+    assert "could not be placed" not in diag2, (
+        f"without original_status, mutated skipped_* should not "
+        f"reach the 'could not be placed' branch; got: {diag2!r}"
+    )
+
+
+def test_trust_cap_returns_medium_after_reconciled():
+    """`_trust_cap` must return MEDIUM for a reconciled record."""
+    from deeppeek.recover.reconcile import _trust_cap
+    from deeppeek.recover.core import FileRecord
+
+    rec = FileRecord(path="x.py", state="FULL_PLUS_PATCH")
+    assert _trust_cap(rec) == "HIGH", (
+        "reconciled-empty record should cap at HIGH"
+    )
+    rec.verification["reconciled"] = {"excluded": []}
+    assert _trust_cap(rec) == "MEDIUM", (
+        "reconciled record must cap at MEDIUM (reconcile excluded "
+        "evidence, it did not verify the remaining content)"
+    )
+
+    # last_full still caps at MEDIUM regardless of `reconciled`.
+    rec2 = FileRecord(path="y.py", state="FULL_PLUS_PATCH")
+    rec2.dedup_reason = "last_full"
+    assert _trust_cap(rec2) == "MEDIUM"
+
+
+def test_reconcile_sets_reconciled_before_trust_cap():
+    """Ordering invariant: `rec.verification["reconciled"]` must be
+    set BEFORE `_trust_cap(rec)` is called in `pass8_7_reconcile`.
+
+    Verified by source inspection rather than integration, because
+    constructing a promotable record would require reproducing the
+    entire patch-application pipeline.  The invariant is the point:
+    a future refactor that reorders these two lines reinstates the
+    bug even if every other reconcile test still passes.
+    """
+    import inspect
+    from deeppeek.recover.reconcile import pass8_7_reconcile
+    src = inspect.getsource(pass8_7_reconcile)
+    idx_reconciled = src.find('rec.verification["reconciled"]')
+    idx_trust_cap = src.find("_trust_cap(rec)")
+    assert idx_reconciled > 0, (
+        "_trust_cap ordering test: pass8_7_reconcile no longer "
+        "sets rec.verification['reconciled']; update the test"
+    )
+    assert idx_trust_cap > 0, (
+        "_trust_cap ordering test: pass8_7_reconcile no longer "
+        "calls _trust_cap; update the test"
+    )
+    assert idx_reconciled < idx_trust_cap, (
+        f"_trust_cap called at char {idx_trust_cap} BEFORE "
+        f"reconciled field set at char {idx_reconciled}; "
+        f"reconciled records will not cap at MEDIUM. "
+        f"Move the _trust_cap call after the reconciled field is set."
+    )
+
 def main():
 
     tests = [
@@ -2031,6 +2200,19 @@ def main():
          test_reconcile_clears_pair_failure_warning),
         ("reconcile clears unresolved symbol warning",
          test_reconcile_clears_unresolved_symbol_warning),
+        ("infer_body_lang python def", test_infer_body_lang_python_def),
+        ("infer_body_lang async and decorated",
+         test_infer_body_lang_async_and_decorated),
+        ("infer_body_lang js first token",
+         test_infer_body_lang_js_first_token),
+        ("structural append appends python defs",
+         test_structural_append_appends_python_defs),
+        ("diagnose exclusion uses original status",
+         test_diagnose_exclusion_uses_original_status),
+        ("trust cap returns medium after reconciled",
+         test_trust_cap_returns_medium_after_reconciled),
+        ("reconcile sets reconciled before trust cap",
+         test_reconcile_sets_reconciled_before_trust_cap),
     ]
     failed = 0
     for name, fn in tests:

@@ -16,6 +16,13 @@ The `.py` file itself parses fine.  Pass 7.5 catches this by
 extracting the JS exports from the target's string literal and
 checking every imported name against them.
 
+Guard (2026-11-05): pass 7.5 skips the "extract embedded JS"
+heuristic for files that are obviously Python modules (3+ top-level
+defs).  A `.py` file with twenty defs is code, not a container —
+its docstrings are prose, not JS.  This prevents spurious
+`missing_js_export` findings on ordinary Python files whose
+docstrings happen to contain "import" or "function".
+
 Pass 7.6 (FIX 2) DEMOTES the involved records to LOW trust.
 Previously, cross-validation findings were informational only:
 they were recorded in `cross_validate.problems` and set the exit
@@ -114,6 +121,7 @@ from .core import (
     _looks_like_diff_body,
     _strip_diff_prefixes,
 )
+from .symbols import _looks_like_python_module
 
 
 # ============================================================================
@@ -210,6 +218,14 @@ def pass7_5_js_validate(records: dict) -> list:
     {`missing_js_module`, `missing_js_export`},
     plus the same shape as pass7's problems so they can be merged
     into the manifest's `cross_validate.problems` list.
+
+    Guard (2026-11-05): skip the "extract embedded JS" step for
+    files that are obviously Python modules (3+ top-level defs).
+    The guard lives on both the source side and the target side —
+    otherwise a source `.py` that IS a container could try to
+    validate an import against a target `.py` that IS a module, or
+    vice versa, and produce either spurious findings or spurious
+    silence.
     """
     from .symbols import (
         _is_js_lang, _extract_js_imports_with_src,
@@ -226,8 +242,11 @@ def pass7_5_js_validate(records: dict) -> list:
         js_source = None
         if _is_js_lang(path):
             js_source = rec.content
-        elif path.endswith(".py"):
+        elif (path.endswith(".py")
+              and not _looks_like_python_module(rec.content)):
             js_source = _extract_dominant_js_string(rec.content)
+        else:
+            continue
 
         if js_source is None:
             continue
@@ -253,7 +272,8 @@ def pass7_5_js_validate(records: dict) -> list:
             target_js = None
             if _is_js_lang(target_path):
                 target_js = target_rec.content
-            elif target_path.endswith(".py"):
+            elif (target_path.endswith(".py")
+                  and not _looks_like_python_module(target_rec.content)):
                 target_js = _extract_dominant_js_string(
                     target_rec.content)
 
@@ -297,6 +317,11 @@ def _js_target_declares_but_does_not_export(
     """True iff `target_rec.content` declares `name` but does not
     export it.  Uses the same JS-extraction path as symbols.py so
     embedded string literals are handled identically.
+
+    Guard (2026-11-05): a `.py` file that is a Python module (3+
+    top-level defs) has no meaningful embedded JS; treat it as
+    non-JS and return False.  This matches `pass7_5_js_validate`'s
+    guard so the two passes agree on what counts as a container.
     """
     from .symbols import (
         _is_js_lang, _extract_dominant_js_string, _extract_js_exports,
@@ -306,7 +331,8 @@ def _js_target_declares_but_does_not_export(
     js = None
     if _is_js_lang(target_rec.path):
         js = target_rec.content
-    elif target_rec.path.endswith(".py"):
+    elif (target_rec.path.endswith(".py")
+          and not _looks_like_python_module(target_rec.content)):
         js = _extract_dominant_js_string(target_rec.content)
     if js is None:
         return False
@@ -477,7 +503,14 @@ def pass7_6b_demote_on_missing_python_export(
 
 def _repair_missing_export(rec, name, verbose=False):
     """Add `export ` before the declaration of `name` in rec.content.
-    Returns True if the repair succeeded and re-validates."""
+    Returns True if the repair succeeded and re-validates.
+
+    Guard (2026-11-05): the verification step re-extracts JS from
+    the repaired content.  Skip it for files that are Python
+    modules; they never had real embedded JS to begin with, and
+    re-running the extractor on a docstring that happens to
+    mention "function" would produce a false positive.
+    """
     from .validate_output import validate_content
     from .symbols import (
         _is_js_lang, _extract_dominant_js_string, _extract_js_exports,
@@ -516,7 +549,8 @@ def _repair_missing_export(rec, name, verbose=False):
 
     if _is_js_lang(rec.path):
         js = repaired
-    elif rec.path.endswith(".py"):
+    elif (rec.path.endswith(".py")
+          and not _looks_like_python_module(repaired)):
         js = _extract_dominant_js_string(repaired)
     else:
         js = None
@@ -1074,21 +1108,38 @@ def pass8_verify(records: dict[str, FileRecord],
 
             rec.trust = "LOW"
             rec.sanity_rejected = True
-            if rec.patches:
+
+            # FIX (2026-10-28): name the culprit patch when it can
+            # be identified.  attribute_sanity_failure replays each
+            # applied patch in order and returns the idx of the first
+            # one whose application makes validate_content fail.
+            # It cannot attribute when the chain depends on
+            # prior_insertions (a later "Add just after:" patch
+            # anchoring to an earlier already-present body), so the
+            # warning falls back to the plain message in that case.
+            _culprit = None
+            if rec.patches and blocks_by_idx is not None:
                 try:
-                    _sanity_blocks = blocks_by_idx
-                except NameError:
-                    _sanity_blocks = None
-                if _sanity_blocks is not None:
                     from .apply_patches import attribute_sanity_failure
-                    _culprit = attribute_sanity_failure(rec, _sanity_blocks)
-                    if _culprit is not None:
-                        rec.verification['sanity_caused_by'] = _culprit
+                    _culprit = attribute_sanity_failure(
+                        rec, blocks_by_idx)
+                except Exception:
+                    _culprit = None
+            if _culprit is not None:
+                rec.verification['sanity_caused_by'] = _culprit
+                _w = (f"content validation failed: {structural_err} "
+                      f"(patch idx={_culprit} caused it)")
+            else:
+                _w = (f"content validation failed: {structural_err} "
+                      f"(patch attribution unavailable — likely "
+                      f"depends on prior_insertions)")
             rec.verification["sanity_reason"] = structural_err
-            rec.warnings.append(
-                f"content validation failed: {structural_err}")
+            rec.warnings.append(_w)
             print(f"  [verify] content validation FAIL in {path}: "
                   f"{structural_err}", file=sys.stderr)
+            if _culprit is not None:
+                print(f"  [verify]   caused by patch idx={_culprit}",
+                      file=sys.stderr)
             continue
         v["content_valid"] = "ok"
 
@@ -1245,27 +1296,7 @@ def pass8_verify(records: dict[str, FileRecord],
 
 def pass8_5_check_symbols(records: dict[str, FileRecord],
                           blocks_by_idx: Optional[dict] = None) -> None:
-    """Cross-reference patch-introduced bare calls against each file's
-    imports and declarations.
-
-    An unresolved call introduced by a patch almost certainly means
-    the block was attributed to the wrong file — e.g. a
-    `pgkitRegisterField(...)` block landing in a module that imports
-    `pgkitRegisterAction` but not `pgkitRegisterField`, which throws
-    `ReferenceError` at load time and blanks the target's UI.
-
-    Records with at least one unresolved call are demoted to LOW
-    trust so the fail-closed policy preserves the target and routes
-    the attempt into `deeppeek/low_trust/`.  The failure, the call
-    names, and the file path are all recorded in `warnings.txt` and
-    `manifest.json`.
-
-    Runs after `pass8_verify` so structural / parse failures already
-    have their say first.  A record that already fail-closed for
-    structural reasons is not re-demoted here; only the
-    `unresolved_calls` list is recorded for completeness.
-    """
-    from .symbols import find_unresolved_calls
+    from .symbols import find_unresolved_references
 
     for path, rec in records.items():
         if rec.content is None:
@@ -1281,19 +1312,34 @@ def pass8_5_check_symbols(records: dict[str, FileRecord],
             if base_block is not None:
                 base = base_block.body
 
-        unresolved = find_unresolved_calls(rec, base, records)
-        if not unresolved:
+        unresolved, mismatched = find_unresolved_references(
+            rec, base, records)
+        if not unresolved and not mismatched:
             continue
 
-        rec.verification["unresolved_calls"] = unresolved
+        if unresolved:
+            rec.verification["unresolved_calls"] = unresolved
+        if mismatched:
+            rec.verification["signature_mismatches"] = [
+                {"name": n, "detail": d} for n, d in mismatched
+            ]
+
         rec.trust = "LOW"
+        parts = []
+        if unresolved:
+            parts.append(
+                "unresolved symbol reference(s): " + ", ".join(unresolved))
+        if mismatched:
+            parts.append(
+                "signature mismatch(es): " + "; ".join(
+                    f"{n}: {d}" for n, d in mismatched))
         rec.warnings.append(
-            "unresolved symbol reference(s) introduced by patch: "
-            + ", ".join(unresolved)
-            + " (patch almost certainly targeted the wrong file)"
+            "patch compatibility check failed: " + " | ".join(parts)
+            + " (patch almost certainly targeted the wrong file or "
+              "depends on an excluded patch)")
+
+        preview = ", ".join(
+            [f"{n} (unresolved)" for n in unresolved[:3]]
+            + [f"{n} ({d})" for n, d in mismatched[:3]]
         )
-        preview = ", ".join(unresolved[:5])
-        suffix = " ..." if len(unresolved) > 5 else ""
-        print(f"  [symbols] {path}: {len(unresolved)} unresolved "
-              f"call(s): {preview}{suffix}",
-              file=sys.stderr)
+        print(f"  [symbols] {path}: {preview}", flush=True)

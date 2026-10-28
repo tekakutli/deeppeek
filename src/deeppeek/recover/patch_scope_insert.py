@@ -30,6 +30,20 @@ The anchor (when present) is only used to find the *position*; the
 scope name determines the *container*.  Without an anchor, insert at
 end of scope.
 
+ANCHOR-DERIVED SCOPE (2026-11-05)
+=================================
+When the prose has an anchor ("after the existing `timeout` parse")
+but no explicit scope name ("in `_comfy_generate_impl`"), the scope
+can be derived from the anchor's position: find the innermost
+class/function declaration whose span contains the anchor.  This
+covers the comfyui.py `try/except` fragment, whose prose pointed at
+a position but not a container.
+
+The derived scope is only trusted when the anchor occurs at least
+once (otherwise there's nothing to derive from); a derived scope
+that can't be located falls through to the same fail-closed return
+the named-scope path uses.
+
 HIGH CHURN: this is the newest heuristic (FIX 8).  It picks up new
 prose patterns, new container shapes, and new anchor idioms as they
 surface in the wild.  Isolating it means iterating on it does not
@@ -96,6 +110,103 @@ def _extract_after_anchor(prose):
     if m:
         return m.group(1)
     return None
+
+
+def _find_enclosing_scope_name(base: str, anchor: str) -> "str | None":
+    """Return the innermost class/function name containing `anchor`'s
+    last occurrence in `base`, or None.
+
+    "Last occurrence" — not first — because docstring mentions of the
+    anchor appear near the top of the file, while the code that
+    actually uses it is much lower.  Taking the last occurrence lands
+    on the code, not the docstring.
+
+    "Innermost" — not outermost — because a class method inside a
+    class is a more useful container for an inserted statement than
+    the class itself.  Walk top-level declarations top-down and keep
+    the last one whose start precedes the anchor; that gives the
+    innermost enclosing class/function.
+    """
+    if not base or not anchor:
+        return None
+
+    positions = []
+    for pat in (
+        re.escape(anchor) + r'\s*\(',
+        re.escape(anchor) + r'\s*\.',
+        re.escape(anchor) + r'\s*\[',
+        re.escape(anchor),
+    ):
+        for m in re.finditer(pat, base):
+            positions.append(m.start())
+        if positions:
+            break
+    if not positions:
+        return None
+
+    target_pos = max(positions)
+
+    decl_re = re.compile(
+        r'(?m)^([ \t]*)(?:async\s+)?(?:def|function|class)\s+(\w+)')
+
+    innermost = None
+    for m in decl_re.finditer(base):
+        if m.start() >= target_pos:
+            break
+        # If this declaration's body extends past target_pos, it's a
+        # candidate container.
+        body_open = base.find("{", m.end())
+        if body_open == -1:
+            # Python `def`: body extends to the next line at-or-below
+            # this indent.  Use the enclosing-decl heuristic directly.
+            if _python_decl_contains(base, m.start(), m.group(1),
+                                     target_pos):
+                innermost = m.group(2)
+                continue
+        else:
+            body_close = _find_matching_brace(
+                base, body_open, is_python=False)
+            if body_close != -1 and m.start() <= target_pos < body_close:
+                innermost = m.group(2)
+                continue
+            # Python `def foo():` may still have a `:` before any `{`;
+            # check the Python case as a fallback.
+            if _python_decl_contains(base, m.start(), m.group(1),
+                                     target_pos):
+                innermost = m.group(2)
+    return innermost
+
+
+def _python_decl_contains(base: str, decl_start: int, decl_indent: str,
+                          target_pos: int) -> bool:
+    """True iff a Python-style def/class at `decl_start` with indent
+    `decl_indent` has a body extending past `target_pos`.
+
+    The declaration's body ends at the next non-blank line whose indent
+    is <= `decl_indent`.  A target within that range is inside the
+    declaration.
+    """
+    if target_pos <= decl_start:
+        return False
+    end_of_line = base.find("\n", decl_start)
+    if end_of_line == -1:
+        return False
+    decl_indent_len = len(decl_indent)
+    scan = end_of_line + 1
+    while scan < len(base):
+        next_nl = base.find("\n", scan)
+        if next_nl == -1:
+            next_nl = len(base)
+        line = base[scan:next_nl]
+        if line.strip():
+            line_indent_len = len(line) - len(line.lstrip())
+            if line_indent_len <= decl_indent_len:
+                # Declaration body ends before target_pos?
+                return target_pos < scan
+        if scan > target_pos:
+            return True
+        scan = next_nl + 1
+    return target_pos > decl_start
 
 
 def _find_scope_body_range(base, scope_name):
@@ -250,7 +361,8 @@ def _try_insert_into_named_scope(base, body, context_before, path=""):
     Fires only when:
       · body is consistently indented (all content lines >= 2);
       · body does NOT start with a top-level declaration keyword;
-      · prose names the target scope with a structural pattern;
+      · prose names the target scope with a structural pattern, OR
+        the prose has an anchor whose enclosing scope can be derived;
       · the scope exists in base.
 
     Never crashes the dispatcher: any raise inside scope detection is
@@ -287,6 +399,13 @@ def _try_insert_into_named_scope(base, body, context_before, path=""):
         pass
 
     scope_name = _extract_scope_name_from_prose(context_before)
+    if not scope_name:
+        # Anchor-derived scope: the prose names a *position* but not
+        # a container.  Find the container by locating the anchor in
+        # base and walking up to its enclosing class/function.
+        anchor = _extract_after_anchor(context_before)
+        if anchor:
+            scope_name = _find_enclosing_scope_name(base, anchor)
     if not scope_name:
         return None
 

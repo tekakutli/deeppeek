@@ -19,11 +19,107 @@ check.  This version additionally:
     --min-trust" warning.  That warning is misleading when pass 8.7
     reconciliation later promotes the record; `pass9_write` already
     emits the accurate "trust=LOW below --min-trust" line for records
-    that stay LOW.  Removing the pass-6 warning eliminates the stale-
-    warning class the pg_panel_bindings.py + pg_panel_scrubs.py
-    failures exhibited.
+    that stay LOW.
+
+  · FIXED-POINT PATCH LOOP (2026-10-28).  The single-pass loop missed
+    the case where a patch's anchor was supplied by a *later* patch in
+    the same batch.  The loop now iterates over the pending set until
+    a full pass adds nothing, then marks the survivors as `failed`.
+
+  · DUPLICATE-INSERTION GATE (2026-10-28).  Every successful patch
+    is post-checked against the pre-application content via
+    `_verify_no_duplicate_insertion`.  A patch whose application
+    added a duplicate copy of a **pre-existing** line outside its own
+    body is reverted and marked `skipped_duplicate_insertion`.
+
+    The gate targets only pre-existing lines.  A patch that splits
+    a single pre-existing line into multiple lines (e.g., object-
+    literal splice) legitimately introduces lines that were not
+    individual lines before; those are not duplicates and must not
+    be flagged.  Motivating false positive: `const board = { a: 1 };`
+    becomes `const board = {\n  a: 1,\n  b: 2,\n};`, and the gate
+    previously flagged the split fragments as "duplicates".
+
+  · STRUCTURAL-SANITY GATE (2026-10-28).  Every successful patch on a
+    `.py` destination is post-checked via `_check_structural_sanity`.
+    A patch whose application introduces a Python syntax error OR a
+    module-level statement injection (try/except/for/while/with at
+    column 0 that wasn't there before) is reverted and marked
+    `skipped_structural_damage`.
+
+    This gate is the fix for the `comfyui.py` failure: a `try/except`
+    fragment whose prose was `"Add just after:"` had no anchor,
+    because the prior patch was already-present (so it never
+    contributed a line to `prior_insertions`).  The fragment fell
+    through every insert heuristic and landed at module level via
+    structural-append.  The record-level `validate_content` correctly
+    fail-closed the file — but the diagnostic was opaque, and the
+    rotation feature was lost.  With this gate, the specific patch
+    fails (with a specific reason), the record continues with the
+    remaining patches, and the fail-closed outcome either goes away
+    (if the misplaced patch was the only defect) or names the culprit
+    patch precisely.
+
+    Motivating dual-gate rationale: `attribute_sanity_failure`
+    cannot replay a patch whose original success depended on
+    `prior_insertions` — so the record-level diagnostic can only
+    name the culprit when the record happens to have exactly one
+    problematic patch.  Per-patch checking is what surfaces the
+    culprit reliably.
+
+  · TERMINAL-STATUS PRESERVATION (2026-10-28).  When the fixed-point
+    loop breaks with `applied_this_pass == 0`, the surviving
+    `pending` list may contain patches whose status was already set
+    to a terminal value (`already-present`, `skipped_duplicate_
+    insertion`, `skipped_structural_damage`).  The follow-up "mark
+    as failed" loop now skips those, leaving their statuses intact.
+
+  · PRIOR-INSERTIONS THREADING (2026-10-28).  `_try_deterministic_
+    patch` (in `patch_dispatch.py`), `_try_blockquoted_patch`, and
+    the fixed-point loop accept a `prior_insertions` set of stripped
+    lines previously inserted this batch.  The anchor-after heuristic
+    uses it as a fallback when the prose has no backtick anchor.
+
+  · ALREADY-PRESENT ANCHORING (2026-10-28).  When a single-line body
+    is `already-present` in base, the body line is added to
+    `prior_insertions`.  This lets a subsequent "Add just after:"
+    block anchor to a pre-existing line that isn't itself the body
+    of any patch — the exact `comfyui.py` shape where the AI printed
+    `output_name = params.get("output_name") or None` as its own
+    block (already-present in base) and then tried to insert a
+    try/except "just after:" it.
+
+  · PRE-GATE FOR DUPLICATE ASSIGNMENTS (2026-10-28b).  Before any
+    heuristic runs, a patch whose body is a single `var = expr` line
+    that already appears verbatim in the current content is marked
+    `already-present` and skipped.  This closes the comfyui.py
+    `output_name = params.get("output_name") or None` shape: the
+    anchor-after heuristic found a "safe" spot inside `finally:` and
+    inserted the assignment there, where it was unreachable dead code.
+    The post-gate `_verify_no_duplicate_insertion` could not catch
+    it because its arithmetic is self-cancelling when the patch body
+    is itself the duplicate — the body_lines subtraction removes the
+    very line the gate is looking for.
+
+    The pre-gate is scoped tightly: it fires only on single-line
+    assignments whose stripped form exactly matches a stripped line
+    in the current content.  Multi-line patches (which legitimately
+    repeat context lines) never trigger it.
+
+    NONE-SAFE BODY (2026-10-28c): `patch.get("body") or ""` guards
+    against `body=None` (a key present with value None, where
+    `patch.get("body", "")` returns None because the default only
+    fires on missing keys).  An empty body is not a duplicate insert.
+
+DEPENDENCY: `_try_deterministic_patch` (in `patch_dispatch.py`) must
+accept the same `prior_insertions=None` keyword that this module
+passes into it.  `_try_blockquoted_patch` below threads the kwarg
+through unchanged.
 """
 
+import re
+from collections import Counter
+from pathlib import Path
 from typing import Optional
 
 from .core import (
@@ -99,9 +195,12 @@ def _is_blockquoted_strong(b_idx, blocks_by_idx):
         return False
 
 
-def _try_blockquoted_patch(content, patch, path):
+def _try_blockquoted_patch(content, patch, path, prior_insertions=None):
+    """Apply a blockquoted patch and validate the result structurally.
+    """
     from .validate_output import validate_content
-    result = _try_deterministic_patch(content, patch, path)
+    result = _try_deterministic_patch(
+        content, patch, path, prior_insertions=prior_insertions)
     if result is None:
         return None
     if result == content:
@@ -144,12 +243,151 @@ def _sanity_gate(base, result):
 
 
 # ===========================================================================
+#  Duplicate-insertion gate (Fix 6)
+# ===========================================================================
+
+def _verify_no_duplicate_insertion(old_content, new_content, patch, path):
+    """Return True iff applying `patch` did not introduce an
+    unexpected duplicate copy of a **pre-existing** line.
+    """
+    old_lines = [ln.strip() for ln in old_content.splitlines()
+                 if ln.strip()]
+    new_lines = [ln.strip() for ln in new_content.splitlines()
+                 if ln.strip()]
+    old_counts = Counter(old_lines)
+    new_counts = Counter(new_lines)
+
+    body_lines = [ln.strip() for ln in patch.get("body", "").splitlines()
+                  if ln.strip()]
+    body_counts = Counter(body_lines)
+    for line, count in body_counts.items():
+        new_counts[line] -= count
+        if new_counts[line] < 0:
+            new_counts[line] = 0
+
+    unexpected = {
+        line: new_counts[line] - old_counts[line]
+        for line in old_counts
+        if new_counts[line] > old_counts[line]
+    }
+    if not unexpected:
+        return True
+
+    patch["duplicate_insertion"] = dict(unexpected)
+    print(f"  [verify] {path}: patch idx={patch.get('idx')} produced "
+          f"unexpected duplicate pre-existing line(s) "
+          f"{dict(unexpected)}",
+          file=__import__("sys").stderr)
+    return False
+
+
+# ===========================================================================
+#  Structural sanity gate (NEW 2026-10-28)
+# ===========================================================================
+
+def _check_structural_sanity(old_content, new_content, path):
+    """Refuse a patch that introduces unfixable structural damage.
+
+    Catches two failure modes on `.py` destinations:
+
+      1. `ast.parse(new_content)` fails.  The patch broke Python
+         syntax in a way the record-level `validate_content` would
+         also catch — but naming it here means the specific patch
+         is marked `skipped_structural_damage` with the syntax error
+         as its reason, rather than the record failing wholesale.
+
+      2. A module-level statement keyword (`try`, `except`, `finally`,
+         `for`, `while`, `with`) was added at column 0 that wasn't in
+         `old_content`.  The motivating case: a `try/except` block
+         was appended at module level because it failed every insert
+         heuristic.  Module-level `try:` is legal Python but
+         references function-local names that don't exist at module
+         scope; the resulting file parses cleanly and is broken at
+         runtime.  Only column-0 occurrences count — an indented
+         `try:` inside a function body is legitimate.
+
+    Returns None for `.py` destinations that pass, or a short
+    reason string.  Always returns None for non-Python destinations —
+    the check is Python-specific by design, and a JS structural
+    check would belong in a sibling gate (unbalanced JS braces are
+    repairable by `repair.py`, so per-patch rejection would prevent
+    the repair suggestion from being generated).
+    """
+    if not old_content:
+        return None
+    if Path(path).suffix.lower() != ".py":
+        return None
+    import ast
+    try:
+        ast.parse(new_content)
+    except SyntaxError as e:
+        return (f"patch introduced Python syntax error at "
+                f"line {e.lineno}: {e.msg}")
+    from .validate_output import _module_level_stmts_added
+    added = _module_level_stmts_added(new_content, old_content)
+    if added:
+        return (f"patch injected module-level statement(s) at "
+                f"column 0: {added}")
+    return None
+
+
+# ===========================================================================
+#  Already-present anchoring (NEW 2026-10-28)
+# ===========================================================================
+
+def _mark_already_present(patch, body, record_inserted):
+    """Mark a patch `already-present` and, if its body is a single
+    non-blank line, add that line to `record_inserted` so subsequent
+    "Add just after:" blocks can anchor to it.
+
+    Motivating case: the AI prints `output_name = params.get(...) or
+    None` as its own block (already in base), then tries to insert a
+    `try/except` fragment "just after:" that line.  Without this,
+    `_try_insert_after_anchor` has no anchor to work with: the prior
+    block was a no-op, so `prior_insertions` never gained the anchor
+    line.  The current line is in `base`, but the anchor heuristic
+    only consults prose backticks and `prior_insertions`.
+    """
+    patch["applied_by"] = "already-present"
+    body_lines = [ln for ln in body.splitlines() if ln.strip()]
+    if len(body_lines) == 1:
+        record_inserted.add(body_lines[0].strip())
+
+
+# ===========================================================================
+#  Duplicate-assignment pre-gate (2026-10-28b)
+# ===========================================================================
+
+_DUP_ASSIGN_LINE_RE = re.compile(r'^[A-Za-z_$][\w$]*\s*=\s*[^=]')
+
+_CONTINUATION_ENDINGS = (
+    "(", "[", "{", "\\", ",", "+", "-", "*", "/", "=", "|", "&",
+    " and", " or",
+)
+
+
+def _is_duplicate_assignment_insert(old_content, patch):
+    """True iff `patch` is a single-line assignment that already
+    exists verbatim in `old_content`.
+    """
+    body = patch.get("body") or ""
+    body_lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    if len(body_lines) != 1:
+        return False
+    line = body_lines[0]
+    if not _DUP_ASSIGN_LINE_RE.match(line):
+        return False
+    if line.endswith(_CONTINUATION_ENDINGS):
+        return False
+    return any(ln.strip() == line for ln in old_content.splitlines())
+
+
+# ===========================================================================
 #  Main loop: pass 6
 # ===========================================================================
 
 def pass6_apply_patches(records, blocks_by_idx, llm):
     import sys
-    from collections import Counter
 
     for path, rec in records.items():
         if rec.state not in ("SINGLE_FULL", "MULTI_FULL", "FULL_PLUS_PATCH"):
@@ -165,20 +403,6 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
             continue
         base = base_block.body
 
-        # NEW: preserve the pre-existing file's preamble.
-        #
-        # When a FULL block replaces a pre-existing file and omits the
-        # pre-existing preamble (leading docstring / comment block),
-        # prepend it.  The pg_state.py failure: block 94 was
-        # `STATE_JS = r\"\"\"...\"\"\"` (the constant body only), the
-        # pre-existing file had a 17-line module docstring above it,
-        # and `pass9_write` wrote the block body verbatim — the
-        # docstring was lost.
-        #
-        # `_preserve_preamble` is a no-op when either side has no
-        # preamble or when the block has its own (explicit new
-        # docstring).  Only fires on the specific "block omits the
-        # pre-existing preamble" shape.
         if rec.source_blocks:
             for _idx in rec.source_blocks:
                 _pre = blocks_by_idx.get(_idx)
@@ -203,61 +427,118 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
             record_inserted |= _collect_inserted_lines(base, content)
             rec.verification["pair_records"] = pair_records
 
-        all_deterministic = True
+        # ------------------------------------------------------------------
+        # FIXED-POINT PATCH LOOP
+        # ------------------------------------------------------------------
         all_ok = True
-        for patch in rec.patches:
-            original_body = patch["body"]
-            filtered_body, was_filtered = _filter_body_by_blocks(
-                original_body, base_stripped_set, record_inserted,
-            )
-            if was_filtered:
-                patch["filtered_duplicate_lines"] = True
-                if not filtered_body.strip():
+        pending = list(rec.patches)
+
+        while pending:
+            applied_this_pass = 0
+            still_pending = []
+            for patch in pending:
+                if _is_duplicate_assignment_insert(content, patch):
                     patch["applied_by"] = "already-present"
+                    patch["duplicate_assignment"] = True
                     print(
-                        f"  [insert-filter] {path} "
-                        f"idx={patch['idx']}: filtered to empty",
+                        f"  [dup-assign] {path} idx={patch['idx']}: "
+                        f"single-line assignment already present; "
+                        f"skipping",
                         file=sys.stderr,
                     )
+                    # Anchor the (already-present) line for subsequent
+                    # "Add just after:" blocks.  See _mark_already_present.
+                    _body = patch.get("body") or ""
+                    _body_lines = [ln for ln in _body.splitlines()
+                                    if ln.strip()]
+                    if len(_body_lines) == 1:
+                        record_inserted.add(_body_lines[0].strip())
                     continue
-                patch_to_apply = {**patch, "body": filtered_body}
-                print(
-                    f"  [insert-filter] {path} "
-                    f"idx={patch['idx']}: filtered duplicate "
-                    f"block(s)",
-                    file=sys.stderr,
+
+                original_body = patch["body"]
+                filtered_body, was_filtered = _filter_body_by_blocks(
+                    original_body, base_stripped_set, record_inserted,
                 )
-            else:
-                patch_to_apply = patch
-
-            if _is_blockquoted_strong(patch["idx"], blocks_by_idx):
-                result = _try_blockquoted_patch(
-                    content, patch_to_apply, path)
-            else:
-                result = _try_deterministic_patch(
-                    content, patch_to_apply, path)
-
-            if result is not None:
-                if result == content:
-                    patch["applied_by"] = "already-present"
+                if was_filtered:
+                    patch["filtered_duplicate_lines"] = True
+                    if not filtered_body.strip():
+                        _mark_already_present(
+                            patch, original_body, record_inserted)
+                        print(
+                            f"  [insert-filter] {path} "
+                            f"idx={patch['idx']}: filtered to empty",
+                            file=sys.stderr,
+                        )
+                        continue
+                    patch_to_apply = {**patch, "body": filtered_body}
+                    print(
+                        f"  [insert-filter] {path} "
+                        f"idx={patch['idx']}: filtered duplicate "
+                        f"block(s)",
+                        file=sys.stderr,
+                    )
                 else:
+                    patch_to_apply = patch
+
+                if _is_blockquoted_strong(patch["idx"], blocks_by_idx):
+                    result = _try_blockquoted_patch(
+                        content, patch_to_apply, path,
+                        prior_insertions=record_inserted)
+                else:
+                    result = _try_deterministic_patch(
+                        content, patch_to_apply, path,
+                        prior_insertions=record_inserted)
+
+                if result is not None and result != content:
+                    if not _verify_no_duplicate_insertion(
+                            content, result, patch, path):
+                        patch["applied_by"] = "skipped_duplicate_insertion"
+                        continue
+                    _struct_err = _check_structural_sanity(
+                        content, result, path)
+                    if _struct_err is not None:
+                        patch["applied_by"] = "skipped_structural_damage"
+                        patch["failure_reason"] = _struct_err
+                        print(
+                            f"  [struct-gate] {path} idx={patch['idx']}: "
+                            f"{_struct_err}",
+                            file=sys.stderr,
+                        )
+                        continue
                     record_inserted |= _collect_inserted_lines(
                         content, result)
                     content = result
                     patch["applied_by"] = "deterministic"
-                continue
+                    applied_this_pass += 1
+                    continue
 
-            if was_filtered:
-                if _is_blockquoted_strong(patch["idx"], blocks_by_idx):
-                    result = _try_blockquoted_patch(
-                        content, patch, path)
-                else:
-                    result = _try_deterministic_patch(
-                        content, patch, path)
-                if result is not None:
-                    if result == content:
-                        patch["applied_by"] = "already-present"
+                if result == content:
+                    _mark_already_present(patch, original_body,
+                                           record_inserted)
+                    continue
+
+                if was_filtered:
+                    if _is_blockquoted_strong(patch["idx"], blocks_by_idx):
+                        result = _try_blockquoted_patch(
+                            content, patch, path,
+                            prior_insertions=record_inserted)
                     else:
+                        result = _try_deterministic_patch(
+                            content, patch, path,
+                            prior_insertions=record_inserted)
+                    if result is not None and result != content:
+                        if not _verify_no_duplicate_insertion(
+                                content, result, patch, path):
+                            patch["applied_by"] = \
+                                "skipped_duplicate_insertion"
+                            continue
+                        _struct_err = _check_structural_sanity(
+                            content, result, path)
+                        if _struct_err is not None:
+                            patch["applied_by"] = \
+                                "skipped_structural_damage"
+                            patch["failure_reason"] = _struct_err
+                            continue
                         record_inserted |= _collect_inserted_lines(
                             content, result)
                         content = result
@@ -269,58 +550,103 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                             f"failed, applied unfiltered",
                             file=sys.stderr,
                         )
+                        applied_this_pass += 1
+                        continue
+                    if result == content:
+                        _mark_already_present(patch, original_body,
+                                               record_inserted)
+                        continue
+
+                if _patch_already_present(patch_to_apply["body"], content):
+                    _mark_already_present(patch, patch_to_apply["body"],
+                                           record_inserted)
                     continue
 
-            if _patch_already_present(patch_to_apply["body"], content):
-                patch["applied_by"] = "already-present"
-                continue
-
-            if _diff_already_applied(patch_to_apply["body"], content):
-                patch["applied_by"] = "already-present"
-                continue
-
-            if _is_deletion_instruction(
-                    patch_to_apply["body"],
-                    patch.get("context_before", "")):
-                if _deletion_already_applied(
-                        patch_to_apply["body"], content):
-                    patch["applied_by"] = "already-present"
+                if _diff_already_applied(patch_to_apply["body"], content):
+                    _mark_already_present(patch, patch_to_apply["body"],
+                                           record_inserted)
                     continue
 
-            broader = _broader_context_for(
-                patch_to_apply, blocks_by_idx, records, path)
-            if broader != patch_to_apply.get("context_before", ""):
-                broader_patch = {
-                    **patch_to_apply, "context_before": broader}
-                if _is_blockquoted_strong(patch["idx"], blocks_by_idx):
-                    retry_result = _try_blockquoted_patch(
-                        content, broader_patch, path)
-                else:
-                    retry_result = _try_deterministic_patch(
-                        content, broader_patch, path)
-                if retry_result is not None:
-                    if retry_result == content:
-                        patch["applied_by"] = "already-present"
-                        patch["broader_context"] = True
+                if _is_deletion_instruction(
+                        patch_to_apply["body"],
+                        patch.get("context_before", "")):
+                    if _deletion_already_applied(
+                            patch_to_apply["body"], content):
+                        _mark_already_present(
+                            patch, patch_to_apply["body"],
+                            record_inserted)
+                        continue
+
+                broader = _broader_context_for(
+                    patch_to_apply, blocks_by_idx, records, path)
+                if broader != patch_to_apply.get("context_before", ""):
+                    broader_patch = {
+                        **patch_to_apply, "context_before": broader}
+                    if _is_blockquoted_strong(
+                            patch["idx"], blocks_by_idx):
+                        retry_result = _try_blockquoted_patch(
+                            content, broader_patch, path,
+                            prior_insertions=record_inserted)
                     else:
+                        retry_result = _try_deterministic_patch(
+                            content, broader_patch, path,
+                            prior_insertions=record_inserted)
+                    if retry_result is not None and retry_result != content:
+                        if not _verify_no_duplicate_insertion(
+                                content, retry_result, patch, path):
+                            patch["applied_by"] = \
+                                "skipped_duplicate_insertion"
+                            continue
+                        _struct_err = _check_structural_sanity(
+                            content, retry_result, path)
+                        if _struct_err is not None:
+                            patch["applied_by"] = \
+                                "skipped_structural_damage"
+                            patch["failure_reason"] = _struct_err
+                            continue
                         record_inserted |= _collect_inserted_lines(
                             content, retry_result)
                         content = retry_result
                         patch["applied_by"] = "deterministic"
                         patch["broader_context"] = True
-                    continue
+                        applied_this_pass += 1
+                        continue
+                    if retry_result == content:
+                        _mark_already_present(
+                            patch, patch_to_apply["body"],
+                            record_inserted)
+                        continue
 
-            all_deterministic = False
-            if llm is not None:
-                result = _try_llm_patch(
-                    content, patch_to_apply, llm, path)
-                if result is not None:
-                    record_inserted |= _collect_inserted_lines(
-                        content, result)
-                    content = result
-                    patch["applied_by"] = "llm"
-                    continue
+                if llm is not None:
+                    result = _try_llm_patch(
+                        content, patch_to_apply, llm, path)
+                    if result is not None and result != content:
+                        if not _verify_no_duplicate_insertion(
+                                content, result, patch, path):
+                            patch["applied_by"] = \
+                                "skipped_duplicate_insertion"
+                            continue
+                        record_inserted |= _collect_inserted_lines(
+                            content, result)
+                        content = result
+                        patch["applied_by"] = "llm"
+                        applied_this_pass += 1
+                        continue
 
+                still_pending.append(patch)
+
+            if applied_this_pass == 0:
+                break
+            pending = still_pending
+
+        # Mark surviving pending patches as failed with diagnostics.
+        for patch in pending:
+            if patch.get("applied_by") in (
+                "already-present",
+                "skipped_duplicate_insertion",
+                "skipped_structural_damage",
+            ):
+                continue
             patch["applied_by"] = "failed"
             try:
                 patch["failure_reason"] = _diagnose_patch_failure(
@@ -350,7 +676,9 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
         rec.verification["patches_applied"] = sum(
             1 for p in rec.patches
             if p.get("applied_by")
-            not in ("failed", "skipped_weak_attribution"))
+            not in ("failed", "skipped_weak_attribution",
+                    "skipped_duplicate_insertion",
+                    "skipped_structural_damage"))
         rec.verification["pairs_applied"] = sum(
             1 for r in pair_records if r["applied_by"] == "deterministic")
 
@@ -385,20 +713,13 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                   file=sys.stderr)
         else:
             had_failure = (not all_ok
-                           or rec.verification.get("pairs_incomplete", False))
+                           or rec.verification.get(
+                               "pairs_incomplete", False))
             if had_failure:
                 rec.trust = "LOW"
                 rec.verification["patches_incomplete"] = (
                     rec.verification.get("patches_incomplete", False)
                     or not all_ok)
-                # NOTE: no "file not written" warning here.  Pass 9
-                # emits the accurate "trust=LOW below --min-trust"
-                # line for records that actually stay LOW; if pass
-                # 8.7 reconciliation promotes the record, no warning
-                # is correct (the file IS written).  Emitting the
-                # warning here unconditionally produced the stale-
-                # warning class in the pg_panel_bindings.py and
-                # pg_panel_scrubs.py failures.
                 print(f"  [pass 6] {path}: incomplete application -> LOW "
                       f"trust", file=sys.stderr)
             else:
@@ -426,7 +747,10 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
     total_failed = total_patches - total_applied - total_noop
     files_with_failures = sum(
         1 for r in records.values()
-        if any(p.get("applied_by") == "failed" for p in r.patches)
+        if any(p.get("applied_by") in
+               ("failed", "skipped_duplicate_insertion",
+                "skipped_structural_damage")
+               for p in r.patches)
         or r.verification.get("pairs_incomplete"))
     n_sanity = sum(1 for r in records.values() if r.sanity_rejected)
     if total_patches or total_pairs:
