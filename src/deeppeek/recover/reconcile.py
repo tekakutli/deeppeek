@@ -21,12 +21,21 @@ on a record that was written at HIGH trust.  `pass8_7_reconcile`
 now removes the pass-6 warning for each excluded patch idx before
 adding its own reconciliation warning.
 
-The `patch or pair application failed; file not written` warning
-from pass 6 is also removed by `pass6_apply_patches` itself (see
-that module) — it never existed to be cleaned up here.  The
-"file not written" state is now reported accurately by
-`pass9_write`'s `trust=LOW below --min-trust` line, which fires
-only for records that actually stay LOW.
+NEW (2026-11-05): THREE MORE CLASSES OF STALE WARNING
+=====================================================
+`content validation failed` from pass 8 was the most confusing
+stale warning in the wild. When pass 8.7 excluded the offending
+patch and re-validated cleanly, `content_valid` became "ok" but
+the warning from the original failed pass-8 run persisted. The
+manifest showed a valid file *and* a "content validation failed"
+warning in the same record. Bug 4 from the comfyui run.
+
+`replace pair(s) failed` and `unresolved symbol reference(s)
+introduced by patch` get the same treatment as the pass-6
+patch-failure warning: when reconcile rewrites their live state to
+"skipped", the aggregate warning becomes a lie.
+
+`_clear_stale_pass6_warnings` now handles all four classes.
 """
 
 import sys
@@ -177,10 +186,50 @@ def _find_minimum_exclusions(rec, base, records, path, blocks_by_idx):
 
 
 def _fuzzy_locate_elsewhere(body, current_path, records):
+    """If `body` matches another record's content, return that
+    record's path; else None.
+
+    Used to label an excluded patch as "likely misattributed" (its
+    content lives in a different file already).
+
+    Two thresholds, calibrated in response to the
+    `output_rotation` misattribution:
+
+      · Very short bodies (< ~200 chars) must match *verbatim*.
+        Boilerplate fragments — a try/except pair, a small helper —
+        legitimately appear in multiple files. Matching one elsewhere
+        is not evidence of misattribution; it is evidence of
+        duplicated shapes. The `output_rotation` try/except is a
+        3-line fragment that appears both in `inpaint_server.py`
+        (where it is applied) and in `comfyui.py` (where it should
+        also apply); the loose fuzzy match wrongly excluded it from
+        `comfyui.py` and broke the feature chain silently. Requiring
+        verbatim match for short bodies prevents that.
+
+      · Larger bodies (>= ~200 chars) use the fuzzy match. A
+        substantial function that also exists elsewhere is genuinely
+        redundant — the AI pasted it into the wrong file.
+    """
     from .patch_text import _content_present_in_base
     body = (body or "").strip()
     if not body or len(body) < 40:
         return None
+
+    if len(body) < 200:
+        # Strict mode for short bodies: exact substring only, no
+        # fuzzy matching. See docstring.
+        best = None
+        for other_path, other_rec in records.items():
+            if other_path == current_path:
+                continue
+            if other_rec.content is None:
+                continue
+            if body in other_rec.content:
+                if best is None or len(other_rec.content) < best[1]:
+                    best = (other_path, len(other_rec.content))
+        return best[0] if best else None
+
+    # Fuzzy mode for substantial bodies.
     best = None
     for other_path, other_rec in records.items():
         if other_path == current_path:
@@ -233,6 +282,29 @@ def _diagnose_exclusion(key, rec, records):
 
 
 def _trust_cap(rec):
+    """Trust ceiling for a record after reconciliation.
+
+    A record that reached HIGH *by excluding patches* is a
+    fixed-up record, not a clean one. Reconciliation excluded the
+    evidence of a problem; it did not verify that the remaining
+    content is what the conversation intended.
+
+    The `comfyui` run's `_trust_cap` returned HIGH for reconciled
+    records, meaning the final manifest showed a record with three
+    excluded patches sitting at the same trust as a record where
+    every patch applied. That is the wrong signal. Cap reconciled
+    records at MEDIUM so the exclusion is visible in the manifest
+    and the user is nudged to inspect before shipping.
+
+    MEDIUM (not LOW) is the right ceiling: under default
+    `--min-trust MEDIUM`, MEDIUM records are still written, so the
+    file lands. LOW would fail-close, which is too aggressive for
+    the routine "one misattributed patch" case. Users who want
+    maximum safety can pass `--min-trust HIGH`, which then fail-closes
+    MEDIUM records too.
+    """
+    if rec.verification.get("reconciled"):
+        return "MEDIUM"
     return "MEDIUM" if rec.dedup_reason == "last_full" else "HIGH"
 
 
@@ -247,37 +319,40 @@ def _base_content(rec, blocks_by_idx):
     return block.body
 
 
-# NEW: warning patterns emitted by pass 6 that reconcile should
-# remove when it excludes the corresponding patch.  The
-# `patch idx=N could not be applied` line is per-patch; reconcile
-# removes it for each excluded idx.  The
-# `patch or pair application failed; file not written` line was
-# removed from pass 6 entirely (see apply_patches.py) so there is
-# nothing to clean up for it here.
 _PASS6_PATCH_WARN_PREFIX = "patch idx="
 
 
 def _clear_stale_pass6_warnings(rec, excluded_keys):
     """Remove warnings that are stale after reconciliation.
 
-    Three warning classes are cleaned up:
+    Four warning classes are cleaned up:
 
     1. `patch idx=N could not be applied (...)` — emitted by pass 6
-       for each failed patch.  When reconcile excludes patch N, the
+       for each failed patch. When reconcile excludes patch N, the
        patch is `skipped_unplaceable`/`skipped_misattributed`, not
-       "failed".  The per-patch warning is stale.
+       "failed". The per-patch warning is stale.
 
     2. `N/M replace pair(s) failed: ...` — emitted by pass 6 when one
-       or more pairs fail.  After reconcile excludes the failing
+       or more pairs fail. After reconcile excludes the failing
        pair(s), the record's live `pair_records` may have no
-       `applied_by == "failed"` entries.  The aggregate warning is
+       `applied_by == "failed"` entries. The aggregate warning is
        stale.
 
     3. `unresolved symbol reference(s) introduced by patch: ...` —
        emitted by pass 8.5 for records whose patches introduce
-       unresolved calls.  Reconcile pop's `rec.verification[
+       unresolved calls. Reconcile pop's `rec.verification[
        "unresolved_calls"]` after re-verifying the record is clean.
        The pass-8.5 warning is stale.
+
+    4. `content validation failed: ...` (NEW) — emitted by pass 8
+       when `validate_content` rejected the record. After reconcile
+       re-validates cleanly, `content_valid` becomes "ok" and the
+       original failure no longer describes the current content.
+       This was the comfyui.py case: the manifest showed
+       `content_valid: "ok"` alongside a `content validation
+       failed` warning in the same record. Keeping that warning is
+       worse than useless — the user sees a failure the run has
+       already fixed.
 
     Idempotent: calling twice does nothing the second time.
     """
@@ -302,10 +377,7 @@ def _clear_stale_pass6_warnings(rec, excluded_keys):
             filtered.append(w)
             continue
 
-        # Class 2: pair-failure aggregate warning.  Live state check:
-        # after reconcile has run, `pair_records` no longer contains
-        # any `failed` entries (reconcile rewrote them to
-        # `skipped_unplaceable` or `skipped_misattributed`).
+        # Class 2: pair-failure aggregate warning.
         if "replace pair(s) failed" in w:
             live_failed = sum(
                 1 for r in rec.verification.get("pair_records", [])
@@ -316,13 +388,20 @@ def _clear_stale_pass6_warnings(rec, excluded_keys):
             filtered.append(w)
             continue
 
-        # Class 3: unresolved-symbol warning from pass 8.5.  Live
-        # state check: reconcile pop's `unresolved_calls` before
-        # calling this helper, so the field is either absent or
-        # empty when we're promoting.
+        # Class 3: unresolved-symbol warning from pass 8.5.
         if w.startswith(
                 "unresolved symbol reference(s) introduced by patch:"):
             if not rec.verification.get("unresolved_calls"):
+                continue
+            filtered.append(w)
+            continue
+
+        # Class 4: content validation failure from pass 8. If the
+        # final content_valid is "ok", the failure was fixed by
+        # reconciliation. The warning describes a state that no
+        # longer exists.
+        if w.startswith("content validation failed:"):
+            if rec.verification.get("content_valid") == "ok":
                 continue
             filtered.append(w)
             continue
@@ -344,6 +423,16 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
         if rec.is_deleted:
             continue
         if not (rec.patches or rec.pairs):
+            continue
+
+        # Refuse to promote a partial reprint. The content is
+        # provably incomplete; reconcile can exclude evidence, not
+        # the defect. Demoting via exclusion would say "we fixed
+        # the file" when the file was never right.
+        if rec.verification.get("partial_reprint"):
+            if verbose:
+                print(f"  [reconcile] {path}: skipping — partial "
+                      f"reprint", file=sys.stderr)
             continue
 
         base = _base_content(rec, blocks_by_idx)
@@ -429,7 +518,6 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
                 continue
 
         rec.trust = _trust_cap(rec)
-        rec.trust = _trust_cap(rec)
         rec.sanity_rejected = False
         rec.verification.pop("sanity_reason", None)
         rec.verification["reconciled"] = {
@@ -441,8 +529,8 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
             ],
         }
 
-        # NEW: clear pass-6 stale warnings for excluded patches
-        # before adding the reconcile-specific warnings.
+        # NEW: clear stale warnings before adding reconcile-specific
+        # ones.
         _clear_stale_pass6_warnings(rec, excluded_keys)
 
         for key in excluded_keys:

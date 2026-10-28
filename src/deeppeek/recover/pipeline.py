@@ -58,10 +58,8 @@ the playground on load.
 
 Pass 7.7 (`pass7_7_repair_js_imports`) attempts a mechanical repair
 first: when the target declares the symbol but does not export it,
-it rewrites the declaration to add `export`.  Adding `export` is
-strictly more permissive — it cannot break a consumer — so this is
-safe to do without user interaction.  If repair succeeds the
-problem is removed from the list and the target stays at its
+it rewrites the declaration to add `export`.  If repair succeeds
+the problem is removed from the list and the target stays at its
 original trust.
 
 Pass 7.6 (`pass7_6_demote_on_missing_export`) is the fallback: it
@@ -70,17 +68,30 @@ isn't written broken.  Under default `--min-trust MEDIUM` neither
 is written; the target tree is preserved and `warnings.txt` tells
 the user exactly which `export` is missing.
 
-RECONCILIATION (PASS 8.7)
-=========================
-Pass 8.7 (`pass8_7_reconcile`) runs after pass 8.5 and before pass
-8.6 (cross-file duplicate detection).  For each record that would
-fail-close, it tries excluding each applied patch/pair in turn and
-keeps the minimal exclusion set that lets the remainder pass every
-check.  When the rebuilt content differs from the record's base
-(meaning real changes will be written), the record is promoted; when
-it equals base (meaning nothing would change), the record stays
-fail-closed — see `reconcile.py` for the "reconciled to base is not
-a rescue" invariant.
+Pass 7.6b (NEW) does the same for Python exports.  The
+`comfyui_krita.py` failure in the wild: `handlers/comfyui.py`
+imports `build_krita_resources` from a target that was truncated
+to two functions; both records shipped at HIGH trust and the
+daemon crashed on reload.  Pass 7.6b demotes both sides so the
+target tree survives intact and the manifest names the missing
+symbol.
+
+Pass 7.8 (NEW) is the universal safety net.  Any `missing_export`
+or `missing_js_export` finding that survives the specific passes
+above still demotes both sides.  When cross-validate gains a new
+finding type in a future change, 7.8 is the pass that makes it a
+trust signal even if no specific handler was added.
+
+SHIELD (PASS 8.8, NEW)
+======================
+Even after dedup, cross-validate demotion, and reconcile, a bug in
+any of those layers could let a record through whose content is
+provably incomplete.  Pass 8.8 compares the recovered content
+against what is *actually on disk* in the target tree, and refuses
+to write a file that would delete substantive top-level
+declarations.  The `comfyui_krita.py` truncation is the motivating
+case — twenty of twenty-two top-level functions would have been
+deleted.  See `shield.py` for the full account.
 
 RESIDUAL EMISSION
 =================
@@ -109,11 +120,14 @@ The safe defaults per pass:
     pass 6     → records keep base content (no patches applied)
     pass 7     → {"exports": {}, "imports": {}, "problems": []}
     pass 7.5   → [] (no JS problems)
-    pass 7.7   → (original problem list unchanged)
     pass 7.6   → 0 (no demotions)
+    pass 7.6b  → 0 (no demotions)
+    pass 7.7   → (original problem list unchanged)
+    pass 7.8   → 0 (no demotions)
     pass 8     → (no-op; no per-file verification)
     pass 8.5   → (no-op; no symbol demotions)
     pass 8.7   → 0 (no reconciliations)
+    pass 8.8   → 0 (no shield demotions)
     pass 9     → caught by the writer's own try/except
 
 These defaults are conservative: a crashed pass cannot accidentally
@@ -143,10 +157,13 @@ from .apply_patches import pass6_apply_patches
 from .validate import (
     pass7_cross_validate, pass7_5_js_validate,
     pass7_6_demote_on_missing_export,
+    pass7_6b_demote_on_missing_python_export,
     pass7_7_repair_js_imports,
+    pass7_8_demote_on_any_finding,
     pass8_verify, pass8_5_check_symbols,
 )
 from .reconcile import pass8_7_reconcile
+from .shield import pass8_8_shield_preexisting
 from .write import pass9_write
 
 
@@ -172,6 +189,12 @@ class RecoverConfig:
     # location, next to manifest.json and warnings.txt).  Path("-") →
     # stdout, for shell pipelines.  Any other path → that file.
     residual_path: Optional[Path] = None
+    # Pass 8.8 shield: refuse to overwrite a target-tree file with
+    # recovered content that would delete substantive top-level
+    # declarations.  On by default; escape hatch is `--min-trust LOW`
+    # (which lets LOW records write), or explicit
+    # shield_preexisting=False for programmatic callers.
+    shield_preexisting: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -360,11 +383,6 @@ def run(cfg: RecoverConfig) -> int:
         print(str(e), file=sys.stderr)
         return 3
 
-    # Save the input dump for `deeppeek restore`.  Only file inputs
-    # trigger this — an in-memory `capture` has no on-disk dump to
-    # round-trip.  Overwrites each run; the directory is
-    # self-gitignored via `.deeppeek/.gitignore`.  Failure is
-    # non-fatal: saving is a convenience, not a pipeline step.
     if cfg.dump_path is not None:
         try:
             from .last_conversation import save_last
@@ -427,7 +445,6 @@ def run(cfg: RecoverConfig) -> int:
     t_start = time.monotonic()
     run_errors: list = []
 
-    # ---- pass 1 (NOT wrapped: parsing failure is fatal) ----
     print("[pass 1] extracting blocks (markdown AST)...")
     blocks, deleted_files = pass1_extract(dump_text)
     n_orphans = sum(1 for b in blocks if b.is_orphan)
@@ -443,7 +460,6 @@ def run(cfg: RecoverConfig) -> int:
             for i, b in enumerate(blocks):
                 b.idx = i
 
-    # ---- pass 2 (wrapped) ----
     print(f"[pass 2] classifying blocks (mode={cfg.llm_mode}, "
           f"escalate_below={cfg.escalate_below})...")
     _run_pass_no_return(
@@ -460,7 +476,6 @@ def run(cfg: RecoverConfig) -> int:
           f"other: {n_other}  recovered-meta: {n_meta}"
           + (f"  preexisting: {n_pre_full}" if n_pre_full else ""))
 
-    # ---- pass 2.5 ----
     print("[pass 2.5] resolving output paths...")
     resolutions = _run_pass(
         "2.5 (resolve)", resolve_paths, [],
@@ -472,12 +487,6 @@ def run(cfg: RecoverConfig) -> int:
                        if r["reason"].startswith("unresolved"))
     print(f"  {n_resolved} resolved, {n_unresolved} unresolved")
 
-    # NEW: after resolution, prune pre-existing baselines that no
-    # conversation block touched.  On a real target tree this drops
-    # the pre-existing set from the whole tree (~571 files here) to
-    # just the files the conversation actually references (~30).
-    # Everything downstream — cross-validate, verify, the manifest's
-    # "files" section, per-pass stderr — is scoped to touched files.
     if cfg.apply_to is not None:
         touched = {b.output_path for b in blocks
                    if b.classified_by != "preexisting" and b.output_path}
@@ -492,7 +501,6 @@ def run(cfg: RecoverConfig) -> int:
             print(f"  pruned {n_pruned} untouched pre-existing "
                   f"baseline(s)", file=sys.stderr)
 
-    # ---- pass 3 (NOT wrapped: grouping failure is fatal) ----
     print("[pass 3] grouping by file...")
     records = pass3_group(blocks, deleted_files)
     n_pre_rec = sum(1 for r in records.values() if r.preexisting_base)
@@ -500,7 +508,6 @@ def run(cfg: RecoverConfig) -> int:
           + (f" ({n_pre_rec} preexisting baselines picked up later)"
              if n_pre_rec else ""))
 
-    # ---- pass 4 (wrapped) ----
     if n_orphans:
         print(f"[pass 4] attributing {n_orphans} orphan fence(s)...")
         blocks_by_idx_all = {b.idx: b for b in blocks}
@@ -511,7 +518,6 @@ def run(cfg: RecoverConfig) -> int:
         attributed = sum(1 for b in blocks if b.is_orphan and b.attributed_to)
         print(f"  {attributed}/{n_orphans} orphans attributed")
 
-    # ---- pass 5 (wrapped) ----
     print("[pass 5] deduplicating multi-print files...")
     blocks_by_idx = {b.idx: b for b in blocks}
     _run_pass_no_return(
@@ -529,7 +535,6 @@ def run(cfg: RecoverConfig) -> int:
     if pre_base_count:
         print(f"  preexisting_baseline: {pre_base_count}")
 
-    # ---- pass 6 (wrapped) ----
     print("[pass 6] applying patches...")
     _p6_errors_before = len(run_errors)
     _run_pass_no_return(
@@ -537,13 +542,6 @@ def run(cfg: RecoverConfig) -> int:
         records, blocks_by_idx, llm,
     )
     if len(run_errors) > _p6_errors_before:
-        # Defense-in-depth.  pass6 has per-patch and per-pair crash
-        # isolation, so reaching here means something catastrophic
-        # (e.g. a crash in the filter/dedup scaffolding before any
-        # patch attempt).  Fail-closed: any record that was supposed
-        # to be patched but did not get its trust updated is
-        # demoted to LOW so write.py routes it to low_trust/ and the
-        # target tree is preserved.
         _fc_count = 0
         for _fc_path, _fc_rec in records.items():
             if _fc_rec.state in ("SINGLE_FULL", "MULTI_FULL",
@@ -558,7 +556,6 @@ def run(cfg: RecoverConfig) -> int:
                   f"fail-closed defensively so the target is "
                   f"preserved", file=sys.stderr)
 
-    # ---- pass 7 (wrapped) ----
     print("[pass 7] cross-validating imports...")
     cross_validate = _run_pass(
         "7 (cross-validate)", pass7_cross_validate,
@@ -580,7 +577,6 @@ def run(cfg: RecoverConfig) -> int:
     else:
         print("  clean")
 
-    # ---- pass 7.5 (wrapped) ----
     print("[pass 7.5] cross-validating JS imports/exports...")
     js_problems = _run_pass(
         "7.5 (js-validate)", pass7_5_js_validate, [],
@@ -626,14 +622,7 @@ def run(cfg: RecoverConfig) -> int:
             print(f"  {len(_repaired)} JS problem(s) auto-repaired",
                   file=sys.stderr)
 
-    # ---- pass 7.6 (wrapped) — FIX 2 ----
-    # Turn a `missing_js_export` finding into a trust signal.  When
-    # the target DECLARES the symbol but does not EXPORT it, both
-    # the target and the importer are demoted to LOW so neither is
-    # written under default --min-trust.  Without this, cross-
-    # validate findings were informational-only and the pg_masks /
-    # pg_state silent corruption could be written at HIGH trust
-    # (the playground would blank on load with a JS ReferenceError).
+    # ---- pass 7.6 (wrapped) — demote on missing JS export ----
     if js_problems:
         n_export_demoted = _run_pass(
             "7.6 (missing-export)",
@@ -644,21 +633,40 @@ def run(cfg: RecoverConfig) -> int:
             print(f"  {n_export_demoted} record(s) demoted to LOW "
                   f"for missing JS export(s)", file=sys.stderr)
 
-    # ---- pass 8 (wrapped) ----
+    # ---- pass 7.6b (wrapped) — demote on missing Python export ----
+    if cross_validate.get("problems"):
+        n_py_export_demoted = _run_pass(
+            "7.6b (missing-python-export)",
+            pass7_6b_demote_on_missing_python_export, 0,
+            run_errors, records, cross_validate["problems"], cfg.trace,
+        ) or 0
+        if n_py_export_demoted:
+            print(f"  {n_py_export_demoted} record(s) demoted to LOW "
+                  f"for missing Python export(s)", file=sys.stderr)
+
+    # ---- pass 7.8 (wrapped) — universal finding demotion ----
+    if cross_validate.get("problems"):
+        n_universal_demoted = _run_pass(
+            "7.8 (universal-demote)",
+            pass7_8_demote_on_any_finding, 0,
+            run_errors, records, cross_validate["problems"], cfg.trace,
+        ) or 0
+        if n_universal_demoted:
+            print(f"  {n_universal_demoted} record-demotion(s) from "
+                  f"the universal safety net", file=sys.stderr)
+
     print("[pass 8] verifying...")
     _run_pass_no_return(
         "8 (verify)", pass8_verify, run_errors,
         records, blocks_by_idx=blocks_by_idx,
     )
 
-    # ---- pass 8.5 (wrapped) ----
     print("[pass 8.5] checking symbol resolution...")
     _run_pass_no_return(
         "8.5 (symbols)", pass8_5_check_symbols, run_errors,
         records, blocks_by_idx=blocks_by_idx,
     )
 
-    # ---- pass 8.7 (wrapped) — reconciliation ----
     print("[pass 8.7] reconciling fail-closed records...")
     n_reconciled = _run_pass(
         "8.7 (reconcile)", pass8_7_reconcile, 0,
@@ -669,7 +677,19 @@ def run(cfg: RecoverConfig) -> int:
               f"(excluded misattributed/unplaceable items)",
               file=sys.stderr)
 
-    # ---- cross-file duplicate detection (wrapped) ----
+    # ---- pass 8.8 (wrapped) — shield pre-existing overwrites ----
+    if cfg.apply_to is not None and cfg.shield_preexisting:
+        print("[pass 8.8] shielding target-tree overwrites...")
+        n_shielded = _run_pass(
+            "8.8 (shield)", pass8_8_shield_preexisting, 0,
+            run_errors, records, cfg.apply_to, cfg.trace,
+        ) or 0
+        if n_shielded:
+            print(f"  [shield] {n_shielded} record(s) failed closed "
+                  f"to protect the target tree", file=sys.stderr)
+        else:
+            print("  no overwrites blocked")
+
     from .cross_file import find_cross_file_duplicates
     cross_file_dups = _run_pass(
         "8.6 (cross-file)", find_cross_file_duplicates, [],
@@ -679,7 +699,6 @@ def run(cfg: RecoverConfig) -> int:
         print(f"  {len(cross_file_dups)} cross-file duplicate(s) "
               f"(see warnings.txt)")
 
-    # ---- pass 9 (wrapped with defense-in-depth) ----
     print("[pass 9] writing files...")
     try:
         rc = pass9_write(
@@ -715,16 +734,6 @@ def run(cfg: RecoverConfig) -> int:
                   f"{cfg.out_dir}/", file=sys.stderr)
         return 1
 
-    # ---- residual emission (additive; never blocks the run) ----
-    # Runs after pass 9 so `rec.trust`, `rec.verification`, and the
-    # per-patch `applied_by` statuses reflect the final state.  The
-    # residual file is a smaller conversation.md containing only the
-    # blocks that did not land in the target tree, ready to be
-    # re-run (after editing) as `deeppeek recover residual.md`.
-    #
-    # The try/except here is deliberately separate from pass 9's —
-    # a residual emission failure must not change the exit code of a
-    # successful recovery.
     try:
         from .residual import emit_residual
         _residual_path = cfg.residual_path

@@ -1,6 +1,8 @@
 """
 recover.validate — Pass 7 (cross-validate imports) and Pass 8
-(verify files), plus Pass 7.5 (JS cross-validation).
+(verify files), plus Pass 7.5 (JS cross-validation),
+Pass 7.6b (Python missing-export demotion), and Pass 7.8
+(universal finding demotion).
 
 Pass 7 is a pure read over the recovered content.
 
@@ -19,6 +21,18 @@ Previously, cross-validation findings were informational only:
 they were recorded in `cross_validate.problems` and set the exit
 code, but the files involved were still written to the target at
 their original trust level.  See `pass7_6_demote_on_missing_export`.
+
+Pass 7.6b (NEW) is the Python analogue of pass 7.6. Cross-validate
+can emit `missing_export` findings for Python imports; when the
+target doesn't declare the name at top level, the importer will
+fail at load time. Both sides are demoted to LOW. Under default
+`--min-trust MEDIUM`, the target tree is preserved; the user reads
+the warning, fixes the missing export, and reruns.
+
+Pass 7.8 (NEW) is the universal safety net: any `missing_export`
+or `missing_js_export` finding that survives the specific passes
+above still demotes both sides. Passes 7.6 and 7.6b are the
+specific handlers; 7.8 is what runs if they missed anything.
 
 Pass 8 verifies ast.parse for .py files and checks that patches took
 effect.
@@ -67,6 +81,24 @@ introduced by a patch almost certainly means the block was
 attributed to the wrong file.  Demote the record to LOW trust so
 the fail-closed policy preserves the target.  See `symbols.py` for
 the extraction rules and the motivating case.
+
+NEW (2026-11-05) **Pre-existing untouched files count as recovered.**
+
+`_resolve_module` and `_rec_will_be_on_disk` previously required
+`rec.content is not None` — i.e., the file had to be written *this
+run* — to count as a resolvable module. Pre-existing files loaded
+from `--apply-to` and left untouched have `content is None` because
+no new content was written, but they are on disk and imports from
+them resolve fine at runtime. Treating them as missing produced
+spurious `missing_module` findings for every pre-existing untouched
+file referenced by a recovered file, which (a) polluted
+`MISSING_FILES.txt` with files that are actually present, and (b)
+made the pass 7.8 universal demotion fire spuriously on importers
+that were perfectly fine.
+
+The fix: a record counts as "recovered" if either (i) its content
+will be written this run, or (ii) it's a pre-existing base loaded
+from disk. Both cases leave the file present in the target tree.
 """
 
 import ast
@@ -83,6 +115,10 @@ from .core import (
     _strip_diff_prefixes,
 )
 
+
+# ============================================================================
+#  Pass 7 — Python import/export cross-validate
+# ============================================================================
 
 def pass7_cross_validate(records: dict[str, FileRecord]) -> dict:
     exports: dict[str, set[str]] = {}
@@ -119,7 +155,7 @@ def pass7_cross_validate(records: dict[str, FileRecord]) -> dict:
                     # resolve and `pg_comfy.py` is not recovered).
                     top = clean.split(".", 1)[0]
                     top_recovered = any(
-                        r.content is not None
+                        _rec_will_be_on_disk(r)
                         and (_basename(p) == top + ".py"
                              or Path(p).as_posix()
                                 == top + "/__init__.py")
@@ -156,9 +192,9 @@ def pass7_cross_validate(records: dict[str, FileRecord]) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Pass 7.5 — JS import/export cross-validation
-# ---------------------------------------------------------------------------
+# ============================================================================
+#  Pass 7.5 — JS import/export cross-validation
+# ============================================================================
 #
 # Catches: pg_masks.py imports _rotateMask from ./pg_state.js, and
 # pg_state.py's STATE_JS string literal doesn't export _rotateMask.
@@ -238,9 +274,10 @@ def pass7_5_js_validate(records: dict) -> list:
 
     return problems
 
-# ---------------------------------------------------------------------------
-# Pass 7.6 — demote on missing JS export (FIX 2)
-# ---------------------------------------------------------------------------
+
+# ============================================================================
+#  Pass 7.6 — demote on missing JS export (FIX 2)
+# ============================================================================
 #
 # Cross-validation findings are trust signals, not just
 # informational.  A `missing_js_export` finding means an importer
@@ -249,24 +286,6 @@ def pass7_5_js_validate(records: dict) -> list:
 # ecosystem is broken (the playground will blank).  Both sides must
 # fail-closed so the target tree is preserved and the user can fix
 # the export manually.
-#
-# The specific failure (pg_state.py `_rotateMask`):
-#
-#   · pg_masks.py imports `_rotateMask` from `./pg_state.js`.
-#   · pg_state.py's STATE_JS declares `function _rotateMask(...)`
-#     but does NOT prefix it with `export`.
-#   · pass7_5_js_validate correctly emits:
-#       {"type": "missing_js_export", "from": "pg_masks.py",
-#        "target": "pg_state.py", "name": "_rotateMask"}
-#   · write.py still wrote pg_state.py at HIGH trust.
-#   · The playground blanks on module load.
-#
-# Pass 7.6 fixes this by demoting both records to LOW when the
-# declaration exists but the export does not.  When the declaration
-# does not exist either (a genuine "the whole module wasn't
-# recovered" case), pass 7.5's `missing_js_module` / pass 7's
-# `missing_module` already handles it; the target file is not
-# written because the record state is MISSING/PARTIAL_ONLY.
 
 _JS_DECL_RE_FOR_MISSING_EXPORT = re.compile(
     r'\b(?:function|class|const|let|var)\s+([A-Za-z_$][\w$]*)'
@@ -366,23 +385,95 @@ def pass7_6_demote_on_missing_export(
 
     return n_demoted
 
-# ---------------------------------------------------------------------------
-# Pass 7.7 — repair JS export findings (FIX)
-# ---------------------------------------------------------------------------
+
+# ============================================================================
+#  Pass 7.6b — demote on missing Python export
+# ============================================================================
 #
-# `pass7_6_demote_on_missing_export` is the *fallback*: it demotes both
-# sides of a missing-export finding so the target file isn't written
-# broken.  But in the common case the repair is trivial — the target
-# declares the symbol; only the `export` keyword is missing.  Adding
-# `export` is strictly more permissive; it cannot break a consumer.
+# The Python analogue of pass 7.6. `pass7_cross_validate` emits
+# `missing_export` findings when a Python importer references a name
+# its target does not declare at top level. Without this pass, those
+# findings only set the exit code — the file that will fail at
+# import time is still written to the target at HIGH trust. The
+# daemon then dies at reload, and every command routed through it
+# dies with it.
 #
-# Pass 7.7 runs *before* pass 7.6.  If repair succeeds, the problem is
-# removed from the list and pass 7.6 never sees it.
-#
-# Only `missing_js_export` is repaired.  `missing_js_import` /
-# `missing_js_module` are left as findings: the import path or export
-# source cannot be synthesized from the finding alone, and getting it
-# wrong introduces a different kind of breakage.
+# Motivating failure: `kritomatic_daemon/handlers/comfyui.py` imports
+# `build_krita_resources`, `paste_animation`, and `resize_canvas` from
+# `kritomatic_daemon/utils/comfyui_krita.py`. When that target was
+# truncated by a partial-reprint of two functions, all three imports
+# broke. Both records shipped at HIGH trust and the daemon crashed.
+
+def pass7_6b_demote_on_missing_python_export(
+        records: dict,
+        problems: list,
+        verbose: bool = False) -> int:
+    """Demote both sides of a Python `missing_export` finding.
+
+    Analogous to `pass7_6_demote_on_missing_export` for JS. When
+    `handlers/comfyui.py` imports `build_krita_resources` from
+    `utils/comfyui_krita.py` and the recovered comfyui_krita.py
+    doesn't declare it at top level, the daemon crashes at import
+    time — the whole handler tree fails, and every command routed
+    through it dies. That is strictly worse than not writing the
+    record at all.
+
+    The importer (whose import will fail) and the target (whose
+    declaration is missing) are both demoted to LOW. Under default
+    `--min-trust MEDIUM` neither reaches the target tree; the user
+    reads the warning, fixes the missing export, and reruns.
+    """
+    n_demoted = 0
+
+    for prob in problems:
+        if prob.get("type") != "missing_export":
+            continue
+
+        from_path = prob.get("from")
+        target_path = prob.get("target")
+        name = prob.get("name")
+
+        if target_path in records:
+            target_rec = records[target_path]
+            if target_rec.trust != "LOW":
+                target_rec.trust = "LOW"
+                target_rec.verification.setdefault(
+                    "missing_python_export", []).append(name)
+                target_rec.warnings.append(
+                    f"missing_python_export: {name!r} is imported by "
+                    f"{from_path} but not declared at this file's "
+                    f"top level; the import will fail at daemon reload"
+                )
+                n_demoted += 1
+                if verbose:
+                    print(f"  [pass 7.6b] {target_path}: missing "
+                          f"export {name!r} (imported by {from_path}); "
+                          f"demoted to LOW", file=sys.stderr)
+
+        if from_path in records:
+            from_rec = records[from_path]
+            if from_rec.trust != "LOW":
+                from_rec.trust = "LOW"
+                from_rec.verification.setdefault(
+                    "missing_python_export_deps", []).append(
+                        {"module": target_path, "name": name})
+                from_rec.warnings.append(
+                    f"missing_python_export: imports {name!r} from "
+                    f"{target_path} but the target does not declare "
+                    f"it; the import will fail at daemon reload"
+                )
+                n_demoted += 1
+                if verbose:
+                    print(f"  [pass 7.6b] {from_path}: missing import "
+                          f"{name!r} from {target_path}; demoted to LOW",
+                          file=sys.stderr)
+
+    return n_demoted
+
+
+# ============================================================================
+#  Pass 7.7 — repair JS export findings
+# ============================================================================
 
 def _repair_missing_export(rec, name, verbose=False):
     """Add `export ` before the declaration of `name` in rec.content.
@@ -423,7 +514,6 @@ def _repair_missing_export(rec, name, verbose=False):
                   f"{name!r} broke validation: {err}", file=sys.stderr)
         return False
 
-    # Verify the export actually took effect on the JS side.
     if _is_js_lang(rec.path):
         js = repaired
     elif rec.path.endswith(".py"):
@@ -463,7 +553,6 @@ def pass7_7_repair_js_imports(records, js_problems, verbose=False):
         name = prob.get("name")
         key = (target, name)
         if key in repaired_set:
-            # Same problem, different importer.  Already repaired.
             repaired.append({
                 "problem": prob,
                 "repair": f"added `export` before {name!r}",
@@ -485,6 +574,68 @@ def pass7_7_repair_js_imports(records, js_problems, verbose=False):
             remaining.append(prob)
     return repaired, remaining
 
+
+# ============================================================================
+#  Pass 7.8 — universal finding demotion
+# ============================================================================
+#
+# A single place that demotes on ANY `missing_export` /
+# `missing_js_export` finding, regardless of how it was generated.
+# Passes 7.6 and 7.6b are the specific handlers; this pass is the
+# safety net that keeps working when a future cross-validate change
+# introduces a new finding type without a matching specific demoter.
+#
+# `missing_module` findings are NOT demoted here. `_is_likely_local`
+# is a heuristic (the underscore rule fires for `pg_comfy`, which is
+# also a real PyPI package); a false positive demotion would
+# fail-close a working file. Missing-module findings remain
+# informational; the shield (pass 8.8) catches the underlying file
+# corruption that is the real risk.
+
+def pass7_8_demote_on_any_finding(records: dict,
+                                  findings: list,
+                                  verbose: bool = False) -> int:
+    """Universal safety net: any missing-export finding demotes both
+    sides.
+
+    Returns the number of record-demotions (may double-count a record
+    if it appears in multiple findings; the important thing is that
+    every finding has been acted on).
+    """
+    n_demoted = 0
+    for prob in findings:
+        ptype = prob.get("type")
+        if ptype not in ("missing_export", "missing_js_export"):
+            continue
+        from_path = prob.get("from")
+        target_path = prob.get("target")
+        name = prob.get("name")
+
+        for path, role in ((target_path, "target"),
+                           (from_path, "importer")):
+            if not path or path not in records:
+                continue
+            rec = records[path]
+            if rec.trust == "LOW":
+                continue
+            rec.trust = "LOW"
+            rec.verification.setdefault(
+                f"{ptype}_demoted", []).append(name)
+            rec.warnings.append(
+                f"{ptype}: {name!r} missing between {from_path} and "
+                f"{target_path} — {role} demoted to LOW"
+            )
+            n_demoted += 1
+            if verbose:
+                print(f"  [pass 7.8] {path}: {role} demoted "
+                      f"({ptype}, {name!r})", file=sys.stderr)
+    return n_demoted
+
+
+# ============================================================================
+#  Module resolution and file-presence checks
+# ============================================================================
+
 def _resolve_js_module(module: str, from_path: str,
                        records: dict) -> Optional[str]:
     """Resolve a relative JS import to the record that emits it.
@@ -504,7 +655,7 @@ def _resolve_js_module(module: str, from_path: str,
         cand = os.path.normpath(
             os.path.join(dirname, base + ext)
         ).replace("\\", "/")
-        if cand in records and records[cand].content is not None:
+        if cand in records and _rec_will_be_on_disk(records[cand]):
             return cand
 
     return None
@@ -549,6 +700,33 @@ def _py_imports(body: str) -> list[tuple[str, str]]:
     return out
 
 
+def _rec_will_be_on_disk(rec: FileRecord) -> bool:
+    """True iff a record's file will exist in the target tree after
+    the run.
+
+    Two cases:
+      * Content will be written this run: `rec.content is not None`
+      * Pre-existing file, unchanged: `rec.preexisting_base` is True
+        (the file was loaded from disk, and if it isn't written, the
+        original stays)
+
+    The pre-existing case is the load-bearing fix over the old test
+    `rec.content is not None`. A pre-existing file that was loaded
+    from `--apply-to` and never rewritten has `content = None` — no
+    new content was produced for it. But the file IS on disk, and
+    imports from it resolve at runtime. Treating it as missing
+    produced spurious `missing_module` findings for every pre-existing
+    untouched file that a recovered file imported from — and, with
+    pass 7.8 in place, spurious demotions of perfectly working
+    importers.
+    """
+    if rec.content is not None:
+        return True
+    if rec.preexisting_base:
+        return True
+    return False
+
+
 _EXTERNAL_NAMESPACES = ("pgkit", "playground_")
 
 
@@ -581,14 +759,14 @@ def _resolve_module(module: str, records: dict[str, FileRecord],
         for ext in ("", ".py", ".js", ".mjs", ".ts", ".tsx"):
             full = candidate + ext
             rec = records.get(full)
-            if rec is not None and rec.content is not None:
+            if rec is not None and _rec_will_be_on_disk(rec):
                 return full
 
         last = parts[-1]
         for ext in ("", ".py", ".js", ".mjs", ".ts", ".tsx"):
             full = last + ext
             rec = records.get(full)
-            if rec is not None and rec.content is not None:
+            if rec is not None and _rec_will_be_on_disk(rec):
                 return full
         return None
 
@@ -596,7 +774,7 @@ def _resolve_module(module: str, records: dict[str, FileRecord],
         for ext in ("", ".py", ".js", ".mjs", ".ts", ".tsx"):
             full = module + ext
             rec = records.get(full)
-            if rec is not None and rec.content is not None:
+            if rec is not None and _rec_will_be_on_disk(rec):
                 return full
         return None
 
@@ -630,20 +808,20 @@ def _resolve_module(module: str, records: dict[str, FileRecord],
     # recovered, every dotted path below it is an attribute
     # access at runtime, not a distinct file.
     for path, rec in records.items():
-        if rec.content is None:
+        if not _rec_will_be_on_disk(rec):
             continue
         if _basename(path) == top_file:
             return path
 
     # Package form: only a specific sub-path resolves.
     for path, rec in records.items():
-        if rec.content is None:
+        if not _rec_will_be_on_disk(rec):
             continue
         if Path(path).as_posix() == top_pkg:
             if sub_file is None:
                 return path
             for sub_path, sub_rec in records.items():
-                if sub_rec.content is None:
+                if not _rec_will_be_on_disk(sub_rec):
                     continue
                 if Path(sub_path).as_posix() == sub_file:
                     return sub_path
@@ -738,11 +916,8 @@ def _diff_lines_for_verify(body: str) -> tuple[list[str], list[str]]:
 def pass8_verify(records: dict[str, FileRecord],
                  blocks_by_idx: Optional[dict] = None) -> None:
     from .validate_output import validate_content
+
     # ---- global patch-conflict detection ----
-    # A block applied to more than one record indicates a parser
-    # or attribution bug.  Demote every affected record to LOW
-    # so the fail-closed policy routes them to low_trust/ instead
-    # of silently duplicating the edit in the target tree.
     patch_usage = {}
     for _p, _r in records.items():
         for _pp in _r.patches:
@@ -775,6 +950,7 @@ def pass8_verify(records: dict[str, FileRecord],
             print(f"  [verify] {_p}: {len(_conflicts)} patch(es) "
                   f"cross-claimed by another record; "
                   f"demoting to LOW", file=sys.stderr)
+
     for path, rec in records.items():
         if rec.content is None:
             continue
@@ -788,7 +964,6 @@ def pass8_verify(records: dict[str, FileRecord],
 
         # Declarations that a deletion patch was explicitly told to
         # remove must not trigger the presence regression check.
-        # Otherwise every correct deletion looks like a lost function.
         allow_missing = set()
         if base_for_check:
             from .core import _is_deletion_instruction, _strip_diff_prefixes
@@ -808,26 +983,12 @@ def pass8_verify(records: dict[str, FileRecord],
                         stripped):
                     allow_missing.add(m.group(1))
 
-        # Deduplicate blocks that were applied twice.  Runs on the raw
-        # patched content BEFORE validate_content, so a file whose only
-        # validation error was a duplicate block gets cleaned up and
-        # passes instead of fail-closing.  Two classes are handled:
-        # duplicate `if (COND) { ... }` with identical normalized
-        # bodies in the same scope, and duplicate module-scope
-        # `const NAME = ...;` (plus its trailing
-        # `if (NAME) { ... }`).
-        # This is the fix for test_31 (duplicate if-guards) and for
-        # the pg_panel_scrubs.py "duplicate top-level declaration"
-        # fail-closed case in the real conversation.
+        # Deduplicate blocks that were applied twice.
         from .validate_output import _dedup_duplicate_blocks
         from .validate_output import _dedup_repeated_statements
         from .validate_output import _LAST_DEDUP_DETAILS
         import deeppeek.recover.validate_output as _vo
 
-        # Skip dedup entirely for pre-existing baselines that the
-        # conversation didn't touch.  Such records are never written
-        # (preexisting_unmodified), so deduping them is wasted work
-        # and produces a misleading count in the manifest.
         _skip_dedup = (
             rec.preexisting_base
             and not rec.pairs
@@ -870,12 +1031,6 @@ def pass8_verify(records: dict[str, FileRecord],
         if structural_err:
             v["content_valid"] = f"FAIL: {structural_err}"
 
-            # Structural brace repair: suggestion only.  Fires only
-            # when the failure is exactly `unbalanced braces (+N)`
-            # and the block is unambiguously structural (no trailing
-            # siblings, complete last statement).  Never auto-writes
-            # to the target — the suggestion lands in low_trust/ for
-            # user review.
             repair_result = None
             repair_raised = None
             if blocks_by_idx is not None:
@@ -906,8 +1061,6 @@ def pass8_verify(records: dict[str, FileRecord],
                       f"(+{repair_result['closers_added']} closer(s))",
                       file=sys.stderr)
             elif repair_result is not None:
-                # Attempted but refused — record why so the manifest
-                # is not silent about what specific criterion fired.
                 reason = (repair_result.get("refused_reason")
                           or "refused (no reason recorded)")
                 v["sanity_repair_available"] = False
@@ -915,14 +1068,12 @@ def pass8_verify(records: dict[str, FileRecord],
                 print(f"  [repair] {path}: refused ({reason})",
                       file=sys.stderr)
             else:
-                # try_repair returned None — not a brace failure.
                 v["sanity_repair_available"] = False
                 v["sanity_repair_reason"] = (
                     "not applicable (not a brace-unbalance failure)")
 
             rec.trust = "LOW"
             rec.sanity_rejected = True
-            # Fix 5: attribute the sanity failure to a specific patch.
             if rec.patches:
                 try:
                     _sanity_blocks = blocks_by_idx
@@ -1007,29 +1158,14 @@ def pass8_verify(records: dict[str, FileRecord],
             for patch in rec.patches:
                 status = patch.get("applied_by")
 
-                # --- skip already-verified or no-op patches ---
                 if status == "failed":
                     continue
                 if status == "already-present":
-                    # No-op at application time; content may have
-                    # evolved since.  Do not re-check.
                     continue
                 if status == "skipped_weak_attribution":
                     continue
                 if status == "deterministic":
-                    # The deterministic patcher matched its anchor
-                    # exactly and mutated the exact lines it named.
-                    # Re-checking the FINAL content afterwards
-                    # produces false failures whenever a later patch
-                    # on the same file edits the same lines again —
-                    # e.g. patch A deletes a block, patch B deletes
-                    # the same block (duplicate assistant message),
-                    # and patch A's verify then reports "the block
-                    # is missing" (which it is — that's the point).
-                    # Trust the patcher.
                     continue
-
-                # Anything else (llm) gets the full verification.
 
                 body = patch["body"]
 
