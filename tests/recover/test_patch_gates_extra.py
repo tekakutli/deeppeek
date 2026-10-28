@@ -2,28 +2,12 @@
 reconciliation pass 8.7b.
 
 See the pre-fix module docstring for the full inventory.  The
-2026-10-28f additions are:
+2026-10-28g addition is a fix for `_try_object_literal_splice`'s
+spurious space between the base prefix and the body object
+(`args= {` when base had `args={`).
 
-  · Scope-first prior-insertion ordering + expression-context refusal
-    in `_try_insert_after_anchor`: refuses anchors inside unclosed
-    brackets in `.py` files, prefers scoped candidates over unscoped
-    ones.  Fixes the args-dict mid-file insertion shape.
-
-  · Already-present pre-check at the top of
-    `_try_deterministic_patch_inner` and `_apply_scoped_single`:
-    skips reprints of content that is already in base.  Fixes the
-    comfyui_krita.py docstring duplication, the inpaint_server.py
-    try/except duplication, the pg_base.py whitespace-drift
-    scoped-replace, and the pg_panel_scrubs.py import mid-file
-    duplication.  Skips deletion instructions and diffs, whose bodies
-    are "content to disappear" / "content to transform" and have
-    their own already-applied predicates.
-
-  · Scope-aware `_try_named_dict_insert` (2026-10-28f):
-    when prose names a specific function, prefer the `@command(args=
-    {...})` decorator of that function over the first `args={...}`
-    in the file.  Fixes patch 62 landing in `comfy_connect` instead
-    of `comfy_generate` in the comfyui.py run.
+The other 2026-10-28 additions are covered by their respective
+tests below.
 """
 import sys
 from pathlib import Path
@@ -37,6 +21,7 @@ from deeppeek.recover.patch_misc_insert import (
     _DICT_ENTRY_START_RE, _ENTRY_OUTER_KEY_RE,
     _try_named_dict_insert,
 )
+from deeppeek.recover.patch_replace import _try_object_literal_splice
 from deeppeek.recover.apply_patches import (
     _is_duplicate_assignment_insert, pass6_apply_patches,
 )
@@ -146,12 +131,6 @@ def test_dict_entry_dashed_key_skipped_when_already_present():
 
 
 def test_dict_entry_scopes_to_prose_function():
-    """`--output_rotation` entry with prose naming `comfy_generate`
-    lands in `comfy_generate`'s args dict, not the first `args={}` in
-    the file (`comfy_connect`'s).
-
-    Motivating incident: patch 62 in the comfyui.py conversation.
-    """
     base = (
         'class Handler:\n'
         '    @command(\n'
@@ -183,7 +162,6 @@ def test_dict_entry_scopes_to_prose_function():
     assert connect_pos < rot_pos < generate_pos, (
         f"--output_rotation not in comfy_generate's decorator:\n{result}"
     )
-    # And NOT in comfy_connect's args (which is before def comfy_connect)
     connect_args_start = result.index('"--host"')
     connect_args_end = connect_pos
     connect_args = result[connect_args_start:connect_args_end]
@@ -193,9 +171,6 @@ def test_dict_entry_scopes_to_prose_function():
 
 
 def test_dict_entry_scoped_already_present_returns_base():
-    """When the prose-named function already has the entry, return
-    base (no-op).  Prevents a second run from re-targeting a
-    different function's args dict."""
     base = (
         'class Handler:\n'
         '    @command(\n'
@@ -221,9 +196,68 @@ def test_dict_entry_scoped_already_present_returns_base():
         "decorator. Add:"
     )
     result = _try_named_dict_insert(base, body, context)
-    assert result is base, (
-        f"expected no-op (already present in comfy_generate); "
-        f"got:\n{result}"
+    assert result is base
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-28g — _try_object_literal_splice whitespace preservation
+# ---------------------------------------------------------------------------
+
+def test_object_literal_splice_preserves_no_space_before_brace():
+    """`args={` (no space) must remain `args={` after splice; the
+    old code produced `args= {` (spurious space).
+
+    Motivating case (comfyui.py, in the wild): the daemon's
+    `comfy_generate` `@command(args={...})` decorator gained
+    `--output_rotation`; the whole args dict was re-spliced by
+    `_try_object_literal_splice`, which inserted a space that wasn't
+    in the source.
+    """
+    base = (
+        '    @command(\n'
+        '        args={\n'
+        '            "--timeout": {"type": "float"},\n'
+        '        },\n'
+        '    )\n'
+        '    def handle(self, params):\n'
+        '        pass\n'
+    )
+    body = (
+        'args={\n'
+        '    "--timeout": {"type": "float"},\n'
+        '    "--count": {"type": "int", "default": 1},\n'
+        '}'
+    )
+    result = _try_object_literal_splice(base, body, "args")
+    assert result is not None, "expected splice to succeed"
+    assert "args={" in result, (
+        f"expected `args={{` (no space); got:\n{result}"
+    )
+    assert "args= {" not in result, (
+        f"spurious `args= {{` (space) introduced:\n{result}"
+    )
+
+
+def test_object_literal_splice_preserves_space_before_brace():
+    """`const board = {` (with space) must remain with the space."""
+    base = (
+        "const board = {\n"
+        "  a: 1,\n"
+        "};\n"
+    )
+    body = (
+        "board = {\n"
+        "  a: 1,\n"
+        "  b: 2,\n"
+        "};"
+    )
+    result = _try_object_literal_splice(base, body, "board")
+    assert result is not None, "expected splice to succeed"
+    assert "const board = {" in result, (
+        f"expected `const board = {{` (with space); got:\n{result}"
+    )
+    assert "const board={" not in result, (
+        f"space before `{{` removed (broke style):\n{result}"
     )
 
 
@@ -692,7 +726,6 @@ def test_prior_insertion_scope_first_over_args_dict():
         "except (TypeError, ValueError):\n"
         "    output_rotation = 0.0"
     )
-
     prior_insertions = {
         'output_name = params.get("output_name") or None',
         '"--output_rotation": {"type": "float", "default": 0.0,',
@@ -824,9 +857,7 @@ def test_try_except_block_reprint_skipped():
         "fence_lang": "py",
     }
     result = _try_deterministic_patch(base, patch, path="x.py")
-    assert result is base, (
-        f"expected unchanged base; got modified content:\n{result!r}"
-    )
+    assert result is base
 
 
 def test_whitespace_drift_scoped_replace_skipped():
@@ -852,10 +883,7 @@ def test_whitespace_drift_scoped_replace_skipped():
         "    </details>"
     )
     result = _apply_scoped(base, "View", body)
-    assert result is base, (
-        f"expected unchanged base (token-equivalent scope); "
-        f"got modified:\n{result!r}"
-    )
+    assert result is base
 
 
 def test_scoped_replace_still_applies_when_scope_differs():
@@ -892,10 +920,7 @@ def test_short_import_already_present_returns_base():
         "fence_lang": "js",
     }
     result = _try_deterministic_patch(base, patch, path="x.js")
-    assert result is base, (
-        f"expected unchanged base (import already present); "
-        f"got:\n{result!r}"
-    )
+    assert result is base
 
 
 # ---------------------------------------------------------------------------
@@ -983,6 +1008,11 @@ def main():
          test_dict_entry_scopes_to_prose_function),
         ("dict entry scoped already present returns base",
          test_dict_entry_scoped_already_present_returns_base),
+        # 2026-10-28g — object-literal splice whitespace preservation
+        ("object_literal_splice preserves no space before brace",
+         test_object_literal_splice_preserves_no_space_before_brace),
+        ("object_literal_splice preserves space before brace",
+         test_object_literal_splice_preserves_space_before_brace),
         # Fix 3 — duplicate-assignment pre-gate
         ("duplicate assignment gate catches single line",
          test_duplicate_assignment_gate_catches_single_line),

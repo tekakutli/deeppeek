@@ -111,6 +111,33 @@ invariant mechanical: `reverify.reverify_reconciled` re-runs every
 demoting pass on every promoted record.  A reconciled record that
 still fails a demoting check is demoted again; it does not ship.
 
+PROSE-PROMISE ADVISORY (PASS 8.9, NEW)
+======================================
+Pass 8.9 warns when a patch's prose promises call-site updates
+that its fence body doesn't include.  The motivating case
+(`comfyui.py` in the wild):
+
+    And update the `_paste_result` signature and the three
+    `paste_image(...)` / `paste_batch_as_layers(...)` call sites
+    inside it so rotation is forwarded:
+
+    [signature-only body]
+
+The prose promises four changes (signature plus three call sites);
+the fence holds only the signature.  Applied verbatim, the result
+compiles but `output_rotation` is accepted and silently discarded
+— the daemon-side rotation feature never fires.
+
+Advisory only: emits a warning, never demotes.  Detecting "prose
+promised more than the fence delivered" reliably requires reading
+prose as instructions, and false positives would block legitimate
+runs.  The warning names the missing work; whether that blocks a
+merge is a human decision.  Runs after pass 8.4 (both are
+read-only over `records` and both consume the same patch/pair
+metadata), before pass 8.7 (so reconcile's per-record decisions
+reflect any advisory the user might act on before the reconcile
+log gets written).
+
 RESIDUAL EMISSION
 =================
 After pass 9 writes its output and returns cleanly, a residual
@@ -120,6 +147,36 @@ successful placement.  The residual is intended as the input to a
 subsequent `deeppeek recover` run once the user has edited the
 failed blocks (or the target).  It never affects the primary run's
 output — it is purely additive.  See `residual.py`.
+
+RESIDUAL FILE LIST ON STDOUT
+============================
+At the very end of `run()`, the list of files the residual
+references — the SAME list `deeppeek prompt reprint` consumes — is
+printed to stdout, delimited by:
+
+    === files not fully recovered (see residual.md) ===
+    <path>
+    <path>
+    === N file(s) not fully recovered ===
+
+The two `===` header lines exist so the machine-readable block
+is trivially distinguishable from the rest of the run's
+chatter, which is on stderr anyway.  A script that wants only
+the paths can `sed -n '/^=== files for deeppeek/,/^=== [0-9]* file/p'`
+or, more simply, read stdout between the two markers.
+
+Two further deliberate details:
+
+  · `unique_residual_paths` is imported from `residual.py` (not
+    re-implemented) so the STDOUT list and `deeppeek prompt
+    reprint`'s file list are guaranteed to match — one parser,
+    one answer.
+
+  · When `--emit-residual -` is set, `emit_residual` writes the
+    residual body itself to stdout; the file list (and its
+    header/footer) is suppressed in that case so the two
+    outputs don't concatenate and break both the residual and
+    the list.
 
 CRASH REPORTING
 ===============
@@ -144,6 +201,8 @@ The safe defaults per pass:
     pass 7.8   → 0 (no demotions)
     pass 8     → (no-op; no per-file verification)
     pass 8.5   → (no-op; no symbol demotions)
+    pass 8.4   → 0 (no lint demotions)
+    pass 8.9   → 0 (no prose-promise advisories)
     pass 8.7   → 0 (no reconciliations)
     pass 8.7b  → 0 (no re-demotions)
     pass 8.8   → 0 (no shield demotions)
@@ -697,6 +756,25 @@ def run(cfg: RecoverConfig) -> int:
         print(f"  {n_lint_demoted} record(s) demoted to LOW for "
               f"unused @command args", file=sys.stderr)
 
+    # ---- pass 8.9 (NEW) — prose-promise advisory ----
+    # Advisory only: warns when a patch's prose promises call-site
+    # updates that its fence body doesn't include.  Motivating case:
+    # comfyui.py's `_paste_result` signature patch, where the prose
+    # said "update the three call sites" but the fence held only the
+    # signature — the daemon feature silently never fires.  Never
+    # demotes; the warning is a hint to the user (see warnings.txt).
+    print("[pass 8.9] checking prose-promise coverage...")
+    from .prose_promise import pass8_9_check_prose_promises
+    n_promise_warned = _run_pass(
+        "8.9 (prose-promise)", pass8_9_check_prose_promises, 0,
+        run_errors, records,
+    ) or 0
+    if n_promise_warned:
+        print(f"  {n_promise_warned} record(s) had prose-promise gaps "
+              f"(see warnings.txt)", file=sys.stderr)
+    else:
+        print("  no promise gaps detected")
+
     print("[pass 8.7] reconciling fail-closed records...")
     n_reconciled = _run_pass(
         "8.7 (reconcile)", pass8_7_reconcile, 0,
@@ -779,8 +857,17 @@ def run(cfg: RecoverConfig) -> int:
                   f"{cfg.out_dir}/", file=sys.stderr)
         return 1
 
+    # ---- residual emission + file-list printout ----
+    #
+    # `_residual_paths_for_stdout` is populated when emit_residual
+    # succeeds AND the residual was not itself redirected to stdout
+    # (the "-" path).  When "--emit-residual -" is active,
+    # emit_residual writes the residual body to stdout; printing the
+    # file list on top of that would corrupt both the residual and
+    # the list, so the file list is suppressed in that one case.
+    _residual_paths_for_stdout: Optional[list] = None
     try:
-        from .residual import emit_residual
+        from .residual import emit_residual, unique_residual_paths
         _residual_path = cfg.residual_path
         if _residual_path is None:
             _residual_path = (
@@ -788,7 +875,7 @@ def run(cfg: RecoverConfig) -> int:
                 if cfg.apply_to is not None
                 else cfg.out_dir / "residual.md"
             )
-        emit_residual(
+        _residual_content = emit_residual(
             records=records,
             blocks=blocks,
             dump_display=dump_display,
@@ -796,6 +883,9 @@ def run(cfg: RecoverConfig) -> int:
             out_path=_residual_path,
             verbose=cfg.trace,
         )
+        if str(_residual_path) != "-":
+            _residual_paths_for_stdout = unique_residual_paths(
+                _residual_content or "")
     except Exception as e:
         print(f"  [!] residual emission failed: "
               f"{type(e).__name__}: {e}", file=sys.stderr)
@@ -805,4 +895,27 @@ def run(cfg: RecoverConfig) -> int:
         print(f"  [!] {len(run_errors)} pass(es) crashed — see "
               f"warnings.txt for the traceback",
               file=sys.stderr)
+
+    # Print, to STDOUT, exactly the list `deeppeek prompt reprint`
+    # would act on.  Same source of truth (`unique_residual_paths`
+    # over the residual we just emitted), so the two cannot diverge.
+    #
+    # Format (the `===` header/footer delimit the machine-readable
+    # block from the rest of the run's chatter, all of which is on
+    # stderr anyway):
+    #
+    #   === files for deeppeek prompt reprint ===
+    #   foo.py
+    #   src/bar.py
+    #   === 2 file(s) ===
+    #
+    # Silent when emit_residual itself failed — a bogus "0 file(s)"
+    # would lie about the pipeline's state.
+    if _residual_paths_for_stdout is not None:
+        print("=== files not fully recovered (see residual.md) ===")
+        for _p in _residual_paths_for_stdout:
+            print(_p)
+        print(f"=== {len(_residual_paths_for_stdout)} file(s) "
+              f"not fully recovered ===")
+
     return rc

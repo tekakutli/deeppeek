@@ -140,9 +140,9 @@ def _try_single_line_replace(base, raw_body, context_before=""):
     return result if result != base else None
 
 
-# ===========================================================================
+# ---------------------------------------------------------------------------
 #  Object-literal splice
-# ===========================================================================
+# ---------------------------------------------------------------------------
 
 def _try_object_literal_splice(base, body_stripped, varname):
     if not varname:
@@ -189,7 +189,22 @@ def _try_object_literal_splice(base, body_stripped, varname):
     else:
         base_m = matches[0]
 
-    prefix_from_base = base_m.group(1)
+    # NEW (2026-10-28g): preserve the base's exact whitespace before
+    # `{` rather than forcing a single space.
+    #
+    # Motivating case (comfyui.py, in the wild): base has `args={`
+    # (no space); body has `args={...}`.  The old code produced
+    # `args= {...}` (spurious space).  Style-wise wrong; worse,
+    # `_max_contiguous_run` treats the modified `args= {` line as
+    # different from base's `args={` line, so a subsequent re-run
+    # sees the patch as still needed and re-applies it.
+    #
+    # Capturing `base[base_m.start():base_open]` gives exactly what
+    # the source had between line start and `{`:
+    #   · `        args=`          (source had no space)
+    #   · `        const board = ` (source had a space)
+    #   · `        args = `        (source had spaces on both sides)
+    # In every case the result preserves the source's original style.
     file_prefix = base[:base_m.start()]
 
     body_m = _OBJECT_LITERAL_ASSIGNMENT_RE.match(body_stripped)
@@ -221,10 +236,10 @@ def _try_object_literal_splice(base, body_stripped, varname):
     body_had_semi = body_stripped.rstrip().endswith(";")
     sep = ";" if (base_had_semi or body_had_semi) else ""
 
+    prefix_through_open = base[base_m.start():base_open]
     result = (
         file_prefix
-        + prefix_from_base
-        + " "
+        + prefix_through_open
         + body_obj
         + sep
         + file_tail
