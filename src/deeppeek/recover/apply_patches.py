@@ -66,20 +66,29 @@ check.  This version additionally:
     a `prior_scopes` dict that threads alongside `prior_insertions`
     into `_try_deterministic_patch`.
 
-    The narrow `patch["context_before"]` for a Find block is usually
-    just `"Find:"`.  The scope is often in the *previous* block's
-    prose ("In `handlers/comfyui.py`, find the `comfy_generate`
-    command decorator. Add:").  Reading broader context captures
-    that scope, which the prior-insertion fallback then uses to
-    disambiguate a repeated anchor.
+  · UNIFIED PATCH-STATUS TAXONOMY (2026-11-01).  `rec.verification`
+    now reports three counters instead of one:
+      patches_applied — deterministic or LLM patches that actually
+                        wrote new bytes
+      patches_noop    — already-present, skipped misattributed,
+                        skipped structural damage, etc.
+      patches_failed  — status `failed`
 
-    Motivating shape: comfyui.py idx=96/97.  idx=96's Find block
-    anchors the line `output_name = params.get("output_name") or
-    None`, which appears twice (in `_comfy_generate_impl` and
-    `comfy_wait`).  Without broader context the extractor can't pick
-    one; with it, `comfy_generate` is recorded, and
-    `patch_anchor_insert._anchor_within_callee` resolves it to
-    `_comfy_generate_impl`.  idx=97 then lands correctly.
+    Before this, `patches_applied` counted every status that wasn't
+    in a "not applied" blacklist, which *included* `already-present`.
+    A pre-existing file whose only patch was already-present reported
+    `patches_applied: 1, written: false` — a manifest that claims
+    applied work the file doesn't contain.  The 2026-10-28 comfyui.py
+    run showed this exactly: a false-positive already-present claim
+    was counted as success, the file was skipped by write.py, and
+    neither the manifest nor the residual named the omission.
+
+    The statuses themselves now live in `core.py` as
+    `APPLIED_STATUSES` / `NO_CHANGE_STATUSES` / `FAILED_STATUSES`,
+    imported here and consumed identically by `consistency.py`'s
+    pass 8.7d verifier.  See `consistency.py`'s module docstring for
+    why every `already-present` claim is now re-verified against the
+    file content.
 
 DEPENDENCY: `_try_deterministic_patch` (in `patch_dispatch.py`) must
 accept the same `prior_insertions=None` and `prior_scopes=None`
@@ -97,6 +106,9 @@ from .core import (
     _is_deletion_instruction,
     _looks_like_diff_body,
     _strip_diff_prefixes,
+    APPLIED_STATUSES,
+    NO_CHANGE_STATUSES,
+    FAILED_STATUSES,
 )
 from .llm import LLMClient
 
@@ -719,12 +731,31 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
             else:
                 all_ok = False
 
+        # NEW (2026-11-01): split the verification counters into
+        # applied / noop / failed using the unified status sets from
+        # core.py.  See the module docstring's UNIFIED PATCH-STATUS
+        # TAXONOMY section — before this, `patches_applied` counted
+        # every status not in a blacklist, which silently included
+        # `already-present`.  A pre-existing file whose only patch
+        # was a false-positive already-present reported
+        # `patches_applied: 1, written: false`; a manifest that
+        # claims applied work the file doesn't contain.
+        #
+        # The three counters are the honest breakdown.  Consumers
+        # that only care "was the file touched" should look at
+        # `written` in the manifest (set by pass 9), not at
+        # `patches_applied`.  Passes that gate on "did anything
+        # land" (write.preexisting_unmodified, dedup, shield) all
+        # consult `NO_CHANGE_STATUSES` membership, not these counts.
         rec.verification["patches_applied"] = sum(
             1 for p in rec.patches
-            if p.get("applied_by")
-            not in ("failed", "skipped_weak_attribution",
-                    "skipped_duplicate_insertion",
-                    "skipped_structural_damage"))
+            if p.get("applied_by") in APPLIED_STATUSES)
+        rec.verification["patches_noop"] = sum(
+            1 for p in rec.patches
+            if p.get("applied_by") in NO_CHANGE_STATUSES)
+        rec.verification["patches_failed"] = sum(
+            1 for p in rec.patches
+            if p.get("applied_by") in FAILED_STATUSES)
         rec.verification["pairs_applied"] = sum(
             1 for r in pair_records if r["applied_by"] == "deterministic")
 
@@ -783,12 +814,13 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
     total_pairs = sum(len(r.pairs) for r in records.values())
     total_applied = sum(
         sum(1 for p in r.patches
-            if p.get("applied_by") in ("deterministic", "llm"))
+            if p.get("applied_by") in APPLIED_STATUSES)
         for r in records.values())
     total_pairs_applied = sum(
         r.verification.get("pairs_applied", 0) for r in records.values())
     total_noop = sum(
-        sum(1 for p in r.patches if p.get("applied_by") == "already-present")
+        sum(1 for p in r.patches
+            if p.get("applied_by") in NO_CHANGE_STATUSES)
         for r in records.values())
     total_failed = total_patches - total_applied - total_noop
     files_with_failures = sum(

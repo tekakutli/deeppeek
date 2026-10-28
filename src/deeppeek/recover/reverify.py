@@ -1,29 +1,21 @@
 """reverify — the verify-reconcile-verify loop.
 
-Pass 8.4 (lint) and pass 8.5 (symbols) both demote records.  Pass
-8.7 (reconcile) promotes records by excluding misattributed items.
-Without re-running 8.4/8.5 after 8.7, reconcile can commit a
-promotion that one of the earlier demotions was warning about — the
-promoted content is different from the pre-exclusion content, so
-each demoting pass must re-run on the promoted content.
+Pass 8.5 (symbols) is the only remaining demoting pass on promoted
+content.  Pass 8.4 (lint) and pass 8.4b (added-param lint) are
+warn-only after the 2026-10-28 alignment — they surface "the
+conversation was incomplete" but do not gate the write.
 
-Fix 2 (see `reconcile.py`) makes `_count_failures` include lint, so
-the *specific* case is caught inside pass 8.7 itself.  This module
-is the *general* safety net: any future demoting pass added to the
-pipeline is automatically re-applied to reconciled records, even if
-a maintainer forgets to update `_count_failures`.
+`reverify_reconciled` re-runs every pass that can affect trust on
+every reconciled-and-promoted record.  If `pass8_5` still rejects the
+promoted content, the record is re-demoted.  Lint passes are called
+idempotently for warning parity, so a promoted record's warnings
+reflect what a fresh pipeline run would have produced.
 
-The invariant:
+The invariant this module enforces:
 
-    every pass that can demote a record must be re-run after every
-    pass that can promote it, on the promoted content, before the
-    promotion is committed.
-
-`pipeline.py` calls `reverify_reconciled` immediately after
-`pass8_7_reconcile` returns.  The order matters: reconcile must
-have run so `rec.verification["reconciled"]` is populated; reverify
-must run before any later pass (like the 8.8 shield) that could
-re-trust the record.
+    every pass that can change a record's trust must be re-run after
+    every pass that can promote it, on the promoted content, before
+    the promotion is committed.
 """
 from __future__ import annotations
 
@@ -35,11 +27,13 @@ def reverify_reconciled(records, blocks_by_idx):
 
     A record counts as "reconciled-and-promoted" iff it has the
     `reconciled` field in its verification AND its trust is not
-    currently LOW.  LOW records were never promoted (reconcile
-    correctly refused to promote them), so re-verifying them is a
-    no-op — but skipping them saves the AST parse cost.
+    currently LOW.  LOW records were never promoted, so re-verifying
+    them is a no-op — but skipping them saves the AST parse cost.
     """
-    from .lint import pass8_4_lint_command_args
+    from .lint import (
+        pass8_4_lint_command_args,
+        pass8_4b_check_added_unused_params,
+    )
     from .validate import pass8_5_check_symbols
 
     promoted = {
@@ -51,17 +45,15 @@ def reverify_reconciled(records, blocks_by_idx):
 
     n_demoted = 0
 
-    # Lint re-check.  A promoted record whose @command declares an
-    # unused arg is still broken; demote again so it stays LOW.
-    n_demoted += pass8_4_lint_command_args(promoted)
+    # Warn-only passes: called idempotently so warnings stay
+    # consistent with what a fresh run would produce.  Their return
+    # values are warning counts, not demotions.
+    pass8_4_lint_command_args(promoted)
+    pass8_4b_check_added_unused_params(promoted, blocks_by_idx)
 
-    # Symbol re-check.  This runs in-place on `promoted` (the same
-    # dict as `records` for the promoted keys); `pass8_5_check_symbols`
-    # iterates `records.items()` and mutates each record's `trust`
-    # directly, so no return value is needed.
+    # Symbol re-check (demoting).
     pass8_5_check_symbols(promoted, blocks_by_idx=blocks_by_idx)
 
-    # pass8_5 doesn't return a count; count by inspecting the result.
     for path, rec in promoted.items():
         if rec.trust == "LOW" and (
                 "unresolved_calls" in rec.verification

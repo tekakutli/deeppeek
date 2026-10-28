@@ -9,6 +9,13 @@ DIFFICULT.  Owns:
               is meaningfully further back).  The previous logic
               required exactly one match and dropped the orphan
               otherwise.
+
+    FIX [4]   (NEW) Scope-name attribution: when the prose names a
+              function or class but no file (e.g. `## Fix 3 — surface
+              per-command errors in `handle_inpaint``), look the scope
+              up in every pre-existing file's body and attribute to
+              the unique file that declares it.  Fail-closed on
+              ambiguity (0 or 2+ matches).
 """
 
 import sys
@@ -116,6 +123,18 @@ def pass4_attribute_orphans(blocks: list[Block],
             _assign(b, subset_matches[0], "subset", verbose)
             continue
 
+        # (d) NEW: scope-name attribution.  When the prose names a
+        # function or class — e.g. "surface per-command errors in
+        # `handle_inpaint`" — but names no file, look the scope up in
+        # every pre-existing file's body.  Attribute to the unique
+        # file that declares it.  Fail-closed on ambiguity (0 or 2+
+        # matches → falls through to unattributed).  This catches the
+        # natural-language header shape that would otherwise fail
+        # closed on every reference.
+        if _try_scope_name_attribution(
+                b, existing_paths, records, blocks_by_idx, verbose):
+            continue
+
         # Unattributed blockquoted blocks are AI-thinking noise:
         # skip silently rather than emitting an orphan warning for
         # every fragment the AI explored but did not commit to.
@@ -124,6 +143,76 @@ def pass4_attribute_orphans(blocks: list[Block],
             b.attributed_by = "blockquote_skip"
         else:
             b.attributed_by = "unattributed"
+
+
+def _try_scope_name_attribution(b: Block,
+                                 existing_paths: list[str],
+                                 records: dict[str, FileRecord],
+                                 blocks_by_idx: dict[int, Block],
+                                 verbose: bool) -> bool:
+    """Try to attribute `b` by the scope name named in its prose.
+
+    Returns True iff attribution was committed (either assigned or
+    explicitly skipped as ambiguous — both are terminal outcomes for
+    this block; falling through is only on "no scope name found").
+
+    The scope name is extracted from the same prose patterns the
+    anchor-insert heuristic uses, so a header like
+        "## Fix 3 — surface per-command errors in `handle_inpaint`"
+    yields `handle_inpaint`.  We then check that name as a top-level
+    `def`/`class`/`function` declaration in each pre-existing
+    baseline.  Exactly-one match → commit.  Any other count → fall
+    through (caller will try subset attribution, then unattributed).
+
+    Fail-closed on ambiguity, on an empty scope name, and on any
+    import error from the downstream helpers.
+    """
+    try:
+        from .patch_scope_insert import _extract_scope_name_from_prose
+    except ImportError:
+        return False
+
+    scope = _extract_scope_name_from_prose(b.context_before or "")
+    if not scope:
+        return False
+
+    # Scope names are identifiers, so a dotted extension suffix (e.g.
+    # `pg_panel_scrubs` extracted from `pg_panel_scrubs.py`) is not
+    # a real scope.  Filter those out — prose attribution or
+    # body-header attribution would have already fired for a real
+    # filename mention, so a bare-scope-word match here means the
+    # extractor picked up the filename stem.  Skipping prevents the
+    # scope-name path from firing on `In pg_panel_scrubs.py, wire
+    # both:` where prose attribution already resolved the block.
+    #
+    # (That case runs *before* this function in the caller's flow,
+    # so in practice we only see truly bare names here; the filter
+    # is a defensive belt for the case where the caller's prose
+    # scan missed a filename due to case or partial-path).
+    if "." in scope:
+        return False
+
+    import re
+    pat = re.compile(
+        r"(?:^|\n)[ \t]*(?:async\s+)?(?:def|class|function)\s+"
+        + re.escape(scope) + r"\b"
+    )
+
+    scope_matches = []
+    for path in existing_paths:
+        for src_idx in records[path].source_blocks:
+            src = blocks_by_idx.get(src_idx)
+            if src is None:
+                continue
+            if pat.search(src.body or ""):
+                scope_matches.append(path)
+                break
+
+    if len(scope_matches) == 1:
+        _assign(b, scope_matches[0], "scope_name", verbose,
+                extra=f"scope={scope}")
+        return True
+    return False
 
 
 def _assign(b: Block, path: str, method: str, verbose: bool,

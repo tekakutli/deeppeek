@@ -1,4 +1,5 @@
-"""recover.lint — Pass 8.4: post-apply lint for `@command` decorators.
+"""recover.lint — Pass 8.4: post-apply lint for `@command` decorators,
+and Pass 8.4b: post-apply lint for added-but-unused parameters.
 
 An `@command(...)` decorator that declares `--foo` but whose method
 body never reads `--foo` from `params` is an incomplete feature: the
@@ -45,28 +46,50 @@ matches the common "command method delegates to a helper" pattern.
 A delegate that itself delegates is not scanned: the caller's intent
 is clear from the first hop.
 
-PASS SCOPE
-==========
-Intentionally narrow: only runs on `.py` files, only inspects
-`@command`-decorated methods, and only reads the decorator dict's arg
-keys against `params.get(...)` / `params[...]` usages in the method
-body (and, with the 2026-10-28f fix, its direct delegates).  False
-positives would be code that destructures params by some other
-mechanism (`**params`, `params.pop`, a helper).  Those exist; the
-caller should follow up any hit rather than trusting it blindly.
+WARN-ONLY (2026-10-28 revision)
+===============================
+A prior version of `pass8_4_lint_command_args` demoted the record to
+LOW when a patch introduced an `@command` arg that the body never
+read.  That demotion — together with `verify-applied`'s — was
+producing exactly the failure mode it was meant to prevent:
+`comfyui.py` was routed into `low_trust/` for `--output_rotation`
+even though every patch had landed cleanly.
 
-Fail-closed when the arg was introduced *by a patch applied this
-run*: the record goes LOW so the target tree is preserved.  Warn-only
-when the arg pre-existed (an old stale arg is not this run's
-responsibility).
+The contract is: `deeppeek` applies patches.  If the conversation
+added an arg and did not wire it, the file ships with the dead arg,
+and a warning surfaces the gap.  Gating the write on the conversation
+having been complete is a category error — it converts a reportable
+fact into a pipeline failure.
+
+`pass8_4` now emits a warning (and `verification.unused_command_args`
+for auditability) and never touches `rec.trust`.
+
+PASS 8.4b — ADDED PARAMETERS NEVER REFERENCED IN THE BODY
+=========================================================
+Companion check at the function-signature level.  A function that
+gained a parameter (via a patch) whose body never references the
+parameter is suspect — the parameter is accepted and discarded.
+Warn-only, same reasoning as `pass8_4`: an interface-compatibility
+signature legitimately gains unused parameters.
+
+Idempotency: warnings keyed on `f"{function}.{param}"` are tracked in
+`rec.verification["added_param_warnings"]`.  Re-running the pass on
+the same content (via `reverify_reconciled` after reconcile) does not
+duplicate warnings.
 """
 
 from __future__ import annotations
 
+import ast
 import re
 from typing import Optional
 
 from .core import FileRecord
+
+
+# ============================================================================
+#  Pass 8.4 — @command arg lint
+# ============================================================================
 
 
 # `@command(...)` followed by a `def name(self, params`.  The
@@ -222,24 +245,28 @@ def _arg_introduced_by_patch(rec: FileRecord, arg: str) -> bool:
 
 
 def pass8_4_lint_command_args(records: dict[str, FileRecord]) -> int:
-    """Scan every recovered .py file's `@command` methods.
+    """Scan every recovered .py file's `@command` methods.  Warn —
+    never demote — for each declared arg that the method body never
+    reads.
 
-    For each declared arg that the method body never reads (via
-    `params.get`/`params[...]`, or via direct delegates):
-      · If a patch introduced the arg this run → demote the record
-        to LOW trust and append a warning.  Fail-closed.
-      · Otherwise → append a warning only.  Pre-existing dead args
-        are not this run's defect.
+    Returns the number of warnings emitted (not demotions).
 
-    Returns the number of records demoted to LOW.
+    The demotion branch that used to live here (patch added a
+    declaration but the wiring didn't apply → demote to LOW) was
+    removed alongside `verify-applied`'s demotion.  Both were
+    attempting to gate the write on the conversation having been
+    complete; the record should ship with the incomplete feature and
+    the warning should surface the gap for human review.
+
+    Records already marked LOW for other reasons are also processed:
+    a LOW record whose `@command` has an unused arg deserves the
+    warning too, for the manifest's accuracy.
     """
-    n_demoted = 0
+    n_warned = 0
     for path, rec in records.items():
         if rec.content is None:
             continue
         if not path.endswith(".py"):
-            continue
-        if rec.trust == "LOW":
             continue
         if rec.is_deleted:
             continue
@@ -264,7 +291,6 @@ def pass8_4_lint_command_args(records: dict[str, FileRecord]) -> int:
                 )
                 continue
 
-            rec.trust = "LOW"
             rec.verification.setdefault(
                 "unused_command_args", []).append({
                     "method": method,
@@ -273,12 +299,186 @@ def pass8_4_lint_command_args(records: dict[str, FileRecord]) -> int:
             rec.warnings.append(
                 f"lint: {method}() declares args never read from "
                 f"params: {introduced} — a patch added the "
-                f"declaration but the wiring did not apply; "
-                f"fail-closing to preserve the target tree"
+                f"declaration but the wiring did not apply "
+                f"(informational; the file is written)"
             )
-            n_demoted += 1
+            n_warned += 1
             print(f"  [lint] {path}: {method}() has unused arg(s) "
-                  f"{introduced}; demoted to LOW", flush=True)
-            break
+                  f"{introduced} (informational)", flush=True)
 
-    return n_demoted
+    return n_warned
+
+
+# ============================================================================
+#  Pass 8.4b — added parameters never referenced in the body
+# ============================================================================
+
+
+def _collect_functions(tree: ast.AST) -> dict:
+    """Return `{qualified_name: {params, body_refs, lineno}}` for
+    every function in `tree`.
+
+    `qualified_name` is `'Class.method'` for methods,
+    `'outer.inner'` for nested functions, `'func'` for module-level
+    functions.  Disambiguation by qualified name means two classes
+    with same-named methods don't collide.
+
+    `params` is the set of parameter names (positional-only,
+    positional-or-keyword, keyword-only, plus `*args`/`**kwargs`
+    captured by their actual names).  `body_refs` is the set of all
+    `ast.Name` identifiers appearing anywhere in the function body,
+    including nested lambdas and comprehensions.  Over-inclusive by
+    design: false negatives (identifiers that look like parameter
+    references but aren't) are preferable to false positives in a
+    warn-only pass.
+    """
+    out: dict = {}
+
+    def _walk(node: ast.AST, prefix: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qname = prefix + child.name
+                params = set()
+                for a in (child.args.posonlyargs
+                          + child.args.args
+                          + child.args.kwonlyargs):
+                    params.add(a.arg)
+                if child.args.vararg:
+                    params.add(child.args.vararg.arg)
+                if child.args.kwarg:
+                    params.add(child.args.kwarg.arg)
+
+                refs = set()
+                for sub in ast.walk(child):
+                    if isinstance(sub, ast.Name):
+                        refs.add(sub.id)
+
+                out[qname] = {
+                    "params": params,
+                    "body_refs": refs,
+                    "lineno": child.lineno,
+                }
+                _walk(child, qname + ".")
+            elif isinstance(child, ast.ClassDef):
+                _walk(child, prefix + child.name + ".")
+            else:
+                _walk(child, prefix)
+
+    _walk(tree, "")
+    return out
+
+
+def _find_added_unused_params(base: str, content: str) -> list[dict]:
+    """Return `[{function, param, line}]` for each parameter that
+    exists in `content`'s function signature but not in `base`'s, and
+    that the body never references.
+
+    Only functions present in both trees are compared — a function
+    that only exists in `content` has every parameter "new", which
+    is not a signal.
+
+    Fail-open: a syntax error in either side returns `[]`.
+    """
+    if not base or not content:
+        return []
+    try:
+        base_tree = ast.parse(base)
+    except SyntaxError:
+        return []
+    try:
+        content_tree = ast.parse(content)
+    except SyntaxError:
+        return []
+
+    base_fns = _collect_functions(base_tree)
+    content_fns = _collect_functions(content_tree)
+
+    out = []
+    for qname, c in content_fns.items():
+        b = base_fns.get(qname)
+        if b is None:
+            continue
+        added = c["params"] - b["params"]
+        if not added:
+            continue
+        for p in added:
+            if p not in c["body_refs"]:
+                out.append({
+                    "function": qname,
+                    "param": p,
+                    "line": c["lineno"],
+                })
+    return out
+
+
+def pass8_4b_check_added_unused_params(
+        records: dict[str, FileRecord],
+        blocks_by_idx: Optional[dict] = None) -> int:
+    """Warn when a function gained a parameter (via a patch) that
+    the function body never references.
+
+    WARN-ONLY.  Returns the number of *new* warnings emitted this
+    call.  Idempotent: repeated runs against the same record do not
+    duplicate warnings, tracked via
+    `verification["added_param_warnings"]`.
+
+    Skips:
+      · non-`.py` records
+      · records with no content or no recoverable base
+      · deleted records
+
+    The base is `blocks_by_idx[rec.last_full_idx].body` — the
+    pre-application content.  `pass6_apply_patches` and every demoting
+    pass compare against the same base; consistency matters here.
+    """
+    n_warned = 0
+
+    for path, rec in records.items():
+        if rec.content is None:
+            continue
+        if not path.endswith(".py"):
+            continue
+        if rec.is_deleted:
+            continue
+
+        # Get base content.  Prefer last_full_idx block.  `None`
+        # means we cannot compare — skip rather than warn on a
+        # synthetic diff (e.g. record with no full-print baseline).
+        base: Optional[str] = None
+        if blocks_by_idx is not None and rec.last_full_idx is not None:
+            base_block = blocks_by_idx.get(rec.last_full_idx)
+            if base_block is not None:
+                base = base_block.body
+        if base is None:
+            continue
+
+        try:
+            added_unused = _find_added_unused_params(base, rec.content)
+        except Exception as e:
+            rec.warnings.append(f"pass 8.4b raised: {e}")
+            continue
+
+        if not added_unused:
+            continue
+
+        # Idempotent warning tracking — a re-run (from reverify after
+        # reconcile) must not duplicate entries.
+        existing = set(rec.verification.get("added_param_warnings", []))
+
+        for v in added_unused:
+            key = f"{v['function']}.{v['param']}"
+            if key in existing:
+                continue
+            existing.add(key)
+            rec.warnings.append(
+                f"added-param-unused: `{v['function']}` (line "
+                f"{v['line']}) gained parameter `{v['param']}` but "
+                f"the function body never references it — the "
+                f"argument is accepted and silently discarded"
+            )
+            n_warned += 1
+
+        if existing:
+            rec.verification["added_param_warnings"] = sorted(existing)
+
+    return n_warned

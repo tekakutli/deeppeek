@@ -8,6 +8,34 @@ spurious space between the base prefix and the body object
 
 The other 2026-10-28 additions are covered by their respective
 tests below.
+
+2026-10-28g — three more fixes, each with its own test:
+
+  · H2 that doesn't name a file resets `current_header` (header
+    leakage across sections — the bug that made Fix 5's fences
+    inherit `pg_state.py` from Fix 4's H2).  Test:
+    `test_h2_without_filename_resets_header` and
+    `test_h3_preserves_header`.
+
+  · Multi-statement apply: `captured = {...}` followed by
+    `def on_progress(...)` no longer silently drops the def.  Test:
+    `test_multi_statement_apply_object_literal_plus_def`.
+
+  · Indented def/class replace: a column-0 `def name(...)` whose
+    body lives *indented* in base is replaced in place, not
+    duplicated.  Test: `test_indented_def_replace_alone`.
+
+2026-10-28h — object-literal trailing-`;` acceptance:
+
+  · The initial trailing-content refusal (2026-10-28g) treated a bare
+    trailing `;` as "trailing content" and refused the splice.  That
+    regressed `tests/recover/fixtures/02_subsection_patches.md`,
+    `04_prose_override.md`, and `35_object_literal_replace.md`, all
+    of which use `export const NAME = {...};` or `NAME = {...};`
+    bodies.  The refined check strips a single leading `;` from the
+    tail before checking for non-comment content.  Test:
+    `test_object_literal_splice_accepts_trailing_semicolon` and
+    `test_object_literal_splice_accepts_trailing_semicolon_plus_comment`.
 """
 import sys
 from pathlib import Path
@@ -259,6 +287,94 @@ def test_object_literal_splice_preserves_space_before_brace():
     assert "const board={" not in result, (
         f"space before `{{` removed (broke style):\n{result}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-28h — object-literal trailing-`;` acceptance
+# ---------------------------------------------------------------------------
+
+def test_object_literal_splice_accepts_trailing_semicolon():
+    """A bare trailing `;` on the body must NOT be treated as
+    "trailing content" by the object-literal refusal.
+
+    Motivating regressions: fixtures 02 (`02_subsection_patches`),
+    04 (`04_prose_override`), and 35 (`35_object_literal_replace`)
+    all use `export const NAME = {...};` or `NAME = {...};` bodies.
+    The initial version of the trailing-content refusal (2026-10-28g)
+    saw the `;` and refused the splice, so `c: 3` (or `b: 2`) was
+    silently dropped from the resulting file.
+    """
+    base = (
+        "// foo.js — full print.\n"
+        "\n"
+        "export const foo = {\n"
+        "  a: 1,\n"
+        "  b: 2,\n"
+        "};\n"
+    )
+    body = (
+        "export const foo = {\n"
+        "  a: 1,\n"
+        "  b: 2,\n"
+        "  c: 3,\n"
+        "};\n"
+    )
+    patch = {"body": body, "context_before": "", "fence_lang": "js"}
+    result = _try_deterministic_patch(base, patch, path="foo.js")
+    assert result is not None, "expected splice to fire"
+    assert "c: 3" in result, (
+        f"`c: 3` missing (trailing `;` refusal bug):\n{result}"
+    )
+    assert result.count("export const foo = {") == 1, (
+        f"duplicate declaration introduced:\n{result}"
+    )
+
+
+def test_object_literal_splice_accepts_trailing_semicolon_plus_comment():
+    """A trailing `;` followed by a comment still passes the refusal
+    check — the comment is not "trailing content"."""
+    base = (
+        "const board = { a: 1 };\n"
+    )
+    body = (
+        "board = {\n"
+        "  a: 1,\n"
+        "  b: 2,\n"
+        "};  // updated\n"
+    )
+    patch = {"body": body, "context_before": "", "fence_lang": "js"}
+    result = _try_deterministic_patch(base, patch, path="board.js")
+    assert result is not None, "expected splice to fire"
+    assert "b: 2" in result
+    assert result.count("const board") == 1
+
+
+def test_object_literal_refuses_trailing_semicolon_plus_statement():
+    """A trailing `;` followed by *code* (not a comment) still triggers
+    the refusal — the code after `;` is real trailing content."""
+    from deeppeek.recover.patch_dispatch import (
+        _try_deterministic_patch,
+    )
+    base = (
+        "def handle():\n"
+        "    captured = {'msg': ''}\n"
+        "    return captured\n"
+    )
+    body = (
+        "captured = {'msg': '', 'errors': []};\n"
+        "def on_progress(idx, res):\n"
+        "    pass\n"
+    )
+    patch = {"body": body, "context_before": "", "fence_lang": "py"}
+    result = _try_deterministic_patch(base, patch, path="x.py")
+    # Either multi-statement apply succeeded (both statements land)
+    # or the whole attempt failed — but the object-literal splice on
+    # its own must NOT have fired and silently dropped the def.
+    if result is not None:
+        assert "def on_progress" in result, (
+            f"object-literal splice dropped the def:\n{result}"
+        )
+        assert "captured = " in result
 
 
 # ---------------------------------------------------------------------------
@@ -989,6 +1105,171 @@ def test_prior_insertion_callee_walk_lands_in_delegate():
     assert content.count("output_name = params.get(") == 2
 
 
+# ---------------------------------------------------------------------------
+# 2026-10-28g — H2 header reset on non-file heading
+# ---------------------------------------------------------------------------
+
+def test_h2_without_filename_resets_header():
+    """An H2 that doesn't parse as a file header resets
+    `current_header`, so subsequent fences don't inherit the previous
+    section's file.  Motivating shape: `## Fix 4 — … (pg_state.py)`
+    followed by `## Fix 5 — text input for rotation` (no file named),
+    whose three fences actually target three different files
+    (pg_base.py, pg_panel_scrubs.py, pg_panel_bindings.py).
+    """
+    from deeppeek.recover.extract import pass1_extract
+    dump = (
+        "## Fix 1 — mask encoding (`foo.py`)\n"
+        "\n"
+        "```python\n"
+        "x = 1\n"
+        "```\n"
+        "\n"
+        "## Fix 2 — some unrelated section\n"
+        "\n"
+        "```python\n"
+        "y = 2\n"
+        "```\n"
+    )
+    blocks, _ = pass1_extract(dump)
+    assert len(blocks) == 2
+    assert blocks[0].header_path == "foo.py"
+    assert blocks[0].is_orphan is False
+    # Second H2 has no filename → header reset, block is orphan
+    assert blocks[1].header_path is None
+    assert blocks[1].is_orphan is True
+
+
+def test_h3_preserves_header():
+    """H3 subsections under a file H2 must keep the header."""
+    from deeppeek.recover.extract import pass1_extract
+    dump = (
+        "## File: `foo.py`\n"
+        "\n"
+        "```python\n"
+        "a = 1\n"
+        "```\n"
+        "\n"
+        "### (a) Add a field\n"
+        "\n"
+        "```python\n"
+        "b = 2\n"
+        "```\n"
+    )
+    blocks, _ = pass1_extract(dump)
+    assert len(blocks) == 2
+    assert all(b.header_path == "foo.py" for b in blocks)
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-28g — multi-statement apply
+# ---------------------------------------------------------------------------
+
+def test_multi_statement_apply_object_literal_plus_def():
+    """Body: `captured = {...}` + `def on_progress(...)`.
+
+    Must apply both statements — object-literal splice for the
+    assignment, indented-def replace for the nested function.  The
+    pre-fix bug was that the object-literal splice silently dropped
+    the def, and the whole patch then failed with "no matching base
+    declaration" (Fix 3's exact shape).
+    """
+    base = (
+        "def handle(payload):\n"
+        "    batch_id = 'abc'\n"
+        "    captured = {'msg': ''}\n"
+        "\n"
+        "    def on_progress(idx, res):\n"
+        "        captured['msg'] = res.get('message', '')\n"
+        "\n"
+        "    return captured\n"
+    )
+    body = (
+        "captured = {'msg': '', 'errors': []}\n"
+        "\n"
+        "def on_progress(idx, res):\n"
+        "    msg = res.get('message', '')\n"
+        "    if msg:\n"
+        "        captured['errors'].append(msg)\n"
+        "    captured['msg'] = msg\n"
+    )
+    patch = {"body": body, "context_before": "", "fence_lang": "py"}
+    result = _try_deterministic_patch(base, patch, path="x.py")
+    assert result is not None, "multi-statement apply should fire"
+    assert "'errors': []" in result
+    assert "captured['errors'].append(msg)" in result
+    # Original `on_progress` body must be gone (not nested)
+    assert result.count("def on_progress") == 1
+
+
+def test_object_literal_refuses_trailing_def():
+    """`x = {...}` followed by `def foo(...)` must not be spliced.
+
+    The multi-statement hook should fire first and either apply both
+    statements correctly, or bail entirely.  What must NOT happen is
+    the object-literal splice firing on its own and silently dropping
+    the trailing def.
+    """
+    base = (
+        "def handle():\n"
+        "    captured = {'msg': ''}\n"
+        "    return captured\n"
+    )
+    body = (
+        "captured = {'msg': '', 'errors': []}\n"
+        "\n"
+        "def on_progress(idx, res):\n"
+        "    pass\n"
+    )
+    patch = {"body": body, "context_before": "", "fence_lang": "py"}
+    result = _try_deterministic_patch(base, patch, path="x.py")
+    # Either multi-statement apply succeeded (both statements land)
+    # or the whole attempt failed — but the object-literal splice on
+    # its own must NOT have fired and silently dropped the def.
+    if result is not None:
+        assert "def on_progress" in result
+        assert "captured = " in result
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-28g — indented def/class replace
+# ---------------------------------------------------------------------------
+
+def test_indented_def_replace_alone():
+    """Body that's just a nested `def name(...)` — replace in place.
+
+    The pre-fix behaviour: scoped-replace declines (no top-level
+    declaration with that name); AST anchor would then insert the
+    new def at the end of the enclosing function — producing TWO
+    copies of `on_progress`.
+    """
+    base = (
+        "def outer():\n"
+        "    def helper(a):\n"
+        "        return a + 1\n"
+        "    return helper(10)\n"
+    )
+    body = (
+        "def helper(a):\n"
+        "    return a + 100\n"
+    )
+    patch = {"body": body, "context_before": "", "fence_lang": "py"}
+    result = _try_deterministic_patch(base, patch, path="x.py")
+    assert result is not None
+    assert "return a + 100" in result
+    assert "return a + 1\n" not in result
+    # Still nested inside `outer`
+    assert "def outer" in result
+    lines = result.split("\n")
+    outer_idx = next(i for i, l in enumerate(lines)
+                     if l.startswith("def outer"))
+    helper_idx = next(i for i, l in enumerate(lines)
+                      if "def helper" in l)
+    assert helper_idx > outer_idx
+    # helper is indented
+    assert lines[helper_idx].startswith("    ")
+
+
 def main():
     tests = [
         # Fix 1 — dict-key grammar
@@ -1013,6 +1294,13 @@ def main():
          test_object_literal_splice_preserves_no_space_before_brace),
         ("object_literal_splice preserves space before brace",
          test_object_literal_splice_preserves_space_before_brace),
+        # 2026-10-28h — object-literal trailing-`;` acceptance
+        ("object_literal_splice accepts trailing semicolon",
+         test_object_literal_splice_accepts_trailing_semicolon),
+        ("object_literal_splice accepts trailing semicolon plus comment",
+         test_object_literal_splice_accepts_trailing_semicolon_plus_comment),
+        ("object_literal refuses trailing semicolon plus statement",
+         test_object_literal_refuses_trailing_semicolon_plus_statement),
         # Fix 3 — duplicate-assignment pre-gate
         ("duplicate assignment gate catches single line",
          test_duplicate_assignment_gate_catches_single_line),
@@ -1081,6 +1369,19 @@ def main():
          test_scoped_replace_still_applies_when_scope_differs),
         ("short import already present returns base",
          test_short_import_already_present_returns_base),
+        # 2026-10-28g — H2 header reset
+        ("h2 without filename resets header",
+         test_h2_without_filename_resets_header),
+        ("h3 preserves header",
+         test_h3_preserves_header),
+        # 2026-10-28g — multi-statement apply
+        ("multi statement apply object literal plus def",
+         test_multi_statement_apply_object_literal_plus_def),
+        ("object literal refuses trailing def",
+         test_object_literal_refuses_trailing_def),
+        # 2026-10-28g — indented def/class replace
+        ("indented def replace alone",
+         test_indented_def_replace_alone),
     ]
     failed = 0
     for name, fn in tests:

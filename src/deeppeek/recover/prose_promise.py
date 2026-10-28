@@ -27,7 +27,7 @@ blocks a merge is a human decision.
 
 WHAT IT DETECTS
 ===============
-Two prose shapes are recognized:
+Two prose shapes are recognized for the *body-level* check:
 
   Pattern A: `<fn chain> call sites`
       update the three `fn1(...)` / `fn2(...)` call sites
@@ -68,8 +68,42 @@ prose contains the promise — matters because the call-site patches
 are separate blocks; their bodies collectively answer "did the
 promised change land anywhere?".  Per-patch checking would warn on
 every signature patch even when the call-site patch is also present.
+
+SECOND-ORDER CHECK — LINE-SPECIFIC CONTENT VERIFICATION
+=======================================================
+The body-level check above answers "does any patch body include the
+promised call-site updates?".  When it does, the pass is silent.
+
+But a patch body that *contains* the promised call-site update can
+still fail to *land* — the same failure `verify_applied` catches,
+but at the prose-promise granularity.  The 2026-10-28 run showed
+this concretely: patch 97's fence held the
+`output_rotation=output_rotation` argument (satisfying the
+body-level check), but the final content lacks that argument
+(satisfying the second-order check's condition for a warning).  The
+advisory was necessary precisely because the body-level check is
+insufficient.
+
+The second-order check runs only when the body-level check is
+satisfied:
+
+  · For each promised fn name, parse `rec.content` as AST and find
+    every `fn(...)` call.
+  · For each such call, inspect its keyword-argument list.
+  · Warn for any call that does not pass `rotation=` as a keyword,
+    with the call's line number.
+
+Advisory only, same as the body-level check.  A call site that
+legitimately omits `rotation=` (e.g. an internal helper that passes
+it positionally, or a differently-shaped call that happens to share
+a name) will produce a warning the user can dismiss.  Under the
+"warn, don't block" contract, this is the correct trade-off.
+
+Only runs on `.py` records where `ast.parse` succeeds — non-Python
+files are skipped.
 """
 
+import ast
 import re
 
 from .core import FileRecord
@@ -167,12 +201,48 @@ def _body_includes_call_updates(body, fn_names):
     return False
 
 
+def _find_calls_missing_kwarg(content, fn_name, kwarg_name):
+    """Return line numbers of every call to `fn_name` in `content`
+    that does not include `kwarg_name=` as a keyword argument.
+
+    AST-based: parses `content` and walks every `ast.Call` whose
+    `func` is a bare `ast.Name` matching `fn_name`.  Attribute calls
+    (`.fn(...)`, `obj.fn(...)`) are not checked: the promised call
+    sites are module-level free functions, and a method call that
+    happens to share a name is a different function entirely.
+
+    Fail-open: a `SyntaxError` in `content` returns `[]`.  By this
+    point in the pipeline `content` has been through `ast.parse`
+    checks; a syntax error here is unexpected but should not block
+    the pipeline.
+    """
+    if not content:
+        return []
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return []
+
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id != fn_name:
+            continue
+        kw_names = {kw.arg for kw in node.keywords if kw.arg}
+        if kwarg_name not in kw_names:
+            out.append(node.lineno)
+    return out
+
+
 def pass8_9_check_prose_promises(records):
     """Advisory: warn when prose promises call-site updates the
-    fence body doesn't include.
+    fence body doesn't include, and (second-order) when the
+    promised updates are in some body but not in the final content.
 
-    Returns the number of warnings emitted (one per record with any
-    unmet promise).
+    Returns the number of warnings emitted.
 
     Never demotes a record.  Warn-only by design — see the module
     docstring, ADVISORY ONLY section.
@@ -202,16 +272,35 @@ def pass8_9_check_prose_promises(records):
             fn for fn in sorted(promised_fns)
             if not _body_includes_call_updates(all_bodies, [fn])
         ]
-        if not missing:
+
+        if missing:
+            rec.warnings.append(
+                f"advisory: prose promises call-site updates to "
+                f"{missing} but no patch body includes them "
+                f"(patch idxs: {patch_idxs}) — the patch may accept "
+                f"a new parameter without forwarding it to the "
+                f"promised call sites"
+            )
+            n_flagged += 1
             continue
 
-        rec.warnings.append(
-            f"advisory: prose promises call-site updates to "
-            f"{missing} but no patch body includes them "
-            f"(patch idxs: {patch_idxs}) — the patch may accept a "
-            f"new parameter without forwarding it to the promised "
-            f"call sites"
-        )
-        n_flagged += 1
+        # Second-order: bodies include the promised updates.  Verify
+        # they actually landed in final content, with line numbers.
+        if not path.endswith(".py"):
+            continue
+        for fn in sorted(promised_fns):
+            line_nos = _find_calls_missing_kwarg(
+                rec.content, fn, "rotation")
+            if not line_nos:
+                continue
+            preview = ", ".join(str(n) for n in line_nos[:5])
+            if len(line_nos) > 5:
+                preview += f", … (+{len(line_nos) - 5} more)"
+            rec.warnings.append(
+                f"advisory: prose promised `{fn}(..., rotation=...)` "
+                f"but {len(line_nos)} call site(s) in the final "
+                f"content do not pass `rotation=` (lines: {preview})"
+            )
+            n_flagged += 1
 
     return n_flagged

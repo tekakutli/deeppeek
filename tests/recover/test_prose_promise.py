@@ -221,6 +221,116 @@ def test_advisory_does_not_demote_trust():
     assert rec.trust == "HIGH", (
         "advisory must not demote; it is warn-only")
 
+# ---------------------------------------------------------------------------
+# Second-order check — line-specific content verification
+# ---------------------------------------------------------------------------
+#
+# The body-level check above answers "does any patch body include the
+# promised call-site updates?".  When it does, the pass is normally
+# silent.  But a patch body that *contains* the update can still fail
+# to *land* — the same failure `verify_applied` catches, at the
+# prose-promise granularity.  The second-order check adds line-level
+# visibility to that case.
+
+def test_second_order_fires_when_content_missing_kwarg():
+    """Body has `rotation=` kwarg, but the final content's call site
+    does not.  Second-order advisory fires."""
+    content = (
+        "def caller(doc, img):\n"
+        "    node = paste_image(doc, img, 0, 0, 'x')\n"
+        "    return node\n"
+    )
+    rec = _rec("x.py", content=content, patches=[{
+        "idx": 1,
+        "body": (
+            "node = paste_image(doc, img, 0, 0, 'x',\n"
+            "                   rotation=output_rotation)\n"
+        ),
+        "context_before": (
+            "Update the three `paste_image(...)` call sites:"
+        ),
+        "applied_by": "deterministic",
+    }])
+    n = pass8_9_check_prose_promises({"x.py": rec})
+    assert n >= 1
+    # Second-order message includes a line number and names the fn.
+    assert any(
+        "paste_image" in w and "rotation=" in w and "line" in w.lower()
+        for w in rec.warnings
+    ), f"expected line-specific advisory, got {rec.warnings!r}"
+
+
+def test_second_order_silent_when_content_has_kwarg():
+    """Body has `rotation=` and final content's call site does too."""
+    content = (
+        "def caller(doc, img):\n"
+        "    node = paste_image(doc, img, 0, 0, 'x',\n"
+        "                       rotation=out)\n"
+        "    return node\n"
+    )
+    rec = _rec("x.py", content=content, patches=[{
+        "idx": 1,
+        "body": (
+            "node = paste_image(doc, img, 0, 0, 'x',\n"
+            "                   rotation=out)\n"
+        ),
+        "context_before": (
+            "Update the three `paste_image(...)` call sites:"
+        ),
+        "applied_by": "deterministic",
+    }])
+    n = pass8_9_check_prose_promises({"x.py": rec})
+    assert n == 0, (
+        f"expected silence (both body and content have kwarg), "
+        f"got warnings={rec.warnings!r}"
+    )
+
+
+def test_second_order_skips_non_py():
+    """Second-order uses AST — non-Python files fall back to the
+    body-level check only."""
+    content = "function caller() { paste_image(doc, img); }"
+    rec = _rec("x.js", content=content, patches=[{
+        "idx": 1,
+        "body": "paste_image(doc, img, rotation=out)",
+        "context_before": (
+            "Update the two `paste_image(...)` call sites:"
+        ),
+        "applied_by": "deterministic",
+    }])
+    n = pass8_9_check_prose_promises({"x.js": rec})
+    # Body-level check passes (body includes kwarg).  Second-order is
+    # skipped for .js.  No warning.
+    assert n == 0
+
+
+def test_second_order_counts_each_missing_call():
+    """Two `paste_image` calls, both missing the kwarg → two lines
+    listed."""
+    content = (
+        "def a():\n"
+        "    paste_image(d, i, 0, 0, 'x')\n"
+        "def b():\n"
+        "    paste_image(d, i, 0, 0, 'y')\n"
+    )
+    rec = _rec("x.py", content=content, patches=[{
+        "idx": 1,
+        "body": "paste_image(d, i, 0, 0, 'x', rotation=r)\n",
+        "context_before": (
+            "Update the two `paste_image(...)` call sites:"
+        ),
+        "applied_by": "deterministic",
+    }])
+    n = pass8_9_check_prose_promises({"x.py": rec})
+    assert n >= 1
+    # The message lists both line numbers.
+    msgs = [w for w in rec.warnings if "paste_image" in w]
+    assert msgs, f"expected advisory, got {rec.warnings!r}"
+    # Both line 2 and line 4 should be mentioned.
+    msg = msgs[0]
+    assert "2" in msg and "4" in msg, (
+        f"expected both line numbers in message, got {msg!r}"
+    )
 
 def main():
     tests = [
@@ -256,6 +366,14 @@ def main():
          test_advisory_skips_deleted),
         ("advisory does not demote trust",
          test_advisory_does_not_demote_trust),
+        ("second order fires when content missing kwarg",
+         test_second_order_fires_when_content_missing_kwarg),
+        ("second order silent when content has kwarg",
+         test_second_order_silent_when_content_has_kwarg),
+        ("second order skips non py",
+         test_second_order_skips_non_py),
+        ("second order counts each missing call",
+         test_second_order_counts_each_missing_call),
     ]
     failed = 0
     for name, fn in tests:

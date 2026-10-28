@@ -23,6 +23,26 @@ need manual editing.  Every failed or excluded block carries a
 those comments survive markdown round-trip but are invisible when
 the file is rendered.
 
+HONEST-REPORTING GUARD (2026-10-28 fix)
+=======================================
+A `no_candidates` attribution — which fires when `existing_paths`
+was empty in `pass4_attribute_orphans` — used to be in the residual
+skip set.  Combined with the pipeline's pre-attribution pruning of
+preexisting baselines (fixed in `pipeline.py`), a conversation
+whose headers did not parse as file headers produced zero records,
+zero attributions, and an **empty residual that claimed success**
+while writing nothing.
+
+The skip set no longer contains `no_candidates` (a block that could
+not be attributed because there were no candidates is a failure, not
+a by-design skip).  Additionally, `_build_residual` has a
+top-of-function guard: if `records` is empty *and* the conversation
+carried substantive code blocks (non-pre-existing, non-meta,
+non-prose, non-blockquote), those blocks are all listed in the
+residual with `outcome=orphan_unattributed` and a note explaining
+that zero records were created.  The pipeline's real failure mode
+is now visible, not silently absorbed.
+
 WHAT GOES IN
 ============
   · `failed` — patch could not be applied by any heuristic.
@@ -78,8 +98,13 @@ from .core import Block, FileRecord
 
 _TRUST_RANK = {"SKIP": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
 
+# Skip-set entries that legitimately indicate "not a block we want to
+# surface in the residual".  `no_candidates` was removed: a block that
+# could not be attributed because `existing_paths` was empty is a
+# pipeline failure, not a benign skip, and must surface.  (2026-10-28
+# fix; see module docstring, HONEST-REPORTING GUARD.)
 _SKIP_ORPHAN_ATTR = frozenset({
-    "empty", "no_candidates", "not_a_file",
+    "empty", "not_a_file",
     "blockquote_skip", "skipped_meta",
 })
 
@@ -301,6 +326,26 @@ def _format_block(b: Block, outcome: str, note: Optional[str]) -> str:
     return "\n".join(lines)
 
 
+def _is_substantive_code_block(b: Block) -> bool:
+    """True iff `b` is a non-noise, non-preexisting code block.
+
+    Used by the honest-reporting guard: on a zero-record run, only
+    blocks that a user would actually want to see in a residual get
+    listed.  Prose/UI blocks, blockquoted thought fragments, and
+    meta dumps are excluded — they were never code the pipeline
+    could have applied.
+    """
+    if b.classified_by == "preexisting":
+        return False
+    if b.kind in _SKIP_KINDS:
+        return False
+    if b.in_blockquote:
+        return False
+    if not b.body.strip():
+        return False
+    return True
+
+
 def _build_residual(records: dict,
                     blocks: list,
                     dump_display: str,
@@ -320,6 +365,24 @@ def _build_residual(records: dict,
         if outcome is None:
             continue
         entries.append((b, outcome, note))
+
+    # HONEST-REPORTING GUARD (2026-10-28): if the pipeline produced
+    # zero records AND there are substantive code blocks in the
+    # conversation, report every such block honestly.  This catches
+    # the pipeline-failure case (pre-existing baselines pruned before
+    # attribution, leaving `existing_paths = []`) which used to
+    # produce an empty residual claiming "all placed" — the failure
+    # was completely invisible.
+    if not entries and not records:
+        for b in blocks:
+            if not _is_substantive_code_block(b):
+                continue
+            entries.append((
+                b, "orphan_unattributed",
+                "no records were created; this block's content was "
+                "not recovered and no pre-existing file was available "
+                "for attribution",
+            ))
 
     header = [
         "# Residual from deeppeek recovery",

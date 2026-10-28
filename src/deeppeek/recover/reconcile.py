@@ -75,11 +75,16 @@ ORDERING FIXES
   · `_trust_cap(rec)` is called *after* `rec.verification
     ["reconciled"]` is populated.
 
-LINT-AWARE REPLAY (2026-10-28b)
-===============================
-`_count_failures` runs pass 8.4's `_find_command_violations` on each
-candidate replay, so a record demoted by pass 8.4 for an unused
-`@command` arg cannot be promoted by pass 8.7's two checks alone.
+WARN-ONLY PASSES EXCLUDED FROM FAILURE COUNTING (2026-10-28)
+============================================================
+An earlier version of `_count_failures` included the lint check
+(pass 8.4's unused-`@command`-arg detection).  That was wrong: lint
+is informational (see `lint.py`'s docstring).  Its presence in the
+failure counter blocked reconcile from promoting records whose only
+"defect" was a warn-only finding — a category error the wrong way
+around.  The counter now includes only demoting checks:
+`validate_content`, `find_unresolved_references`, and any surviving
+`applied_by == "failed"` patches/pairs.
 
 DISTINCTIVE SCOPE-NAME MISATTRIBUTION (2026-10-28b)
 ===================================================
@@ -174,8 +179,11 @@ def _replay_excluding(rec, base, excluded_keys, path,
 def _count_failures(content, path, rec, base, records, excluded_keys):
     """Return (n_failures, [failure_descriptors]).
 
-    Runs every demoting check pass 8.x performs.  See the module
-    docstring, LINT-AWARE REPLAY section.
+    Runs every *demoting* check pass 8.x performs.  Lint and
+    added-param-lint are NOT included: both are warn-only (see
+    `lint.py` and `verify_applied.py` docstrings).  Only checks that
+    actually change `rec.trust` participate here, so reconcile's
+    promotion decision is not blocked by informational warnings.
     """
     from .validate_output import validate_content
     from .symbols import find_unresolved_references
@@ -194,23 +202,6 @@ def _count_failures(content, path, rec, base, records, excluded_keys):
             "unresolved": unresolved,
             "mismatched": mismatched,
         }))
-
-    if path.endswith(".py") and "@command" in content:
-        try:
-            from .lint import (
-                _find_command_violations, _arg_introduced_by_patch,
-            )
-            violations = _find_command_violations(content)
-        except Exception:
-            violations = []
-        for v in violations:
-            introduced = [a for a in v["unused"]
-                          if _arg_introduced_by_patch(rec, a)]
-            if introduced:
-                failures.append(("unused_command_args", {
-                    "method": v["name"],
-                    "args":   introduced,
-                }))
 
     for p in rec.patches:
         if p.get("applied_by") != "failed":

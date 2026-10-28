@@ -1,4 +1,10 @@
-"""Unit tests for pass 8.4 (@command decorator arg lint)."""
+"""Unit tests for pass 8.4 (@command decorator arg lint).
+
+Warn-only after the 2026-10-28 alignment: the pass emits a warning
+when a patch introduces an `@command` arg the body never reads, but
+does not change `rec.trust`.  The file ships; the warning names the
+incomplete feature.
+"""
 import sys
 from pathlib import Path
 
@@ -177,7 +183,7 @@ def test_delegated_reads_dont_fix_unrelated_args():
 
 
 # ---------------------------------------------------------------------------
-# _arg_introduced_by_patch (fixed semantics)
+# _arg_introduced_by_patch
 # ---------------------------------------------------------------------------
 
 def test_arg_introduced_by_declaration():
@@ -213,10 +219,10 @@ def test_arg_substring_not_matched():
 
 
 # ---------------------------------------------------------------------------
-# pass8_4_lint_command_args
+# pass8_4_lint_command_args — warn-only semantics
 # ---------------------------------------------------------------------------
 
-def test_no_demotion_when_all_used():
+def test_no_warning_when_all_used():
     rec = _rec("x.py",
         '@command(args={"--foo": {"type": "str"}})\n'
         'def handle(self, params):\n'
@@ -228,7 +234,9 @@ def test_no_demotion_when_all_used():
     assert not rec.warnings
 
 
-def test_demotes_when_arg_introduced_by_patch():
+def test_warns_when_arg_introduced_by_patch():
+    """Warn-only: an unused arg added by a patch is reported but does
+    not change trust."""
     rec = _rec("x.py",
         '@command(args={"--foo": {"type": "str"}})\n'
         'def handle(self, params):\n'
@@ -241,12 +249,12 @@ def test_demotes_when_arg_introduced_by_patch():
     records = {"x.py": rec}
     n = pass8_4_lint_command_args(records)
     assert n == 1
-    assert rec.trust == "LOW"
+    assert rec.trust == "HIGH", "pass8_4 is warn-only; trust unchanged"
     assert "unused_command_args" in rec.verification
     assert any("lint:" in w and "foo" in w for w in rec.warnings)
 
 
-def test_no_demotion_when_arg_preexisting():
+def test_no_warning_when_arg_preexisting():
     rec = _rec("x.py",
         '@command(args={"--foo": {"type": "str"}})\n'
         'def handle(self, params):\n'
@@ -263,7 +271,7 @@ def test_no_demotion_when_arg_preexisting():
     assert any("pre-existing" in w for w in rec.warnings)
 
 
-def test_wiring_patch_does_not_trigger_demotion():
+def test_wiring_patch_does_not_trigger_warning():
     rec = _rec("x.py",
         '@command(args={"--foo": {"type": "str"}})\n'
         'def handle(self, params):\n'
@@ -279,7 +287,7 @@ def test_wiring_patch_does_not_trigger_demotion():
     assert rec.trust == "HIGH"
 
 
-def test_delegated_reads_prevent_demotion():
+def test_delegated_reads_prevent_warning():
     """The motivating comfyui.py shape: the arg is declared in the
     @command decorator and read in a helper the method delegates to.
     Lint must not fire."""
@@ -299,7 +307,7 @@ def test_delegated_reads_prevent_demotion():
     records = {"x.py": rec}
     n = pass8_4_lint_command_args(records)
     assert n == 0, (
-        f"expected no demotion (delegated read); "
+        f"expected no warning (delegated read); "
         f"got unused={rec.verification.get('unused_command_args')}"
     )
     assert rec.trust == "HIGH"
@@ -320,7 +328,9 @@ def test_skips_non_python():
     assert rec.trust == "HIGH"
 
 
-def test_skips_already_low():
+def test_processes_already_low_records():
+    """LOW records still get lint warnings — the warning is
+    informational, orthogonal to existing trust state."""
     rec = _rec("x.py",
         '@command(args={"--foo": {"type": "str"}})\n'
         'def handle(self, params):\n'
@@ -332,8 +342,8 @@ def test_skips_already_low():
     rec.trust = "LOW"
     records = {"x.py": rec}
     n = pass8_4_lint_command_args(records)
-    assert n == 0
-    assert rec.trust == "LOW"
+    assert n == 1, "LOW records still get warnings"
+    assert rec.trust == "LOW", "trust not touched"
 
 
 def test_skips_none_content():
@@ -379,7 +389,9 @@ def test_crash_in_extractor_does_not_raise():
         lint_mod._find_command_violations = original
 
 
-def test_one_demotion_per_record():
+def test_one_warning_per_record():
+    """Two unused args in the same record still emit one warning
+    listing both.  Trust unchanged."""
     rec = _rec("x.py",
         '@command(args={\n'
         '    "--foo": {"type": "str"},\n'
@@ -394,10 +406,10 @@ def test_one_demotion_per_record():
         }])
     records = {"x.py": rec}
     n = pass8_4_lint_command_args(records)
-    assert n == 1
-    assert rec.trust == "LOW"
+    assert n >= 1
+    assert rec.trust == "HIGH"
     assert len(rec.verification["unused_command_args"]) == 1
-    assert rec.verification["unused_command_args"][0]["unused"] == \
+    assert sorted(rec.verification["unused_command_args"][0]["unused"]) == \
         ["bar", "foo"]
 
 
@@ -427,22 +439,23 @@ def main():
         ("arg usage does not count as introduction",
          test_arg_usage_does_not_count_as_introduction),
         ("arg substring not matched", test_arg_substring_not_matched),
-        ("no demotion when all used", test_no_demotion_when_all_used),
-        ("demotes when arg introduced by patch",
-         test_demotes_when_arg_introduced_by_patch),
-        ("no demotion when arg preexisting",
-         test_no_demotion_when_arg_preexisting),
-        ("wiring patch does not trigger demotion",
-         test_wiring_patch_does_not_trigger_demotion),
-        ("delegated reads prevent demotion",
-         test_delegated_reads_prevent_demotion),
+        ("no warning when all used", test_no_warning_when_all_used),
+        ("warns when arg introduced by patch",
+         test_warns_when_arg_introduced_by_patch),
+        ("no warning when arg preexisting",
+         test_no_warning_when_arg_preexisting),
+        ("wiring patch does not trigger warning",
+         test_wiring_patch_does_not_trigger_warning),
+        ("delegated reads prevent warning",
+         test_delegated_reads_prevent_warning),
         ("skips non-python", test_skips_non_python),
-        ("skips already low", test_skips_already_low),
+        ("processes already low records",
+         test_processes_already_low_records),
         ("skips none content", test_skips_none_content),
         ("skips deleted", test_skips_deleted),
         ("crash in extractor does not raise",
          test_crash_in_extractor_does_not_raise),
-        ("one demotion per record", test_one_demotion_per_record),
+        ("one warning per record", test_one_warning_per_record),
     ]
     failed = 0
     for name, fn in tests:

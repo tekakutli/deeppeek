@@ -32,6 +32,51 @@ DEFAULT_LLM_TIMEOUT   = 60
 DEFAULT_PROBE_TIMEOUT = 10
 
 
+# ===========================================================================
+#  Patch status taxonomy — the single source of truth
+# ===========================================================================
+#
+# Every pass that reasons about "did this patch apply?" MUST classify
+# statuses through one of these three sets. Before 2026-11-01, four
+# passes each carried their own ad-hoc filter, which disagreed at the
+# margins — most visibly `write.preexisting_unmodified` treating
+# `already-present` as a no-op (skip the file) while
+# `apply_patches.patches_applied` counted it as a success (report the
+# file as patched). That mismatch is why comfyui.py's real patch was
+# silently dropped in the 2026-10-28 run and the manifest nonetheless
+# reported "1 patch applied".
+
+APPLIED_STATUSES = frozenset({
+    # The patcher's deterministic or LLM heuristics produced a change.
+    "deterministic",
+    "llm",
+})
+
+NO_CHANGE_STATUSES = frozenset({
+    # The patcher declined to change the file. Either the content was
+    # already there (`already-present`), or a gate excluded it
+    # (misattributed, unplaceable, weak attribution, duplicate
+    # insertion, structural damage). The file may still be rewritten
+    # from a stored `rec.content`, but no *new* patch bytes are added.
+    "already-present",
+    "skipped_misattributed",
+    "skipped_unplaceable",
+    "skipped_weak_attribution",
+    "skipped_duplicate_insertion",
+    "skipped_structural_damage",
+})
+
+FAILED_STATUSES = frozenset({
+    # The patcher attempted application and could not place the body.
+    # Under fail-closed this forces the record to LOW trust.
+    "failed",
+})
+
+ALL_TERMINAL_STATUSES = (
+    APPLIED_STATUSES | NO_CHANGE_STATUSES | FAILED_STATUSES
+)
+
+
 DIFF_CONTEXT_PHRASES = (
     "change inside",
     "add this",
@@ -77,26 +122,98 @@ def _narrow_context(context_before: str) -> str:
     ).lower()
 
 
-_DELETE_SIGNAL_PHRASES = (
-    "delete",
-    "remove",
-    "get rid of",
+# ===========================================================================
+#  Deletion-instruction prose signals  (2026-11-01 narrowing)
+# ===========================================================================
+#
+# A "deletion instruction" is prose that reads as an instruction to
+# *remove* the block that follows: "Delete the panelState block:",
+# "Remove the following:", "Get rid of …:", etc. In those cases the
+# block's body is content-to-delete; the patcher must attempt a
+# match-and-remove against the base, not treat the block as a patch to
+# be applied.
+#
+# The pre-2026-11-01 implementation used bare substring matching:
+#     any(sig in narrow for sig in ("delete", "remove", ...))
+# which fires on any prose that happens to contain the word.
+#
+# Motivating false positive (comfyui.py, 2026-10-28 run):
+#     prose: "Delete-and-recreate the layer instead of updating in place"
+#     body:  a full `def comfy_set_layer_pixels(self, params):` body
+#
+# The prose uses "delete" as a compound-verb ("delete-and-recreate"),
+# not as an instruction to delete the block. `_is_deletion_instruction`
+# fired, sending the patch through `_delete_exact_block`, which found
+# no unique match of the body in base, returned None, and left the
+# dispatcher to fall through to the "already-present" branch (via
+# `_patch_already_present`'s 85% token-equivalence fallback). The
+# manifest claimed success; the file was silently skipped.
+#
+# Narrowed rule: the deletion verb must be
+#   (a) at the start of a line followed by whitespace or a colon, OR
+#   (b) followed by a clear deictic ("this", "these", "those"), OR
+#   (c) followed by "the" + a deictic-ish noun — "following", "above",
+#       "below", "block", "code", "line", "lines", "section",
+#       "function", "method", "class", "declaration", "definition", OR
+#   (d) part of one of a small set of inherently-deletiony multi-word
+#       phrases ("get rid of", "take out", "strip out", "no longer").
+#
+# A compound verb like "delete-and-recreate" passes none of these:
+# `\bdelete\b(?=[\s:])` fails (`-` follows, not whitespace); `delete
+# this` etc. needs whitespace between verb and deictic.
+#
+# The "the + deictic-noun" branch was added in the second round: a
+# previous form allowed "the <any noun>", which fires on descriptive
+# prose like "Call delete() to remove the item" — `remove the item`
+# matched because `item` was accepted as a bare noun. The narrowed
+# branch requires the noun to name code-or-deictic material
+# specifically, so "the item" no longer matches while "the following
+# declaration" still does.
+
+_DELETION_START_RE = re.compile(
+    r'^\s*(?:delete|remove|drop|eliminate|wipe)\b(?=[\s:])',
+    re.MULTILINE,
+)
+
+_DELETION_DETERMINER_RE = re.compile(
+    r'\b(?:delete|remove|drop|eliminate|wipe)\s+'
+    r'(?:'
+    r'this|these|those'
+    r'|'
+    r'the\s+(?:following|above|below|block|code|line|lines|section|'
+    r'function|method|class|declaration|definition)'
+    r')\b'
+)
+
+_DELETION_PHRASES = (
     "no longer",
-    "revert",
-    "drop",
-    "strip out",
-    "strip ",
-    "eliminate",
+    "revert this",
+    "revert the",
+    "get rid of",
     "take out",
-    "wipe",
+    "strip out",
 )
 
 
 def _has_deletion_signal(prose: str) -> bool:
     """True iff the last three lines of `prose` contain a deletion-
-    signal phrase."""
+    instruction signal.
+
+    Narrowed 2026-11-01 — see the block comment above for the
+    motivating false positive and the reasoning behind the three
+    accepted shapes.  The determiner branch additionally requires a
+    deictic noun after "the" so descriptive prose like "remove the
+    item" doesn't accidentally fire.
+    """
     narrow = "\n".join(prose.splitlines()[-3:]).lower()
-    return any(sig in narrow for sig in _DELETE_SIGNAL_PHRASES)
+    if _DELETION_START_RE.search(narrow):
+        return True
+    if _DELETION_DETERMINER_RE.search(narrow):
+        return True
+    for phrase in _DELETION_PHRASES:
+        if phrase in narrow:
+            return True
+    return False
 
 
 def _looks_like_diff_body(body: str) -> bool:
@@ -181,6 +298,11 @@ def _is_deletion_instruction(body: str, context_before: str) -> bool:
     """True iff `body` should be handled as a "delete this block"
     instruction rather than a diff patch or object-literal
     redeclaration.
+
+    Delegates to `_has_deletion_signal` for the prose check; that
+    function narrowed its pattern set on 2026-11-01, so this function
+    fires on a smaller set of prose than before. See the block
+    comment above `_DELETION_START_RE`.
     """
     if _is_pure_deletion_diff_strict(body):
         return True
@@ -226,16 +348,16 @@ SKIP_MISSING_FILES = {
     "Makefile", "README.md", "LICENSE", ".gitignore",
 }
 
-# Patch statuses that mean "the patch did not land in the destination
-# file." Used by write.py and residual.py to report placement failures
-# consistently. Deliberately excludes:
+# Placement-failure set: statuses that mean "the patch did not land in
+# the destination file." Deliberately excludes:
 #   · "already-present":          the patch's content was already there
+#                                 (or, post-8.7d, was claimed to be and
+#                                 has been flipped to "failed" if not)
 #   · "skipped_misattributed":    content lives in another file, recorded
 #                                 separately in verification.reconciled
 #   · "skipped_weak_attribution": tracked separately in reconcile's
 #                                 per-patch diagnostics
-_PLACEMENT_FAILURES = frozenset({
-    "failed",
+_PLACEMENT_FAILURES = FAILED_STATUSES | frozenset({
     "skipped_structural_damage",
     "skipped_unplaceable",
 })
@@ -330,12 +452,4 @@ class FileRecord:
     pairs: list = field(default_factory=list)
     sanity_rejected: bool = False
     # NEW (2026-11-02): structural-brace-repair suggestion, if any.
-    # Populated by `validate.pass8_verify` when a sanity-rejected
-    # record's failure is exactly `unbalanced braces (+N)` and the
-    # block shape meets `repair.try_repair`'s high-confidence
-    # criteria.  Contains the full file content (base + repaired
-    # block inserted) ready to `cp` over the target.  Never written
-    # to the target by `pass9_write` — a `.repaired` suggestion
-    # lands in `low_trust/` and the manifest records
-    # `verification.sanity_repair_available: true`.
     repair_content: Optional[str] = None

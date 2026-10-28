@@ -83,6 +83,17 @@ review nothing.
 are per-file post-patch bodies and the LLM prompt cache, not the
 top-level report.  `manifest.json` names every low-trust file, so
 the model can ask for one specifically if it needs the body.
+
+RESIDUAL FILE LIST ON STDOUT
+============================
+`review` runs `recover --apply-here` as a subprocess, which captures
+recover's stdout.  To surface the residual tail recover prints at
+the end of its own run (the "files not fully recovered" list), the
+run() tail re-reads `apply_to/deeppeek/residual.md` — which recover
+already wrote — and re-emits the same block via
+`_print_residual_tail()`.  Same `unique_residual_paths` parser as
+recover, so the two commands cannot diverge.  Emitted on both the
+dry-run and normal paths, since `recover` runs in both.
 """
 
 from __future__ import annotations
@@ -559,6 +570,51 @@ def _stage_emit_parallel(prompt, files, args):
 
 
 # ---------------------------------------------------------------------------
+# Residual file-list tail (stdout)
+# ---------------------------------------------------------------------------
+
+def _print_residual_tail(meta_dir: Path) -> None:
+    """Print the residual file list to stdout, matching recover's
+    `=== files not fully recovered (see residual.md) ===` block.
+
+    `review` runs `recover --apply-here` as a subprocess (see
+    `_stage_apply`), which captures recover's stdout — including
+    the residual tail recover itself prints.  To surface the same
+    information from `review`, this helper reads the residual file
+    recover wrote (`apply_to/deeppeek/residual.md`) and re-runs the
+    same `unique_residual_paths` parser recover uses, so the two
+    commands print identical lists.
+
+    Handles the "residual.md is missing" case (recover crashed
+    before emitting it) by emitting the markers with an empty body
+    and logging the reason to stderr.  Silent skips would lie about
+    the pipeline state; a missing residual means the set of
+    un-recovered files is unknown, not empty.
+    """
+    from ..recover.residual import unique_residual_paths
+
+    residual_path = meta_dir / "residual.md"
+    if not residual_path.is_file():
+        print(f"  [!] no residual.md at {residual_path} — recover "
+              f"likely failed before emitting it", file=sys.stderr)
+        paths: list = []
+    else:
+        try:
+            text = residual_path.read_text(encoding="utf-8")
+        except OSError as e:
+            print(f"  [!] cannot read {residual_path}: {e}",
+                  file=sys.stderr)
+            paths = []
+        else:
+            paths = unique_residual_paths(text)
+
+    print("=== files not fully recovered (see residual.md) ===")
+    for p in paths:
+        print(p)
+    print(f"=== {len(paths)} file(s) not fully recovered ===")
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -622,13 +678,22 @@ def run(args: argparse.Namespace) -> int:
         print(f"[dry-run] composer text ({source_tag}) below; not typed.",
               file=sys.stderr)
         print(composer_text)
-        return 0
-
-    if args.no_pipe:
-        files = []
+        rc = 0
     else:
-        files = [status_path, *meta_files]
-    return _stage_emit_parallel(composer_text, files, args)
+        if args.no_pipe:
+            files = []
+        else:
+            files = [status_path, *meta_files]
+        rc = _stage_emit_parallel(composer_text, files, args)
+
+    # Emit the same `=== files not fully recovered (see residual.md)
+    # ===` block that recover prints, on both the dry-run and normal
+    # paths — the apply has already run in both, so the residual is
+    # already on disk in both.  The block goes to stdout; the rest
+    # of the run's chatter stays on stderr.
+    _print_residual_tail(meta_dir)
+
+    return rc
 
 
 # ---------------------------------------------------------------------------

@@ -8,6 +8,29 @@ first revision.  The grouping pass now keys records by the resolved
 group), which is what makes `--apply-to` write to the correct
 subdirectories and what makes conversation blocks merge with their
 matching pre-existing baselines.
+
+HEADING-AS-SECTION-BOUNDARY (2026-10-28 fix)
+============================================
+An H1 or H2 that does NOT parse as a file header resets
+`current_header` to `None`.  Without this, a header like
+
+    ## Fix 4 — rotation doesn't shrink (`pg_state.py`)
+
+sets `current_header = pg_state.py`, and the *next* H2
+
+    ## Fix 5 — text input for rotation
+
+(which names no file) leaves `current_header` at `pg_state.py`, so
+every fence under Fix 5 inherits a header that targets a file it
+doesn't belong to.  Fix 5's three fences actually target
+`pg_base.py` / `pg_panel_scrubs.py` / `pg_panel_bindings.py`; only
+their prose names the target.  The inheritance caused them to be
+attributed as headed partials against `pg_state.py` and driven to
+`PARTIAL_ONLY`.
+
+H3+ subsections do NOT reset — `## File: foo.js` followed by
+`### (a) Add a field` should keep the file header (fixture 02
+relies on this).
 """
 
 import re
@@ -23,6 +46,19 @@ def _walk_block_tokens(tokens):
         yield tok
         if tok.children and tok.type != "inline":
             yield from _walk_block_tokens(tok.children)
+
+
+# NEW: single-filename fallback regex.  Matches a bounded source-file
+# path anywhere in the header text.  Bounded by `\b` so it does not
+# eat the trailing `)` of `(utils/foo.py)`, and by the extension list
+# so it does not fire on `.md` references in prose (`.md` is in the
+# list but `## Fix 1 — …` phrasing without a filename produces zero
+# matches, which the fallback correctly refuses).
+_SINGLE_FILENAME_RE = re.compile(
+    r'\b([A-Za-z0-9_./\-]+\.'
+    r'(?:py|js|mjs|cjs|jsx|ts|tsx|md|json|yaml|yml|toml|sh|bash|'
+    r'html|css|scss|rs|go|rb|php|java|kt|c|cc|cpp|h|hpp))\b',
+)
 
 
 def _parse_file_header(text: str) -> Optional[tuple[str, Optional[str]]]:
@@ -71,6 +107,21 @@ def _parse_file_header(text: str) -> Optional[tuple[str, Optional[str]]]:
         ext = "." + m.group(1).split(".")[-1].lower()
         if ext in SOURCE_EXTENSIONS or "/" in m.group(1):
             return m.group(1), None
+
+    # NEW: natural-language header fallback.  A heading that contains
+    # exactly one source-extension filename anywhere in its text is a
+    # file header.  Catches the assistant's natural shapes:
+    #     "## Fix 1 — mask encoding (`utils/comfyui_krita.py`)"
+    #     "## Rewrite of `board.py`"
+    #     "**pg_state.py.** fittedImageRect and clampPan:"
+    # Zero matches → not a file header (correctly falls through to
+    # prose-only parsing, preserving `## File: ` and `== file ==`
+    # conventions).  Two or more matches → not a file header either
+    # (ambiguous; the prose or the block body should carry the
+    # attribution signal instead).
+    matches = _SINGLE_FILENAME_RE.findall(s)
+    if len(matches) == 1:
+        return matches[0], None
 
     return None
 
@@ -174,6 +225,28 @@ def pass1_extract(dump_text: str) -> tuple[list[Block], list[str]]:
                     current_header = parsed
                     current_context_lines = []
                 else:
+                    # NEW: an H1 or H2 that does NOT name a file is a
+                    # section boundary.  Without resetting, the next
+                    # fence inherits the *previous* H2's file header.
+                    #
+                    # Concretely: the natural-language header shape
+                    #   "## Fix 4 — rotation doesn't shrink (`pg_state.py`)"
+                    # sets current_header=pg_state.py; a later
+                    #   "## Fix 5 — text input for rotation"
+                    # (which names no file) then leaves current_header
+                    # at pg_state.py, so every fence under Fix 5 gets
+                    # the wrong header.  Fix 5's three fences actually
+                    # target pg_base.py / pg_panel_scrubs.py /
+                    # pg_panel_bindings.py, and their correct target
+                    # is expressed only in their prose.
+                    #
+                    # Reset on H1/H2 only.  H3+ are subsections of the
+                    # current file section (e.g. "### (a) Add a field"
+                    # under "## File: foo.js") and must preserve the
+                    # header.  Existing fixtures rely on this — see
+                    # tests/recover/fixtures/02_subsection_patches.md.
+                    if tok.tag in ("h1", "h2"):
+                        current_header = None
                     current_context_lines.append(raw)
                     if len(current_context_lines) > 40:
                         current_context_lines = current_context_lines[-40:]
