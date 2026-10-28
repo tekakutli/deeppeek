@@ -7,6 +7,7 @@ loop calls for each patch.  It dispatches, in order:
    0. signature-only replacement (before the completeness gate —
       a bare `def foo():` fails `ast.parse` and would otherwise be
       rejected before any heuristic can run)
+   0a. already-present pre-check (2026-10-28f — see below)
    1. placeholder-marker gate (refuse or merge — see below)
    2. Python-completeness gate
    3. deletions
@@ -22,9 +23,68 @@ loop calls for each patch.  It dispatches, in order:
   13. insert-into-named-scope        (FIX 8 + anchor-derived scope)
   14. insert-before-anchor           (FIX 3)
   15. insert-between-anchors         (FIX 3)
-  16. insert-after-anchor            (with `prior_insertions` fallback)
+  16. insert-after-anchor            (with `prior_insertions` fallback
+                                      + `prior_scopes` disambiguation)
   17. AST anchor (optional dependency)
   18. structural append
+
+ALREADY-PRESENT PRE-CHECK (2026-10-28f)
+=======================================
+An early check that runs after signature replace and before any
+heuristic fires.  If the patch's content is already present in base,
+returning base (no change) lets the outer loop mark the patch
+`already-present` instead of letting a heuristic re-apply it and
+duplicate content.
+
+Motivating cases (all observed re-running on an already-modified
+tree): a `paste_image` docstring paragraph re-appended to a function
+that already had it (`comfyui_krita.py`); a `try/except` block
+re-inserted immediately above its own prior copy (`inpaint_server.py`);
+a `<details>` section re-applied at a different indent (`pg_base.py`);
+a `--output_rotation` arg entry duplicated inside an `@command(args=
+{...})` decorator (`comfyui.py`, when the base already had it).
+
+Two tiers, per `patch_already.py`'s module docstring:
+  · Short bodies (< 3 lines): `_exact_lines_present` (sliding-window
+    only; token fallback false-positives on single-line import changes)
+  · Multi-line bodies (>= 3 lines): `_max_contiguous_run >= 95% of
+    body lines` AND `_patch_already_present` (85% token presence).
+    The contiguity gate keeps comfyui.py's `idx=97` try/except — which
+    introduces `output_rotation` (new tokens) but whose tokens are
+    otherwise dispersed in base — from being falsely skipped.
+
+DEFERRED PREDICATES (2026-10-28f hotfix)
+========================================
+The pre-check is *skipped* for two patch shapes:
+
+  · Deletion instructions (`_is_deletion_instruction(body, ctx)`):
+    the body IS the content that should disappear.  It's trivially
+    "already present" — because it's the thing being removed.  Letting
+    the pre-check fire here treats the deletion as a no-op and the
+    block is never deleted.  Regression observed in
+    `tests/recover/test_recover.py::test_07` (deletion shapes):
+    every deletion patch became `already-present`, the `.panelState`
+    declaration stayed in the file, and `_function_presence_check`
+    then sanity-rejected the record because the record's body didn't
+    remove it (the sanity path's `allow_missing` is populated only
+    from `applied_by == "deterministic"` patches, and `already-present`
+    patches don't count).
+
+  · Diff bodies (`_looks_like_diff_body(body)`): a diff represents
+    "transform base into something else" via `-`/`+`/` ` prefixes.
+    The literal diff text (including `-` prefixed lines) is never
+    present in base as-is, so the multi-line token check would pass
+    by accident on the bare content — but the pre-check's *intent*
+    ("skip if applied") is already covered by `_diff_already_applied`
+    downstream, which correctly distinguishes "the additions are
+    present, the deletions are gone" from "the additions are present
+    but the deletions still exist".
+
+Deletions and diffs have their own already-applied predicates
+(`_deletion_already_applied`, `_diff_already_applied`); those run at
+the appropriate point in the dispatcher and produce the correct
+`already-present` outcome without blocking the deletion/diff from
+firing in the first place.
 
 PLACEHOLDER-MARKER GATE
 =======================
@@ -54,20 +114,28 @@ Prior-insertions threading
 `_try_deterministic_patch` and `_try_deterministic_patch_inner` both
 accept a `prior_insertions=None` keyword that is a set of stripped
 lines previously inserted by earlier patches in the same pass-6
-batch.  It is threaded to `_try_insert_after_anchor`, which uses it
-as a fallback anchor source when the prose has no backticked anchor.
-Additionally, the pass-6 loop feeds single-line already-present
-bodies into `prior_insertions` (see `_mark_already_present` in
-`apply_patches.py`), so a bare `output_name = params.get(...)`
-that's already in base becomes an anchor for the following
-`"Add just after:"` block.
+batch, and a `prior_scopes=None` keyword that is a dict mapping each
+such line to the scope name extracted from its Find-block prose.
+
+`prior_insertions` is threaded to `_try_insert_after_anchor`, which
+uses it as a fallback anchor source when the prose has no backticked
+anchor.  `prior_scopes` lets that fallback disambiguate an anchor
+that appears multiple times in the base: when `base.count(stripped)`
+is greater than 1, the fallback calls
+`patch_anchor_insert._anchor_within_scope` / `_anchor_within_callee`
+with the recorded scope name (see that module's PRIOR-INSERTIONS
+SCOPE CONTEXT section, and the 2026-10-28f correction there for
+scope-first ordering).
 
 SIGNATURE-ONLY REPLACEMENT
 ==========================
-Runs *first*, before the placeholder gate and completeness gate.
-A signature-only block (`def foo(x) -> int:` with no body) fails
-`ast.parse` and would be rejected before any heuristic had a
-chance.  `_try_signature_replace` handles it directly.
+Runs *first*, before the already-present pre-check and completeness
+gate.  A signature-only block (`def foo(x) -> int:` with no body)
+fails `ast.parse` and would be rejected before any heuristic had a
+chance.  `_try_signature_replace` handles it directly.  Because a
+signature-only body is a *fragment* (its body lives in base), the
+already-present pre-check would be a false positive on it — hence
+signature replace must run before it.
 """
 
 import re
@@ -94,6 +162,11 @@ from .patch_heuristics import (
     _try_insert_into_named_scope,
     _try_signature_replace,
     _try_named_dict_insert,
+)
+from .patch_already import (
+    _patch_already_present,
+    _exact_lines_present,
+    _max_contiguous_run,
 )
 from .prose import _extract_scope_from_body
 
@@ -133,10 +206,23 @@ def _join_continuations(body: str) -> str:
 def _try_import_replace(base, raw_body):
     """If body is an import statement and base has an import from the
     same module, replace the base's import with the body.
+
+    Refuses when the body is not *only* an import statement — a body
+    like `import { foo } from "x";\n\nconst bar = ...` would
+    otherwise replace the base's import line with the whole body,
+    misplacing the trailing content at the import's position.
+
+    Returns `base` (not None) when the base already has an identical
+    import — the outer loop then marks the patch `already-present`.
     """
     joined = _join_continuations(raw_body)
     m = _IMPORT_JOIN_RE.search(joined)
     if not m:
+        return None
+    # Refuse multi-line bodies that are not pure imports.
+    body_stripped = joined.strip()
+    tail = body_stripped[m.end():].strip() if m.end() < len(body_stripped) else ""
+    if tail:
         return None
     module = m.group(2)
 
@@ -147,6 +233,9 @@ def _try_import_replace(base, raw_body):
             continue
         if lm.group(2) != module:
             continue
+        # NEW: already-present short-circuit for identical imports.
+        if stripped == body_stripped:
+            return base
         indent = line[:len(line) - len(line.lstrip())]
         reindented = _reindent_body(indent, raw_body.strip())
         result = base.replace(line, reindented, 1)
@@ -225,17 +314,57 @@ def _is_syntactically_complete_python(body, path):
 
 
 # ===========================================================================
+#  Already-present pre-check helpers (2026-10-28f)
+# ===========================================================================
+
+def _is_already_applied(body_stripped, base):
+    """True iff the body is already present in base well enough that
+    applying it again would duplicate content.
+
+    Two tiers (see patch_already.py module docstring and the module-
+    level ALREADY-PRESENT PRE-CHECK section above):
+
+      · Short bodies (< 3 lines): strict contiguous-window match.
+        Token fallback would false-positive on single-line import
+        changes.
+
+      · Multi-line bodies (>= 3 lines): require a long contiguous
+        run AND token presence.  The contiguity gate is what
+        distinguishes a reprint (content genuinely already there)
+        from a new block whose tokens happen to be dispersed in
+        base (comfyui.py idx=97: a try/except that introduces
+        `output_rotation` — new tokens — but whose remaining
+        vocabulary is otherwise common in base).
+    """
+    body_lines = [ln for ln in body_stripped.splitlines() if ln.strip()]
+    if len(body_lines) < 3:
+        return _exact_lines_present(body_stripped, base)
+    run, total = _max_contiguous_run(body_stripped, base)
+    if total == 0:
+        return False
+    if run / total < 0.95:
+        return False
+    return _patch_already_present(body_stripped, base)
+
+
+# ===========================================================================
 #  Dispatcher
 # ===========================================================================
 
 def _try_deterministic_patch(base, patch, path="",
-                              prior_insertions=None):
+                              prior_insertions=None, prior_scopes=None):
     """Crash-isolated entry point.
+
+    `prior_scopes` is an optional `dict[stripped_line -> scope_name]`
+    that disambiguates a repeated prior-insertion anchor.  See
+    `apply_patches._record_single_line_anchor` and the module
+    docstring, Prior-insertions threading section.
     """
     try:
         return _try_deterministic_patch_inner(
             base, patch, path,
             prior_insertions=prior_insertions,
+            prior_scopes=prior_scopes,
         )
     except Exception as e:
         import sys
@@ -245,19 +374,36 @@ def _try_deterministic_patch(base, patch, path="",
 
 
 def _try_deterministic_patch_inner(base, patch, path="",
-                                    prior_insertions=None):
+                                    prior_insertions=None,
+                                    prior_scopes=None):
     raw_body = patch["body"]
     body_stripped = raw_body.strip()
     if not body_stripped:
         return None
 
-    # Signature-only replacement.  Runs BEFORE the placeholder and
-    # completeness gates: a bare `def foo(x):` is not a complete
-    # Python statement, and it contains no placeholder.  This only
-    # cares about matching a signature line in base.
+    context_before = patch.get("context_before", "")
+
+    # Signature-only replacement.  Runs BEFORE the already-present
+    # pre-check: a signature-only body is a fragment whose body is
+    # in base, so the pre-check would false-positive on it.
     signature_replace = _try_signature_replace(base, raw_body)
     if signature_replace is not None:
         return signature_replace
+
+    # NEW (2026-10-28f): already-present pre-check.
+    # Skipped for deletion instructions and diff bodies — their bodies
+    # are "content to disappear" and "content to transform", not
+    # "content to insert".  Both have their own already-applied
+    # predicates downstream (`_deletion_already_applied`,
+    # `_diff_already_applied`).  Firing `_is_already_applied` on them
+    # would treat the content-to-delete as content-already-present and
+    # skip the deletion entirely — the exact cause of the test_07
+    # regression.
+    _is_deletion = _is_deletion_instruction(raw_body, context_before)
+    _is_diff = _looks_like_diff_body(raw_body)
+    if not _is_deletion and not _is_diff:
+        if _is_already_applied(body_stripped, base):
+            return base
 
     # Placeholder gate.  See module docstring.
     if _has_placeholder_marker(raw_body):
@@ -266,8 +412,6 @@ def _try_deterministic_patch_inner(base, patch, path="",
             merged = _try_merge_placeholder_in_scope(
                 base, scope_name, raw_body)
             if merged is not None and not _has_placeholder_marker(merged):
-                # Merge succeeded; treat the merged body as if the AI
-                # had written the complete block.
                 raw_body = merged
                 body_stripped = raw_body.strip()
             else:
@@ -295,14 +439,12 @@ def _try_deterministic_patch_inner(base, patch, path="",
     if not _is_syntactically_complete_python(raw_body, path):
         return None
 
-    context_before = patch.get("context_before", "")
-
-    if _is_deletion_instruction(raw_body, context_before):
+    if _is_deletion:
         deleted = _delete_exact_block(base, raw_body)
         if deleted is not None:
             return deleted
 
-    if _looks_like_diff_body(raw_body):
+    if _is_diff:
         diffed = _try_raw_diff_patch(base, raw_body)
         if diffed is not None:
             return diffed
@@ -345,6 +487,7 @@ def _try_deterministic_patch_inner(base, patch, path="",
         result = _try_deterministic_patch_inner(
             base, fallback_patch, path,
             prior_insertions=prior_insertions,
+            prior_scopes=prior_scopes,
         )
         if result is not None:
             return result
@@ -401,6 +544,7 @@ def _try_deterministic_patch_inner(base, patch, path="",
         base, raw_body, context_before,
         prior_insertions=prior_insertions,
         path=path,
+        prior_scopes=prior_scopes,
     )
     if inserted is not None:
         return inserted

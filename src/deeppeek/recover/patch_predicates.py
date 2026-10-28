@@ -31,24 +31,104 @@ Why a separate module:
 import re
 
 
+# ===========================================================================
+#  Continuation markers  (2026-10-28e)
+# ===========================================================================
+#
+# Suffixes that mark a line as mid-expression rather than a completed
+# statement: a trailing binary/assignment operator, a line
+# continuation, a bare scope opener (`:`), an unclosed paren/bracket
+# on the same line, or the Python boolean operators `and` / `or`.
+#
+# `\b` on `and` / `or` prevents false positives on identifiers that
+# happen to end with those letters (`band`, `floor`, `understand`).
+#
+# Kept as a compiled regex rather than a suffix tuple because
+# `str.endswith("and")` would also match `"band"`, `"sand"`, and
+# other identifiers where `and` is only a substring.
+
+_CONTINUATION_END_RE = re.compile(
+    r'(?:[,+*/\\=|&(]|\band\b|\bor\b|:)$'
+)
+
+
+def _has_unclosed_brackets(text):
+    """Return True iff `text` has unclosed `(`, `[`, or `{` brackets.
+
+    Brackets inside string literals (single-, double-quoted, or
+    backticked) are ignored.  Escape sequences (`\\"`, `\\'`, ``\\```)
+    inside strings are honored.
+
+    Used by `_body_is_complete_at_boundary` as the "is this a complete
+    expression?" half of the language-agnostic check: a body ending in
+    a bare assignment (`x = 1`) is balanced and complete, while a body
+    opening a bracketed group without closing it (`x = (`) is not.
+    """
+    if not text:
+        return False
+    depth = 0
+    i = 0
+    n = len(text)
+    in_str = None
+    while i < n:
+        ch = text[i]
+        if in_str:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch in ('"', "'", chr(96)):
+            in_str = ch
+            i += 1
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        i += 1
+    return depth != 0
+
+
 def _body_is_complete_at_boundary(body):
     """True iff `body` can be inserted between two lines as a
     complete statement.
 
     Complete = last non-blank line ends with `;`, `}`, `)`, or is a
-    closing HTML tag (`</details>`, `</summary>`, …),
-    OR the body is a single-line comment (`// ...` or `# ...`),
-    OR the body is a standalone block comment (`/* ... */`).
-    Everything else is either a continuation (ends with `,`,
-    `+`, `*`, etc.), an opener (ends with `{` or `(`), or a
-    fragment.
+    closing HTML tag (`</details>`, `</summary>`, …), OR the body is a
+    single-line comment (`// ...` or `# ...`), OR the body is a
+    standalone block comment (`/* ... */`), OR the body is
+    bracket-balanced (no unclosed `(`, `[`, `{`) and the last
+    non-blank line does not end with a continuation marker (`,`, `\\`,
+    a binary operator, `and`, `or`, or a bare `:`).
+
+    The last clause makes the check language-agnostic.  Python
+    statements like `x = 1` and `return x` — which have no trailing
+    `;` — are recognized as complete; so are multi-line constructs
+    ending in an assignment (`try: ... output = 0`).  JS statements
+    using ASI (`x = 1` without `;`) are accepted the same way.
+
+    Bodies that open a bracketed group without closing it (`x = (`,
+    `[1, 2`), that end mid-expression (`x = 1 +`), or that end in a
+    scope opener (`def foo():`, `if x:`) are still rejected.
+
+    The check fires at the top of every insert heuristic
+    (`_try_insert_before_anchor`, `_try_insert_between_anchors`,
+    `_try_insert_after_anchor`) because those insert a body
+    *adjacent to* existing lines; an incomplete body would corrupt
+    the surrounding code.  The check is deliberately strict about
+    *structure* (unclosed brackets, dangling operators) and
+    deliberately lenient about *statement terminators* (no `;`
+    requirement), so a well-formed body from any language is
+    accepted.
     """
     if not body or not body.strip():
         return False
     lines = [ln for ln in body.splitlines() if ln.strip()]
     if not lines:
         return False
-    first = lines[0].strip()
     last = lines[-1].strip()
     if last.startswith("//") or last.startswith("#"):
         return True
@@ -58,13 +138,11 @@ def _body_is_complete_at_boundary(body):
         return True
     if last == "}":
         return True
-    # FIX 3: HTML closing tags count as complete.  A block ending
-    # with `</details>` closes the tag it opened.  The between-
-    # anchors heuristic needs this (the pg_base.py `View` block
-    # ends in `</details>`); the before-anchor heuristic inherits
-    # it (any complete body is a valid before-anchor insert).
     if last.startswith("</"):
         return True
+    if not _has_unclosed_brackets(body):
+        if not _CONTINUATION_END_RE.search(last):
+            return True
     return False
 
 

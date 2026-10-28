@@ -45,6 +45,29 @@ Handles only Python docstrings (FunctionDef/AsyncFunctionDef/ClassDef
 with a leading string constant).  JS comments, `<details>` inner
 text, and non-docstring placeholders fall through to the
 dispatcher's fail-closed refusal, which is the safe outcome.
+
+ALREADY-PRESENT SCOPED-REPLACE (2026-10-28f)
+============================================
+`_apply_scoped_single` used to *always* replace the scope's content
+with the patch body, even when the reindented body was token-
+equivalent to what was already there.  Re-running on an already-
+applied base then produced whitespace drift (bug 3: the `<details>`
+View section went from 10-space to 6-space indent in a second run,
+byte-identical after strip).
+
+Fix: after computing the reindented body and BEFORE the final
+assembly, check `_content_present_in_base(base_scope_text,
+reindented, threshold=0.99)`.  When 99%+ of the reindented body's
+lines are token-present in the existing scope, return `base` — the
+outer caller (`_apply_pairs` / `_try_deterministic_patch_inner`)
+treats it as `already-present`.
+
+Threshold 0.99 rather than 0.85 so a legitimate scoped-replace that
+changes even one substantive line still applies.  Specifically:
+
+  · A rename (`foo` → `bar`): scope's line 1 mismatch → 0% match.
+  · A 1-line change in a 20-line scope: 19/20 = 95% < 99%.
+  · A reprint of an identical scope (whitespace-only drift): 100%.
 """
 
 import re
@@ -62,6 +85,7 @@ from .patch_text import (
     _find_matching_brace, _reindent_body, _insert_lines_in_inner,
     _body_starts_with_comment, _find_leading_comment_start,
     _first_identifier,
+    _content_present_in_base,
 )
 
 
@@ -256,9 +280,6 @@ def _looks_like_scope_close(line):
 # ===========================================================================
 #  Placeholder merge  (2026-10-28)
 # ===========================================================================
-#
-# See module docstring, PLACEHOLDER MERGE section.
-
 
 def _find_python_docstring_span(body: str):
     """Return (start_char, end_char) of the first docstring in the
@@ -266,12 +287,6 @@ def _find_python_docstring_span(body: str):
 
     Character offsets are into `body`.  `end_char` is exclusive —
     it points past the closing triple quote.
-
-    A "docstring" here means: the first statement of the function
-    body is a bare string literal (an `ast.Expr` wrapping an
-    `ast.Constant` of type `str`).  This is Python's own definition;
-    a string literal as a non-first statement is not a docstring, and
-    is not handled.
     """
     try:
         tree = ast.parse(body)
@@ -310,10 +325,7 @@ def _find_python_docstring_span(body: str):
 
 
 def _extract_python_docstring(body: str):
-    """Return the first function/class's docstring *content* (the
-    string value without surrounding quotes), or None if there is
-    no such function or it has no docstring.
-    """
+    """Return the first function/class's docstring *content*."""
     try:
         tree = ast.parse(body)
     except SyntaxError:
@@ -340,47 +352,6 @@ def _merge_docstring_with_placeholder(base_scope: str,
                                       new_body: str) -> str:
     """If `new_body`'s function docstring begins with a placeholder
     marker, replace the marker with `base_scope`'s docstring content.
-
-    Returns `new_body` unchanged when:
-      · the new body's docstring contains no placeholder, or
-      · the new body's first function has no docstring at all, or
-      · the base scope's first function has no docstring.
-
-    When the merge fires, the base docstring's *content* (the string
-    value, without surrounding quotes) replaces the marker inside
-    the new body's docstring.  The new body's own docstring
-    delimiters stay, and any trailing text after the marker (e.g. an
-    appended paragraph) is preserved.
-
-    The base content is used verbatim, without re-indent.  A
-    docstring's first line typically has no leading whitespace
-    (it sits immediately after the opening quote), while its
-    continuation lines are indented to match the enclosing scope.
-    That layout is exactly what a merged docstring wants, so the
-    `ast.get_docstring` value is inserted as-is after trimming its
-    surrounding blank lines.  Re-indenting would push the first
-    line in by four spaces for no benefit.
-
-    Example layout:
-
-        base docstring body:
-            Decode a PNG and write it as a new layer.
-            <blank>
-                The PNG comes straight from ComfyUI.
-                QImage decodes it to Format_ARGB32.
-
-        new body docstring:
-            ... (docstring unchanged) ...
-            <blank>
-                `rotation` is degrees, positive = clockwise.
-
-        merged docstring body:
-            Decode a PNG and write it as a new layer.
-            <blank>
-                The PNG comes straight from ComfyUI.
-                QImage decodes it to Format_ARGB32.
-            <blank>
-                `rotation` is degrees, positive = clockwise.
     """
     new_doc_span = _find_python_docstring_span(new_body)
     if new_doc_span is None:
@@ -405,14 +376,6 @@ def _try_merge_placeholder_in_scope(base: str,
                                     new_body: str):
     """Attempt to consume a placeholder marker in `new_body` by
     merging the base scope's content.
-
-    Returns the merged body, or None if no merge is possible.
-
-    Uses `_SCOPE_PATTERNS` directly (matching `_apply_scoped_single`)
-    rather than `_find_scope_in_base`.  `_find_scope_in_base` is
-    brace-aware — it requires a `{` in the matched span — so it
-    returns None for every Python scope.  That made the merge path
-    unreachable for the Python docstring case it exists to handle.
     """
     if not scope_name or not new_body:
         return None
@@ -794,6 +757,20 @@ def _apply_scoped_single(base, scope_name, new_body):
         while m_end > m_start and base[m_end - 1] == "\n":
             m_end -= 1
         reindented = _reindent_body(base_indent, new_body)
+
+        # NEW (2026-10-28f): already-present scoped-replace.
+        # If 99%+ of the reindented body's lines are already token-
+        # present in the base scope, return base (no change).  The
+        # caller (outer patch loop or reconcile replay) marks the
+        # patch already-present.  Threshold 0.99 rather than 0.85 so
+        # a legitimate scoped-replace that changes even one
+        # substantive line still applies.  See the module docstring,
+        # ALREADY-PRESENT SCOPED-REPLACE section, and the motivating
+        # pg_base.py View-details whitespace-drift bug.
+        if _content_present_in_base(base_scope_text, reindented,
+                                     threshold=0.99):
+            return base
+
         if not _scope_signature_ok(reindented):
             return None
         return base[:indent_pos] + reindented + base[m_end:]

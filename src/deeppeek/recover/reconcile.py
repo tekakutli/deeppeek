@@ -17,96 +17,81 @@ patch idx before adding its own reconciliation warning.
 THREE MORE CLASSES OF STALE WARNING
 ===================================
 `content validation failed` from pass 8, `replace pair(s) failed`
-from pass 6, and `unresolved symbol reference(s) introduced by patch`
-from pass 8.5 get the same treatment: when reconcile rewrites their
-live state, the aggregate warning is removed.
+from pass 6, and `patch compatibility check failed` (pass 8.5) get
+the same treatment: when reconcile rewrites their live state, the
+aggregate warning is removed.
+
+PREFIX-MATCHING CORRECTION (2026-10-28e)
+========================================
+The stale-warning cleanup previously matched on
+`"unresolved symbol reference(s) introduced by patch:"` — a prefix
+that pass 8.5 never emits.  The actual warning text is
+`"patch compatibility check failed: unresolved symbol reference(s)..."`.
+The prefix mismatch meant a warning that a reconcile diagnostic on
+the *next* line contradicted survived reconcile in `warnings.txt`,
+producing an internally inconsistent report.
+
+The cleanup now matches the actual prefixes:
+  · "patch compatibility check failed:"   (pass 8.5)
+  · "unresolved symbol reference(s) introduced by patch:"  (legacy)
+  · "signature mismatch(es):"              (pass 8.5 sub-form)
+
+Each is cleared when the corresponding verification field
+(`unresolved_calls` / `signature_mismatches`) has been popped by
+reconcile.
+
+DIAGNOSTIC MESSAGE SPLIT (2026-10-28e)
+======================================
+`_diagnose_exclusion` used to prefix every patch exclusion with
+"introduces an unresolved symbol or structural failure" even when
+`_fuzzy_locate_elsewhere` had positively located the content in a
+different record.  That prefix contradicted the next clause
+("content matches X — likely misattributed").  Motivating case:
+pg_panel_scrubs.py idx=72, whose warning read "introduces an
+unresolved symbol or structural failure; content matches
+playgrounds/inpaint/pg_panel_bindings.py — likely misattributed".
+
+The three cases are now distinct:
+
+  1. `original_status == "failed"` — the patch never applied.
+     Message: "could not be placed; the rest of the record applies
+     cleanly without it."
+
+  2. `_fuzzy_locate_elsewhere` found a match — the patch applied
+     in-memory (it "compiled") but its content belongs in another
+     file.  Message: "content already exists in <other> — likely
+     misattributed, not written here."
+
+  3. Neither — the patch applied but produced a validation failure
+     that could not be attributed to a better file.  Message:
+     "introduces an unresolved symbol or structural failure; content
+     not found in any other file."
 
 ORDERING FIXES
 ==============
-  · `_diagnose_exclusion` now receives the pre-mutation status via
-    `original_status`, so the "could not be placed" branch is
-    reachable.  Prior versions mutated the status first and read it
-    after, so the generic "unresolved symbol" message always fired.
+  · `_diagnose_exclusion` receives the pre-mutation status via
+    `original_status`.
 
   · `_trust_cap(rec)` is called *after* `rec.verification
-    ["reconciled"]` is populated.  Prior versions called it before,
-    so reconciled records always saw HIGH instead of the documented
-    MEDIUM cap.
+    ["reconciled"]` is populated.
 
 LINT-AWARE REPLAY (2026-10-28b)
 ===============================
-`_count_failures` now runs pass 8.4's `_find_command_violations` on
-each candidate replay.  Without this, a record demoted by pass 8.4
-for an unused `@command` arg could be *promoted* by pass 8.7 if
-reconcile's own two checks (validate_content + symbols) happened to
-pass on the replayed content — even though the replayed content still
-declares the arg without reading it.  The result: a semantically
-broken file ships at MEDIUM trust.
-
-Motivating case (comfyui.py): `--output_rotation` was declared by a
-patch that applied; the wiring patch was excluded.  Pass 8.4
-correctly demoted to LOW.  Pass 8.7 replayed the content, saw a
-valid Python file with all symbols resolved, and promoted to MEDIUM
-— shipping the dead arg.  The fix: reconcile's replay now respects
-every demoting pass, not just the two it was originally written
-against.  This is the general invariant — a check that can demote
-must be re-run after any pass that can promote.
+`_count_failures` runs pass 8.4's `_find_command_violations` on each
+candidate replay, so a record demoted by pass 8.4 for an unused
+`@command` arg cannot be promoted by pass 8.7's two checks alone.
 
 DISTINCTIVE SCOPE-NAME MISATTRIBUTION (2026-10-28b)
 ===================================================
-`_fuzzy_locate_elsewhere` classifies an excluded patch as "likely
-misattributed" by checking whether its content already exists in a
-different record.  The original check used line-overlap thresholds
-(verbatim for short bodies, 0.85 for long) — which missed the
-`_clearImageAction` case: a function whose body was modified by
-three new lines dropped overlap below 0.85, so the misattribution
-was reported as an opaque "unresolved symbol" instead of "the body
-lives in pg_panel_bindings.py".
-
-New fast path: if the body declares *exactly one* top-level scope
-whose name is distinctive (a function/class, not a plain variable)
-AND that scope is also declared in another record AND the bodies
-overlap at 0.4, the other record is returned directly.
-
-"Distinctive" excludes short/generic names (`draw`, `_get`, `run`)
-that legitimately appear across playground files; a body with
-`_clearImageAction` or `syncPanelFields` is almost certainly
-specific to one file, so a same-named scope elsewhere is a strong
-misattribution signal.
-
-"SINGLE SCOPE" is load-bearing
-------------------------------
-The fast path requires that `_top_level_decls(body)` returns exactly
-one name.  A multi-decl body (a cluster of 10 functions, a class
-plus its helpers) is bulk content, not the "one function whose body
-lives elsewhere" shape.  Without this guard, a body of 10 helper
-functions with similar names (helper_0..helper_9) trips the path
-against an unrelated file that happens to have helper_0..helper_7,
-even though a whole-file 0.8 similarity is not the kind of
-misattribution the fast path exists to catch.  This guard is the
-fix for the test_patch_gates.py::test_fuzzy_long_body_uses_higher_
-threshold regression: the test's intent (0.85 for long bodies) is
-preserved for multi-scope bodies; the fast path only short-circuits
-it for single-scope bodies, where it is a much stronger signal.
+`_fuzzy_locate_elsewhere`'s fast path: if the body declares exactly
+one top-level scope whose name is distinctive AND that scope is also
+declared in another record AND the bodies overlap at 0.4, return
+that other record's path.
 
 MISATTRIBUTION GUARD (raised thresholds)
 ========================================
-`_fuzzy_locate_elsewhere` classifies an excluded patch as "likely
-misattributed" (content lives in a different file already) versus
-"could not be placed".  The threshold split:
-
-  · Short bodies (< 500 chars) require *verbatim* substring match.
-    Short bodies are idioms (try/except, arg-parse) that recur in
-    many files; a fuzzy hit at this length is not evidence of
-    misattribution.  Motivating case: a 4-line try/except block
-    matching a different file's try/except by 3-of-4 lines, where
-    the differing line names a different variable (`params` vs
-    `payload`) — that is not the same block.
-
-  · Substantial bodies (>= 500 chars) use fuzzy match at 0.85.
-    A 15% line drift on a large function is consistent with a
-    legitimate-but-different implementation; raising the threshold
-    (from 0.7) is conservative.
+Short bodies (< 500 chars) require verbatim substring match.
+Substantial bodies (>= 500 chars) use fuzzy match at 0.85.
 """
 
 import re
@@ -189,9 +174,8 @@ def _replay_excluding(rec, base, excluded_keys, path,
 def _count_failures(content, path, rec, base, records, excluded_keys):
     """Return (n_failures, [failure_descriptors]).
 
-    Runs every demoting check pass 8.x performs, so a promotion by
-    reconcile is only as strong as the *weakest* re-verified check.
-    See the module docstring, LINT-AWARE REPLAY section.
+    Runs every demoting check pass 8.x performs.  See the module
+    docstring, LINT-AWARE REPLAY section.
     """
     from .validate_output import validate_content
     from .symbols import find_unresolved_references
@@ -211,8 +195,6 @@ def _count_failures(content, path, rec, base, records, excluded_keys):
             "mismatched": mismatched,
         }))
 
-    # LINT-AWARE (2026-10-28b): re-run pass 8.4's unused-arg check on
-    # the replayed content.  See module docstring.
     if path.endswith(".py") and "@command" in content:
         try:
             from .lint import (
@@ -290,14 +272,7 @@ def _find_minimum_exclusions(rec, base, records, path, blocks_by_idx):
 def _is_distinctive_scope_name(name):
     """True iff `name` is long enough and distinctive enough that a
     same-named scope in another file is a strong misattribution
-    signal.
-
-    Excluded: short names (`draw`, `_get`, `run`), and names without
-    an underscore or camelCase (which is most generic verbs).  The
-    filter targets the motivating case (`_clearImageAction` — 17
-    chars, has an underscore) while avoiding false positives on
-    common helper names shared across playground files.
-    """
+    signal."""
     if not name or len(name) < 8:
         return False
     return "_" in name or any(c.isupper() for c in name)
@@ -308,29 +283,6 @@ def _scope_name_lives_elsewhere(body, current_path, records):
     distinctive AND that scope is also declared in another record AND
     the two bodies overlap at 0.4, return the other record's path.
     Else None.
-
-    SINGLE-SCOPE GUARD (2026-10-28b, fixes regression)
-    --------------------------------------------------
-    The fast path requires that the body declare exactly one
-    top-level scope.  A multi-decl body is bulk content, not the
-    "one function whose body lives elsewhere" shape — the fast path
-    is a signal for the case where a *single* function was misplaced.
-
-    Without this guard, a body of 10 helper functions
-    (helper_0..helper_9) trips the path against an unrelated file
-    that has helper_0..helper_7, since the body's first extracted
-    scope name (helper_0) matches and line overlap exceeds 0.4.
-    That defeats the 0.85 threshold for long bodies that
-    `test_fuzzy_long_body_uses_higher_threshold` locks in.  The
-    guard restores the threshold for multi-scope bodies while
-    keeping the fast path for single-scope bodies where it is
-    genuinely diagnostic.
-
-    Overlap threshold 0.4 — the `_clearImageAction` shape has 5 of 7
-    lines in common (0.71), so 0.4 is comfortable.  `syncPanelFields`
-    across two playgrounds (two different sets of element wiring)
-    overlaps under 0.4 and correctly fails the fast path, falling
-    through to the general 0.85 check.
     """
     from .prose import _extract_scope_from_body
     from .patch_text import _content_present_in_base
@@ -340,8 +292,6 @@ def _scope_name_lives_elsewhere(body, current_path, records):
     if not _is_distinctive_scope_name(scope_name):
         return None
 
-    # Single-scope guard: a multi-decl body is not a misattribution
-    # signal for any one of its scopes.  See the docstring above.
     if len(_top_level_decls(body)) != 1:
         return None
 
@@ -366,25 +316,12 @@ def _scope_name_lives_elsewhere(body, current_path, records):
 def _fuzzy_locate_elsewhere(body, current_path, records):
     """If `body` matches another record's content, return that
     record's path; else None.
-
-    Order of checks:
-
-      1. Distinctive-scope-name match (2026-10-28b): the body declares
-         a single distinctive function/class/<details> whose same-
-         named scope also lives in another record AND the two bodies
-         overlap meaningfully.  See module docstring, DISTINCTIVE
-         SCOPE-NAME MISATTRIBUTION section.
-
-      2. Existing verbatim / threshold logic: short bodies require
-         verbatim substring; substantial bodies use fuzzy match at
-         0.85.  See module docstring, MISATTRIBUTION GUARD section.
     """
     from .patch_text import _content_present_in_base
     body = (body or "").strip()
     if not body or len(body) < 40:
         return None
 
-    # NEW (2026-10-28b): distinctive scope-name fast path.
     scope_match = _scope_name_lives_elsewhere(body, current_path, records)
     if scope_match is not None:
         return scope_match
@@ -427,9 +364,19 @@ def _diagnose_exclusion(key, rec, records, original_status=None):
     """Produce a human-readable exclusion message.
 
     `original_status` overrides `patch.get("applied_by")` when the
-    caller has already mutated the patch status.  Without this, the
-    "could not be placed" branch never fires because the status is
-    already "skipped_unplaceable" by the time we read it.
+    caller has already mutated the patch status.
+
+    Three distinct cases (see module docstring, DIAGNOSTIC MESSAGE
+    SPLIT section):
+
+      1. `original_status == "failed"` — never applied.  "Could not
+         be placed."
+      2. `_fuzzy_locate_elsewhere` finds a match — applied but
+         belongs elsewhere.  "Content already exists in X;
+         misattributed."
+      3. Neither — applied but produces a validation failure that
+         couldn't be attributed.  "Introduces X; content not found
+         elsewhere."
     """
     if key[0] == "patch":
         idx = key[1]
@@ -448,9 +395,8 @@ def _diagnose_exclusion(key, rec, records, original_status=None):
             patch.get("body", ""), rec.path, records)
         if other is not None:
             return (f"excluded patch idx={idx} ({first!r}): "
-                    f"introduces an unresolved symbol or structural "
-                    f"failure; content matches {other} — likely "
-                    f"misattributed, not written here")
+                    f"content already exists in {other} — "
+                    f"likely misattributed, not written here")
         return (f"excluded patch idx={idx} ({first!r}): "
                 f"introduces an unresolved symbol or structural "
                 f"failure; content not found in any other file")
@@ -464,12 +410,7 @@ def _trust_cap(rec):
     """Trust ceiling for a record after reconciliation.
 
     A reconciled record caps at MEDIUM: reconciliation excluded the
-    evidence of a problem, not the problem itself.  MEDIUM (not LOW)
-    so the file still writes under default `--min-trust MEDIUM`, but
-    the exclusion is visible in the manifest.
-
-    The precondition — that `rec.verification["reconciled"]` is set
-    before this function is called — is the caller's job.
+    evidence of a problem, not the problem itself.
     """
     if rec.verification.get("reconciled"):
         return "MEDIUM"
@@ -487,12 +428,15 @@ def _base_content(rec, blocks_by_idx):
     return block.body
 
 
-_PASS6_PATCH_WARN_PREFIX = "patch idx="
-
-
 def _clear_stale_pass6_warnings(rec, excluded_keys):
-    """Remove warnings that are stale after reconciliation.  See the
-    module docstring for the four warning classes cleaned up."""
+    """Remove warnings that are stale after reconciliation.
+
+    PREFIX-MATCHING CORRECTION (2026-10-28e): the third class matches
+    `patch compatibility check failed:` (pass 8.5's actual output) as
+    well as the legacy `unresolved symbol reference(s) introduced by
+    patch:` prefix.  Both are cleared when the verification field has
+    been popped by reconcile.
+    """
     excluded_patch_idxs = set()
     for key in excluded_keys:
         if key[0] == "patch":
@@ -523,9 +467,18 @@ def _clear_stale_pass6_warnings(rec, excluded_keys):
             filtered.append(w)
             continue
 
-        if w.startswith(
-                "unresolved symbol reference(s) introduced by patch:"):
-            if not rec.verification.get("unresolved_calls"):
+        if (w.startswith(
+                "patch compatibility check failed:")
+                or w.startswith(
+                    "unresolved symbol reference(s) introduced by patch:")):
+            if (not rec.verification.get("unresolved_calls")
+                    and not rec.verification.get("signature_mismatches")):
+                continue
+            filtered.append(w)
+            continue
+
+        if w.startswith("signature mismatch(es):"):
+            if not rec.verification.get("signature_mismatches"):
                 continue
             filtered.append(w)
             continue
@@ -586,8 +539,6 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
                       file=sys.stderr)
             continue
 
-        # Capture original statuses before mutation so the
-        # diagnostic still knows which patches genuinely failed.
         original_statuses = {}
         for key in excluded_keys:
             if key[0] == "patch":

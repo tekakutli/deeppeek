@@ -226,6 +226,20 @@ SKIP_MISSING_FILES = {
     "Makefile", "README.md", "LICENSE", ".gitignore",
 }
 
+# Patch statuses that mean "the patch did not land in the destination
+# file." Used by write.py and residual.py to report placement failures
+# consistently. Deliberately excludes:
+#   · "already-present":          the patch's content was already there
+#   · "skipped_misattributed":    content lives in another file, recorded
+#                                 separately in verification.reconciled
+#   · "skipped_weak_attribution": tracked separately in reconcile's
+#                                 per-patch diagnostics
+_PLACEMENT_FAILURES = frozenset({
+    "failed",
+    "skipped_structural_damage",
+    "skipped_unplaceable",
+})
+
 SOURCE_EXTENSIONS = (
     ".py", ".js", ".mjs", ".jsx", ".ts", ".tsx", ".md", ".json",
     ".yaml", ".yml", ".css", ".toml", ".rs", ".go", ".c", ".cpp",

@@ -44,6 +44,19 @@ once (otherwise there's nothing to derive from); a derived scope
 that can't be located falls through to the same fail-closed return
 the named-scope path uses.
 
+SCOPE PROSE EXTENSION (2026-10-28e)
+===================================
+`_extract_scope_name_from_prose` now also matches "find the `X`
+command/method/function/..." and "the `X` command/method/function/..."
+shapes.  Motivating case: `kritomatic_daemon/handlers/comfyui.py`
+prose reads "In `handlers/comfyui.py`, find the `comfy_generate`
+command decorator. Add:" — the current patterns (in/to/for/the-X-
+function) didn't catch any of these.  With the extension, the
+extractor returns `comfy_generate`, which
+`patch_anchor_insert._anchor_within_callee` then resolves to
+`_comfy_generate_impl` (the callee that actually contains the
+anchor).
+
 HIGH CHURN: this is the newest heuristic (FIX 8).  It picks up new
 prose patterns, new container shapes, and new anchor idioms as they
 surface in the wild.  Isolating it means iterating on it does not
@@ -67,9 +80,22 @@ _SCOPE_NAME_FROM_PROSE_RES = (
     re.compile(r'\bto\s+`([A-Za-z_][\w$]*)`', re.IGNORECASE),
     # "for `Name`"
     re.compile(r'\bfor\s+`([A-Za-z_][\w$]*)`', re.IGNORECASE),
-    # "the `Name` function/class/method"
+    # "the `Name` function/class/method/..." (extended below)
     re.compile(r'\bthe\s+`([A-Za-z_][\w$]*)`\s+'
                r'(?:function|class|method|block|section)\b',
+               re.IGNORECASE),
+    # NEW (2026-10-28e): "find the `Name` command/method/function/..."
+    # and bare "the `Name` command/method/function/...".  Covers the
+    # comfyui.py prose shape ("find the `comfy_generate` command
+    # decorator").  Kept after the more specific patterns so they
+    # take precedence.
+    re.compile(r'\bfind\s+the\s+`([A-Za-z_][\w$]*)`\s+'
+               r'(?:command|method|function|class|handler|endpoint|'
+               r'decorator|implementation)\b',
+               re.IGNORECASE),
+    re.compile(r'\bthe\s+`([A-Za-z_][\w$]*)`\s+'
+               r'(?:command|method|function|class|handler|endpoint|'
+               r'decorator|implementation)\b',
                re.IGNORECASE),
 )
 

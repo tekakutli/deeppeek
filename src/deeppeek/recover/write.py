@@ -53,6 +53,14 @@ New in 2026-11-01 (g): the final summary reports reconciliation
 counts alongside the fail-closed count, so the operator sees
 "reconciled: N records, M items excluded" when pass 8.7 rescued a
 run that would otherwise have been fail-closed end to end.
+
+New in 2026-10-28e: centralised placement-failure reporting.
+`patch_failures` and `patch_failure_reasons` now use the shared
+`_PLACEMENT_FAILURES` set from `core.py`, so
+`skipped_structural_damage` — a patch that the structural sanity
+gate refused and which therefore never landed — is reported alongside
+`failed` and `skipped_unplaceable` instead of silently dropping out
+of both lists.  The FAIL-CLOSED summary loop uses the same set.
 """
 
 import hashlib
@@ -67,6 +75,7 @@ from typing import Optional
 from .core import (
     Block, FileRecord,
     SKIP_MISSING_FILES, SOURCE_EXTENSIONS,
+    _PLACEMENT_FAILURES,
     _basename,
 )
 from .llm import LLMClient
@@ -259,6 +268,8 @@ def _compute_block_disposition(b, records):
       · `block_skipped_misattributed` / `block_skipped_unplaceable` —
         pass 8.7 excluded the block and the rest of the record
         wrote cleanly.
+      · `block_skipped_structural_damage` — the structural sanity
+        gate refused the patch; see apply_patches._check_structural_sanity.
       · `block_failed` — patch failed and no reconciliation could
         recover the record.
       · `block_unapplied` — record fail-closed; block's patch may
@@ -1014,7 +1025,7 @@ def pass9_write(records: dict,
                 "reason": p.get("failure_reason", "unknown"),
             }
             for p in rec.patches
-            if p.get("applied_by") == "failed"
+            if p.get("applied_by") in _PLACEMENT_FAILURES
         ]
 
         decisions[path] = {
@@ -1031,7 +1042,7 @@ def pass9_write(records: dict,
             "pair_count": len(rec.pairs),
             "patch_failures": [
                 p["idx"] for p in rec.patches
-                if p.get("applied_by") == "failed"
+                if p.get("applied_by") in _PLACEMENT_FAILURES
             ],
             "patch_failure_reasons": patch_failure_reasons,
             "pair_failures": pair_failures,
@@ -1193,11 +1204,15 @@ def pass9_write(records: dict,
             if frec.content is None:
                 continue
             for pf in frec.patches:
-                if pf.get("applied_by") != "failed":
+                if pf.get("applied_by") not in _PLACEMENT_FAILURES:
                     continue
                 first_line = _patch_first_line(pf, limit=60)
                 reason = pf.get("failure_reason", "unknown")
-                print(f"    PATCH_FAILED {fpath} idx={pf['idx']}: "
+                tag = ("STRUCT_DAMAGE"
+                       if pf.get("applied_by")
+                       == "skipped_structural_damage"
+                       else "PATCH_FAILED")
+                print(f"    {tag} {fpath} idx={pf['idx']}: "
                       f"{first_line!r} — {reason}",
                       file=sys.stderr)
                 ctx = _patch_context(pf, limit=200)

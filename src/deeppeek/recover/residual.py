@@ -26,6 +26,10 @@ the file is rendered.
 WHAT GOES IN
 ============
   · `failed` — patch could not be applied by any heuristic.
+  · `skipped_structural_damage` — patch was applied in-memory but
+    refused by the structural sanity gate (see
+    `apply_patches._check_structural_sanity`); the file that would
+    have resulted is not what the patch's author meant.
   · `skipped_unplaceable` — patch/pair was excluded by pass 8.7
     reconciliation as unreconcilable (was failed or would corrupt).
   · `skipped_weak_attribution` — attribution was too weak to apply.
@@ -195,6 +199,15 @@ def _block_outcome(b: Block, rec: Optional[FileRecord],
             return ("skipped_unplaceable",
                     patch.get("failure_reason")
                     or "reconciliation excluded this patch")
+        if status == "skipped_structural_damage":
+            # NEW (2026-10-28e): structural sanity gate refused the
+            # patch; the record fail-closed.  Report it as its own
+            # outcome so the residual names the specific cause
+            # (e.g. "patch injected module-level statement(s) at
+            # column 0: ['try']") rather than a generic not_written.
+            return ("skipped_structural_damage",
+                    patch.get("failure_reason")
+                    or "structural sanity gate refused the patch")
         if status == "failed":
             return "failed", patch.get("failure_reason")
         if status == "skipped_weak_attribution":
@@ -368,3 +381,70 @@ def emit_residual(records: dict,
         print(f"  [residual] wrote {out_path} "
               f"({n_entries} block(s) unplaced)", file=sys.stderr)
     return content
+# ===========================================================================
+#  Reading: parse an existing residual.md
+# ===========================================================================
+#
+# The inverse of `_format_block`.  Two consumers:
+#
+#   · `deeppeek residual`        — list files in a residual.md
+#   · `deeppeek prompt reprint`  — build the file list the AI is
+#                                  asked to reprint
+#
+# Markers are the exact ones `_format_block` emits:
+#
+#   <!-- deeppeek: idx=N outcome=X [note='...'] [line=A..B] -->
+#   [context_before prose]
+#   ## File: `path`
+#   [fenced body]
+
+_BLOCK_MARKER_RE = re.compile(r'^<!-- deeppeek:\s', re.MULTILINE)
+_FENCE_OPENER_RE = re.compile(r'^(`{3,}|~{3,})', re.MULTILINE)
+_FILE_HEADER_RE = re.compile(r'^## File:\s*`([^`\n]+)`\s*$', re.MULTILINE)
+_OUTCOME_RE = re.compile(r'\boutcome=(\w+)')
+
+
+def parse_residual_entries(text: str) -> list:
+    """Parse a residual.md back into per-block entries.
+
+    Returns a list of `(path_or_None, outcome_or_None)` tuples, in
+    block order.  `path` is None for blocks with no `## File:` header
+    (unattributed orphans); `outcome` is None when the marker comment
+    carries no `outcome=` field.
+
+    The `## File:` header is only looked for *before* the first fence
+    opener in each block — a `## File:` line inside the recovered
+    file's own body is content, not a residual header.  This matters
+    for residuals of markdown files, where the body can itself
+    contain headers.
+    """
+    positions = [m.start() for m in _BLOCK_MARKER_RE.finditer(text)]
+    if not positions:
+        return []
+    positions.append(len(text))
+
+    entries = []
+    for i in range(len(positions) - 1):
+        chunk = text[positions[i]:positions[i + 1]]
+        marker_line = chunk.split("\n", 1)[0]
+        outcome_match = _OUTCOME_RE.search(marker_line)
+        outcome = outcome_match.group(1) if outcome_match else None
+
+        fence_match = _FENCE_OPENER_RE.search(chunk)
+        head = chunk[:fence_match.start()] if fence_match else chunk
+        file_match = _FILE_HEADER_RE.search(head)
+        path = file_match.group(1) if file_match else None
+
+        entries.append((path, outcome))
+    return entries
+
+
+def unique_residual_paths(text: str) -> list:
+    """Deduplicated, sorted list of file paths referenced by the
+    residual.  Unattributed blocks (no `## File:`) are ignored.
+    """
+    seen = set()
+    for p, _ in parse_residual_entries(text):
+        if p is not None:
+            seen.add(p)
+    return sorted(seen)

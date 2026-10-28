@@ -32,47 +32,15 @@ check.  This version additionally:
     added a duplicate copy of a **pre-existing** line outside its own
     body is reverted and marked `skipped_duplicate_insertion`.
 
-    The gate targets only pre-existing lines.  A patch that splits
-    a single pre-existing line into multiple lines (e.g., object-
-    literal splice) legitimately introduces lines that were not
-    individual lines before; those are not duplicates and must not
-    be flagged.  Motivating false positive: `const board = { a: 1 };`
-    becomes `const board = {\n  a: 1,\n  b: 2,\n};`, and the gate
-    previously flagged the split fragments as "duplicates".
-
   · STRUCTURAL-SANITY GATE (2026-10-28).  Every successful patch on a
     `.py` destination is post-checked via `_check_structural_sanity`.
     A patch whose application introduces a Python syntax error OR a
-    module-level statement injection (try/except/for/while/with at
-    column 0 that wasn't there before) is reverted and marked
+    module-level statement injection is reverted and marked
     `skipped_structural_damage`.
 
-    This gate is the fix for the `comfyui.py` failure: a `try/except`
-    fragment whose prose was `"Add just after:"` had no anchor,
-    because the prior patch was already-present (so it never
-    contributed a line to `prior_insertions`).  The fragment fell
-    through every insert heuristic and landed at module level via
-    structural-append.  The record-level `validate_content` correctly
-    fail-closed the file — but the diagnostic was opaque, and the
-    rotation feature was lost.  With this gate, the specific patch
-    fails (with a specific reason), the record continues with the
-    remaining patches, and the fail-closed outcome either goes away
-    (if the misplaced patch was the only defect) or names the culprit
-    patch precisely.
-
-    Motivating dual-gate rationale: `attribute_sanity_failure`
-    cannot replay a patch whose original success depended on
-    `prior_insertions` — so the record-level diagnostic can only
-    name the culprit when the record happens to have exactly one
-    problematic patch.  Per-patch checking is what surfaces the
-    culprit reliably.
-
-  · TERMINAL-STATUS PRESERVATION (2026-10-28).  When the fixed-point
-    loop breaks with `applied_this_pass == 0`, the surviving
-    `pending` list may contain patches whose status was already set
-    to a terminal value (`already-present`, `skipped_duplicate_
-    insertion`, `skipped_structural_damage`).  The follow-up "mark
-    as failed" loop now skips those, leaving their statuses intact.
+  · TERMINAL-STATUS PRESERVATION (2026-10-28).  Surviving `pending`
+    patches with a terminal `applied_by` status are not relabelled
+    `failed` by the follow-up loop.
 
   · PRIOR-INSERTIONS THREADING (2026-10-28).  `_try_deterministic_
     patch` (in `patch_dispatch.py`), `_try_blockquoted_patch`, and
@@ -82,39 +50,41 @@ check.  This version additionally:
 
   · ALREADY-PRESENT ANCHORING (2026-10-28).  When a single-line body
     is `already-present` in base, the body line is added to
-    `prior_insertions`.  This lets a subsequent "Add just after:"
-    block anchor to a pre-existing line that isn't itself the body
-    of any patch — the exact `comfyui.py` shape where the AI printed
-    `output_name = params.get("output_name") or None` as its own
-    block (already-present in base) and then tried to insert a
-    try/except "just after:" it.
+    `prior_insertions` so a subsequent "Add just after:" block can
+    anchor to a pre-existing line.
 
   · PRE-GATE FOR DUPLICATE ASSIGNMENTS (2026-10-28b).  Before any
     heuristic runs, a patch whose body is a single `var = expr` line
     that already appears verbatim in the current content is marked
-    `already-present` and skipped.  This closes the comfyui.py
-    `output_name = params.get("output_name") or None` shape: the
-    anchor-after heuristic found a "safe" spot inside `finally:` and
-    inserted the assignment there, where it was unreachable dead code.
-    The post-gate `_verify_no_duplicate_insertion` could not catch
-    it because its arithmetic is self-cancelling when the patch body
-    is itself the duplicate — the body_lines subtraction removes the
-    very line the gate is looking for.
+    `already-present` and skipped.
 
-    The pre-gate is scoped tightly: it fires only on single-line
-    assignments whose stripped form exactly matches a stripped line
-    in the current content.  Multi-line patches (which legitimately
-    repeat context lines) never trigger it.
+  · PRIOR-INSERTIONS SCOPE CONTEXT (2026-10-28e).  `_mark_already_
+    present` and the duplicate-assignment pre-gate now also record
+    the scope named by the Find block's *broader* prose (via
+    `_broader_context_for`, which pulls the last two preceding
+    blocks' `context_before`), keyed by the already-present line, in
+    a `prior_scopes` dict that threads alongside `prior_insertions`
+    into `_try_deterministic_patch`.
 
-    NONE-SAFE BODY (2026-10-28c): `patch.get("body") or ""` guards
-    against `body=None` (a key present with value None, where
-    `patch.get("body", "")` returns None because the default only
-    fires on missing keys).  An empty body is not a duplicate insert.
+    The narrow `patch["context_before"]` for a Find block is usually
+    just `"Find:"`.  The scope is often in the *previous* block's
+    prose ("In `handlers/comfyui.py`, find the `comfy_generate`
+    command decorator. Add:").  Reading broader context captures
+    that scope, which the prior-insertion fallback then uses to
+    disambiguate a repeated anchor.
+
+    Motivating shape: comfyui.py idx=96/97.  idx=96's Find block
+    anchors the line `output_name = params.get("output_name") or
+    None`, which appears twice (in `_comfy_generate_impl` and
+    `comfy_wait`).  Without broader context the extractor can't pick
+    one; with it, `comfy_generate` is recorded, and
+    `patch_anchor_insert._anchor_within_callee` resolves it to
+    `_comfy_generate_impl`.  idx=97 then lands correctly.
 
 DEPENDENCY: `_try_deterministic_patch` (in `patch_dispatch.py`) must
-accept the same `prior_insertions=None` keyword that this module
-passes into it.  `_try_blockquoted_patch` below threads the kwarg
-through unchanged.
+accept the same `prior_insertions=None` and `prior_scopes=None`
+keywords that this module passes into it.  `_try_blockquoted_patch`
+below threads both kwargs through unchanged.
 """
 
 import re
@@ -195,12 +165,21 @@ def _is_blockquoted_strong(b_idx, blocks_by_idx):
         return False
 
 
-def _try_blockquoted_patch(content, patch, path, prior_insertions=None):
+def _try_blockquoted_patch(content, patch, path, prior_insertions=None,
+                            prior_scopes=None):
     """Apply a blockquoted patch and validate the result structurally.
+
+    `prior_scopes` is threaded unchanged to `_try_deterministic_patch`
+    so prior-insertion anchors keep their recorded scopes.  See
+    `_mark_already_present` and the module docstring,
+    PRIOR-INSERTIONS SCOPE CONTEXT section.
     """
     from .validate_output import validate_content
     result = _try_deterministic_patch(
-        content, patch, path, prior_insertions=prior_insertions)
+        content, patch, path,
+        prior_insertions=prior_insertions,
+        prior_scopes=prior_scopes,
+    )
     if result is None:
         return None
     if result == content:
@@ -290,28 +269,12 @@ def _check_structural_sanity(old_content, new_content, path):
 
     Catches two failure modes on `.py` destinations:
 
-      1. `ast.parse(new_content)` fails.  The patch broke Python
-         syntax in a way the record-level `validate_content` would
-         also catch — but naming it here means the specific patch
-         is marked `skipped_structural_damage` with the syntax error
-         as its reason, rather than the record failing wholesale.
+      1. `ast.parse(new_content)` fails.
 
-      2. A module-level statement keyword (`try`, `except`, `finally`,
-         `for`, `while`, `with`) was added at column 0 that wasn't in
-         `old_content`.  The motivating case: a `try/except` block
-         was appended at module level because it failed every insert
-         heuristic.  Module-level `try:` is legal Python but
-         references function-local names that don't exist at module
-         scope; the resulting file parses cleanly and is broken at
-         runtime.  Only column-0 occurrences count — an indented
-         `try:` inside a function body is legitimate.
+      2. A module-level statement keyword was added at column 0.
 
-    Returns None for `.py` destinations that pass, or a short
-    reason string.  Always returns None for non-Python destinations —
-    the check is Python-specific by design, and a JS structural
-    check would belong in a sibling gate (unbalanced JS braces are
-    repairable by `repair.py`, so per-patch rejection would prevent
-    the repair suggestion from being generated).
+    Returns None for `.py` destinations that pass, or a short reason
+    string.  Always returns None for non-Python destinations.
     """
     if not old_content:
         return None
@@ -332,26 +295,66 @@ def _check_structural_sanity(old_content, new_content, path):
 
 
 # ===========================================================================
-#  Already-present anchoring (NEW 2026-10-28)
+#  Prior-line recording (NEW 2026-10-28e)
 # ===========================================================================
 
-def _mark_already_present(patch, body, record_inserted):
-    """Mark a patch `already-present` and, if its body is a single
-    non-blank line, add that line to `record_inserted` so subsequent
-    "Add just after:" blocks can anchor to it.
+def _record_single_line_anchor(patch, body, record_inserted,
+                                prior_scopes=None, broader_ctx=None):
+    """Record the body's single line (if any) as already-present.
 
-    Motivating case: the AI prints `output_name = params.get(...) or
-    None` as its own block (already in base), then tries to insert a
-    `try/except` fragment "just after:" that line.  Without this,
-    `_try_insert_after_anchor` has no anchor to work with: the prior
-    block was a no-op, so `prior_insertions` never gained the anchor
-    line.  The current line is in `base`, but the anchor heuristic
-    only consults prose backticks and `prior_insertions`.
+    Also records the scope named by the patch's prose — or, when the
+    narrow `context_before` doesn't name one, by the *broader* prose
+    (`broader_ctx`, supplied by the caller via `_broader_context_for`).
+
+    Broader-context recording is the load-bearing piece for the
+    comfyui.py shape (blocks idx=96/97): the Find block's own prose
+    is just `"Find:"`, but the two preceding blocks' prose names
+    `comfy_generate` as the wider context.  With broader context,
+    `prior_scopes[anchor]` carries that scope, which
+    `patch_anchor_insert._anchor_within_callee` then resolves to
+    `_comfy_generate_impl`.
+    """
+    if not isinstance(patch, dict):
+        return
+    body_lines = [ln for ln in body.splitlines() if ln.strip()]
+    if len(body_lines) != 1:
+        return
+    line = body_lines[0].strip()
+    if not line:
+        return
+    record_inserted.add(line)
+
+    if prior_scopes is None:
+        return
+    try:
+        from .patch_scope_insert import _extract_scope_name_from_prose
+    except ImportError:
+        return
+    scope = _extract_scope_name_from_prose(patch.get("context_before") or "")
+    if not scope and broader_ctx:
+        scope = _extract_scope_name_from_prose(broader_ctx)
+    if scope:
+        prior_scopes[line] = scope
+
+
+# ===========================================================================
+#  Already-present anchoring (2026-10-28 / 2026-10-28e)
+# ===========================================================================
+
+def _mark_already_present(patch, body, record_inserted,
+                          prior_scopes=None, broader_ctx=None):
+    """Mark a patch `already-present` and record its single line as
+    an anchor for subsequent "Add just after:" blocks.
+
+    `broader_ctx` (optional) is passed to `_record_single_line_anchor`
+    as the fallback scope source when the narrow `context_before`
+    doesn't name a scope.  See the module docstring, PRIOR-INSERTIONS
+    SCOPE CONTEXT section.
     """
     patch["applied_by"] = "already-present"
-    body_lines = [ln for ln in body.splitlines() if ln.strip()]
-    if len(body_lines) == 1:
-        record_inserted.add(body_lines[0].strip())
+    _record_single_line_anchor(patch, body, record_inserted,
+                                prior_scopes=prior_scopes,
+                                broader_ctx=broader_ctx)
 
 
 # ===========================================================================
@@ -418,6 +421,12 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
             line.strip() for line in base.split("\n") if line.strip()
         }
         record_inserted = set()
+        # NEW (2026-10-28e): prior-insertion scope context.  Maps a
+        # stripped line to the scope name extracted from the Find
+        # block's broader prose.  Consumed by
+        # `_try_insert_after_anchor`'s prior-insertion fallback when
+        # the anchor is repeated in the base.
+        prior_scopes: dict = {}
 
         trust_cap = "MEDIUM" if rec.dedup_reason == "last_full" else "HIGH"
 
@@ -426,6 +435,9 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
             content, pair_records = _apply_pairs(content, rec.pairs)
             record_inserted |= _collect_inserted_lines(base, content)
             rec.verification["pair_records"] = pair_records
+
+        def _broader_for(p):
+            return _broader_context_for(p, blocks_by_idx, records, path)
 
         # ------------------------------------------------------------------
         # FIXED-POINT PATCH LOOP
@@ -447,12 +459,13 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                         file=sys.stderr,
                     )
                     # Anchor the (already-present) line for subsequent
-                    # "Add just after:" blocks.  See _mark_already_present.
+                    # "Add just after:" blocks.  See _record_single_line_anchor.
                     _body = patch.get("body") or ""
-                    _body_lines = [ln for ln in _body.splitlines()
-                                    if ln.strip()]
-                    if len(_body_lines) == 1:
-                        record_inserted.add(_body_lines[0].strip())
+                    _record_single_line_anchor(
+                        patch, _body, record_inserted,
+                        prior_scopes=prior_scopes,
+                        broader_ctx=_broader_for(patch),
+                    )
                     continue
 
                 original_body = patch["body"]
@@ -463,7 +476,10 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                     patch["filtered_duplicate_lines"] = True
                     if not filtered_body.strip():
                         _mark_already_present(
-                            patch, original_body, record_inserted)
+                            patch, original_body, record_inserted,
+                            prior_scopes=prior_scopes,
+                            broader_ctx=_broader_for(patch),
+                        )
                         print(
                             f"  [insert-filter] {path} "
                             f"idx={patch['idx']}: filtered to empty",
@@ -483,11 +499,15 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                 if _is_blockquoted_strong(patch["idx"], blocks_by_idx):
                     result = _try_blockquoted_patch(
                         content, patch_to_apply, path,
-                        prior_insertions=record_inserted)
+                        prior_insertions=record_inserted,
+                        prior_scopes=prior_scopes,
+                    )
                 else:
                     result = _try_deterministic_patch(
                         content, patch_to_apply, path,
-                        prior_insertions=record_inserted)
+                        prior_insertions=record_inserted,
+                        prior_scopes=prior_scopes,
+                    )
 
                 if result is not None and result != content:
                     if not _verify_no_duplicate_insertion(
@@ -513,19 +533,26 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                     continue
 
                 if result == content:
-                    _mark_already_present(patch, original_body,
-                                           record_inserted)
+                    _mark_already_present(
+                        patch, original_body, record_inserted,
+                        prior_scopes=prior_scopes,
+                        broader_ctx=_broader_for(patch),
+                    )
                     continue
 
                 if was_filtered:
                     if _is_blockquoted_strong(patch["idx"], blocks_by_idx):
                         result = _try_blockquoted_patch(
                             content, patch, path,
-                            prior_insertions=record_inserted)
+                            prior_insertions=record_inserted,
+                            prior_scopes=prior_scopes,
+                        )
                     else:
                         result = _try_deterministic_patch(
                             content, patch, path,
-                            prior_insertions=record_inserted)
+                            prior_insertions=record_inserted,
+                            prior_scopes=prior_scopes,
+                        )
                     if result is not None and result != content:
                         if not _verify_no_duplicate_insertion(
                                 content, result, patch, path):
@@ -553,18 +580,27 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                         applied_this_pass += 1
                         continue
                     if result == content:
-                        _mark_already_present(patch, original_body,
-                                               record_inserted)
+                        _mark_already_present(
+                            patch, original_body, record_inserted,
+                            prior_scopes=prior_scopes,
+                            broader_ctx=_broader_for(patch),
+                        )
                         continue
 
                 if _patch_already_present(patch_to_apply["body"], content):
-                    _mark_already_present(patch, patch_to_apply["body"],
-                                           record_inserted)
+                    _mark_already_present(
+                        patch, patch_to_apply["body"], record_inserted,
+                        prior_scopes=prior_scopes,
+                        broader_ctx=_broader_for(patch),
+                    )
                     continue
 
                 if _diff_already_applied(patch_to_apply["body"], content):
-                    _mark_already_present(patch, patch_to_apply["body"],
-                                           record_inserted)
+                    _mark_already_present(
+                        patch, patch_to_apply["body"], record_inserted,
+                        prior_scopes=prior_scopes,
+                        broader_ctx=_broader_for(patch),
+                    )
                     continue
 
                 if _is_deletion_instruction(
@@ -574,7 +610,10 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                             patch_to_apply["body"], content):
                         _mark_already_present(
                             patch, patch_to_apply["body"],
-                            record_inserted)
+                            record_inserted,
+                            prior_scopes=prior_scopes,
+                            broader_ctx=_broader_for(patch),
+                        )
                         continue
 
                 broader = _broader_context_for(
@@ -586,11 +625,15 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                             patch["idx"], blocks_by_idx):
                         retry_result = _try_blockquoted_patch(
                             content, broader_patch, path,
-                            prior_insertions=record_inserted)
+                            prior_insertions=record_inserted,
+                            prior_scopes=prior_scopes,
+                        )
                     else:
                         retry_result = _try_deterministic_patch(
                             content, broader_patch, path,
-                            prior_insertions=record_inserted)
+                            prior_insertions=record_inserted,
+                            prior_scopes=prior_scopes,
+                        )
                     if retry_result is not None and retry_result != content:
                         if not _verify_no_duplicate_insertion(
                                 content, retry_result, patch, path):
@@ -614,7 +657,10 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                     if retry_result == content:
                         _mark_already_present(
                             patch, patch_to_apply["body"],
-                            record_inserted)
+                            record_inserted,
+                            prior_scopes=prior_scopes,
+                            broader_ctx=_broader_for(patch),
+                        )
                         continue
 
                 if llm is not None:
