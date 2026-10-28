@@ -15,6 +15,27 @@ parent directory of the listed files.
 When no FILE arguments are given, the script scans DEFAULT_DIR using the
 configured filters below.
 
+TREE MODES
+==========
+Two tree-rendering modes exist:
+
+  Default (FILE mode)  — the DIRECTORY TREE section shows the subtree
+                         that contains the listed files, pruned of any
+                         directory that holds no listed file.  Matches
+                         the "what's in this dump" question exactly.
+
+  --tree-from-scan     — (only valid with FILE arguments) the DIRECTORY
+                         TREE section is built from a full scan of the
+                         scan root, showing EVERY file that matches
+                         DEFAULT_EXTENSIONS.  Files that are in the
+                         explicit list have no marker; files that were
+                         filtered out are suffixed with `[skip]`.  This
+                         lets a caller (notably dump_filtered.py) show
+                         the full project tree with the filtered set
+                         highlighted, so the user can see what was
+                         excluded without losing the context of what
+                         the project contains.
+
 Files whose own content *looks like another dump* — i.e. contains a
 `=====...=====\nFILE i/N: ...` block header at line start — are skipped
 by default (DEFAULT_SKIP_DUMP_FILES = True). This prevents an
@@ -221,18 +242,35 @@ def find_files(
 def _render_tree(node: dict, prefix: str) -> list[str]:
     lines: list[str] = []
     dirs = sorted(k for k in node if k != _FILES)
-    files = sorted(node.get(_FILES, []))
-    entries: list[tuple[str, bool]] = (
-        [(d, True) for d in dirs] + [(f, False) for f in files]
+
+    # File entries may be plain strings (legacy tree modes) or
+    # (name, is_included) tuples (produced by build_tree with
+    # mark_skipped=True).  Normalize to a list of (name, is_included)
+    # before rendering.
+    raw_files = node.get(_FILES, [])
+    file_entries: list[tuple[str, bool]] = []
+    for f in raw_files:
+        if isinstance(f, tuple):
+            file_entries.append(f)
+        else:
+            file_entries.append((f, True))
+    file_entries.sort(key=lambda x: x[0])
+
+    entries: list[tuple[str, bool, bool]] = (
+        [(d, True, True) for d in dirs]
+        + [(name, False, is_included) for name, is_included in file_entries]
     )
 
-    for i, (name, is_dir) in enumerate(entries):
+    for i, (name, is_dir, is_included) in enumerate(entries):
         last = i == len(entries) - 1
         connector = "└── " if last else "├── "
-        lines.append(prefix + connector + name + ("/" if is_dir else ""))
         if is_dir:
+            lines.append(prefix + connector + name + "/")
             extension = "    " if last else "│   "
             lines.extend(_render_tree(node[name], prefix + extension))
+        else:
+            suffix = "" if is_included else "  [skip]"
+            lines.append(prefix + connector + name + suffix)
     return lines
 
 
@@ -241,13 +279,32 @@ def build_tree(
     include_dirs: set[str],
     tree_exclude_dirs: list[str],
     dumped_files: list[Path],
+    mark_skipped: bool = False,
+    extensions: list[str] | None = None,
 ) -> dict:
     """Build a nested dict describing the directory structure under `root`.
 
     Every directory found under `root` is included — including directories
     that were excluded from dumping — except those matching
-    `tree_exclude_dirs`.  The files listed inside each directory are only
-    the ones that were actually dumped.
+    `tree_exclude_dirs`.
+
+    `dumped_files` is the set of files that will actually appear as FILE
+    blocks in the dump.
+
+    When `mark_skipped=False` (default, original behaviour), only files in
+    `dumped_files` appear in the tree.  This matches what a
+    "files I was asked to dump" tree should show.
+
+    When `mark_skipped=True`, every file under `root` whose name matches
+    one of `extensions` (if provided) appears in the tree:
+      · files in `dumped_files` are added as plain strings
+      · files NOT in `dumped_files` are added as `(name, False)` tuples
+
+    `_render_tree` renders the two forms differently, appending `  [skip]`
+    to any file marked as not-included.  This is what powers the
+    `--tree-from-scan` mode: the tree shows the full candidate set with
+    the filtered-out files highlighted, without losing context about what
+    the project actually contains.
     """
     dumped = {Path(os.path.relpath(f, root)) for f in dumped_files}
     tree: dict = {}
@@ -269,8 +326,22 @@ def build_tree(
             node = node.setdefault(part, {})
 
         for name in filenames:
-            if (Path(*rel_parts) / name) in dumped:
-                node.setdefault(_FILES, []).append(name)
+            rel = Path(*rel_parts) / name
+            is_included = rel in dumped
+            if is_included:
+                node.setdefault(_FILES, []).append(
+                    (name, True) if mark_skipped else name
+                )
+            elif mark_skipped:
+                # Only show files that would have been candidates under
+                # the scan's extension filter.  A `.png` or binary blob
+                # that would never be dumped is noise in the tree, not
+                # signal about what was excluded.
+                if extensions and not any(
+                    name.endswith(e) for e in extensions
+                ):
+                    continue
+                node.setdefault(_FILES, []).append((name, False))
 
     return tree
 
@@ -285,6 +356,10 @@ def build_tree_from_files(
     Only the directories that lead to one of `files` appear.  Files still
     inside a directory matched by `tree_exclude_dirs` are pruned from the
     tree (but they will still be dumped — this only affects rendering).
+
+    This is the legacy "pruned" tree used when FILE arguments are passed
+    without `--tree-from-scan`.  For the "full tree with [skip] markers"
+    mode, use `build_tree(..., mark_skipped=True, extensions=...)`.
     """
     tree: dict = {}
     for f in files:
@@ -426,6 +501,15 @@ def main() -> int:
         action="store_false", default=None,
         help=("Include files whose content looks like another dump."),
     )
+    parser.add_argument(
+        "--tree-from-scan", action="store_true", default=False,
+        help=("(FILE mode only) Build the DIRECTORY TREE section from a "
+              "full scan of the scan root instead of the common parent "
+              "of the listed files, and mark every file NOT in the "
+              "explicit list with `  [skip]`.  Shows the full project "
+              "tree with the excluded files highlighted.  No effect "
+              "without FILE arguments."),
+    )
     args = parser.parse_args()
 
     root = Path(DEFAULT_DIR)
@@ -461,9 +545,19 @@ def main() -> int:
         if not common.is_dir():
             common = common.parent
 
-        tree_root = common
+        if args.tree_from_scan:
+            # Scan the whole project (from the scan root, not the
+            # common parent of the listed files) so the tree shows
+            # everything, with `[skip]` on the excluded files.
+            tree_root = root.resolve()
+        else:
+            tree_root = common
         recursive = True
     else:
+        if args.tree_from_scan:
+            print("warning: --tree-from-scan has no effect without FILE "
+                  "arguments; ignoring", file=sys.stderr)
+
         affix = args.affix if args.affix is not None else DEFAULT_AFFIX
         if affix == "":
             affix = None
@@ -515,10 +609,23 @@ def main() -> int:
         fh.write("DIRECTORY TREE\n")
         fh.write(HEADER + "\n")
         fh.write("```\n")
-        if args.files:
-            tree = build_tree_from_files(tree_root, files, tree_exclude_dirs)
+        if args.files and not args.tree_from_scan:
+            # Legacy FILE mode: pruned tree containing only the
+            # listed files' common subtree.
+            tree = build_tree_from_files(
+                tree_root, files, tree_exclude_dirs,
+            )
         else:
-            tree = build_tree(tree_root, include_dirs, tree_exclude_dirs, files)
+            # Scan mode OR --tree-from-scan: walk the whole tree
+            # under `tree_root`.  In --tree-from-scan mode, files
+            # not in `files` are shown with `[skip]`; in scan mode,
+            # every file in `files` is added unmarked (identical to
+            # the original behaviour for the scan case).
+            tree = build_tree(
+                tree_root, include_dirs, tree_exclude_dirs, files,
+                mark_skipped=args.tree_from_scan,
+                extensions=extensions if args.tree_from_scan else None,
+            )
         fh.write(render_tree(tree, str(tree_root)) + "\n")
         fh.write("```\n\n")
 

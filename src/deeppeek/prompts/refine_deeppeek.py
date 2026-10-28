@@ -10,9 +10,15 @@ Pipeline (extends `review`):
     apply      deeppeek recover <conversation> --apply-here
     require    hard: deeppeek/ must exist post-apply
     status     scripts/status.py in cwd → <ws>/diff.txt
-    dump       dump.py -r in the deeppeek source, with DEFAULT_EXCLUDE_DIRS
-               extended to also exclude "commands" and "extension"
+    dump       dump.py in the deeppeek source, restricted to an
+               explicit whitelist (recover/ pipeline, its tests,
+               the fixtures, pyproject.toml, test infrastructure)
+    cwd-dump   (optional, --with-dump) dump_filtered.py in cwd,
+               filtered to files whose basenames appear as `## File:`
+               headers in the conversation.  Attached as a file chip
+               alongside everything else.
     pipe       diff.txt + meta files + conversation.md + deeppeek_dump.md
+               [+ project_dump_<cwd>_filtered.md with --with-dump]
     type       short templated prompt
 
 Differences from `review`:
@@ -20,12 +26,39 @@ Differences from `review`:
   · The original conversation markdown is attached as a file chip, so
     the model can see what was actually applied (not just what happened
     when applying it).
-  · A full dump of the deeppeek source is attached, so the model can
+  · A dump of deeppeek's own source is attached, so the model can
     quote specific file paths and function names when proposing fixes.
+    The dump is restricted to the recovery pipeline and its tests —
+    everything else (browser-capture protocol, extension, CLI
+    dispatch, AI prompt pipelines, docs, README) is excluded, because
+    the refine prompt is about making `recover` general and robust,
+    not about the rest of the tool.
+  · With `--with-dump`, a filtered dump of the current working
+    directory is attached too, so the model can see the actual current
+    state of every file the conversation tries to edit.  The dump is
+    produced by `scripts/dumps/dump_filtered.py`, which extracts every
+    `## File:` basename from the conversation, scans cwd for matches,
+    and passes an explicit file list to `dump.py`.  Basename matching
+    is intentionally loose: `utils.py` in several directories all
+    match, because the conversation may not encode the project's real
+    layout, and a false positive costs one extra file while a false
+    negative costs a file the model needs to see.
 
-The dump explicitly loads dump.py as a module and overrides
-DEFAULT_EXCLUDE_DIRS — the exclusion list is not exposed on dump.py's
-CLI, so shelling out would not let us add "commands" and "extension".
+Both the deeppeek-source dump and the cwd dump use `dump.py`'s
+FILE-args mode (an explicit file list) rather than scan mode.  In
+scan mode `dump.py` walks the tree and applies its own filters;
+FILE-args mode bypasses those filters entirely — "what you list is
+what you get."  That is what makes the whitelist deterministic:
+`_collect_refine_dump_files` returns exactly the files that should
+appear, and `dump.py` writes exactly those.
+
+The cwd dump is a subprocess, not an import.  `dump_filtered.py` is
+deliberately standalone (no deeppeek import) so the user can run it
+directly from a terminal to preview the dump before wiring it into
+this pipeline.  Running it as a subprocess also keeps the argv/cwd
+context clean — we've just invoked dump.py in `_stage_dump_deeppeek`,
+and the module-level state dump.py caches (parser cache, etc.) stays
+out of this stage.
 
 `--text STR` behaves exactly as in `review`: it replaces the composer
 text verbatim, and the attachments are still piped unless `--no-pipe`
@@ -52,16 +85,31 @@ from typing import Optional
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _STATUS_PY_SCRIPT = _PROJECT_ROOT / "scripts" / "status.py"
 _DUMP_PY_SCRIPT = _PROJECT_ROOT / "scripts" / "dumps" / "dump.py"
+_DUMP_FILTERED_PY_SCRIPT = _PROJECT_ROOT / "scripts" / "dumps" / "dump_filtered.py"
+_DUMP_FILTERED_TIMEOUT = 300.0  # seconds, for the dump_filtered.py subprocess
 DEFAULT_CONVERSATION = Path("/tmp/conversation.md")
 
-# Extra directory names to exclude from the deeppeek source dump, on
-# top of whatever dump.py ships with at DEFAULT_EXCLUDE_DIRS.
-# `commands/` and `extension/` are large subtrees that rarely carry
-# the patching logic the refinement prompt cares about; excluding them
-# keeps the dump small enough that the model can actually read it end
-# to end.  The user can pass `--dump-py` to use a different script
-# whose excludes fit better.
-_REFINE_DUMP_EXCLUDE_EXTRA = ["commands", "extension"]
+# The refine prompt asks the AI to make the recovery pipeline robust
+# enough to ingest any script in the wild.  That requires the
+# pipeline itself, the test fixtures that pin down expected
+# behaviour, and the dependency list — nothing else.  The
+# browser-capture protocol, the extension, the CLI dispatcher, the
+# AI prompt pipelines, the docs, and the general README are all
+# context the model does not need, and their inclusion dilutes
+# attention on the actual pipeline.
+#
+# Directories are collected recursively; individual files are added
+# verbatim.  `tests/helpers.py` is imported by `test_schema.py`;
+# `tests/conftest.py` puts `src/` on sys.path for pytest.
+_REFINE_DUMP_KEEP_DIRS = (
+    "src/deeppeek/recover",
+    "tests/recover",
+)
+_REFINE_DUMP_KEEP_FILES = (
+    "pyproject.toml",
+    "tests/conftest.py",
+    "tests/helpers.py",
+)
 
 
 DEFAULT_PROMPT_TEMPLATE = """\
@@ -280,29 +328,78 @@ def _stage_status(cwd: Path, ws: Path,
 
 
 # ---------------------------------------------------------------------------
-# deeppeek source dump
+# deeppeek source dump — restricted to the recovery pipeline
 # ---------------------------------------------------------------------------
 
-def _stage_dump_deeppeek(source: Path, ws: Path,
-                          args: argparse.Namespace) -> Path:
-    """Dump `source` recursively to <ws>/deeppeek_dump.md.
+def _collect_refine_dump_files(source: Path) -> list[Path]:
+    """Return the explicit file list the refine dump should include.
 
-    Loads dump.py as a module, extends DEFAULT_EXCLUDE_DIRS with
-    _REFINE_DUMP_EXCLUDE_EXTRA, then invokes `main()` with `-r -o`
-    so the output path is exact.
+    Explicit-file mode (not scan mode) is what keeps the dump
+    focused.  `dump.py` in scan mode would emit every source file
+    under the tree; the refine prompt only cares about the recovery
+    pipeline, so we list exactly those paths and pass them to
+    `dump.py`'s FILE-args mode.
 
-    Loading-as-module (rather than shelling out) is required because
-    dump.py does not expose its exclusion list on the CLI.
+    In FILE-args mode `dump.py` bypasses its extension / affix /
+    include / exclude filters entirely — what we list is what gets
+    dumped — so the resulting markdown has no files outside the
+    whitelist above.
     """
-    dump_py = args.dump_py or _DUMP_PY_SCRIPT
+    keep: list[Path] = []
+
+    for keep_dir in _REFINE_DUMP_KEEP_DIRS:
+        d = source / keep_dir
+        if not d.is_dir():
+            continue
+        for p in sorted(d.rglob("*")):
+            if not p.is_file():
+                continue
+            rel_parts = p.relative_to(source).parts
+            if any(part.startswith(".") or part == "__pycache__"
+                   for part in rel_parts):
+                continue
+            keep.append(p)
+
+    for keep_file in _REFINE_DUMP_KEEP_FILES:
+        p = source / keep_file
+        if p.is_file():
+            keep.append(p)
+
+    return keep
+
+
+def _stage_dump_deeppeek(source: Path, ws: Path) -> Path:
+    """Dump the refine-relevant subset of `source` to
+    <ws>/deeppeek_dump.md.
+
+    Uses `dump.py`'s FILE-args mode with an explicit file list
+    (see `_collect_refine_dump_files`).  Explicit-file mode is what
+    keeps the dump focused — the AI is being asked to fix the
+    recovery pipeline, not to read the whole project.
+
+    Loading `dump.py` as a module (rather than shelling out) lets
+    the process reuse the running interpreter and avoids an extra
+    Python startup.
+    """
+    dump_py = _DUMP_PY_SCRIPT
     if not dump_py.is_file():
         raise SystemExit(
             f"error: dump.py not found at {dump_py}\n"
-            f"  pass --dump-py to point at a different script"
+            f"  this file ships with deeppeek at "
+            f"`scripts/dumps/dump.py`;\n"
+            f"  reinstall from a source checkout "
+            f"(`pipx install --editable /path/to/deeppeek --force`)"
         )
     if not source.is_dir():
         raise SystemExit(
             f"error: deeppeek source is not a directory: {source}")
+
+    files = _collect_refine_dump_files(source)
+    if not files:
+        raise SystemExit(
+            f"error: refine dump would be empty — none of "
+            f"{_REFINE_DUMP_KEEP_DIRS} or {_REFINE_DUMP_KEEP_FILES} "
+            f"exist under {source}")
 
     out = ws / "deeppeek_dump.md"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -314,18 +411,20 @@ def _stage_dump_deeppeek(source: Path, ws: Path,
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
-    base_excludes = list(getattr(mod, "DEFAULT_EXCLUDE_DIRS", []) or [])
-    mod.DEFAULT_EXCLUDE_DIRS = base_excludes + list(_REFINE_DUMP_EXCLUDE_EXTRA)
-
-    print(f"[dump] dump.py -r in {source}", file=sys.stderr)
-    print(f"  added excludes (on top of dump.py defaults): "
-          f"{_REFINE_DUMP_EXCLUDE_EXTRA}", file=sys.stderr)
+    print(f"[dump] dump.py (explicit file list) in {source}",
+          file=sys.stderr)
+    print(f"  keep dirs:  {list(_REFINE_DUMP_KEEP_DIRS)}",
+          file=sys.stderr)
+    print(f"  keep files: {list(_REFINE_DUMP_KEEP_FILES)}",
+          file=sys.stderr)
+    print(f"  {len(files)} file(s) selected", file=sys.stderr)
 
     old_cwd = Path.cwd()
     saved_argv = sys.argv
     try:
         os.chdir(str(source))
-        sys.argv = [str(dump_py), "-r", "-o", str(out)]
+        rel_paths = [str(f.relative_to(source)) for f in files]
+        sys.argv = [str(dump_py), "-o", str(out)] + rel_paths
         rc = mod.main()
     finally:
         sys.argv = saved_argv
@@ -335,8 +434,84 @@ def _stage_dump_deeppeek(source: Path, ws: Path,
         raise SystemExit(f"error: dump.py exited {rc}")
     if not out.is_file() or not out.read_text(encoding="utf-8").strip():
         raise SystemExit(f"error: dump.py did not produce {out}")
-    print(f"  wrote {out} ({out.stat().st_size:,} bytes)", file=sys.stderr)
+    print(f"  wrote {out} ({out.stat().st_size:,} bytes)",
+          file=sys.stderr)
     return out
+
+
+# ---------------------------------------------------------------------------
+# cwd dump (filtered to conversation-referenced files)
+# ---------------------------------------------------------------------------
+#
+# Delegates to `scripts/dumps/dump_filtered.py`, a standalone script
+# that extracts every `## File:` basename from the conversation,
+# scans cwd for matching files, and runs dump.py with an explicit
+# file list.  See that script's module docstring for the design.
+#
+# Kept as a subprocess (rather than an in-process import) for two
+# reasons:
+#
+#   · dump_filtered.py is deliberately standalone (no deeppeek
+#     import) so the user can run it directly from a terminal to
+#     preview the dump before wiring it into this pipeline.
+#   · The subprocess runs dump.py in a clean argv/cwd context,
+#     avoiding any state leak from having just invoked dump.py in
+#     `_stage_dump_deeppeek`.
+
+def _stage_dump_cwd_filtered(cwd: Path, ws: Path,
+                              conversation: Path) -> Optional[Path]:
+    """Run dump_filtered.py; return the dump path, or None if no
+    files matched (exit 2).  On hard failure, raise SystemExit.
+
+    Exit codes from dump_filtered.py:
+      0 — matches found; real dump written
+      2 — no matches; stub written (caller should NOT pipe it)
+      anything else — hard error; abort
+    """
+    script = _DUMP_FILTERED_PY_SCRIPT
+    if not script.is_file():
+        raise SystemExit(
+            f"error: dump_filtered.py not found at {script}\n"
+            f"  this file ships with deeppeek at "
+            f"`scripts/dumps/dump_filtered.py`;\n"
+            f"  reinstall from a source checkout "
+            f"(`pipx install --editable /path/to/deeppeek --force`)")
+
+    # Match dump_filtered.py's own default naming (dump.py's
+    # `<stem>_<dirname><suffix>` convention + `_filtered`), so the
+    # file the user sees in the workspace matches what
+    # `scripts/dumps/dump_filtered.py <conv> <cwd>` would have
+    # produced on its own.
+    dirname = cwd.name or "root"
+    dirname = dirname.replace(os.sep, "_").replace("/", "_")
+    out = ws / f"project_dump_{dirname}_filtered.md"
+    cmd = [
+        sys.executable, str(script),
+        str(conversation),
+        str(cwd),
+        "-o", str(out),
+    ]
+
+    print(f"[cwd-dump] filtering {cwd} to files mentioned in "
+          f"{conversation.name}", file=sys.stderr)
+    rc, _, _ = _run_cmd(
+        cmd, cwd=cwd,
+        timeout=_DUMP_FILTERED_TIMEOUT, allow_failure=True,
+    )
+    if rc == 0:
+        if not out.is_file():
+            raise SystemExit(
+                f"error: dump_filtered.py reported success but did "
+                f"not write {out}")
+        return out
+    if rc == 2:
+        print(f"  [cwd-dump] no files in {cwd} matched any header "
+              f"in {conversation.name}; not attaching the cwd dump",
+              file=sys.stderr)
+        return None
+    raise SystemExit(
+        f"error: dump_filtered.py exited {rc} "
+        f"(see stderr above for details)")
 
 
 # ---------------------------------------------------------------------------
@@ -503,7 +678,7 @@ def run(args: argparse.Namespace) -> int:
     for f in meta_files:
         print(f"    {f.name}", file=sys.stderr)
 
-    dump_path = _stage_dump_deeppeek(inferred, ws, args)
+    dump_path = _stage_dump_deeppeek(inferred, ws)
 
     # Conversation must exist — apply just read it, but check anyway
     # so `--no-pipe` runs can still build the prompt from its path.
@@ -511,6 +686,15 @@ def run(args: argparse.Namespace) -> int:
         raise SystemExit(
             f"error: conversation file not found: {args.conversation}"
         )
+
+    # 6b. Optional: cwd dump filtered to files mentioned in the
+    #     conversation.  Runs regardless of --no-pipe (like the
+    #     status capture and deeppeek dump); the filtered dump is a
+    #     useful workspace artifact even when not piped.
+    cwd_dump_path: Optional[Path] = None
+    if args.with_dump:
+        cwd_dump_path = _stage_dump_cwd_filtered(
+            cwd, ws, args.conversation)
 
     # 7. Build the composer text.
     composer_text, source_tag = _resolve_composer_text(
@@ -526,6 +710,8 @@ def run(args: argparse.Namespace) -> int:
             print(f"  {f}", file=sys.stderr)
         print(f"  {args.conversation}", file=sys.stderr)
         print(f"  {dump_path}", file=sys.stderr)
+        if cwd_dump_path is not None:
+            print(f"  {cwd_dump_path}", file=sys.stderr)
         print(f"\n[dry-run] recover exited {recover_rc}", file=sys.stderr)
         print(f"[dry-run] composer text ({source_tag}) below; not typed.",
               file=sys.stderr)
@@ -541,6 +727,8 @@ def run(args: argparse.Namespace) -> int:
             args.conversation,
             dump_path,
         ]
+        if cwd_dump_path is not None:
+            files.append(cwd_dump_path)
     return _stage_emit_parallel(composer_text, files, args)
 
 
@@ -586,11 +774,19 @@ def register(sub: argparse._SubParsersAction) -> None:
              f"arguments and print a diff-style view to stdout.",
     )
     p.add_argument(
-        "--dump-py", type=Path, default=None,
-        help=f"override the dump.py script path "
-             f"(default: {_DUMP_PY_SCRIPT}).  Must support `-r -o "
-             f"PATH`; its DEFAULT_EXCLUDE_DIRS will be extended "
-             f"with {_REFINE_DUMP_EXCLUDE_EXTRA}.",
+        "--with-dump", action="store_true",
+        help="also dump the current working directory (the project "
+             "being reviewed) and attach it as a file chip.  The "
+             "dump is filtered to files whose basenames appear as "
+             "`## File:` headers in the conversation — this keeps "
+             "it small enough for the model to actually read, "
+             "while preserving the current state of every file the "
+             "conversation tries to edit.  Basenames with multiple "
+             "matches (e.g. `utils.py` in several directories) "
+             "include every match; the conversation may not "
+             "specify a path, so any potential target is kept.  "
+             "Runs regardless of --no-pipe (the filtered dump is "
+             "a useful workspace artifact even when not piped).",
     )
     p.add_argument(
         "--no-pipe", action="store_true",
