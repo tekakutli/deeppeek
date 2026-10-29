@@ -17,6 +17,7 @@ from .commands import (
     prompt as prompt_cmd,
     test as test_cmd,
     scripts as scripts_cmd,
+    hijack as hijack_cmd,
 )
 
 
@@ -37,6 +38,7 @@ def _build_root_parser() -> argparse.ArgumentParser:
     pipe_cmd.register(sub)
     type_cmd.register(sub)
     enter_cmd.register(sub)
+    hijack_cmd.register(sub)
     prompt_cmd.register(sub)
     extension_cmd.register(sub)
     diagnose_cmd.register(sub)
@@ -65,6 +67,7 @@ _DISPATCH = {
     # that forgets the intercept fails with a clear message rather
     # than a KeyError.
     "scripts": scripts_cmd.run,
+    "hijack": hijack_cmd.run,
 }
 
 

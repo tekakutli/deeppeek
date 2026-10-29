@@ -193,6 +193,66 @@ function attachHandlers(es) {
     } catch (_) {}
   });
 
+  // ---- hijack-install (deeppeek hijack) ----
+  es.addEventListener("hijack-install", async (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+    const batchId = data.batch_id;
+    console.log(`DSX: hijack-install received (batch=${batchId})`);
+    let result = { success: false, reason: "no active deepseek tab" };
+    try {
+      const [tab] = await browser.tabs.query({
+        active: true, currentWindow: true,
+      });
+      if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+        const resp = await browser.tabs.sendMessage(tab.id, {
+          type: "DSX_HIJACK_INSTALL",
+        });
+        result = resp || { success: false, reason: "no response from content script" };
+      }
+    } catch (err) {
+      result = { success: false, reason: `sendMessage threw: ${err.message}` };
+    }
+    console.log(`DSX: hijack-install result:`, result);
+    try {
+      await fetch(`${DSX_URL}/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ __ack: "hijack-install", batch_id: batchId, result }),
+      });
+    } catch (_) {}
+  });
+
+  // ---- hijack-uninstall ----
+  es.addEventListener("hijack-uninstall", async (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+    const batchId = data.batch_id;
+    console.log(`DSX: hijack-uninstall received (batch=${batchId})`);
+    let result = { success: false, reason: "no active deepseek tab" };
+    try {
+      const [tab] = await browser.tabs.query({
+        active: true, currentWindow: true,
+      });
+      if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+        const resp = await browser.tabs.sendMessage(tab.id, {
+          type: "DSX_HIJACK_UNINSTALL",
+        });
+        result = resp || { success: false, reason: "no response from content script" };
+      }
+    } catch (err) {
+      result = { success: false, reason: `sendMessage threw: ${err.message}` };
+    }
+    console.log(`DSX: hijack-uninstall result:`, result);
+    try {
+      await fetch(`${DSX_URL}/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ __ack: "hijack-uninstall", batch_id: batchId, result }),
+      });
+    } catch (_) {}
+  });
+
   // ---- clear (deeppeek prompt delete) ----
   es.addEventListener("clear", async (e) => {
     let data = {};

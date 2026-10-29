@@ -165,6 +165,45 @@
       }
     }
 
+    if (msg.type === "DSX_HIJACK_INSTALL") {
+      if (!(await ensurePageWorldFn("__dsx_hijack_install_json"))) {
+        return { success: false, reason: "page-world hijack unavailable" };
+      }
+      try {
+        const json = await window.wrappedJSObject
+          .__dsx_hijack_install_json("{}");
+        return JSON.parse(json);
+      } catch (e) {
+        return { success: false, reason: `hijack install threw: ${e.message}` };
+      }
+    }
+
+    if (msg.type === "DSX_HIJACK_UNINSTALL") {
+      if (!(await ensurePageWorldFn("__dsx_hijack_uninstall_json"))) {
+        return { success: false, reason: "page-world hijack unavailable" };
+      }
+      try {
+        const json = await window.wrappedJSObject
+          .__dsx_hijack_uninstall_json("{}");
+        return JSON.parse(json);
+      } catch (e) {
+        return { success: false, reason: `hijack uninstall threw: ${e.message}` };
+      }
+    }
+
+    if (msg.type === "DSX_HIJACK_STATUS") {
+      if (!(await ensurePageWorldFn("__dsx_hijack_status_json"))) {
+        return { success: false, reason: "page-world hijack unavailable" };
+      }
+      try {
+        const json = await window.wrappedJSObject
+          .__dsx_hijack_status_json("{}");
+        return JSON.parse(json);
+      } catch (e) {
+        return { success: false, reason: `hijack status threw: ${e.message}` };
+      }
+    }
+
     return null;
   });
 
