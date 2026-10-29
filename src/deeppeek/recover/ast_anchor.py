@@ -18,7 +18,7 @@ Direct
 
 Embedded
     The block is code *inside a string literal* of the container file.
-    E.g. a `.py` file with `PANEL_FIELDS_JS = r""""""` and a JS
+    E.g. a `.py` file with `PANEL_FIELDS_JS = r\"\"\"\"\"\"` and a JS
     block that belongs inside that string.  This is the common
     "JS/HTML in a Python constant" pattern (playgrounds, template
     systems).  The algorithm:
@@ -41,6 +41,22 @@ Depends on the `[ast]` extra: `tree-sitter` + `tree-sitter-javascript`
 (+ `tree-sitter-typescript` and `tree-sitter-python` if installed;
 each is optional — missing grammars are silently skipped, so the tool
 degrades to text-only mode transparently).
+
+GRAMMAR AVAILABILITY REPORTING
+==============================
+`ast_status()` reports per-grammar availability, not just JS/Python.
+The 2026-10-28 pg_base.py run showed why: tree-sitter-html was not in
+the `[ast]` extra, so `_try_embedded_html_snap` silently returned None
+for every candidate, `_try_region_replace` fell back to a raw
+similarity window, and a 3-line window was spliced with a 17-line body
+producing a nested `<div class="field">` inside itself.  Every gate
+downstream (ast.parse, js_balance, patch_presence) reported success
+because the tag counts were balanced.
+
+`ast_status()["html"]` and `["css"]` expose that gap; the pipeline
+logs them at startup so a user with a broken or partial grammar
+install sees the reason structural checks degraded to line-based
+heuristics, rather than inferring it from a silently-corrupted target.
 """
 
 from typing import Optional
@@ -709,6 +725,47 @@ def is_available() -> bool:
     return _has_inprocess_ast() or _has_venv_ast()
 
 
+def _grammar_available(module_name: str) -> bool:
+    """True iff the tree-sitter grammar module is importable in this
+    interpreter or in the repo .venv's Python.
+
+    Used only for diagnostics — the actual code paths already fall back
+    to balance-only checks when a grammar is unavailable.  The pipeline
+    logs this so a user with a broken grammar install sees the reason
+    structural checks silently degraded to line-based heuristics.
+
+    Motivating case: tree-sitter-html was not in the `[ast]` extra, so
+    `_try_embedded_html_snap` silently returned None for every
+    candidate.  `ast_status()["html"]` was not exposed, so the pg_base
+    run's structural failure was invisible in the manifest until we
+    opened the file.
+    """
+    try:
+        __import__(module_name)
+        return True
+    except ImportError:
+        pass
+    py = _find_venv_python()
+    if py is None:
+        return False
+    probe = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(_src_dir())!r})\n"
+        f"try:\n"
+        f"    __import__({module_name!r})\n"
+        f"except ImportError:\n"
+        f"    sys.exit(1)\n"
+    )
+    try:
+        proc = subprocess.run(
+            [str(py), "-c", probe],
+            capture_output=True, timeout=5.0,
+        )
+        return proc.returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
 def ast_status() -> dict:
     """Report AST availability and how it is provided.
 
@@ -716,12 +773,17 @@ def ast_status() -> dict:
       in_process: bool   — tree-sitter importable in current interpreter
       via_venv:   bool   — tree-sitter importable via repo .venv subprocess
       venv_path:  str|None — path to repo .venv python if found
+      html:       bool   — tree-sitter-html importable (in-process or
+                          via .venv)
+      css:        bool   — tree-sitter-css importable
     """
     venv_py = _find_venv_python()
     return {
         "in_process": _has_inprocess_ast(),
         "via_venv": _has_venv_ast(),
         "venv_path": str(venv_py) if venv_py else None,
+        "html": _grammar_available("tree_sitter_html"),
+        "css": _grammar_available("tree_sitter_css"),
     }
 
 
@@ -748,7 +810,7 @@ def try_ast_anchor(base: str, body: str, path: str,
         print("  [ast] skipped: tree-sitter unavailable in-process "
               "and in repo .venv", file=sys.stderr)
         print("         install: pipx inject deeppeek tree-sitter "
-              "tree-sitter-javascript", file=sys.stderr)
+              "tree-sitter-javascript tree-sitter-html", file=sys.stderr)
         print("         or:      .venv/bin/pip install -e '.[ast]'",
               file=sys.stderr)
         return None

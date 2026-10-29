@@ -83,7 +83,7 @@ PROSE-NAMED-SCOPE: INSERT vs REPLACE (2026-11-05)
 
 Two bugs in the prior version:
 
-  1. The regex `\b(?:in|inside|within|to|for)\s+`[A-Za-z_][\w$]*``
+  1. The regex `\\b(?:in|inside|within|to|for)\\s+`[A-Za-z_][\\w$]*``
      did NOT match dotted identifiers or filenames (`pg_base.py`,
      `comfyui_krita.py`).  When the prose said "In `pg_base.py`,
      replace the rotation field:", the regex missed it and
@@ -105,6 +105,36 @@ verb — the "insert into scope" shape — is gated.
 The regex also now accepts dots in the backticked identifier, so
 "In `pg_base.py`, ..." is correctly recognised as naming a scope
 (and, since it also says "replace", region-replace runs).
+
+SNAP-FIRST CANDIDATE ORDERING (2026-11-05)
+==========================================
+The candidate set used to try the RAW similarity window first,
+appending the AST-snapped and pair-swept candidates after.  That
+worked when the raw window was small enough to be a legitimate
+statement, but produced silent corruption on the pg_base.py shape:
+the raw 3-line `<input>` window passed all structural checks
+(balanced tags, balanced braces), so `splice_region` returned it as
+the winner and the AST snap — which would have expanded to the
+outer `<div class="field">` — was never consulted.
+
+The 2026-11-05 fix reorders the candidates: snap first, then raw,
+then pair-sweep.  Combined with the opening-signature strictness
+below, this ensures a body that reopens a wrapper always expands
+to the enclosing element rather than being spliced over a
+mid-element window.
+
+HTML OPENING-SIGNATURE STRICTNESS (2026-11-05)
+==============================================
+For `.py`/`.html` destinations where the body's first line starts
+with `<`, the similarity sweep requires the window's first line to
+match the body's first line *exactly* (after stripping).  Without
+this, `<div class="field" style="align-items:center;">` matched a
+window opening `<input type="range" id="viewRotation"` — both start
+with `<`.  The looser "first word" check is retained for JS/Python.
+
+PROSE-NAMED-SCOPE — unchanged
+=============================
+Insertion vs replacement distinction preserved exactly.
 
 Prior docstring content (unchanged):
 - MULTI-STATEMENT APPLY (2026-10-28g)
@@ -520,7 +550,8 @@ def _is_already_applied(body_stripped, base):
 
 
 # ============================================================================
-#  Region replace (2026-10-29; size-aware 2026-11-05)
+#  Region replace (2026-10-29; size-aware 2026-11-05;
+#                 snap-first ordering 2026-11-05)
 # ============================================================================
 
 def _try_region_replace(base: str, body_stripped: str,
@@ -551,6 +582,13 @@ def _try_region_replace(base: str, body_stripped: str,
     body, so expand-shaped edits (body larger than base region) are
     not structurally penalised.  See the module docstring,
     SIZE-AWARE SIMILARITY.
+
+    Snap-first candidate ordering (2026-11-05): the AST-snapped
+    boundaries are tried BEFORE the raw similarity window.  Combined
+    with the HTML opening-signature strictness below, this ensures
+    that a body which reopens a wrapper (e.g. `<div class="field">`)
+    expands to the enclosing element rather than being spliced over
+    a mid-element window.
     """
     if not body_stripped or not base:
         return None
@@ -579,6 +617,8 @@ def _try_region_replace(base: str, body_stripped: str,
     body_set = set(body_stripped_list)
     first_body = body_stripped_list[0]
     first_body_word = first_body.split(None, 1)[0] if first_body else ""
+    is_html_dest = path.endswith((".py", ".html"))
+    is_html_body = first_body.startswith("<")
 
     best: Optional[tuple] = None
     for factor in (0.3, 0.4, 0.5, 0.6, 0.7, 0.85, 1.0,
@@ -606,7 +646,15 @@ def _try_region_replace(base: str, body_stripped: str,
             first_window_word = (
                 first_window.split(None, 1)[0] if first_window else ""
             )
-            if first_window_word != first_body_word:
+            # HTML opening-signature strictness: when the body's first
+            # line starts with `<` and the destination is `.py`/`.html`,
+            # require an exact (stripped) first-line match.  Otherwise
+            # `<div class="field">` matches `<input type="range">` —
+            # both start with `<` — and the wrong window is chosen.
+            if is_html_dest and is_html_body:
+                if first_window != first_body:
+                    continue
+            elif first_window_word != first_body_word:
                 continue
 
             window_set = set(window_stripped_list)
@@ -638,10 +686,17 @@ def _try_region_replace(base: str, body_stripped: str,
     )
     total = len(base_lines)
 
-    candidates = [(start, end)]
-    snapped = try_ast_snapped_boundaries(base, path, start, end)
+    # Snap-first candidate ordering: try the enclosing-element snap
+    # BEFORE the raw similarity window.  For an HTML body that
+    # reopens a wrapper, the raw window is a mid-element fragment;
+    # splicing there produces a nested duplicate instead of a
+    # replacement.  The snapped candidate expands to the enclosing
+    # element, which is what a "replace" body means.
+    candidates: list = []
+    snapped = try_ast_snapped_boundaries(base, path, start, end, body_stripped)
     if snapped is not None and snapped != (start, end):
         candidates.append(snapped)
+    candidates.append((start, end))
     candidates.extend(try_boundary_pairs(start, end, total))
 
     for trial_start, trial_end in candidates:
@@ -676,6 +731,7 @@ def _try_deterministic_patch_inner(base, patch, path="",
         return None
 
     context_before = patch.get("context_before", "")
+    scope_hint = patch.get("scope_hint", "") or ""
 
     signature_replace = _try_signature_replace(base, raw_body)
     if signature_replace is not None:
@@ -759,7 +815,9 @@ def _try_deterministic_patch_inner(base, patch, path="",
         (ln.lstrip() for ln in raw_body.splitlines() if ln.strip()), "")
     if _first_stripped.startswith("@"):
         _decorated_scope_result = _try_insert_into_named_scope(
-            base, raw_body, context_before, path)
+            base, raw_body, context_before, path,
+            scope_hint=scope_hint,
+        )
         if _decorated_scope_result is not None:
             return _decorated_scope_result
 
@@ -857,7 +915,9 @@ def _try_deterministic_patch_inner(base, patch, path="",
         return inserted
 
     inserted = _try_insert_into_named_scope(
-        base, raw_body, context_before, path)
+        base, raw_body, context_before, path,
+        scope_hint=scope_hint,
+    )
     if inserted is not None:
         return inserted
 

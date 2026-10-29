@@ -30,6 +30,27 @@ The anchor (when present) is only used to find the *position*; the
 scope name determines the *container*.  Without an anchor, insert at
 end of scope.
 
+SCOPE-HINT FALLBACK (2026-11-05)
+================================
+`_try_insert_into_named_scope` now accepts an optional `scope_hint`
+parameter.  When the fence's own prose is scope-silent (e.g. "And in
+every failure return:"), `_extract_scope_name_from_prose` returns
+`None` and the caller passes the enclosing H2-derived scope from
+`Block.scope_hint`.
+
+Motivating case: block 634 in the 2026-10-28 run.  Prose: "And in
+every failure return:".  Enclosing H2: "## Fix 3 — surface
+per-command errors in `handle_inpaint`".  Pass 1 attached
+`scope_hint="handle_inpaint"` to the block; pass 4 used it for
+attribution; but the patch dict built in `pass6_apply_patches` lost
+it, so the dispatcher had nothing to insert into.  The block
+orphaned, went to the residual as `orphan_unattributed`.
+
+The fix: `pass6_apply_patches` copies `scope_hint` onto the patch
+dict, and this heuristic accepts it as a second-class source of the
+scope name.  Prose continues to win when present (the fence's own
+context is more specific than the enclosing section's).
+
 ANCHOR-DERIVED SCOPE (2026-11-05)
 =================================
 When the prose has an anchor ("after the existing `timeout` parse")
@@ -398,7 +419,8 @@ def _verify_scope_insertion(base: str, result: str,
     return new_decls.issubset(direct_member_names)
 
 
-def _try_insert_into_named_scope(base, body, context_before, path=""):
+def _try_insert_into_named_scope(base, body, context_before, path="",
+                                  *, scope_hint=""):
     """Insert a scope-shaped body (nested statement or decorated method)
     into a named class/function from the prose.
 
@@ -406,11 +428,19 @@ def _try_insert_into_named_scope(base, body, context_before, path=""):
       · body is consistently indented (all content lines >= 2);
       · body does NOT start with a top-level declaration keyword;
       · prose names the target scope with a structural pattern, OR
+        the enclosing H2's `scope_hint` names it, OR
         the prose has an anchor whose enclosing scope can be derived;
       · the scope exists in base;
       · for `.py` destinations, the AST check
         (`_verify_scope_insertion`) confirms the inserted body's
         declarations are direct children of the target scope.
+
+    Precedence for the scope name (2026-11-05): the fence's own
+    prose wins when it names a scope; the `scope_hint` from the
+    enclosing H2 is a fallback when the prose is scope-silent.
+    Motivating case: block 634 in the 2026-10-28 run, where the
+    prose was "And in every failure return:" but the H2 was "##
+    Fix 3 — surface per-command errors in `handle_inpaint`".
     """
     if not body or not body.strip():
         return None
@@ -435,7 +465,10 @@ def _try_insert_into_named_scope(base, body, context_before, path=""):
     if _SCOPE_DECL_HEAD_RE.match(first_stripped):
         return None
 
+    # Prose wins; H2 scope_hint is a fallback when prose is silent.
     scope_name = _extract_scope_name_from_prose(context_before)
+    if not scope_name:
+        scope_name = scope_hint or None
     if not scope_name:
         anchor = _extract_after_anchor(context_before)
         if anchor:

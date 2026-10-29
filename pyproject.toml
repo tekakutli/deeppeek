@@ -18,6 +18,8 @@ ast = [
     "tree-sitter>=0.21",
     "tree-sitter-javascript>=0.21",
     "tree-sitter-python>=0.21",
+    "tree-sitter-html>=0.20.0",
+    "tree-sitter-css>=0.21.0",
 ]
 
 [project.scripts]

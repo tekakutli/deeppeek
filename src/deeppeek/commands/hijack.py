@@ -22,6 +22,10 @@ whose prose says `utils/paths.py` writes to `<dir>/paths.py`. Pass
 subdirectories as needed). Stripping is the safe default because a
 declared path could otherwise land files in unexpected places; the
 basename cannot escape `<dir>`.
+
+Existing files at the target path are overwritten (last write wins).
+No ` (1)` suffix is generated, so re-clicking a Download button is
+idempotent. This mirrors `deeppeek recover --apply-to` semantics.
 """
 import argparse
 import base64
@@ -161,6 +165,7 @@ def run(args: argparse.Namespace) -> int:
         mode_desc = (
             "preserve-path" if preserve_path else "flat (basename only)"
         )
+        mode_desc += ", overwrites existing files"
         print(f"\nHijacker installed.", file=sys.stderr)
         print(f"Mode: {mode_desc}", file=sys.stderr)
         print(f"Downloads will be written to: {out_dir}", file=sys.stderr)
@@ -201,7 +206,12 @@ def run(args: argparse.Namespace) -> int:
                     name = "download.bin"
                 rel = Path(name)
 
-            target = _dedup_target(out_dir / rel)
+            # Overwrite semantics: same path replaces whatever was
+            # there. No ` (1)` suffix, so re-clicking a Download
+            # button is idempotent. Matches `deeppeek recover
+            # --apply-to`, which also overwrites.
+            target = out_dir / rel
+            existed = target.exists()
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(data)
@@ -215,12 +225,13 @@ def run(args: argparse.Namespace) -> int:
                 display = target.relative_to(out_dir)
             except ValueError:
                 display = target
-            flattened = (
-                not preserve_path
-                and filename
-                and ("/" in filename or "\\" in filename)
-            )
-            note = f", declared {filename}" if flattened else ""
+            notes = []
+            if not preserve_path and filename and (
+                    "/" in filename or "\\" in filename):
+                notes.append(f"declared {filename}")
+            if existed:
+                notes.append("overwrote")
+            note = (", " + ", ".join(notes)) if notes else ""
             print(f"  [{n_written}] {display} "
                   f"({len(data):,} bytes, source={source}{note})",
                   file=sys.stderr)

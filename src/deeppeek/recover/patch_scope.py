@@ -8,7 +8,7 @@ and full-replace fail-closed.
 
 AST-SNAPPED BOUNDARIES (2026-10-29)
 ===================================
-`_apply_scoped_single` now splices via `patch_bounds.splice_region`
+`_apply_scoped_single` splices via `patch_bounds.splice_region`
 instead of the direct `base[:indent_pos] + reindented + base[m_end:]`.
 The splice candidate set is:
 
@@ -26,14 +26,76 @@ The splice candidate set is:
      scope is HTML `<details>` where the JS parser can't help).
 
 Each candidate goes through `patch_bounds.splice_region`, which
-validates structurally.  The first valid splice wins.  When none
-produces valid content, `_apply_scoped_single` returns None and
-fail-closed kicks in (the record lands in `low_trust/`).
+validates structurally, and then through `_verify_scope_isolation`
+(see below), which rejects candidates that silently damaged a
+sibling scope.  The first candidate that passes both wins.  When
+none does, `_apply_scoped_single` returns None and fail-closed kicks
+in (the record lands in `low_trust/`).
+
+SCOPE-ISOLATION VERIFICATION (2026-10-29)
+=========================================
+A "scope replace" must replace exactly one scope. Siblings must be
+byte-identical before and after. The motivating failure — the
+2026-10-29 `pg_panel_bindings.py` run — was a candidate whose
+splice boundary swallowed an adjacent function:
+
+    function _pickMaskAction() {           // ← base has these 3 lines
+      input.addEventListener("change", onMask);
+    }
+    function _clearImageAction() {         // ← the scope being replaced
+      ...
+    }
+
+Applying the replacement with a boundary that cut into
+`_pickMaskAction` produced a file where `_clearImageAction` was
+replaced correctly but `_pickMaskAction`'s `addEventListener` line
+had disappeared.  Both are top-level declarations; nothing in
+`splice_region`'s structural check noticed.
+
+`_verify_scope_isolation(base, result, scope_name, path)` is called
+on every candidate that passes the structural gate. It compares
+*declarations by name*:
+
+  · every base declaration except `scope_name` must appear
+    byte-identical in `result`;
+  · additional declarations in `result` are allowed (a scope
+    replace may add helper functions next to the scope it
+    replaces);
+  · comments, docstrings, decorators, and any preamble attached
+    to `scope_name` may change (they belong to the replaced scope).
+
+Comparison is name-indexed, not position-indexed — a candidate that
+swaps two sibling functions' order would fail position-based
+comparison but is not a semantic violation, and a candidate that
+leaves comments untouched but rewrites one sibling's body would
+pass position-based comparison but IS a semantic violation.
+Name-indexing gets both right.
+
+Language coverage:
+
+  · `.py`    — `ast.parse`, top-level FunctionDef / AsyncFunctionDef
+              / ClassDef.
+  · `.js`    — tree-sitter-javascript, top-level function_declaration
+              / class_declaration / lexical_declaration / variable_
+              declaration / export_statement.
+  · `.html`  — tree-sitter-html, top-level `<details>` elements,
+              keyed by their `<summary>` text.
+  · embedded — JS/HTML inside a `.py` triple-quoted string is
+              checked by recursing into the string.
+
+When the language's parser is unavailable (tree-sitter not
+installed, or `ast.parse` raises on content that `splice_region`
+already validated for structural balance), the isolation check fails
+open. The dispatcher's structural gate remains the outer safety
+net; isolation exists to catch the class of silent sibling damage
+that structural balance cannot detect.
 
 PATH THREADING (2026-10-29)
 ===========================
 `_apply_scoped` and `_apply_scoped_single` take an optional `path`
-argument so the AST snap can pick the right grammar.  Callers
+argument so the AST snap can pick the right grammar, the isolation
+check can pick the right parser, and `splice_region` can dispatch to
+the right structural validator.  Callers
 (`patch_dispatch._try_deterministic_patch_inner`,
 `patch_pairs._apply_pairs`) pass the record's path through.
 
@@ -71,6 +133,7 @@ Prior docstring content (unchanged):
 
 import re
 import ast
+from pathlib import Path
 
 from .prose import (
     _extract_scope_from_body,
@@ -660,7 +723,7 @@ def _try_ellipsis_splice(base, body, context_before=""):
 
 
 # ===========================================================================
-#  Scoped replace
+#  Scoped-replace
 # ===========================================================================
 
 def _new_body_is_complete_for_scope(base_scope_text, new_body):
@@ -705,12 +768,273 @@ def _try_scoped_partial_splice(base_scope_text, new_body):
     return result_text
 
 
+# ===========================================================================
+#  Scope-isolation verification  (2026-10-29)
+# ===========================================================================
+#
+# See the module docstring, SCOPE-ISOLATION VERIFICATION.  Short
+# version: a scope-replace on X may change X and anything attached to
+# X (comments, docstrings, decorators, leading preamble).  It must
+# NOT change any *other* top-level declaration.  Additional
+# declarations may be added — a scope-replace that also introduces
+# helpers next to the scope it replaces is a legitimate shape.
+#
+# The check is name-indexed on purpose.  Reordering two sibling
+# functions is legal; changing one sibling's body while leaving its
+# name in place is not.  Position-based comparison gets both wrong.
+
+_JS_DECL_NODE_TYPES = frozenset({
+    "function_declaration",
+    "generator_function_declaration",
+    "class_declaration",
+    "lexical_declaration",
+    "variable_declaration",
+    "export_statement",
+})
+
+
+def _node_text(node):
+    t = node.text
+    if isinstance(t, bytes):
+        return t.decode("utf-8", "replace")
+    return t or ""
+
+
+def _verify_scope_isolation(base, result, scope_name, path=""):
+    """Reject a scope-replace that also modified a sibling scope.
+
+    Compares *declarations* by name — functions, classes, top-level
+    bindings — not raw position, not comments, not preamble. The
+    pg_panel_bindings.py motivating case (`_pickMaskAction` truncated
+    alongside the intended `_clearImageAction` change) is caught by
+    "base declaration changed but its name isn't `scope_name`".
+
+    Rules:
+      · Every base declaration except `scope_name` must appear
+        unchanged in `result`.
+      · Additional declarations in `result` are allowed (a
+        scope-replace may add helper functions next to the scope
+        it replaces).
+      · Comments, docstrings, decorators, and any preamble
+        attached to `scope_name` may change (they belong to the
+        replaced scope).
+      · Fails open when the content cannot be parsed (tree-sitter
+        missing, syntax error in an unrelated region). The
+        dispatcher's structural gate is the outer safety net; this
+        check exists to prevent silent sibling damage in the cases
+        where parsing succeeds.
+
+    Returns True iff isolation holds.
+    """
+    if not base or not result:
+        return False
+
+    ext = Path(path).suffix.lower() if path else ""
+
+    if ext == ".py":
+        if not _py_decls_isolated(base, result, scope_name):
+            return False
+        return _embedded_html_isolated(base, result, scope_name)
+    if ext in (".js", ".mjs", ".jsx", ".ts", ".tsx"):
+        return _js_decls_isolated(base, result, scope_name)
+    if ext == ".html":
+        return _html_details_isolated(base, result, scope_name)
+    return True
+
+
+def _py_decls_isolated(base, result, scope_name):
+    try:
+        base_tree = ast.parse(base)
+        result_tree = ast.parse(result)
+    except SyntaxError:
+        return True
+    base_lines = base.splitlines()
+    result_lines = result.splitlines()
+
+    def _decls(tree, lines):
+        out = {}
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                     ast.ClassDef)):
+                continue
+            text = "\n".join(
+                lines[node.lineno - 1:node.end_lineno])
+            out[node.name] = text
+        return out
+
+    base_decls = _decls(base_tree, base_lines)
+    result_decls = _decls(result_tree, result_lines)
+    for name, text in base_decls.items():
+        if name == scope_name:
+            continue
+        if name not in result_decls:
+            return False
+        if result_decls[name] != text:
+            return False
+    return True
+
+
+def _js_decls_isolated(base, result, scope_name):
+    try:
+        from .ast_anchor import _get_parser
+    except ImportError:
+        return True
+    parser = _get_parser("javascript")
+    if parser is None:
+        return True
+
+    def _decls(content):
+        try:
+            tree = parser.parse(content.encode("utf-8"))
+        except Exception:
+            return None
+        if tree.root_node.has_error:
+            return None
+        lines = content.splitlines()
+        out = {}
+        for child in tree.root_node.children:
+            name = _js_decl_name(child)
+            if name is None:
+                continue
+            text = "\n".join(
+                lines[child.start_point[0]:child.end_point[0] + 1])
+            out[name] = text
+        return out
+
+    base_decls = _decls(base)
+    result_decls = _decls(result)
+    if base_decls is None or result_decls is None:
+        return True
+    for name, text in base_decls.items():
+        if name == scope_name:
+            continue
+        if name not in result_decls:
+            return False
+        if result_decls[name] != text:
+            return False
+    return True
+
+
+def _js_decl_name(node):
+    if node.type == "export_statement":
+        for child in node.children:
+            n = _js_decl_name(child)
+            if n:
+                return n
+        return None
+    if node.type in ("function_declaration",
+                     "generator_function_declaration",
+                     "class_declaration"):
+        for child in node.children:
+            if child.type == "identifier":
+                return _node_text(child)
+        return None
+    if node.type in ("lexical_declaration", "variable_declaration"):
+        for child in node.children:
+            if child.type == "variable_declarator":
+                for c in child.children:
+                    if c.type == "identifier":
+                        return _node_text(c)
+        return None
+    return None
+
+
+def _html_details_isolated(base, result, scope_name):
+    base_map = _html_details_map(base)
+    result_map = _html_details_map(result)
+    if base_map is None or result_map is None:
+        return True
+    for summary, text in base_map.items():
+        if summary == scope_name:
+            continue
+        if summary not in result_map:
+            return False
+        if result_map[summary] != text:
+            return False
+    return True
+
+
+def _html_details_map(content):
+    try:
+        import tree_sitter_html  # type: ignore
+        from tree_sitter import Language, Parser
+    except ImportError:
+        return None
+    try:
+        lang = Language(tree_sitter_html.language())
+        parser = Parser(lang)
+        tree = parser.parse(content.encode("utf-8"))
+    except Exception:
+        return None
+    if tree.root_node.has_error:
+        return None
+    lines = content.splitlines()
+    out = {}
+
+    def _walk(node):
+        if node.type == "element":
+            tag = _html_tag_name(node)
+            if tag == "details":
+                summary = _html_summary_of(node, content)
+                if summary:
+                    text = "\n".join(
+                        lines[node.start_point[0]:node.end_point[0] + 1])
+                    out[summary] = text
+                return
+        for child in node.children:
+            _walk(child)
+
+    _walk(tree.root_node)
+    return out
+
+
+def _html_tag_name(node):
+    for child in node.children:
+        if child.type in ("start_tag", "self_closing_tag"):
+            for c in child.children:
+                if c.type == "tag_name":
+                    return _node_text(c).lower()
+    return None
+
+
+def _html_summary_of(details_node, content):
+    for child in details_node.children:
+        if child.type == "element" and _html_tag_name(child) == "summary":
+            text = "\n".join(
+                content.splitlines()[
+                    child.start_point[0]:child.end_point[0] + 1])
+            m = re.search(r"<summary[^>]*>(.*?)</summary>",
+                          text, re.DOTALL | re.IGNORECASE)
+            if m:
+                return re.sub(r"\s+", " ", m.group(1)).strip()
+    return ""
+
+
+def _embedded_html_isolated(base, result, scope_name):
+    pat = re.compile(
+        r'(?:[rbufRBUF]{0,2})("""|\'\'\')(.*?)\1',
+        re.DOTALL,
+    )
+    base_strs = [m.group(2) for m in pat.finditer(base)
+                 if len(m.group(2)) >= 200]
+    result_strs = [m.group(2) for m in pat.finditer(result)
+                   if len(m.group(2)) >= 200]
+    for bs, rs in zip(base_strs, result_strs):
+        if not _html_details_isolated(bs, rs, scope_name):
+            return False
+    return True
+
+
+# ===========================================================================
+#  Scoped-replace — application
+# ===========================================================================
+
 def _apply_scoped_single(base, scope_name, new_body, path=""):
     """Apply a single-scope replacement.
 
-    AST-snapped boundaries + structural validation, per the module
-    docstring.  Returns None when no candidate splice produced valid
-    content.
+    AST-snapped boundaries + structural validation + scope-isolation
+    verification, per the module docstring.  Returns None when no
+    candidate splice produced valid, isolated content.
     """
     if not scope_name or not new_body.strip():
         return None
@@ -743,7 +1067,12 @@ def _apply_scoped_single(base, scope_name, new_body, path=""):
             reindented = _reindent_body(base_indent, spliced)
             if not _scope_signature_ok(reindented):
                 return None
-            return base[:indent_pos] + reindented + base[m_end:]
+            partial_result = (
+                base[:indent_pos] + reindented + base[m_end:])
+            if not _verify_scope_isolation(
+                    base, partial_result, scope_name, path or ""):
+                return None
+            return partial_result
 
         if m_start < len(base) and base[m_start] == "\n":
             indent_pos = m_start + 1
@@ -768,7 +1097,8 @@ def _apply_scoped_single(base, scope_name, new_body, path=""):
         if not _scope_signature_ok(reindented):
             return None
 
-        # AST-snapped splice with structural validation (2026-10-29).
+        # AST-snapped splice with structural validation (2026-10-29)
+        # and scope-isolation verification (2026-10-29).
         from .patch_bounds import (
             try_boundary_pairs, try_ast_snapped_boundaries,
             splice_region,
@@ -790,7 +1120,7 @@ def _apply_scoped_single(base, scope_name, new_body, path=""):
 
         candidates = [(start_line, end_line)]
         snapped = try_ast_snapped_boundaries(
-            base, path or "", start_line, end_line)
+            base, path or "", start_line, end_line, reindented)
         if snapped is not None and snapped != (start_line, end_line):
             candidates.append(snapped)
         candidates.extend(try_boundary_pairs(
@@ -803,8 +1133,12 @@ def _apply_scoped_single(base, scope_name, new_body, path=""):
             result = splice_region(
                 base, trial_start, trial_end, body_lines,
                 path or "", min_fraction=0.3)
-            if result is not None:
-                return result
+            if result is None:
+                continue
+            if not _verify_scope_isolation(
+                    base, result, scope_name, path or ""):
+                continue
+            return result
         return None
     return None
 
@@ -812,8 +1146,22 @@ def _apply_scoped_single(base, scope_name, new_body, path=""):
 def _apply_scoped(base, scope_name, new_body, path=""):
     """Apply a scoped replace, handling multi-scope bodies correctly.
 
-    `path` is forwarded to `_apply_scoped_single` for AST snapping
-    and structural validation.
+    `path` is forwarded to `_apply_scoped_single` for AST snapping,
+    structural validation, and scope-isolation verification.
+
+    Two multi-scope cases:
+
+      · All sub-scopes exist in base: apply each as its own
+        scoped-replace (the pg_pixels.py fix — two adjacent
+        functions rewritten in one block, split into two replaces).
+
+      · Some sub-scopes are new (not in base): fall through to the
+        single-scope path.  The new helpers land inside the first
+        scope's replacement region — the whole new_body is spliced
+        into the first scope's span, so the helpers appear at the
+        position the AI placed them (the pg_panel_bindings.py fix —
+        `_inpaintAction` replaced, `_rotatedMaskToCanvasB64` and
+        `_setOriginalFromB64` added next to it).
     """
     if not scope_name or not new_body.strip():
         return None

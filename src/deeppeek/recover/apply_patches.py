@@ -26,6 +26,17 @@ intentionally-truncated bodies) exercise the repair path, while
 pg_panel_scrubs.py / pg_panel_bindings.py (which use complete bodies
 that were mis-spliced) get rejected at heuristic time.
 
+DUPLICATE-NESTING GATE (2026-11-05)
+===================================
+`_check_structural_sanity` now also rejects patches that introduce
+the same HTML element (same `tag` + same `class`) nested inside
+itself, when the base did not already have that nesting.  Motivating
+case: pg_base.py, where `_try_region_replace` spliced a 17-line body
+over a 3-line `<input>` window, producing `<div class="field">`
+nested inside another `<div class="field">`.  Every existing gate
+(`ast.parse`, `js_balance`, `patch_presence`) reported success
+because the tag counts balanced.
+
 PASS-6 FAILED-STATUS ANNOTATION (2026-10-29)
 ============================================
 After the apply loop, if the record's *final* content is structurally
@@ -35,6 +46,17 @@ to `failed`.  Reconcile (pass 8.7) sees the failed status and its
 `_find_minimum_exclusions` can propose exclusions.  The
 `no-unbalanced-body` guard prevents this from firing on user-provided
 truncation, where pass 8's `try_repair` is the correct handler.
+
+SCOPE-HINT PROPAGATION (2026-11-05)
+===================================
+`pass6_apply_patches` now copies each trailing block's `scope_hint`
+onto the patch dict it builds.  Without it, `_try_insert_into_named_
+scope` — which resolves the target scope from prose — had no way to
+find the scope for block 634's shape (prose: "And in every failure
+return:", H2: "## Fix 3 — surface per-command errors in
+`handle_inpaint`").  The scope was attached to the Block by pass 1's
+extractor and read by pass 4's scope-name attribution, but the patch
+dict lost it, so the dispatcher could not place the block.
 
 PATH THREADING (2026-10-29)
 ===========================
@@ -299,6 +321,27 @@ def _check_structural_sanity(old_content, new_content, path,
         if added:
             return (f"patch injected module-level statement(s) at "
                     f"column 0: {added}")
+        # Duplicate-nesting gate (2026-11-05): reject a patch that
+        # introduced the same (tag, class) nested inside itself,
+        # when the base did not already have that nesting.
+        # Motivating case: pg_base.py, where a 3-line window was
+        # spliced with a 17-line body producing `<div class="field">`
+        # inside another `<div class="field">`.  Structural validation
+        # alone misses this — the tags balance.
+        from .validate_output import (
+            _extract_embedded_html, _has_duplicate_class_nesting,
+        )
+        base_html = _extract_embedded_html(old_content)
+        result_html = _extract_embedded_html(new_content)
+        if base_html and result_html:
+            if (not _has_duplicate_class_nesting(base_html)
+                    and _has_duplicate_class_nesting(result_html)):
+                return (
+                    "patch introduced a duplicate element nested "
+                    "inside itself (same `class=` value): the body "
+                    "re-opened a wrapper the splice was supposed to "
+                    "replace"
+                )
         from .patch_bounds import structural_valid
         if not structural_valid(new_content, path):
             return ("patch produced structurally-invalid embedded "

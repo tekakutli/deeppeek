@@ -126,7 +126,8 @@ resolved.  deeppeek must be able to ingest any script in the wild and
 have general solutions to its challenges — nothing custom.
 
 Focus on deeppeek.  Forget about building on the project we were
-working on for now.
+working on for now. Try to use structural techniques, like AST
+tree-sitter, over regex.
 """
 
 

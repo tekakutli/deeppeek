@@ -39,6 +39,14 @@ detects the failure classes that matter for those projects:
 
   6. Module-level statement regression - for Python files.
 
+  7. Duplicate-nesting regression - for embedded HTML.  Rejects a
+     patch that introduced the same `<tag class="X">` nested inside
+     itself when it wasn't in the base.  Motivating case: pg_base.py,
+     where a 3-line window was spliced with a 17-line body producing
+     `<div class="field">` inside `<div class="field">`.  Every
+     existing gate (ast.parse, js_balance, patch_presence) reported
+     success because the tag counts balanced.
+
 TREE-SITTER-FIRST WITH BALANCE HINT (2026-10-29)
 ================================================
 A pure tree-sitter-first reorder regressed `try_repair`, which gates
@@ -148,9 +156,28 @@ Fix: `_js_scope_for_pos(content, path, pos)` returns
 
   - anything else: whole-file region, unchanged.
 
-`_dedup_repeated_statements` groups candidates by `(indent, stmt)` as
-before, and now requires `region_start == region_start` AND
-`scope_open == scope_open` before removing.
+DUPLICATE-BLOCK DEDUP NOW USES `_js_scope_for_pos` (2026-10-29)
+===============================================================
+`_dedup_duplicate_blocks` and `_find_duplicate_string_calls` used
+`_same_python_string` to detect same-scope occurrences.  That check
+only proved the two occurrences were inside the same Python string
+literal — it did NOT prove they were in the same JS scope.  Result:
+two `if (!res.success) { … }` blocks in `_kritaImportAction` and
+`_kritaImportMasksAction` (different JS functions, same Python
+string) were deduped; one copy of the guard was removed from each
+call site.  Same story for `input.addEventListener("change", …)`
+in `_pickImageAction` and `_pickMaskAction`.  Both removals broke
+unrelated functionality while the actual patch (`_clearImageAction`
+rotating input sync) landed correctly — the corruption was silent
+because every removed block was semantically valid on its own.
+
+Fix: both functions now compare `_js_scope_for_pos(...)` tuples
+instead of the Python-string span alone.  Two occurrences in
+different JS functions never match (different `scope_open`); two
+occurrences in different Python strings never match (different
+`region_start`/`region_end`); two occurrences at the top level of
+the same string (`scope_open == -1` for both) still dedup as
+before.
 
 REFERENCE-AWARE DECLARATION-PRESENCE CHECK (2026-11-05)
 =======================================================
@@ -159,7 +186,7 @@ present in base and absent in result as a violation.  Two classes
 of false positive:
 
   · **Local-variable declarations.**  `_declared_names` matched
-    `^\s*(?:export\s+)?(?:const|let|var)\s+…` at any indent, so a
+    `^\\s*(?:export\\s+)?(?:const|let|var)\\s+…` at any indent, so a
     `  const deg = Math.round(v);` inside a JS function counted as
     a top-level declaration.  When the patch replaced that function
     body, `deg` disappeared from `result` and the check flagged it
@@ -173,7 +200,7 @@ of false positive:
 
 Two fixes address the two classes independently:
 
-  · `_DECL_PATTERNS` now anchors at column 0 (`^` not `^\s*`), so
+  · `_DECL_PATTERNS` now anchors at column 0 (`^` not `^\\s*`), so
     indented declarations are excluded.  A top-level declaration
     in a `.py` or `.js` file starts at column 0 by definition; an
     indented one is a local, and locsals are outside the scope of
@@ -187,11 +214,33 @@ Two fixes address the two classes independently:
     and passes; an accidental deletion that orphans a call site
     still fails.
 
-The reference check uses word-bounded matching (`\bname\b`), so
+The reference check uses word-bounded matching (`\\bname\\b`), so
 `_syncRotationWidget` does not match `_syncRotationWidgets` — the
 `t`/`s` boundary does not qualify.  This is the same "the check is
 conservative" reasoning as the rest of the module: a real dangling
 reference is flagged; a rename is not.
+
+HTML STRUCTURAL HELPERS (2026-11-05)
+====================================
+Two helpers detect duplicate-nesting corruption in embedded HTML —
+the failure shape from the pg_base.py run where a 3-line window was
+spliced with a 17-line body:
+
+    _extract_embedded_html(py_content)   Concatenate every triple-
+                                         quoted string in a .py file
+                                         that looks like HTML.
+
+    _has_duplicate_class_nesting(html)   True iff any element with
+                                         class="X" contains a
+                                         descendant with the same
+                                         class="X".
+
+Both are called from `apply_patches._check_structural_sanity`.  The
+duplicate-nesting check is the last line of defence against
+`_try_region_replace` picking the wrong window when tree-sitter-html
+is unavailable — every other gate (ast.parse, js_balance,
+patch_presence) reports success on the pg_base.py shape because the
+tag counts balance.
 """
 import ast
 import re
@@ -263,6 +312,17 @@ def _js_balance(text: str) -> tuple:
             brackets -= 1
         i += 1
     return braces, parens, brackets, (1 if in_str else 0)
+
+
+def _node_text(node) -> str:
+    """Extract a tree-sitter node's text as a string."""
+    try:
+        t = node.text
+    except Exception:
+        return ""
+    if isinstance(t, bytes):
+        return t.decode("utf-8", errors="replace")
+    return t or ""
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +710,98 @@ def _html_structural_check(text: str, label: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Duplicate-nesting detection (2026-11-05)
+# ---------------------------------------------------------------------------
+
+def _has_duplicate_class_nesting(html_text: str) -> bool:
+    """True iff any element with class="X" contains a descendant
+    element with the same class="X".
+
+    Catches the pg_base.py shape: `<div class="field">` nested inside
+    itself because a wrapper wasn't replaced.  HTML tolerates this but
+    it is never what a replace-intent patch meant to produce.
+
+    Returns False when tree-sitter-html is not installed, or when the
+    content does not parse cleanly.  That makes the check a no-op
+    when the grammar is missing — the caller's structural_valid gate
+    remains the outer defence; this check exists to catch the class
+    of corruption structural_valid cannot see (tag counts that
+    balance while the DOM shape is wrong).
+    """
+    if not html_text or not html_text.strip():
+        return False
+    try:
+        import tree_sitter_html  # type: ignore
+        from tree_sitter import Language, Parser
+    except ImportError:
+        return False
+    try:
+        parser = Parser(Language(tree_sitter_html.language()))
+        tree = parser.parse(html_text.encode("utf-8"))
+    except Exception:
+        return False
+    if tree is None or tree.root_node.has_error:
+        return False
+
+    def _class_of(node):
+        for child in node.children:
+            if child.type == "start_tag":
+                for c in child.children:
+                    if c.type == "attribute":
+                        name = value = None
+                        for ac in c.children:
+                            if ac.type == "attribute_name":
+                                name = _node_text(ac).lower()
+                            elif ac.type == "quoted_attribute_value":
+                                for qc in ac.children:
+                                    if qc.type == "attribute_value":
+                                        value = _node_text(qc)
+                        if name == "class" and value:
+                            return value
+        return None
+
+    def _walk(node, seen):
+        if node.type == "element":
+            cls = _class_of(node)
+            next_seen = seen
+            if cls is not None:
+                if cls in seen:
+                    return True
+                next_seen = seen | {cls}
+            for child in node.children:
+                if _walk(child, next_seen):
+                    return True
+            return False
+        for child in node.children:
+            if _walk(child, seen):
+                return True
+        return False
+
+    return _walk(tree.root_node, frozenset())
+
+
+def _extract_embedded_html(py_content: str) -> str:
+    """Concatenate every triple-quoted string in a .py file that
+    looks like HTML.
+
+    Used by the duplicate-nesting gate in
+    `apply_patches._check_structural_sanity`, which needs to compare
+    base and result HTML as standalone documents.  Concatenating
+    (rather than checking per-string) simplifies the gate; the
+    duplicate-nesting heuristic is safe against false positives from
+    unrelated strings because a class-X-in-class-X nesting inside a
+    single raw string is the corruption shape we care about.
+    """
+    if not py_content:
+        return ""
+    chunks = []
+    for _offset, block in _iter_triple_quoted(py_content):
+        if _looks_like_html(block):
+            chunks.append(block)
+    return "\n".join(chunks)
+
+
+# ---------------------------------------------------------------------------
 # Extract embedded triple-quoted strings
 # ---------------------------------------------------------------------------
 
@@ -912,6 +1064,14 @@ def _js_scope_for_pos(content: str, path: str, pos: int) -> tuple:
     `scope_open` is the JS scope-open offset *within that region*;
     -1 for top-level of the region, or for positions that are not in
     an embedded JS region at all.
+
+    (2026-10-29 extension) `_dedup_duplicate_blocks` and
+    `_find_duplicate_string_calls` now use this instead of
+    `_same_python_string` to decide same-scope.  That fixes the
+    `pg_panel_bindings.py` bug where two `if (!res.success) { … }`
+    blocks in two different JS functions of the same raw string were
+    treated as duplicates and one copy of the guard was deleted from
+    each call site.
     """
     ext = Path(path).suffix.lower() if path else ""
     if ext in (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"):
@@ -1127,7 +1287,16 @@ def _python_string_spans(content: str) -> list:
             re.DOTALL,
         )
         for m in pat.finditer(content):
-            spans.append((m.start(), m.end()))
+            # Content-only range: group 1 covers the string body
+            # between the triple-quotes (excluding the r-prefix and
+            # the closing quotes).  _js_scope_for_pos slices this
+            # range and walks it with _enclosing_scope_depth, which
+            # needs to see the JS body - not the Python string
+            # syntax (three quotes toggle in_str three times, so the
+            # entire JS body is skipped as "inside a string" and
+            # every position reports scope_open = -1, making
+            # cross-function duplicates look same-scope).
+            spans.append((m.start(1), m.end(1)))
     spans.sort()
     return spans
 
@@ -1140,16 +1309,22 @@ def _same_python_string(pos_a: int, pos_b: int, spans: list) -> bool:
 
 
 # NEW (2026-11-05): find duplicate top-level string-literal registrations.
+# (2026-10-29) Takes `path` and uses `_js_scope_for_pos` for the
+# same-scope check so two calls in different JS functions of the same
+# Python string are NOT collapsed.
 def _find_duplicate_string_calls(
         content: str,
         is_python: bool,
-        py_spans: list) -> list:
+        py_spans: list,
+        path: str = "") -> list:
     """Return [(start_char, end_char, desc)] for duplicate
     `name("key", …)` registrations.
 
-    For `.py` destinations, both occurrences must be inside the SAME
-    enclosing triple-quoted string; a duplicate across two different
-    embedded-JS strings is an intentional example, not a bug.
+    For `.py` destinations, both occurrences must be in the same
+    enclosing JS scope inside the same triple-quoted string. A
+    duplicate across two different JS functions of the same raw
+    string is legitimate code (each function installs its own
+    listener), not a bug.
 
     For `.js` destinations, both occurrences must be in the same
     enclosing scope (per `_enclosing_scope_depth`).
@@ -1158,18 +1333,21 @@ def _find_duplicate_string_calls(
     removals: list = []
 
     for m in _STRING_LITERAL_CALL_RE.finditer(content):
-        # Determine enclosing Python string, if relevant.
-        enclosing_span = None
+        # Determine scope key using _js_scope_for_pos so we correctly
+        # distinguish "different JS function" from "different Python
+        # string" from "same scope".
         if is_python:
-            for span_start, span_end in py_spans or []:
-                if span_start <= m.start() < span_end:
-                    enclosing_span = (span_start, span_end)
-                    break
-            if enclosing_span is None:
+            scope_start, scope_end, js_scope = _js_scope_for_pos(
+                content, path, m.start())
+            if scope_start == scope_end:
                 # Not inside any Python string literal — the
                 # registration pattern is JS-specific, so skip
                 # anything outside the embedded JS.
                 continue
+            scope_key = (scope_start, scope_end, js_scope)
+        else:
+            _d, scope_open = _enclosing_scope_depth(content, m.start())
+            scope_key = scope_open
 
         open_paren = content.find("(", m.start())
         if open_paren < 0:
@@ -1182,14 +1360,6 @@ def _find_duplicate_string_calls(
             end += 1
         if end < len(content) and content[end] == "\n":
             end += 1
-
-        # For non-Python, the scope (enclosing function/block) must
-        # match — same as the if-block dedup.
-        if is_python:
-            scope_key = enclosing_span
-        else:
-            _d, scope_open = _enclosing_scope_depth(content, m.start())
-            scope_key = scope_open
 
         key = (len(m.group("indent")),
                m.group("name"),
@@ -1212,7 +1382,12 @@ def _find_duplicate_string_calls(
 
 
 def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
-    """Remove duplicate-applied blocks.  Returns (new_content, n_removed)."""
+    """Remove duplicate-applied blocks.  Returns (new_content, n_removed).
+
+    Uses `_js_scope_for_pos` (not `_same_python_string`) for the
+    same-scope check.  See the module docstring,
+    DUPLICATE-BLOCK DEDUP NOW USES `_js_scope_for_pos`.
+    """
     ext = Path(path).suffix.lower()
     if ext not in _DEDUP_SAFE_EXTENSIONS:
         return content, 0
@@ -1249,7 +1424,8 @@ def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
             if not body_a or body_a != body_b:
                 continue
             if is_python:
-                if not _same_python_string(prev_start, m.start(), py_spans):
+                if (_js_scope_for_pos(content, path, prev_start)
+                        != _js_scope_for_pos(content, path, m.start())):
                     continue
             else:
                 if (_enclosing_scope_depth(content, prev_start)
@@ -1292,7 +1468,8 @@ def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
                 seen_const[name] = (m.start(), end_char)
                 continue
             if is_python:
-                if not _same_python_string(prev_start, m.start(), py_spans):
+                if (_js_scope_for_pos(content, path, prev_start)
+                        != _js_scope_for_pos(content, path, m.start())):
                     continue
             removals.append((m.start(), end_char, "const " + name))
             continue
@@ -1335,8 +1512,9 @@ def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
                     _seen_decl[_key] = (_m.start(), _end)
                     continue
                 if is_python:
-                    if not _same_python_string(
-                            _prev_start, _m.start(), py_spans):
+                    if (_js_scope_for_pos(content, path, _prev_start)
+                            != _js_scope_for_pos(
+                                content, path, _m.start())):
                         _seen_decl[_key] = (_m.start(), _end)
                         continue
                 removals.append((_m.start(), _end,
@@ -1345,8 +1523,9 @@ def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
             _seen_decl[_key] = (_m.start(), _end)
 
     # NEW (2026-11-05): string-literal-call registration dedup.
+    # 2026-10-29: thread path so scope detection uses _js_scope_for_pos.
     removals.extend(
-        _find_duplicate_string_calls(content, is_python, py_spans))
+        _find_duplicate_string_calls(content, is_python, py_spans, path))
 
     if not removals:
         return content, 0

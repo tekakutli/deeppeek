@@ -59,6 +59,23 @@ abort.
 `pass9_write` is wrapped in its own try/except so a bug in the
 writer never produces a silent no-op.
 
+STRUCTURAL-EQUIVALENCE PASS (2026-11-05)
+========================================
+New pass 8.10 runs before shield.  For every written-or-writable
+record with patches applied, it diffs base and result at the
+structural level — Python declarations, JS declarations, HTML
+elements keyed by (tag, class) — and reports any signature that was
+*added* that wasn't declared by the patch body, or *removed* that
+wasn't declared as removed.  It also runs the duplicate-nesting
+check on embedded HTML (the pg_base.py shape).
+
+Any divergence demotes the record to LOW.  This is the last line of
+defence against a heuristic that structurally "worked" (everything
+parses, everything balances) but produced a semantically wrong
+result — the failure class that motivated it (pg_base.py's nested
+duplicate `<div class="field">`) was invisible to every downstream
+check because tag counts balance.
+
 See the pre-fix module docstring for the rest of the pass
 descriptions, ROBUSTNESS, PRE-EXISTING BASELINE PRUNING, CROSS-
 VALIDATE TRUST DEMOTION, SHIELD, RE-VERIFY, VERIFY-APPLIED,
@@ -330,6 +347,69 @@ def _load_preexisting_blocks(apply_to: Path) -> list[Block]:
 
 
 # ---------------------------------------------------------------------------
+# Structural-equivalence pass (2026-11-05)
+# ---------------------------------------------------------------------------
+
+def _check_structural_equivalence(records, blocks_by_idx):
+    """Return {path: [SignatureChange, ...]} for every record with
+    structural divergences introduced by its patches.
+
+    A "structural divergence" is a top-level declaration or HTML
+    element that was *added* or *removed* by the patch, beyond what
+    the patch body declared.  The motivating case: pg_base.py, where
+    `_try_region_replace` spliced a body over a mid-element window
+    and produced a nested `<div class="field">` inside `<div
+    class="field">`.  Tag counts balance; ast.parse passes; the only
+    signal is that the DOM shape changed.
+
+    Fail-closed: a record with any divergence is demoted to LOW.
+    Every change is recorded on `verification["structural_divergence"]`
+    and the record's warnings so the user sees exactly what went
+    wrong.
+    """
+    from .structural_diff import structural_diff
+
+    out: dict = {}
+    for path, rec in records.items():
+        if rec.content is None or rec.is_deleted:
+            continue
+        if rec.state not in ("SINGLE_FULL", "FULL_PLUS_PATCH",
+                             "MULTI_FULL"):
+            continue
+        if rec.trust == "LOW":
+            continue    # already fail-closed
+        if blocks_by_idx is None or rec.last_full_idx is None:
+            continue
+        base_block = blocks_by_idx.get(rec.last_full_idx)
+        if base_block is None:
+            continue
+
+        body_text = "\n".join(
+            p.get("body", "") for p in rec.patches)
+        try:
+            changes = structural_diff(
+                base_block.body, rec.content, path, body_text)
+        except Exception as e:
+            rec.warnings.append(
+                f"structural-equivalence check raised: {e}")
+            continue
+        if not changes:
+            continue
+
+        rec.trust = "LOW"
+        rec.verification["structural_divergence"] = [
+            {"kind": c.kind, "lang": c.lang,
+             "signature": c.signature, "detail": c.detail}
+            for c in changes
+        ]
+        for c in changes:
+            rec.warnings.append(
+                f"structural: {c.kind} {c.signature!r} ({c.detail})")
+        out[path] = changes
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -398,6 +478,28 @@ def run(cfg: RecoverConfig) -> int:
               file=sys.stderr)
     else:
         print(f"[startup] layout: {layout}", file=sys.stderr)
+
+    # Grammar availability diagnostic.  Report which tree-sitter
+    # grammars are importable so a user with a partial grammar install
+    # sees why structural checks might be degrading to line-based
+    # heuristics.  Motivating case: pg_base.py's duplicate-`<div>`
+    # corruption, which was invisible because tree-sitter-html was
+    # missing and `_try_embedded_html_snap` silently no-opped.
+    try:
+        from .ast_anchor import ast_status
+        _ast = ast_status()
+        _missing = [g for g in ("html", "css")
+                    if not _ast.get(g)]
+        if _missing:
+            print(f"[startup] tree-sitter grammar missing: "
+                  f"{', '.join(_missing)} — structural checks for "
+                  f"embedded {', '.join(_missing).upper()} "
+                  f"will fall back to line-based heuristics; install "
+                  f"`tree-sitter-{'` and `tree-sitter-'.join(_missing)}` "
+                  f"(or run .venv/bin/pip install -e '.[ast]')",
+                  file=sys.stderr)
+    except Exception:
+        pass
 
     t_start = time.monotonic()
     run_errors: list = []
@@ -751,6 +853,28 @@ def run(cfg: RecoverConfig) -> int:
               f"lines (informational)", file=sys.stderr)
     else:
         print("  all applied patches present in final content")
+
+    # NEW (2026-11-05): structural-equivalence pass.  Detects semantic
+    # divergence that every existing gate misses when the shapes
+    # balance (nested same-class HTML, added/removed declarations not
+    # declared by any patch body).  See the module docstring,
+    # STRUCTURAL-EQUIVALENCE PASS.
+    print("[pass 8.10] structural-equivalence check...")
+    _structural_changes = _run_pass(
+        "8.10 (structural-diff)", _check_structural_equivalence, {},
+        run_errors, records, blocks_by_idx,
+    ) or {}
+    _n_structural = sum(len(c) for c in _structural_changes.values())
+    if _n_structural:
+        print(f"  {_n_structural} structural divergence(s) introduced "
+              f"by patches \u2014 demoting affected records to LOW",
+              file=sys.stderr)
+        for _p, _changes in _structural_changes.items():
+            for _c in _changes[:3]:
+                print(f"    {_p}: {_c.kind} {_c.signature!r} "
+                      f"({_c.detail})", file=sys.stderr)
+    else:
+        print("  no unexpected structural divergences")
 
     if cfg.apply_to is not None and cfg.shield_preexisting:
         print("[pass 8.8] shielding target-tree overwrites...")

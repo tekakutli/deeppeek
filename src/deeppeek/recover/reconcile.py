@@ -5,25 +5,78 @@ excluding the minimum set of patches/pairs that caused the failure.
 See the pre-fix module docstring for the motivating cases and the
 "reconciled to base is not a rescue" invariant.
 
-PATH THREADING (2026-10-29)
-===========================
-`_replay_excluding` now passes `path=path` to `_apply_pairs`, so
-scope replaces executed during reconcile replay get AST-snapped
-boundaries and structural validation — the same treatment they got
-during the initial pass-6 application.  Without this, reconcile
-could not replay a scope-replace that pass 6 applied correctly, and
-would silently produce different results during its exclusion
-search.
+CUMULATIVE-CONTEXT DIAGNOSTICS (2026-10-29; refined 2026-11-05)
+================================================================
+`_diagnose_exclusion` used to compare the excluded patch's body
+against `records` (other files) only. When a patch was excluded for
+a reason that depends on *state the record is going to have*, that
+comparison produced misleading messages.
 
-PRIOR-PASS ANNOTATION INTERACTION (2026-10-29)
-==============================================
-Pass 6 now downgrades `deterministic` patches to `failed` when the
-record's final content is structurally invalid (see
-`apply_patches.pass6_apply_patches`).  Reconcile's `_applied_keys`
-sees the failed status and its `_find_minimum_exclusions` can try
-excluding them.  When a single patch caused the corruption, this
-promotes the record; when multiple did, it stays LOW (correct
-fail-closed).
+Motivating case: `inpaint_server.py` in the 2026-10-29 run. Two
+patches, applied in order:
+
+  idx 633: adds `errors: []` to `captured = {...}` and records
+           `captured["errors"].append(...)` in the progress handler.
+  idx 634: a *multi-statement* body — `detail = ...` followed by a
+           new multi-line `return {"success": False, ..., "errors":
+           captured["errors"], ...}` — that replaces the failure
+           return block. The `"errors"` key is only valid because
+           633 already added it.
+
+Reconcile correctly kept 633 and excluded 634. But `_diagnose_exclusion`
+compared 634's body against `records` (the other file records) instead
+of against the cumulative state (`base + 633`), found nothing, and
+reported:
+
+  "excluded patch idx=634 ('return {'): introduces an unresolved symbol
+   or structural failure; content not found in any other file"
+
+There is no unresolved symbol in 634. `detail`, `captured`, `elapsed`,
+and `round` all resolve on `base + 633`. The patch applies cleanly.
+
+The 2026-11-05 fix goes further than the 2026-10-29 one.  Both the
+*exclusion search* (`_find_minimum_exclusions` → `_replay_excluding`)
+and the *diagnostic* (`_diagnose_exclusion`) now route every patch
+application through the single helper `_apply_single_patch_in_replay`,
+and the diagnostic path uses a dedicated helper `_replay_state_up_to`
+to reconstruct the exact `(content, record_inserted, prior_scopes)`
+state that would have been live when the excluded patch was about to
+apply.  Without this, the two paths could apply the same patch
+against slightly different prior-insertion contexts and produce
+different results — the diagnostic would describe a state the
+pipeline never reached.
+
+The 2026-10-29 version threaded `prior_insertions` through
+`_replay_excluding` but still called `_try_deterministic_patch`
+directly from `_diagnose_exclusion` with only `cumulative_base` —
+losing the prior-insertion context.  The inpaint_server.py run of
+2026-11-05 surfaced that: `_diagnose_exclusion` produced "applies
+structurally, but the result fails validate_content: declaration(s)
+present in base but missing from result, and still referenced:
+['handle_krita_import_masks']", which described neither the state
+`_replay_excluding` had built nor the state `_try_deterministic_patch`
+actually consumed.
+
+PRIOR-INSERTIONS REPLAY (2026-10-29)
+====================================
+`_replay_excluding` now threads `prior_insertions` and `prior_scopes`
+through `_try_deterministic_patch`, the same way
+`pass6_apply_patches` does. The two code paths now see the same
+content; without this, reconcile could exclude a patch that
+`pass6_apply_patches` had placed correctly using the
+prior-insertion fallback, because `_replay_excluding` (which did
+not pass `prior_insertions`) failed to reproduce that placement.
+
+CUMULATIVE-BASE COMPUTATION (2026-10-29)
+========================================
+`_diagnose_exclusion` receives `cumulative_bases[key]` = the state
+with all *other* excluded keys applied but not `key` itself. The
+prior code computed `excluded_keys - {key}` (which for a
+single-exclusion record is the empty set, i.e. "apply everything,
+including `key`"). `_try_deterministic_patch(cumulative_base, key)`
+then saw `key` as already-applied and returned unchanged — so the
+diagnostic always said "applies cleanly" for every single-exclusion
+record, regardless of the actual applicability. Fixed to `{key}`.
 
 Prior docstring content (unchanged):
 - STALE-WARNING CLEANUP
@@ -44,6 +97,7 @@ from typing import Optional
 from .apply_patches import (
     _apply_pairs, _broader_context_for, _try_deterministic_patch,
 )
+from .patch_text import _collect_inserted_lines
 
 
 _NO_OP_STATUSES = frozenset({
@@ -79,56 +133,157 @@ def _applied_keys(rec):
     return keys
 
 
+def _apply_single_patch_in_replay(rec, content, patch, path,
+                                  blocks_by_idx, records,
+                                  record_inserted, prior_scopes):
+    """Apply one patch during replay.  Mutates `record_inserted` in
+    place and returns the new content, or None on failure.
+
+    Factored out so `_diagnose_exclusion` and `_replay_excluding`
+    execute the exact same patch application against the exact same
+    prior-insertions state.  If these diverged, the diagnostic would
+    describe a result the pipeline never produced.
+
+    See the module docstring, CUMULATIVE-CONTEXT DIAGNOSTICS for the
+    motivating failure (`inpaint_server.py` in the 2026-11-05 run).
+    """
+    result = _try_deterministic_patch(
+        content, patch, path,
+        prior_insertions=record_inserted,
+        prior_scopes=prior_scopes,
+    )
+    if result is None:
+        broader = _broader_context_for(
+            patch, blocks_by_idx, records, path)
+        if broader != patch.get("context_before", ""):
+            broader_patch = {**patch, "context_before": broader}
+            result = _try_deterministic_patch(
+                content, broader_patch, path,
+                prior_insertions=record_inserted,
+                prior_scopes=prior_scopes,
+            )
+    if result is None:
+        return None
+    if result != content:
+        record_inserted |= _collect_inserted_lines(content, result)
+    return result
+
+
 def _replay_excluding(rec, base, excluded_keys, path,
-                      blocks_by_idx, records):
+                      blocks_by_idx, records,
+                      ignore_status=False):
     """Replay pass-6 application with `excluded_keys` removed.
 
     `path` is passed to `_apply_pairs` so scope replaces executed
     during replay get AST-snapped boundaries (the same treatment as
-    the initial application).  Without this, replay could not
+    the initial application).
+
+    `prior_insertions` / `prior_scopes` are tracked the same way
+    `pass6_apply_patches` does. Without them, replay could not
     reproduce the pass-6 result and reconcile's exclusion search
-    would fail for every pair-carrying record.
+    would fail for every record whose patches depend on the
+    prior-insertion fallback. See the module docstring,
+    PRIOR-INSERTIONS REPLAY.
+
+    `ignore_status=False` (the default) preserves the original
+    semantics: patches whose `applied_by` is in `_NO_OP_STATUSES` or
+    is `"failed"` are skipped. `ignore_status=True` re-applies every
+    patch not in `excluded_keys`, regardless of its recorded status;
+    used by the diagnostic path after statuses have been mutated.
+
+    All patch applications are routed through
+    `_apply_single_patch_in_replay` so this function and
+    `_diagnose_exclusion` cannot drift apart.
     """
     content = base
+
+    record_inserted: set = set()
+    prior_scopes: dict = {}
 
     pairs_kept = [
         pair for pair in rec.pairs
         if _pair_key(pair) not in excluded_keys
     ]
     if pairs_kept:
-        content, _ = _apply_pairs(content, pairs_kept, path=path)
+        new_content, _ = _apply_pairs(content, pairs_kept, path=path)
+        record_inserted |= _collect_inserted_lines(content, new_content)
+        content = new_content
 
     for patch in rec.patches:
         if _patch_key(patch) in excluded_keys:
             continue
         status = patch.get("applied_by")
-        if status in _NO_OP_STATUSES or status == "failed":
+        if not ignore_status and (
+                status in _NO_OP_STATUSES or status == "failed"):
             continue
 
-        result = _try_deterministic_patch(content, patch, path)
-        if result is None:
-            broader = _broader_context_for(
-                patch, blocks_by_idx, records, path)
-            if broader != patch.get("context_before", ""):
-                broader_patch = {
-                    **patch, "context_before": broader}
-                result = _try_deterministic_patch(
-                    content, broader_patch, path)
-        if result is None:
+        new_content = _apply_single_patch_in_replay(
+            rec, content, patch, path,
+            blocks_by_idx, records,
+            record_inserted, prior_scopes,
+        )
+        if new_content is None:
             return None
-        content = result
+        content = new_content
 
     return content
+
+
+def _replay_state_up_to(rec, base, excluded_keys, stop_key, path,
+                        blocks_by_idx, records,
+                        ignore_status=False):
+    """Replay up to (but not including) `stop_key`.
+
+    Returns `(content, record_inserted, prior_scopes)` — the same
+    state `_apply_single_patch_in_replay` mutates.  The diagnostic
+    path uses this to apply `stop_key` against the exact cumulative
+    state that would have been live when the patch was originally
+    attempted.  See the module docstring, CUMULATIVE-CONTEXT
+    DIAGNOSTICS.
+
+    Returns None when a prerequisite patch cannot be replayed (the
+    diagnostic then falls back to `cumulative_base`-only comparison).
+    """
+    content = base
+    record_inserted: set = set()
+    prior_scopes: dict = {}
+
+    pairs_kept = [
+        pair for pair in rec.pairs
+        if _pair_key(pair) not in excluded_keys
+    ]
+    if pairs_kept:
+        new_content, _ = _apply_pairs(content, pairs_kept, path=path)
+        record_inserted |= _collect_inserted_lines(content, new_content)
+        content = new_content
+
+    for patch in rec.patches:
+        if _patch_key(patch) == stop_key:
+            break
+        if _patch_key(patch) in excluded_keys:
+            continue
+        status = patch.get("applied_by")
+        if not ignore_status and (
+                status in _NO_OP_STATUSES or status == "failed"):
+            continue
+        new_content = _apply_single_patch_in_replay(
+            rec, content, patch, path,
+            blocks_by_idx, records,
+            record_inserted, prior_scopes,
+        )
+        if new_content is None:
+            return None
+        content = new_content
+
+    return (content, record_inserted, prior_scopes)
 
 
 def _count_failures(content, path, rec, base, records, excluded_keys):
     """Return (n_failures, [failure_descriptors]).
 
-    Runs every *demoting* check pass 8.x performs.  Lint and
+    Runs every *demoting* check pass 8.x performs. Lint and
     added-param-lint are NOT included: both are warn-only (see
-    `lint.py` and `verify_applied.py` docstrings).  Only checks that
-    actually change `rec.trust` participate here, so reconcile's
-    promotion decision is not blocked by informational warnings.
+    `lint.py` and `verify_applied.py` docstrings).
     """
     from .validate_output import validate_content
     from .symbols import find_unresolved_references
@@ -288,19 +443,42 @@ def _patch_first_line(patch):
     return ""
 
 
-def _diagnose_exclusion(key, rec, records, original_status=None):
+def _diagnose_exclusion(key, rec, records, original_status=None,
+                        cumulative_base=None, cumulative_state=None):
     """Produce a human-readable exclusion message.
 
-    Three distinct cases:
+    Five distinct cases:
 
       1. `original_status == "failed"` — never applied.  "Could not
          be placed."
-      2. `_fuzzy_locate_elsewhere` finds a match — applied but
+
+      2. `cumulative_state` is provided (the 2026-11-05 fix): a
+         `(content, record_inserted, prior_scopes)` tuple
+         reconstructed by `_replay_state_up_to`.  The excluded patch
+         is applied against that exact state — same prior-insertions,
+         same broader-context retry, same result as the pipeline
+         would have produced — and `validate_content` +
+         `find_unresolved_references` describe the outcome.
+         See the module docstring, CUMULATIVE-CONTEXT DIAGNOSTICS.
+
+      3. `cumulative_base` is provided but `cumulative_state` is not:
+         fall back to the 2026-10-29 behaviour, which applies the
+         patch against `cumulative_base` without prior-insertions.
+         This is what the diagnostic used to do; retained for callers
+         that only have a content-only base.
+
+      4. `_fuzzy_locate_elsewhere` finds a match — applied but
          belongs elsewhere.  "Content already exists in X;
          misattributed."
-      3. Neither — applied but produces a validation failure that
+
+      5. Neither — applied but produces a validation failure that
          couldn't be attributed.  "Introduces X; content not found
          elsewhere."
+
+    Cases 2 and 3 both extend the pre-fix diagnostics.  They differ in
+    what state they apply the patch to; 2 is what the pipeline
+    actually saw, 3 is a best-effort reconstruction when the pipeline
+    state is unavailable.
     """
     if key[0] == "patch":
         idx = key[1]
@@ -311,12 +489,122 @@ def _diagnose_exclusion(key, rec, records, original_status=None):
         status = (original_status if original_status is not None
                   else patch.get("applied_by"))
         first = _patch_first_line(patch)
+        body = patch.get("body", "") or ""
+
+        # Case 2: cumulative-state diagnostic.  Uses the exact
+        # prior_insertions/prior_scopes context the pipeline built.
+        if cumulative_state is not None and body.strip():
+            content, record_inserted, prior_scopes = cumulative_state
+            try:
+                result = _apply_single_patch_in_replay(
+                    rec, content, patch, rec.path,
+                    {}, {}, record_inserted, prior_scopes,
+                )
+            except Exception:
+                result = None
+            if result is not None:
+                from .validate_output import validate_content
+                from .symbols import find_unresolved_references
+                err = validate_content(
+                    result, rec.path, base=content)
+                if err is not None:
+                    return (
+                        f"excluded patch idx={idx} ({first!r}): "
+                        f"applies structurally, but the result "
+                        f"fails validate_content: {err}"
+                    )
+                try:
+                    trial = replace(rec, content=result)
+                    unresolved, _ = find_unresolved_references(
+                        trial, content, records)
+                except Exception:
+                    unresolved = []
+                if not unresolved:
+                    return (
+                        f"excluded patch idx={idx} ({first!r}): "
+                        f"applies on cumulative state and produces "
+                        f"valid content with no unresolved symbols; "
+                        f"reconcile excluded it for the wrong "
+                        f"reason \u2014 please report"
+                    )
+                return (
+                    f"excluded patch idx={idx} ({first!r}): "
+                    f"applies structurally, but introduces "
+                    f"unresolved symbol(s) {unresolved} on "
+                    f"cumulative state"
+                )
+            # result is None: the patch doesn't apply on cumulative
+            # state.  Diagnose the specific failure reason.
+            try:
+                from .patch_diag import _diagnose_patch_failure
+                underlying = _diagnose_patch_failure(
+                    patch, content, content)
+            except Exception:
+                underlying = None
+            if underlying:
+                return (
+                    f"excluded patch idx={idx} ({first!r}): "
+                    f"fails on cumulative state: {underlying}"
+                )
+
+        # Case 3: content-only cumulative diagnostic (2026-10-29
+        # behaviour; kept for callers that only have the base).
+        elif cumulative_base is not None and body.strip():
+            try:
+                result = _try_deterministic_patch(
+                    cumulative_base, patch, rec.path)
+            except Exception:
+                result = None
+            if result is not None:
+                from .validate_output import validate_content
+                from .symbols import find_unresolved_references
+                err = validate_content(
+                    result, rec.path, base=cumulative_base)
+                if err is not None:
+                    return (
+                        f"excluded patch idx={idx} ({first!r}): "
+                        f"applies structurally, but the result "
+                        f"fails validate_content: {err}"
+                    )
+                try:
+                    trial = replace(rec, content=result)
+                    unresolved, _ = find_unresolved_references(
+                        trial, cumulative_base, records)
+                except Exception:
+                    unresolved = []
+                if not unresolved:
+                    return (
+                        f"excluded patch idx={idx} ({first!r}): "
+                        f"applies on cumulative state and produces "
+                        f"valid content with no unresolved symbols; "
+                        f"reconcile excluded it for the wrong "
+                        f"reason \u2014 please report"
+                    )
+                return (
+                    f"excluded patch idx={idx} ({first!r}): "
+                    f"applies structurally, but introduces "
+                    f"unresolved symbol(s) {unresolved} on "
+                    f"cumulative state"
+                )
+            try:
+                from .patch_diag import _diagnose_patch_failure
+                underlying = _diagnose_patch_failure(
+                    patch, cumulative_base, cumulative_base)
+            except Exception:
+                underlying = None
+            if underlying:
+                return (
+                    f"excluded patch idx={idx} ({first!r}): "
+                    f"fails on cumulative state: {underlying}"
+                )
+
+        # Pre-fix diagnostics.
         if status == "failed":
             return (f"excluded patch idx={idx} ({first!r}): "
                     f"could not be placed; the rest of the record "
                     f"applies cleanly without it")
         other = _fuzzy_locate_elsewhere(
-            patch.get("body", ""), rec.path, records)
+            body, rec.path, records)
         if other is not None:
             return (f"excluded patch idx={idx} ({first!r}): "
                     f"content already exists in {other} — "
@@ -526,12 +814,42 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
 
         _clear_stale_pass6_warnings(rec, excluded_keys)
 
+        # Cumulative states: for each excluded key, the *exact*
+        # `(content, record_inserted, prior_scopes)` state that would
+        # have been live when the excluded patch was about to apply —
+        # i.e. all OTHER patches applied (including any excluded
+        # patches OTHER than this key), and this key itself NOT
+        # applied.  Then the diagnostic replays `key` against that
+        # state using the same `_apply_single_patch_in_replay` helper
+        # the exclusion search uses.
+        #
+        # The 2026-11-05 refinement: `_replay_state_up_to` returns
+        # the full tuple, not just the content.  Without it, the
+        # diagnostic applied the patch against a state that had no
+        # `prior_insertions` context, and produced a message describing
+        # a result the pipeline never reached.
+        cumulative_states = {}
+        for key in excluded_keys:
+            cumulative_states[key] = _replay_state_up_to(
+                rec, base, set(excluded_keys) - {key}, key, path,
+                blocks_by_idx, records,
+                ignore_status=True,
+            )
+        cumulative_bases = {
+            k: v[0] if v is not None else None
+            for k, v in cumulative_states.items()
+        }
+
         for key in excluded_keys:
             original_status = None
             if key[0] == "patch":
                 original_status = original_statuses.get(key[1])
             diag = _diagnose_exclusion(
-                key, rec, records, original_status=original_status)
+                key, rec, records,
+                original_status=original_status,
+                cumulative_base=cumulative_bases.get(key),
+                cumulative_state=cumulative_states.get(key),
+            )
             rec.warnings.append(diag)
             if verbose:
                 print(f"  [reconcile] {path}: {diag}", file=sys.stderr)
