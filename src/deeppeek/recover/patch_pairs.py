@@ -15,6 +15,22 @@ successful no-op rather than a failure.  Fail-closed semantics are
 preserved: a pair whose intent is *not* in base still fails.
 
 Imports from patch_text, patch_scope, patch_diag, patch_heuristics.
+
+PATH THREADING (2026-10-29)
+===========================
+`_apply_pairs` and `_try_replace_pair` now take an optional `path`.
+It is forwarded to `_apply_scoped`, which uses it to pick the right
+AST grammar when snapping splice boundaries (via `patch_bounds`) and
+to run structural validation on the spliced content.  `_try_replace_pair`
+also uses `path` to validate the fuzzy-replace and object-literal-splice
+results before returning them — raw replace is safe by construction
+(exact string match), but fuzzy is windowed and can be off by one line.
+
+When `path` is empty (no extension known, e.g. an ad-hoc call from a
+script), the boundary helpers degrade gracefully: AST snapping is
+skipped, and `structural_valid` returns `True` for unrecognised
+extensions.  The caller-visible behaviour is unchanged from the
+pre-threading version.
 """
 
 from .patch_text import _content_present_in_base
@@ -25,7 +41,7 @@ from .patch_heuristics import (
 )
 
 
-def _apply_pairs(base, pairs):
+def _apply_pairs(base, pairs, path=""):
     """Apply each pair.  Each pair is independently crash-isolated:
     a raise inside one pair is recorded as that pair's failure and
     the loop continues with the next pair.
@@ -36,7 +52,8 @@ def _apply_pairs(base, pairs):
         try:
             if pair["old_idx"] == -1:
                 result = _apply_scoped(
-                    current, pair["scope_name"], pair["new_body"])
+                    current, pair["scope_name"], pair["new_body"],
+                    path=path)
                 if result is None:
                     reason = _diagnose_scoped_failure(
                         current, pair["scope_name"],
@@ -46,7 +63,8 @@ def _apply_pairs(base, pairs):
                     continue
             else:
                 result = _try_replace_pair(
-                    current, pair["old_body"], pair["new_body"])
+                    current, pair["old_body"], pair["new_body"],
+                    path=path)
                 if result is None:
                     reason = _diagnose_replace_failure(
                         current, pair["old_body"],
@@ -188,7 +206,18 @@ def _try_object_literal_splice_for_pair(base, old_body, new_body):
 #  Replace-pair application
 # ===========================================================================
 
-def _try_replace_pair(base, old, new):
+def _try_replace_pair(base, old, new, path=""):
+    """Apply a replace pair; return new content, base (already-present),
+    or None (fail-closed).
+
+    `path` is used only for post-splice structural validation.  Raw
+    replace (`base.replace(old, new, 1)`) is safe by construction —
+    the exact `old` string is present and gets swapped for `new`,
+    which the AI produced as a replacement.  Fuzzy replace is windowed
+    and can land off by one line; the structural check catches that.
+    Object-literal splice is windowed too (the `[open, close]` of the
+    literal); same check.
+    """
     from .patch_text import _has_ellipsis_marker
     if not old.strip():
         return None
@@ -205,17 +234,27 @@ def _try_replace_pair(base, old, new):
     if _pair_ambiguous(base, old, new):
         return None
 
+    def _validated(result):
+        if result is None or result == base:
+            return result
+        if not path:
+            return result
+        from .patch_bounds import structural_valid
+        if structural_valid(result, path):
+            return result
+        return None
+
     # Object-literal `new` body: route through the splice branch so
     # the base's const/let/var/export prefix is preserved.
     _spliced = _try_object_literal_splice_for_pair(base, old, new)
     if _spliced is not None:
-        return _spliced
+        return _validated(_spliced)
 
     # Exact match (old must be unique).
     if old in base and base.count(old) == 1:
         result = base.replace(old, new, 1)
         if result != base:
-            return result
+            return _validated(result)
 
     # Whitespace-normalized (trailing-whitespace drift on base lines).
     def _norm(s):
@@ -226,11 +265,11 @@ def _try_replace_pair(base, old, new):
         pos = base_norm.find(old_norm)
         result = base_norm[:pos] + new + base_norm[pos + len(old_norm):]
         if result != base_norm:
-            return result
+            return _validated(result)
 
     # Fuzzy line-level match (token-equivalent lines, superset lines).
     fuzzy = _try_fuzzy_replace(base, old, new)
     if fuzzy is not None:
-        return fuzzy
+        return _validated(fuzzy)
 
     return None

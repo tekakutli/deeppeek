@@ -14,7 +14,7 @@ loop calls for each patch.  It dispatches, in order:
    5. import replaces
    6. single-line replaces
    6a. indented def/class replaces
-   6b. decorated-def scope insert (2026-11-02) — see below
+   6b. decorated-def scope insert (2026-11-02)
    7. scoped replaces
    8. ellipsis splices, with fallback
    9. object-literal splices (with trailing-content refusal)
@@ -29,159 +29,92 @@ loop calls for each patch.  It dispatches, in order:
   17. AST anchor
   18. structural append
 
-MULTI-STATEMENT APPLY (2026-10-28g)
-===================================
-A body that contains two or more adjacent top-level statements can't
-be handled by any single heuristic.  `_try_multi_statement_apply`
-splits the body into individual top-level statements and applies each
-one through the normal dispatcher.  A sub-statement that fails to
-place causes the whole multi-statement attempt to bail (fail-closed).
+AST-SNAPPED REGION-REPLACE (2026-10-29)
+=======================================
+`_try_region_replace` now splices via `patch_bounds.splice_region`
+instead of the raw `"\n".join(base_lines[:start] + body + base_lines[end:])`.
+The candidate set is:
 
-Recursion is prevented by the module-level `_in_multi_statement`
-flag.  Assumes single-threaded execution.
+  1. The unmodified `[start, end)` from the similarity sweep.
+  2. AST-snapped boundaries — expanded outward to the enclosing
+     top-level statements (`ast` for `.py`, tree-sitter for `.js`/
+     `.ts`/etc. and for the dominant embedded JS string in a `.py`).
+  3. A ±3-line sweep around the original boundaries as fallback.
 
-INDENTED DEF/CLASS REPLACE (2026-10-28g)
-========================================
-`_try_indented_def_replace` finds the unique indented match of a
-`def name(...)` in base and replaces it in place.  Fires only when
-the name has no column-0 declaration (scoped-replace owns the
-top-level case) and exactly one indented match exists.
+Each candidate goes through `splice_region`, which validates
+structurally.  The first valid splice wins.  When none produces
+valid content, `_try_region_replace` returns None and the caller
+falls through to the insert heuristics (which may fail-closed
+cleanly) or to fail-closed at the record level.
 
-INDENTED-DEF REINDENT BUG (2026-11-01)
-======================================
-`body_stripped` used to be `raw_body.strip()`, which only removed
-the first line's indent.  Passing `raw_body` (with original indent)
-to `_try_indented_def_replace` fixes `_reindent_body`'s
-`orig_indent_len` computation.
+This closes the class of failure that produced invalid embedded JS
+in `pg_panel_scrubs.py` and `pg_panel_bindings.py` on 2026-10-28:
+a line-based window that stopped one line short of the closing `}`,
+leaving a stray `}` as an orphan, which `validate_content` caught
+too late (in pass 8, not at heuristic time).
 
-MULTI-STATEMENT DEDENT (2026-11-01b)
-====================================
-`_try_deterministic_patch_inner` calls
-`textwrap.dedent(raw_body).strip()` for `body_stripped`.  The prior
-`.strip()` only removed leading whitespace from the first line, so
-a body indented at 4 spaces on every line produced a hybrid where
-the first line was at column 0 and subsequent lines were at 8
-spaces.  `_split_python_statements` then saw no top-level split
-point.
+SIZE-AWARE SIMILARITY (2026-11-05)
+==================================
+`_try_region_replace` used a flat `min_ratio=0.55` gate before
+running the splice.  For a patch whose body is *larger* than the
+base region it replaces (expand-shaped edit — the
+`pg_base.py` rotation widget goes from 10 lines to 17), the ratio
+is structurally penalised: `SequenceMatcher.ratio() = 2*M / (len(A) + len(B))`,
+so a 7-line match against a 10-line base and 17-line body scores
+`14/27 ≈ 0.52` — under the gate, even though the actual content is
+7 lines of solid match.
 
-`textwrap.dedent` removes the *common* leading whitespace across
-all lines.  `inpaint_server.py`'s motivating shape — `captured =
-{...}` followed by `def on_progress(...)` — now splits into two
-statements cleanly.
+The 2026-11-05 fix computes an `effective_min_ratio` per candidate
+window, scaled down by the size ratio between window and body:
 
-DECORATOR MERGE (2026-11-02)
-============================
-`_split_python_statements` now merges a `@decorator` line with the
-`def`/`class` line that follows it.  Without this, a body like
-`@command(name="new")\ndef new_cmd(...)` was split into TWO
-statements: a bare decorator (which no heuristic can place) and the
-def.  Multi-statement apply would attempt the decorator first, it
-would fail (as it should — a bare decorator has no meaning), and
-the whole multi-statement attempt would bail.  The intended
-dispatch (scope-insert into the prose-named class) was never
-reached.
+    size_ratio = min(w_size, body_size) / max(w_size, body_size)
+    effective_min_ratio = min_ratio * size_ratio
 
-With the merge, `_split_python_statements` returns ONE statement
-for a decorator + def/class unit.  Multi-statement doesn't fire;
-`_try_insert_into_named_scope` receives the decorated body intact
-and places it correctly.
+For the rotation-widget case, `size_ratio = 10/17 ≈ 0.59`, so
+`effective_min_ratio ≈ 0.32`, and the 0.52 actual ratio passes.
+The structural-validity gate inside `splice_region` is unchanged,
+so a bad splice from a wrong window is still rejected.
 
-LANGUAGE-AWARE STRUCTURAL CHECK (2026-11-01b)
-=============================================
-`_try_indented_def_replace`'s structural gate now calls
-`structural.check_balance(body, path)` instead of `_js_balance`.
-`.py` destinations route through `ast.parse`; JS bodies fall back
-to `_js_balance`.
+PROSE-NAMED-SCOPE: INSERT vs REPLACE (2026-11-05)
+=================================================
+`_prose_names_scope` gates region-replace: when the prose says
+"in `X`", the region-replace path is refused so that
+`_try_insert_into_named_scope` runs instead.
 
-DECORATED-SCOPE ROUTING (2026-11-02)
-====================================
-A body whose first non-blank line starts with `@` is a decorated
-def/class.  Such bodies MUST be placed inside their prose-named
-scope (a class or module); the `named_dict`, `context`, and
-`object_entry` heuristics do not know how to place a decorated
-definition and will misplace it (context-insert inserts at the
-anchor line's indent — 8 spaces inside a method — producing a
-nested def with wrong semantics).
+Two bugs in the prior version:
 
-New in the chain: before those heuristics, if the body starts with
-`@`, try `_try_insert_into_named_scope` directly.  This is a narrow
-routing that only affects decorated bodies.
+  1. The regex `\b(?:in|inside|within|to|for)\s+`[A-Za-z_][\w$]*``
+     did NOT match dotted identifiers or filenames (`pg_base.py`,
+     `comfyui_krita.py`).  When the prose said "In `pg_base.py`,
+     replace the rotation field:", the regex missed it and
+     region-replace was NOT gated — actually the right outcome,
+     but by accident.
 
-REGION REPLACE (2026-10-29)
-===========================
-The class of edit that neither the specific replacement heuristics
-(scoped, object-literal, signature, indented-def) nor the insert
-family handles correctly: a body that is a *modified version* of an
-existing multi-declaration region but does not declare a scope and
-is not a pure object-literal assignment.
+  2. More importantly: the gate fired for *replace* prose too.
+     "In `handle_inpaint`, replace the mask pipeline with:" was
+     gated as if it were an insert, and `_try_insert_into_named_
+     scope` inserted rather than replacing.  The result was a
+     scope content doubled (once in the base, once inserted).
 
-Canonical shape (from the 2026-10-28 run):
+The 2026-11-05 fix distinguishes the two: prose that both names a
+scope AND contains a replace-family verb is *replace intent*, and
+region-replace is NOT gated (region-replace is exactly the path
+that should fire).  Only prose that names a scope without a replace
+verb — the "insert into scope" shape — is gated.
 
-    base:
-        const rotationEl = document.getElementById("viewRotation");
-        const rotationValueEl = document.getElementById("viewRotationValue");
+The regex also now accepts dots in the backticked identifier, so
+"In `pg_base.py`, ..." is correctly recognised as naming a scope
+(and, since it also says "replace", region-replace runs).
 
-        if (rotationEl) { rotationEl.addEventListener(...); }
-
-        pgkitRegisterField("view.rotation", { ... });
-
-    body:
-        const rotationEl = document.getElementById("viewRotation");
-        const rotationInputEl = document.getElementById("viewRotationInput");
-        const rotationValueEl = document.getElementById("viewRotationValue");
-
-        if (rotationEl) { rotationEl.addEventListener(...); }
-        if (rotationInputEl) { rotationInputEl.addEventListener(...); }
-
-        pgkitRegisterField("view.rotation", { ... });
-
-Before this heuristic: every replacement path returns None (no
-scope to replace, not a `def`/`class` signature, not an object-
-literal assignment), the body falls through to `_try_structural_append`
-or `_ast_insert`, and the resulting file has both the old region
-AND the new region — duplicate `const` declarations, duplicate
-`if` blocks, dead code.
-
-Region-replace fires when:
-  · The body's first non-blank line has the same opening word as
-    the candidate base window (e.g. `const` matches `const`).
-  · At least 40% of the window's stripped lines appear verbatim in
-    the body.
-  · The window and body are at least 55% line-similar under
-    `SequenceMatcher`.
-  · AND the surrounding prose does NOT name a scope ("in `X`",
-    "to `X`", "find the `X` command", etc.).  When prose names a
-    scope, `_try_insert_into_named_scope` is the correct route —
-    the target is explicit and region-replace must not override
-    it.  The prose gate is what keeps `test_40` (try/except
-    inside a named function) correct: without it, region-replace
-    would fire on the try/except body *before* insert-into-scope
-    runs, replacing the wrong block.
-
-The two overlap measures reject the failure modes that would
-otherwise let region-replace clobber real code:
-
-  · Pure insertion — body's `if (condC) { doC(); }` shares `if`
-    and `}` with base's `if (condA) { doA(); doA2(); }`, but the
-    verbatim-overlap is zero.  Rejected by the 40% check.
-
-  · Unrelated same-construct — body's rewritten `function foo()`
-    is entirely new content but starts with `function`.  The
-    overlap is 2/4 = 50% (matches `function foo() {` and `}`
-    only) but the similarity is 44% — under 55%.  Rejected by the
-    similarity check.
-
-Region-replace sits after scoped-replace in the chain so it never
-overrides a more specific replacement.  It sits before the insert
-family so a modified region *replaces* rather than being appended
-after itself.
-
-A tree-sitter based variant (matching by declaration name instead
-of line-similarity) can be added later as `recover/js_scope.py`
-once a `js_scope_index` module exists; the text heuristic above is
-sufficient for the shapes the 2026-10-28 run produced.  The two
-SKIP cases in `tests/recover/test_region_replace.py` are that
-future-work marker.
+Prior docstring content (unchanged):
+- MULTI-STATEMENT APPLY (2026-10-28g)
+- INDENTED DEF/CLASS REPLACE (2026-10-28g)
+- INDENTED-DEF REINDENT BUG (2026-11-01)
+- MULTI-STATEMENT DEDENT (2026-11-01b)
+- DECORATOR MERGE (2026-11-02)
+- LANGUAGE-AWARE STRUCTURAL CHECK (2026-11-01b)
+- DECORATED-SCOPE ROUTING (2026-11-02)
+- REGION REPLACE (2026-10-29)
 """
 
 import difflib
@@ -230,61 +163,64 @@ _in_multi_statement = False
 # ============================================================================
 #
 # Every shape below is a way for the surrounding prose to say "put
-# this inside scope X".  When any of them match, `_try_insert_into_
-# named_scope` is the correct handler and region-replace must not
-# compete — the prose has already named the destination.
+# this inside scope X".  When any of them match AND the prose does
+# not carry a replace-family verb, `_try_insert_into_named_scope` is
+# the correct handler and region-replace must not compete — the
+# prose has already named the destination as an *insertion* target.
 #
-# Kept as a compiled set of alternatives rather than reaching into
-# `patch_scope_insert._extract_scope_name_from_prose` so this gate
-# stays local: if the scope extractor changes its patterns, this
-# gate can still answer the simpler "does prose name any scope?"
-# question without breaking.
+# FIX (2026-11-05): the backticked-identifier character class now
+# accepts dots and slashes, so `pg_base.py` and
+# `playgrounds/inpaint/pg_base.py` are recognised.  A prose line like
+# "In `pg_base.py`, replace the rotation field:" is recognised as
+# scope-naming (backtick-in-scope).  Whether region-replace is then
+# gated depends on whether a replace verb is also present — see
+# `_prose_names_scope`.
 _PROSE_NAMES_SCOPE_RE = re.compile(
-    r'\b(?:in|inside|within|to|for)\s+`[A-Za-z_][\w$]*`'
-    r'|\bfind\s+the\s+`[A-Za-z_][\w$]*`'
-    r'|\bthe\s+`[A-Za-z_][\w$]*`\s+'
+    r'\b(?:in|inside|within|to|for)\s+`[A-Za-z_][\w$./]*`'
+    r'|\bfind\s+the\s+`[A-Za-z_][\w$./]*`'
+    r'|\bthe\s+`[A-Za-z_][\w$./]*`\s+'
     r'(?:command|method|function|class|handler|endpoint|'
     r'decorator|implementation)\b'
     r'|\badd\s+(?:the\s+following\s+)?(?:method|function|command|'
-    r'class)\s+to\s+`[A-Za-z_][\w$]*`',
+    r'class)\s+to\s+`[A-Za-z_][\w$./]*`',
+    re.IGNORECASE,
+)
+
+
+# Replace-family verbs.  Presence of any of these in the prose turns
+# a scope-naming into a *replace* intent, and region-replace is the
+# correct path — it must not be gated.
+_PROSE_REPLACE_SCOPE_RE = re.compile(
+    r'\b(?:replace|change|update|rewrite|modify|substitute|swap)\b',
     re.IGNORECASE,
 )
 
 
 def _prose_names_scope(prose: str) -> bool:
-    """True iff the prose names a scope for this block to go into.
+    """True iff the prose names a target scope AND the intent is
+    *insertion into* that scope, not *replacement of* it.
 
-    Prose that names a scope is an instruction: the block belongs
-    inside that scope.  Insert-into-scope handles it; region-replace
-    must not run — a body that *could* look like a replacement of
-    some existing region (e.g. a `try:`/`except:` fragment under a
-    function whose body already has one) is being inserted as a
-    second sibling, not as a rewrite.
+    A prose line like "In `handle_inpaint`, add a try/except around
+    the payload reads:" names a scope and says "add" — insertion.
+    Region-replace must not fire.
 
-    The motivating shape that motivated the gate:
-    `test_40`'s try/except body, prose "In `handle_thing`, after
-    the existing `payload.get` reads:".  Without the gate,
-    region-replace fires on the try/except fragment because it
-    structurally resembles the existing try/except block, replacing
-    it and losing the `timeout` bindings the function still returns.
+    A prose line like "In `pg_base.py`, replace the rotation field:"
+    names a scope and says "replace" — replacement.  Region-replace
+    is exactly the handler that should fire, and it must not be
+    gated by the scope-name check.
+
+    See the module docstring, PROSE-NAMED-SCOPE: INSERT vs REPLACE.
     """
     if not prose:
         return False
-    return bool(_PROSE_NAMES_SCOPE_RE.search(prose))
+    if not _PROSE_NAMES_SCOPE_RE.search(prose):
+        return False
+    if _PROSE_REPLACE_SCOPE_RE.search(prose):
+        return False   # it's a replace; let region-replace run
+    return True
 
 
 def _split_python_statements(body: str) -> list:
-    """Split Python source into top-level statements.
-
-    Refuses bodies containing triple-quoted strings: the regex-based
-    splitter can't tell a top-level `def` inside a string literal from
-    a real one.
-
-    DECORATOR MERGE (2026-11-02): a `@decorator` line followed by a
-    `def`/`class` line is ONE statement (the decorator belongs with
-    its def).  Splitting them leaves the decorator orphaned, which
-    no heuristic can place.
-    """
     if '"""' in body or "'''" in body:
         return []
 
@@ -307,10 +243,6 @@ def _split_python_statements(body: str) -> list:
             )
         )
         if starts_new and current:
-            # Decorator merge: if the previous non-blank line in
-            # `current` is a decorator (`@...`), keep the current
-            # line attached — whether it's another decorator or the
-            # def/class the decorators apply to.
             last_non_blank = ""
             for ln in reversed(current):
                 if ln.strip():
@@ -330,7 +262,6 @@ def _split_python_statements(body: str) -> list:
             current.pop()
         stmts.append("\n".join(current))
 
-    # Merge leading-comment-only chunks into the next real statement.
     merged: list = []
     pending: list = []
     for s in stmts:
@@ -406,15 +337,6 @@ def _try_multi_statement_apply(base, body, path,
 
 
 def _try_indented_def_replace(base: str, body: str, path: str = ""):
-    """Replace an *indented* `def name(...)` / `async def` / `class`
-    declaration in base with the body's version.
-
-    `body` MUST preserve its original indentation.  Pass `raw_body`
-    from the caller.
-
-    `path` routes `structural.check_balance` to `ast.parse` for `.py`
-    bodies.
-    """
     from .structural import check_balance
 
     m = re.match(
@@ -598,7 +520,7 @@ def _is_already_applied(body_stripped, base):
 
 
 # ============================================================================
-#  Region replace (2026-10-29)
+#  Region replace (2026-10-29; size-aware 2026-11-05)
 # ============================================================================
 
 def _try_region_replace(base: str, body_stripped: str,
@@ -610,23 +532,25 @@ def _try_region_replace(base: str, body_stripped: str,
     """Replace a region of `base` with `body_stripped` when the body
     is a modified version of that region.
 
-    See the module docstring, REGION REPLACE section, for the
-    motivating shape and the acceptance criteria.
+    The similarity sweep selects the best-scoring window (score =
+    overlap_fraction + ratio), then `splice_region` tries the raw
+    boundaries, the AST-snapped boundaries, and a ±3-line sweep.
+    Each candidate is validated structurally; the first valid
+    splice wins.
 
     Gated on `context_before`: when the surrounding prose names a
-    scope ("in `X`", "to `X`", "find the `X` command", "add the
-    following method to `X`", etc.), the block is being inserted
-    into a specific scope and `_try_insert_into_named_scope` will
-    place it correctly.  Region-replace must not run in that case
-    — a fragment that structurally resembles some existing region
-    (e.g. a `try:`/`except:` inside a function that already has one)
-    is a *second* sibling, not a rewrite.  Without this gate,
-    `test_40`'s try/except fragment replaces the existing try/except
-    and drops the `timeout` bindings the function still returns.
+    scope as an *insertion target* (see `_prose_names_scope`), this
+    returns None so `_try_insert_into_named_scope` can place the
+    body without region-replace overriding it.  When the prose
+    names a scope as a *replacement target* (e.g. "In `pg_base.py`,
+    replace ..."), region-replace is not gated — it is the correct
+    handler for that shape.
 
-    Returns the modified content, or None when no region qualifies,
-    when the prose names a scope, or when firing would risk
-    clobbering unrelated content.
+    Per-window similarity threshold (2026-11-05): the flat
+    `min_ratio` is scaled down by the size ratio between window and
+    body, so expand-shaped edits (body larger than base region) are
+    not structurally penalised.  See the module docstring,
+    SIZE-AWARE SIMILARITY.
     """
     if not body_stripped or not base:
         return None
@@ -638,10 +562,6 @@ def _try_region_replace(base: str, body_stripped: str,
     if len(body_lines) < 3:
         return None
 
-    # Exact-substring already-applied check: if the whole body is
-    # already in base, the caller's `_is_already_applied` should
-    # have fired; guard anyway so a direct call does not produce a
-    # redundant region-replace.
     if body_stripped in base:
         return None
 
@@ -661,16 +581,21 @@ def _try_region_replace(base: str, body_stripped: str,
     first_body_word = first_body.split(None, 1)[0] if first_body else ""
 
     best: Optional[tuple] = None
-    # The factor sweep covers both directions: bodies that are
-    # larger than their base region (typical expansion) and bodies
-    # that are smaller than their region (typical contraction).
-    # `max(3, …)` keeps a floor so tiny bodies do not produce
-    # degenerate one-line windows.
     for factor in (0.3, 0.4, 0.5, 0.6, 0.7, 0.85, 1.0,
                    1.15, 1.3, 1.5, 1.8, 2.2):
         window_size = max(3, int(len(body_lines) * factor))
         if window_size > len(base_lines):
             continue
+        # Size-aware threshold: a window that is much smaller or much
+        # larger than the body structurally caps the achievable
+        # SequenceMatcher ratio.  Scale the minimum down by the size
+        # ratio so expand-shrink edits are not rejected on ratio
+        # alone.  The structural validation inside splice_region
+        # still rejects bad boundaries.
+        size_ratio = min(window_size, len(body_lines)) / max(
+            window_size, len(body_lines)
+        )
+        effective_min_ratio = min_ratio * size_ratio
         for start in range(len(base_lines) - window_size + 1):
             window = base_lines[start:start + window_size]
             window_stripped_list = _stripped_nonblank(window)
@@ -681,11 +606,9 @@ def _try_region_replace(base: str, body_stripped: str,
             first_window_word = (
                 first_window.split(None, 1)[0] if first_window else ""
             )
-            # Same opening construct only.
             if first_window_word != first_body_word:
                 continue
 
-            # Criterion 1: verbatim line overlap.
             window_set = set(window_stripped_list)
             if not window_set:
                 continue
@@ -693,13 +616,12 @@ def _try_region_replace(base: str, body_stripped: str,
             if overlap / len(window_set) < min_overlap:
                 continue
 
-            # Criterion 2: line-similarity.
             sm = difflib.SequenceMatcher(
                 None, window_stripped_list, body_stripped_list,
                 autojunk=False,
             )
             ratio = sm.ratio()
-            if ratio < min_ratio:
+            if ratio < effective_min_ratio:
                 continue
 
             score = (overlap / len(window_set)) + ratio
@@ -711,21 +633,23 @@ def _try_region_replace(base: str, body_stripped: str,
 
     _score, start, end, _ratio = best
 
-    new_lines = base_lines[:start] + body_lines + base_lines[end:]
-    result = "\n".join(new_lines)
+    from .patch_bounds import (
+        try_boundary_pairs, try_ast_snapped_boundaries, splice_region,
+    )
+    total = len(base_lines)
 
-    # Preserve base's trailing-newline behaviour.
-    if base.endswith("\n") and not result.endswith("\n"):
-        result += "\n"
+    candidates = [(start, end)]
+    snapped = try_ast_snapped_boundaries(base, path, start, end)
+    if snapped is not None and snapped != (start, end):
+        candidates.append(snapped)
+    candidates.extend(try_boundary_pairs(start, end, total))
 
-    if result == base:
-        return None
-
-    # Aggressive-replace guard: don't lose more than half the file.
-    if len(new_lines) < len(base_lines) * 0.5:
-        return None
-
-    return result
+    for trial_start, trial_end in candidates:
+        result = splice_region(
+            base, trial_start, trial_end, body_lines, path)
+        if result is not None:
+            return result
+    return None
 
 
 def _try_deterministic_patch(base, patch, path="",
@@ -831,7 +755,6 @@ def _try_deterministic_patch_inner(base, patch, path="",
         if _indented_result is not None:
             return _indented_result
 
-    # NEW (2026-11-02): decorated-def scope routing.
     _first_stripped = next(
         (ln.lstrip() for ln in raw_body.splitlines() if ln.strip()), "")
     if _first_stripped.startswith("@"):
@@ -847,7 +770,8 @@ def _try_deterministic_patch_inner(base, patch, path="",
     else:
         _scope_name, _scope_kind = _extract_scope_from_body(body_stripped)
     if _scope_name and _scope_in_base(base, _scope_name, _scope_kind):
-        _scope_result = _apply_scoped(base, _scope_name, body_stripped)
+        _scope_result = _apply_scoped(
+            base, _scope_name, body_stripped, path=path)
         if _scope_result is not None:
             return _scope_result
         patch["failure_reason"] = (
@@ -912,13 +836,6 @@ def _try_deterministic_patch_inner(base, patch, path="",
                 base, body_stripped, id_m.group(1))
         return None
 
-    # NEW (2026-10-29): region-replace.  For bodies that are a
-    # modified version of an existing base region but don't match
-    # any of the more specific replacement heuristics.  Gated on
-    # prose not naming a scope (see `_prose_names_scope`): when the
-    # prose already tells us where the block goes,
-    # `_try_insert_into_named_scope` is the correct route and
-    # region-replace must not override it.
     _region_result = _try_region_replace(
         base, body_stripped, path, context_before)
     if _region_result is not None:

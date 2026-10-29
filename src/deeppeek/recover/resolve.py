@@ -75,15 +75,50 @@ vote unless `inpaint_server.py` is also in the same conversation).
 
 `topic_weights` (produced by `recover.topic.infer_topic_weights`)
 fills that gap: it is a precomputed `{relative_dir: weight}` dict
-derived from the whole dump.  `_discriminate` adds
-`topic_weights[dir] * 20.0` to each candidate's total score.  When
-the topic bonus alone is >= 20 points, the gap threshold for
-confident resolution drops from 10 to 5 — the topic signal is
-strong enough to override the marginal-confidence guard without
-the false-positive risk of a bare content tie.
+derived from the whole dump.
 
-With no topic_weights (default), scoring is identical to the
-pre-2026-11-05 version.
+CONTENT-FIRST DISCRIMINATION (2026-11-05)
+=========================================
+Prior to this change, `_discriminate` computed
+`content_score + dir_bonus + topic_bonus` and sorted by the total.
+Both bonuses are scale-unbounded: `dir_votes[d] * 15` and
+`topic_weights[d] * 20`.  In the 2026-10-28 inpaint conversation,
+the topic weight for `playgrounds/cable` was 49.0 (a
+`topic.py` bug — see its PROSE-ONLY VOTING docstring).  That
+produced `topic_bonus = 980.0` and total = `content_score + 980`,
+which dwarfed the inpaint candidate's content score of ~20 and
+guaranteed cable won.  The content signal alone was barely ~6 points
+for cable; the resolver was effectively picking the directory on a
+*prior* and dropping the evidence.
+
+The 2026-11-05 fix restructures `_discriminate`:
+
+  1. If any candidate's content score beats the runner-up by a
+     large enough margin (15 points), that candidate wins on
+     content alone.  The priors are ignored — they can only
+     refine a close call, not override a clear one.
+
+  2. Otherwise, both bonuses are computed *capped and normalised*:
+       · `dir_bonus` is capped per-directory at 3 votes * 5 = 15
+       · `topic_bonus` is normalised by the maximum candidate's
+         topic weight, capped at +10 total
+     The combined score then has a bounded bonus contribution of at
+     most 25 points, small enough that 3+ matched declarations (25
+     content points) can dominate it.
+
+  3. If the combined margin is still small (<5), fail closed.
+
+  The net effect: a wrong topic prior can cost the resolver a
+  tie-break, but cannot hand it a clearly-wrong answer.  When
+  content is ambiguous and topic is wrong, the outcome is "no
+  confident choice" (which routes to the literal header path, the
+  previous safe default), not "cable confidently."
+
+The `topic.py` prose-only fix removes the specific trigger, but the
+structural change in `_discriminate` is the real invariant: no
+prior may dominate content.  Even a future bug in `topic.py` should
+not be able to misroute a file whose content is clearly a match for
+one candidate.
 """
 import os
 import re
@@ -270,59 +305,88 @@ def _discriminate(block: Block, candidates: list[str],
                   reason_tag: str,
                   dir_votes=None,
                   topic_weights=None) -> tuple[Optional[str], str]:
-    # Directory votes are a BONUS, not a filter.  Every candidate
-    # gets +15 per unambiguous sibling that resolved to its directory,
-    # so a `pg_base.py` candidate in `playgrounds/inpaint/` gets +30
-    # from the 2 `inpaint_server.py` blocks, while the sam3_segment
-    # candidate gets 0.  Content similarity decides when the bonus is
-    # tied; the bonus breaks ties the same way a human would ("the
-    # conversation already agreed on this directory twice").
-    #
-    # Topic weights are a second, orthogonal bonus derived from the
-    # whole conversation's directory mentions.  Same shape: +20 per
-    # point of topic_weight, with the topic gate dropping the gap
-    # threshold only when the topic signal alone is strong.
+    """Pick among ambiguous candidates, evidence first.
+
+    Content score is the primary signal.  `dir_votes` and
+    `topic_weights` are tie-breakers with bounded magnitude — they
+    cannot override a clear content win, and combined they contribute
+    at most ~25 points, so 3-4 matched declarations (25 content
+    points) still dominate them.
+
+    See the module docstring, CONTENT-FIRST DISCRIMINATION, for why
+    this restructuring matters: unbounded priors let a wrong topic
+    weight hand the resolver a 980-vs-20 win.
+    """
+    # Baseline scoring for each candidate.
     scored = []
     for full in candidates:
         content_score = _score(block, full, preexisting_by_full[full])
-        dir_bonus = 0.0
+        scored.append([full, content_score, 0.0, 0.0, content_score])
+
+    # Content-only short circuit: if the top content score clearly
+    # beats the runner-up, commit on content alone.  Priors are not
+    # consulted.  This is the invariant the module docstring describes
+    # — no prior may override a clear content win.
+    content_sorted = sorted(scored, key=lambda x: x[1], reverse=True)
+    if len(content_sorted) == 1:
+        return content_sorted[0][0], reason_tag
+
+    best_c = content_sorted[0][1]
+    second_c = content_sorted[1][1]
+    if best_c - second_c >= 15.0:
+        if verbose:
+            print(f"  [resolve] idx={block.idx} "
+                  f"{block.header_path!r} {reason_tag}: chose "
+                  f"{content_sorted[0][0]} (content-only, gap "
+                  f"{best_c - second_c:.1f})", file=sys.stderr)
+        return (content_sorted[0][0],
+                f"{reason_tag} (content, gap {best_c - second_c:.1f})")
+
+    # Content is close.  Compute capped, normalised priors.
+    #
+    #   dir_bonus:  +5 per unambiguous sibling resolution to the
+    #               candidate's directory, capped at +15 (3 siblings).
+    #   topic_bonus: scaled by the max candidate's topic weight so
+    #                the best-scoring directory gets +10 total.
+    max_topic = 0.0
+    if topic_weights:
+        for full in candidates:
+            w = float(topic_weights.get(os.path.dirname(full), 0.0))
+            if w > max_topic:
+                max_topic = w
+
+    for entry in scored:
+        full = entry[0]
+        d = os.path.dirname(full)
         if dir_votes:
-            d = os.path.dirname(full)
-            dir_bonus = float(dir_votes.get(d, 0)) * 15.0
-        topic_bonus = 0.0
-        if topic_weights:
-            d = os.path.dirname(full)
-            topic_bonus = float(topic_weights.get(d, 0)) * 20.0
-        scored.append((full, content_score, dir_bonus, topic_bonus,
-                       content_score + dir_bonus + topic_bonus))
+            vote_count = min(float(dir_votes.get(d, 0)), 3.0)
+            entry[2] = vote_count * 5.0
+        if topic_weights and max_topic > 0:
+            w = float(topic_weights.get(d, 0.0))
+            entry[3] = (w / max_topic) * 10.0
+        entry[4] = entry[1] + entry[2] + entry[3]
 
     scored.sort(key=lambda x: x[4], reverse=True)
 
-    if len(scored) == 1:
-        return scored[0][0], reason_tag
-
-    (best, _bc, _bd, _bt, best_total) = scored[0]
+    (best, _bc, _bd, best_tb, best_total) = scored[0]
     (_sb, _sc, _sd, _st, second_total) = scored[1]
     gap = best_total - second_total
 
-    topic_ready = (topic_weights is not None
-                   and _bt >= 20.0)
-
-    if best_total >= 20.0 and gap >= 10.0:
+    if best_total >= 10.0 and gap >= 10.0:
         if verbose:
             print(f"  [resolve] idx={block.idx} "
                   f"{block.header_path!r} {reason_tag}: chose "
-                  f"{best} (score {best_total:.1f} vs "
+                  f"{best} (combined {best_total:.1f} vs "
                   f"{second_total:.1f})", file=sys.stderr)
-        return best, f"{reason_tag} (score {best_total:.1f})"
+        return best, f"{reason_tag} (combined {best_total:.1f})"
 
-    if topic_ready and gap >= 5.0:
+    if best_tb >= 5.0 and gap >= 5.0:
         if verbose:
             print(f"  [resolve] idx={block.idx} "
                   f"{block.header_path!r} {reason_tag}: chose "
-                  f"{best} (topic-aided; score {best_total:.1f} vs "
+                  f"{best} (topic-aided; {best_total:.1f} vs "
                   f"{second_total:.1f})", file=sys.stderr)
-        return best, f"{reason_tag} (topic-aided score {best_total:.1f})"
+        return best, f"{reason_tag} (topic-aided {best_total:.1f})"
 
     if verbose:
         print(f"  [resolve] idx={block.idx} "

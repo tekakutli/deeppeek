@@ -12,6 +12,27 @@ re-deriving "is this a delete / a replace / an insert" from prose on
 every pass, we parse it once here and record it on the Block.
 `pass5_deduplicate` reads `intent` and `paired_with`; `pass6` reads
 the same.  Adding a new prose pattern is one entry in `prose.py`.
+
+H2-DERIVED SCOPE HINT PRESERVATION (2026-11-05)
+===============================================
+`pass1_extract` attaches a `scope_hint` to orphan blocks whose
+enclosing H1/H2 heading names a scope (e.g.
+"## Fix 3 — surface per-command errors in `handle_inpaint`").  That
+hint is a *fallback*: a fence whose own prose names a different
+scope uses the prose's scope; only a prose-silent fence inherits the
+heading's hint.
+
+`pass2_classify` originally assigned `b.scope_hint = intent.scope_hint`
+unconditionally.  When the fence's own prose was scope-silent (e.g.
+"And in every failure return:"), `parse_intent` returned
+`Intent()` with an empty `scope_hint`, and that empty value clobbered
+the H2-derived hint.  The block then went to attribution with no
+scope at all, and `_try_scope_name_attribution` bailed.  That is the
+exact failure shape of block idx 634 in the 2026-10-28 run.
+
+The fix: only override `scope_hint`/`scope_name` when the parsed
+intent carries a non-empty `scope_hint`.  When the prose is silent,
+the H2-derived value survives into attribution.
 """
 
 import json
@@ -98,10 +119,19 @@ def pass2_classify(blocks: list[Block], llm: Optional[LLMClient],
         # NEW: parse prose intent now, once per block.  Attaches
         # b.intent, b.scope_hint, b.scope_name.  Downstream passes
         # read those instead of re-deriving them.
+        #
+        # FIX (2026-11-05): preserve the H2-derived scope hint when
+        # the prose is scope-silent.  A prose-silent fence (e.g.
+        # "And in every failure return:") returns an empty
+        # `scope_hint` from `parse_intent`; overwriting the block's
+        # existing H2-derived `scope_hint` with that empty value
+        # loses the section-heading scope, and attribution bails.
+        # That is the block idx 634 failure shape.
         intent = parse_intent(b.context_before)
         b.intent = intent.action
-        b.scope_hint = intent.scope_hint
-        b.scope_name = intent.scope_name
+        if intent.scope_hint:
+            b.scope_hint = intent.scope_hint
+            b.scope_name = intent.scope_name
 
     if mode == "off":
         _apply_hard_overrides(blocks, verbose)

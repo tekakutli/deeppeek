@@ -6,34 +6,49 @@ This module is the *orchestrator*: it owns `pass6_apply_patches`
 per-record insertion filter.  The actual heuristics live in their
 own modules.
 
-REPLACE-INTENT DETECTION (2026-11-05)
-=====================================
-The duplicate-line filter (`_filter_body_by_blocks`) drops body
-lines that already appear in the base, on the theory that they are
-context, not content.  That is correct when the patch is *inserting*
-new content.  It is wrong when the patch is a *modification* of a
-base block: the filter strips the anchor lines (the identical
-prefix), leaving a body that starts with the new content, which the
-dispatcher then treats as a fresh insertion and appends after a
-plausible anchor.
+STRUCTURAL SANITY GATE (2026-10-29, revised)
+============================================
+`_check_structural_sanity` validates embedded content in `.py` files
+(JS/HTML inside triple-quoted string literals) — the pg_panel failure
+class where outer Python parses fine but inner JS is broken.
 
-Motivating failure (2026-10-29 pg_panel_scrubs.py run): the
-rotation-wiring patch's first two lines were identical to base, so
-they were filtered out.  The residue began with `const
-rotationInputEl`, which the AST anchor heuristic placed after the
-existing `pgkitRegisterField("status.running", …)` call — leaving
-the old `if (rotationEl) { … }` block, the old
-`pgkitRegisterField("view.rotation", …)`, and the (now unused)
-`_syncRotationWidget` in the file.  Duplicate registrations,
-duplicate event listeners, dead code.
+For `.js`/`.ts`/`.html` destinations the gate is **conditional on the
+patch body being well-formed**.  A patch body that is itself
+unbalanced (e.g. `if (cond) { doA();` with no closer) is *user-
+provided truncation*: the correct behaviour is to apply it and let
+pass 8's `try_repair` produce a fix suggestion for the user.  A patch
+body that is balanced but whose result is not is *heuristic misfire*:
+the boundary was wrong, and we reject so the next heuristic gets a
+chance.
 
-`patch_replace_intent.detect_replace_intent` runs BEFORE the filter.
-If the unfiltered body diffs against the best-matching base window
-with at least one `replace` or `delete` opcode AND has enough
-contiguous matched lines to be a genuine subsequence, the patch is
-a replacement: the full body replaces the matched region, the
-filter is skipped, and the extractor is applied to the exact region
-that matched.
+This conditional gate is what lets test_28 / test_29 (which use
+intentionally-truncated bodies) exercise the repair path, while
+pg_panel_scrubs.py / pg_panel_bindings.py (which use complete bodies
+that were mis-spliced) get rejected at heuristic time.
+
+PASS-6 FAILED-STATUS ANNOTATION (2026-10-29)
+============================================
+After the apply loop, if the record's *final* content is structurally
+invalid AND the base was structurally clean AND no applied patch had
+an unbalanced body, every patch marked `deterministic` is downgraded
+to `failed`.  Reconcile (pass 8.7) sees the failed status and its
+`_find_minimum_exclusions` can propose exclusions.  The
+`no-unbalanced-body` guard prevents this from firing on user-provided
+truncation, where pass 8's `try_repair` is the correct handler.
+
+PATH THREADING (2026-10-29)
+===========================
+`_apply_pairs` is called with `path=path` so pairs get AST snapping +
+structural validation on their splice.  Reconcile's
+`_replay_excluding` does the same.
+
+Prior docstring content (unchanged):
+- REPLACE-INTENT DETECTION
+- Blockquoted structural check
+- Duplicate-insertion gate
+- Fixed-point patch loop
+- Prior-line recording / prior-insertions scope context
+- Broader-context retry
 """
 import re
 from collections import Counter
@@ -78,7 +93,7 @@ def _diagnose_patch_failure(patch, content, base):
 
 
 # ===========================================================================
-#  Broader-context retry helper (FIX 5)
+#  Broader-context retry helper
 # ===========================================================================
 
 def _broader_context_for(patch, blocks_by_idx, records, path):
@@ -101,7 +116,7 @@ def _broader_context_for(patch, blocks_by_idx, records, path):
 
 
 # ===========================================================================
-#  Blockquoted structural check (FIX 6)
+#  Blockquoted structural check
 # ===========================================================================
 
 def _is_blockquoted_strong(b_idx, blocks_by_idx):
@@ -119,13 +134,6 @@ def _is_blockquoted_strong(b_idx, blocks_by_idx):
 
 def _try_blockquoted_patch(content, patch, path, prior_insertions=None,
                             prior_scopes=None):
-    """Apply a blockquoted patch and validate the result structurally.
-
-    `prior_scopes` is threaded unchanged to `_try_deterministic_patch`
-    so prior-insertion anchors keep their recorded scopes.  See
-    `_mark_already_present` and the module docstring,
-    PRIOR-INSERTIONS SCOPE CONTEXT section.
-    """
     from .validate_output import validate_content
     result = _try_deterministic_patch(
         content, patch, path,
@@ -174,13 +182,10 @@ def _sanity_gate(base, result):
 
 
 # ===========================================================================
-#  Duplicate-insertion gate (Fix 6)
+#  Duplicate-insertion gate
 # ===========================================================================
 
 def _verify_no_duplicate_insertion(old_content, new_content, patch, path):
-    """Return True iff applying `patch` did not introduce an
-    unexpected duplicate copy of a **pre-existing** line.
-    """
     old_lines = [ln.strip() for ln in old_content.splitlines()
                  if ln.strip()]
     new_lines = [ln.strip() for ln in new_content.splitlines()
@@ -213,41 +218,105 @@ def _verify_no_duplicate_insertion(old_content, new_content, patch, path):
 
 
 # ===========================================================================
-#  Structural sanity gate (NEW 2026-10-28)
+#  Body wellformedness probe (2026-10-29)
+# ===========================================================================
+#
+# Distinguishes heuristic misfire from user-provided truncation:
+#
+#   · body well-formed + result broken  →  heuristic misfire.  Reject
+#     (so the next heuristic gets a chance).
+#   · body truncated + result truncated  →  user-provided truncation.
+#     Apply, let pass 8's `try_repair` handle it (test_28, test_29).
+#
+# Structural check skips diff bodies and deletion instructions — their
+# syntax isn't well-formed code, and those classes are handled by their
+# own validators.
+
+def _body_is_wellformed(body: str, path: str) -> bool:
+    """True iff `body` is well-formed for `path`'s destination language.
+
+    - diff bodies, deletion instructions: True (handled elsewhere)
+    - `.py` bodies: try `ast.parse`.  On failure, try `_js_balance`
+      (may be embedded JS the caller will re-wrap).
+    - `.js`/`.ts`/`.html` bodies: `_js_balance`.
+    - unknown/empty path: `_js_balance`.
+    """
+    if not body or not body.strip():
+        return True
+    if _looks_like_diff_body(body):
+        return True
+    if _is_deletion_instruction(body, ""):
+        return True
+    ext = Path(path).suffix.lower() if path else ""
+    if ext == ".py":
+        import ast
+        import textwrap
+        try:
+            ast.parse(textwrap.dedent(body))
+            return True
+        except SyntaxError:
+            pass
+        # Not valid Python — may be embedded JS/HTML content.
+        # Fall through to the balance check.
+    from .validate_output import _js_balance
+    b, p, k, u = _js_balance(body)
+    return (b, p, k, u) == (0, 0, 0, 0)
+
+
+# ===========================================================================
+#  Structural sanity gate
 # ===========================================================================
 
-def _check_structural_sanity(old_content, new_content, path):
+def _check_structural_sanity(old_content, new_content, path,
+                              patch_body=""):
     """Refuse a patch that introduces unfixable structural damage.
 
-    Catches two failure modes on `.py` destinations:
+    For `.py` destinations: `ast.parse` plus the module-level-stmt
+    check, PLUS embedded-JS/HTML validation.  The embedded check is
+    what catches broken playground JS (outer Python parses fine).
 
-      1. `ast.parse(new_content)` fails.
+    For `.js`/`.ts`/`.html` destinations: validated only when the
+    patch body was itself well-formed.  A truncated body is user-
+    provided truncation and is applied as-is so pass 8's
+    `try_repair` can suggest a fix.
 
-      2. A module-level statement keyword was added at column 0.
-
-    Returns None for `.py` destinations that pass, or a short reason
-    string.  Always returns None for non-Python destinations.
+    Returns None when the gate does not fire, or a short reason
+    string when it does.
     """
     if not old_content:
         return None
-    if Path(path).suffix.lower() != ".py":
+    ext = Path(path).suffix.lower()
+
+    if ext == ".py":
+        import ast
+        try:
+            ast.parse(new_content)
+        except SyntaxError as e:
+            return (f"patch introduced Python syntax error at "
+                    f"line {e.lineno}: {e.msg}")
+        from .validate_output import _module_level_stmts_added
+        added = _module_level_stmts_added(new_content, old_content)
+        if added:
+            return (f"patch injected module-level statement(s) at "
+                    f"column 0: {added}")
+        from .patch_bounds import structural_valid
+        if not structural_valid(new_content, path):
+            return ("patch produced structurally-invalid embedded "
+                    "content (JS/HTML parse error inside a Python "
+                    "string literal)")
         return None
-    import ast
-    try:
-        ast.parse(new_content)
-    except SyntaxError as e:
-        return (f"patch introduced Python syntax error at "
-                f"line {e.lineno}: {e.msg}")
-    from .validate_output import _module_level_stmts_added
-    added = _module_level_stmts_added(new_content, old_content)
-    if added:
-        return (f"patch injected module-level statement(s) at "
-                f"column 0: {added}")
+
+    if ext in (".js", ".mjs", ".jsx", ".ts", ".tsx", ".html"):
+        from .patch_bounds import structural_valid
+        if not structural_valid(new_content, path):
+            if _body_is_wellformed(patch_body, path):
+                return f"patch produced structurally-invalid {ext} content"
+        return None
     return None
 
 
 # ===========================================================================
-#  Prior-line recording (NEW 2026-10-28e)
+#  Prior-line recording
 # ===========================================================================
 
 def _record_single_line_anchor(patch, body, record_inserted,
@@ -276,7 +345,7 @@ def _record_single_line_anchor(patch, body, record_inserted,
 
 
 # ===========================================================================
-#  Already-present anchoring (2026-10-28 / 2026-10-28e)
+#  Already-present anchoring
 # ===========================================================================
 
 def _mark_already_present(patch, body, record_inserted,
@@ -288,7 +357,7 @@ def _mark_already_present(patch, body, record_inserted,
 
 
 # ===========================================================================
-#  Duplicate-assignment pre-gate (2026-10-28b)
+#  Duplicate-assignment pre-gate
 # ===========================================================================
 
 _DUP_ASSIGN_LINE_RE = re.compile(r'^[A-Za-z_$][\w$]*\s*=\s*[^=]')
@@ -313,22 +382,17 @@ def _is_duplicate_assignment_insert(old_content, patch):
 
 
 # ===========================================================================
-#  Replace-intent application (NEW 2026-11-05)
+#  Replace-intent application
 # ===========================================================================
 
 def _try_replace_intent(content: str, patch, path: str,
                         record_inserted: set):
     """Attempt to apply `patch` as a region replacement.
 
-    Returns the new content (bytes) on success, `content` unchanged
-    (already applied) if the replacement produces no diff, or None
-    if the replace-intent detection did not fire or its result
-    failed one of the sanity gates.
-
-    The three sanity gates mirror the ones the normal patch path
-    uses: no duplicate pre-existing lines introduced, structural
-    sanity on Python destinations, and — implicitly — the resulting
-    content must actually differ from `content`.
+    Candidate regions: unmodified `(start, end)` from
+    `detect_replace_intent`, AST-snapped boundaries, ±N-line sweep.
+    Each spliced via `patch_bounds.splice_region`, which validates
+    structurally.  The first valid splice wins.
     """
     body = patch.get("body") or ""
     intent = detect_replace_intent(content, body)
@@ -343,30 +407,37 @@ def _try_replace_intent(content: str, patch, path: str,
     if start_line >= end_line:
         return None
 
-    new_lines = (base_lines[:start_line]
-                 + replacement_body.split("\n")
-                 + base_lines[end_line:])
-    new_content = "\n".join(new_lines)
+    from .patch_bounds import (
+        try_boundary_pairs, try_ast_snapped_boundaries, splice_region,
+    )
+    body_lines = replacement_body.split("\n")
 
-    if new_content == content:
-        return content
+    candidates = [(start_line, end_line)]
+    snapped = try_ast_snapped_boundaries(
+        content, path, start_line, end_line)
+    if snapped is not None and snapped != (start_line, end_line):
+        candidates.append(snapped)
+    candidates.extend(try_boundary_pairs(
+        start_line, end_line, len(base_lines)))
 
-    if not _verify_no_duplicate_insertion(
-            content, new_content, patch, path):
-        return None
-    struct_err = _check_structural_sanity(content, new_content, path)
-    if struct_err is not None:
-        patch["failure_reason"] = struct_err
-        patch["replace_intent_rejected"] = True
-        return None
-
-    patch["replace_intent"] = {
-        "start_line": start_line,
-        "end_line": end_line,
-        "replaced_lines": end_line - start_line,
-    }
-    record_inserted |= _collect_inserted_lines(content, new_content)
-    return new_content
+    for trial_start, trial_end in candidates:
+        result = splice_region(
+            content, trial_start, trial_end, body_lines, path)
+        if result is None:
+            continue
+        if result == content:
+            return content
+        if not _verify_no_duplicate_insertion(
+                content, result, patch, path):
+            continue
+        patch["replace_intent"] = {
+            "start_line": trial_start,
+            "end_line": trial_end,
+            "replaced_lines": trial_end - trial_start,
+        }
+        record_inserted |= _collect_inserted_lines(content, result)
+        return result
+    return None
 
 
 # ===========================================================================
@@ -411,16 +482,14 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
 
         pair_records = []
         if rec.pairs:
-            content, pair_records = _apply_pairs(content, rec.pairs)
+            content, pair_records = _apply_pairs(
+                content, rec.pairs, path=path)
             record_inserted |= _collect_inserted_lines(base, content)
             rec.verification["pair_records"] = pair_records
 
         def _broader_for(p):
             return _broader_context_for(p, blocks_by_idx, records, path)
 
-        # ------------------------------------------------------------------
-        # FIXED-POINT PATCH LOOP
-        # ------------------------------------------------------------------
         all_ok = True
         pending = list(rec.patches)
 
@@ -447,10 +516,6 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
 
                 original_body = patch["body"]
 
-                # NEW (2026-11-05): replace-intent detection runs
-                # BEFORE the duplicate-line filter, because the filter
-                # strips the anchor lines that prove this is a
-                # replacement rather than an insertion.
                 _ri_result = _try_replace_intent(
                     content, patch, path, record_inserted)
                 if _ri_result is not None:
@@ -519,7 +584,8 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                         patch["applied_by"] = "skipped_duplicate_insertion"
                         continue
                     _struct_err = _check_structural_sanity(
-                        content, result, path)
+                        content, result, path,
+                        patch_body=patch_to_apply["body"])
                     if _struct_err is not None:
                         patch["applied_by"] = "skipped_structural_damage"
                         patch["failure_reason"] = _struct_err
@@ -564,7 +630,8 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                                 "skipped_duplicate_insertion"
                             continue
                         _struct_err = _check_structural_sanity(
-                            content, result, path)
+                            content, result, path,
+                            patch_body=patch["body"])
                         if _struct_err is not None:
                             patch["applied_by"] = \
                                 "skipped_structural_damage"
@@ -645,7 +712,8 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                                 "skipped_duplicate_insertion"
                             continue
                         _struct_err = _check_structural_sanity(
-                            content, retry_result, path)
+                            content, retry_result, path,
+                            patch_body=broader_patch["body"])
                         if _struct_err is not None:
                             patch["applied_by"] = \
                                 "skipped_structural_damage"
@@ -721,6 +789,45 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                     f"(record not failed)")
             else:
                 all_ok = False
+
+        # ==================================================================
+        #  FAILED-STATUS ANNOTATION (2026-10-29, revised)
+        # ==================================================================
+        # If content is structurally invalid AND base was clean AND no
+        # applied patch had an unbalanced body, downgrade every
+        # `deterministic` patch to `failed`.  Reconcile can then
+        # exclude them.
+        #
+        # The `no-unbalanced-body` guard is what distinguishes
+        # heuristic misfire (reject, downgrade, let reconcile clean
+        # up) from user-provided truncation (apply broken, let pass 8
+        # try_repair suggest a fix — tests 28, 29).
+        from .patch_bounds import structural_valid as _structural_valid
+        applied_patches = [p for p in rec.patches
+                           if p.get("applied_by") == "deterministic"]
+        any_unbalanced_body = any(
+            not _body_is_wellformed(p.get("body", ""), path)
+            for p in applied_patches
+        )
+        if (content
+                and not _structural_valid(content, path)
+                and (not base or _structural_valid(base, path))
+                and not any_unbalanced_body):
+            for p in applied_patches:
+                p["applied_by"] = "failed"
+                p["failure_reason"] = (
+                    "patch produced structurally-invalid content "
+                    "(detected in pass 6; see validate_content for "
+                    "the specific parse error)")
+            rec.trust = "LOW"
+            rec.verification["patches_incomplete"] = True
+            print(
+                f"  [struct-annotation] {path}: content is "
+                f"structurally invalid; deterministic patches "
+                f"downgraded to failed so reconcile can exclude",
+                file=sys.stderr,
+            )
+            all_ok = False
 
         rec.verification["patches_applied"] = sum(
             1 for p in rec.patches

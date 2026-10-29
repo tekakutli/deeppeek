@@ -47,9 +47,40 @@ Before this fix, the hint was lost: the block orphaned, went to the
 residual as `orphan_unattributed`, and the `errors` return never
 landed in `inpaint_server.py`.
 
-The hint is a *fallback*, not an override: a fence whose own prose
-names a different scope uses the prose's scope.  Only when the
+H2 SCOPE RESET (2026-10-30)
+===========================
+The scope hint is a *fallback*, not an override: a fence whose own
+prose names a different scope uses the prose's scope.  Only when the
 fence's prose is silent does the section's scope hint apply.
+
+A corollary the 2026-10-30 fix added: the scope hint must be *reset*
+when a new H1/H2 arrives, even if that heading names no scope.
+Without the reset, `## Fix 3 — ... in handle_inpaint` set
+`current_scope = "handle_inpaint"`, and `## Fix 4 — rotation
+doesn't shrink` (which names no scope) left it in place.  Every
+fence under Fix 5 then inherited `handle_inpaint` as its scope
+hint — which `_try_scope_name_attribution` dutifully looked up as
+`def handle_inpaint` in the preexisting tree, producing nonsense
+attributions for HTML-body fences that had nothing to do with the
+Python function.
+
+The reset is unconditional on H1/H2.  H3+ subsections inherit
+their enclosing H2's hint, same as before.
+
+H2 FILE-HEADER SCOPE RESET (2026-11-05)
+=======================================
+Companion to the H2-scope-reset fix: when an H1/H2 parses as a
+*file header* (`## File: foo.py`), `current_scope` must also be
+reset.  Previously only the non-file-header H1/H2 branch reset the
+scope, so a file-header H2 arriving after an `## Fix ... in
+handle_inpaint` section would leave `current_scope` set to
+`handle_inpaint`.  Any subsequent orphan fence under the file
+header would inherit the stale scope.
+
+The file-header branch is otherwise scope-silent — a `## File:`
+heading never carries "in `X`" text — so resetting to the result of
+`_extract_scope_hint(raw)` is equivalent to resetting to `""`, but
+expresses the intent in one place.
 """
 
 import re
@@ -107,10 +138,10 @@ def _extract_scope_hint(heading_text: str) -> str:
 
     The three alternatives in `_SCOPE_IN_HEADING_RE` cover:
 
-      · "in `X`", "inside `X`", "within `X`", "to `X`" — the
+      • "in `X`", "inside `X`", "within `X`", "to `X`" — the
         standard "this section is about X" form.
-      · "find the `X`" — the imperative form.
-      · "of `X`" — the descriptive form ("Rewrite of `runInpaint`").
+      • "find the `X`" — the imperative form.
+      • "of `X`" — the descriptive form ("Rewrite of `runInpaint`").
 
     First match wins; a heading that names multiple scopes returns
     the first.  Returns "" when no scope is named.
@@ -296,6 +327,18 @@ def pass1_extract(dump_text: str) -> tuple[list[Block], list[str]]:
                 parsed = _parse_file_header(raw)
                 if parsed is not None:
                     current_header = parsed
+                    # FIX (2026-11-05): reset current_scope on a
+                    # file-header H1/H2 too.  Previously only the
+                    # non-file-header branch reset it, so
+                    # `## File: foo.py` arriving after
+                    # `## Fix 3 — ... in handle_inpaint` left the
+                    # stale `handle_inpaint` hint in place for any
+                    # subsequent orphan fence under the file
+                    # header.  A `## File:` heading never carries
+                    # "in `X`" text, so this is equivalent to
+                    # resetting to "" — expressed via the extractor
+                    # for uniformity.
+                    current_scope = _extract_scope_hint(raw)
                     current_context_lines = []
                 else:
                     # NEW: an H1 or H2 that does NOT name a file is a
@@ -325,9 +368,21 @@ def pass1_extract(dump_text: str) -> tuple[list[Block], list[str]]:
                         # "## Fix 3 — surface errors in `handle_inpaint`"
                         # yields "handle_inpaint", which later
                         # orphans in this section fall back on.
-                        _hint = _extract_scope_hint(raw)
-                        if _hint:
-                            current_scope = _hint
+                        #
+                        # Reset unconditionally.  A new H1/H2 starts a
+                        # new section; if the section does not name a
+                        # scope, the previous section's scope must not
+                        # survive into this one.  Without the reset,
+                        # `handle_inpaint` (from "## Fix 3 — … in
+                        # `handle_inpaint`") would leak into every
+                        # fence under the following H2s — an HTML
+                        # rotation widget under "## Fix 5 — text input
+                        # for rotation" would get a
+                        # `scope_hint = "handle_inpaint"` and
+                        # `_try_scope_name_attribution` would look for
+                        # `def handle_inpaint` and pick a Python file
+                        # for an HTML block.
+                        current_scope = _extract_scope_hint(raw)
                     current_context_lines.append(raw)
                     if len(current_context_lines) > 40:
                         current_context_lines = current_context_lines[-40:]

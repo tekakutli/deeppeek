@@ -52,11 +52,11 @@ The fix: when tree-sitter reports an error, still compute
 `_js_balance` and append the balance diagnosis as a parenthetical
 hint.  Both properties hold simultaneously:
 
-  · The primary diagnostic is a tree-sitter error with a location
+  - The primary diagnostic is a tree-sitter error with a location
     ("parse error at line N, col M"), which is what the user needs
     to see for a general structural failure.
 
-  · The balance hint (`unbalanced braces (+1)`) is a substring of
+  - The balance hint (`unbalanced braces (+N)`) is a substring of
     the message, so downstream consumers that gate on the balance
     shape — `repair.try_repair`, and any future consumer that keys
     on the same signal — continue to work.
@@ -91,6 +91,107 @@ generically: any top-level call `name("string", …)` that appears
 twice with the same `name` and same `"string"` key, within the same
 enclosing Python string (for `.py` destinations — the playground
 pattern), or anywhere in the file (for `.js` destinations).
+
+`_looks_like_js` THRESHOLD (2026-10-29)
+=======================================
+The previous scoring fired on `signals >= 2`, which let docstrings
+that mention two code-ish words (`const`, `function`, `document`,
+`=>`) get routed through `_js_structural_check`.  Tree-sitter then
+reported a parse error on prose and the record was fail-closed.
+
+`_looks_like_js` now (a) short-circuits positive on unmistakable
+code patterns (`function ident(`, `const ident = …function|{|[|
+document.|new |async`), and (b) requires 3 moderate signals instead
+of 2 for the ambiguous case.  A real playground JS block contains
+`function foo(...)` or `=>` or `export const`, so the tighter
+threshold does not lose coverage.
+
+REPEATED-STATEMENT DEDUP NOW RESPECTS EMBEDDED-JS SCOPES
+========================================================
+(2026-10-30)
+
+`_dedup_repeated_statements` removes a patch-contributed single-line
+statement that appears exactly twice, in the same *enclosing scope*,
+within a small window.  Its same-scope test called
+`_enclosing_scope_depth(content, pos)` — but for a `.py` file with
+embedded JS, `_enclosing_scope_depth` treats the whole triple-quoted
+string literal as one opaque block, so every statement inside it
+reported the same `scope_open = -1` (or the same outer-Python offset
+if the string happened to sit inside a Python function).  Two
+identical statements in two different JS arrow functions therefore
+looked same-scope and one was removed.
+
+Motivating failure (2026-10-29 pg_panel_scrubs.py run): the two
+rotation-widget event listeners (`if (rotationEl)` and
+`if (rotationInputEl)`) both contain `if (!isFinite(v)) return;`,
+`_applyRotation(v);`, and `pgkitNotifyLocal("view.rotation");`.
+The dedup pass deleted all three from the second listener, leaving
+the text field non-functional.  The file parses, the record reports
+`content_valid: ok`, `ast_parse: ok` — the corruption is invisible
+without opening the file.
+
+Fix: `_js_scope_for_pos(content, path, pos)` returns
+`(region_start, region_end, scope_open)`:
+
+  - `.js`-family: whole-file region, real JS scope.  Behavior
+    matches the pre-fix code.
+
+  - `.py`: locate the enclosing triple-quoted string literal (via
+    `_python_string_spans`), compute `_enclosing_scope_depth` on
+    the *string literal's content*, return
+    `(string_start, string_end, scope_within_string)`.  Two
+    statements in different string literals have different
+    `region_start` and are never deduped (matches
+    `_dedup_duplicate_blocks`).  Two statements in the same string
+    but different JS scopes have different `scope_open` and are
+    never deduped.
+
+  - anything else: whole-file region, unchanged.
+
+`_dedup_repeated_statements` groups candidates by `(indent, stmt)` as
+before, and now requires `region_start == region_start` AND
+`scope_open == scope_open` before removing.
+
+REFERENCE-AWARE DECLARATION-PRESENCE CHECK (2026-11-05)
+=======================================================
+`_function_presence_check` used to treat *any* declaration name
+present in base and absent in result as a violation.  Two classes
+of false positive:
+
+  · **Local-variable declarations.**  `_declared_names` matched
+    `^\s*(?:export\s+)?(?:const|let|var)\s+…` at any indent, so a
+    `  const deg = Math.round(v);` inside a JS function counted as
+    a top-level declaration.  When the patch replaced that function
+    body, `deg` disappeared from `result` and the check flagged it
+    — even though `deg` was never a top-level symbol.
+
+  · **Renames.**  When a patch renamed `_syncRotationWidget` to
+    `_syncRotationWidgets`, the base's declaration disappeared and
+    the result had a differently-named one.  That is not a
+    regression; it is a rename.  The old check treated it as a
+    deletion.
+
+Two fixes address the two classes independently:
+
+  · `_DECL_PATTERNS` now anchors at column 0 (`^` not `^\s*`), so
+    indented declarations are excluded.  A top-level declaration
+    in a `.py` or `.js` file starts at column 0 by definition; an
+    indented one is a local, and locsals are outside the scope of
+    this check.
+
+  · `_function_presence_check` now uses a *reference* check rather
+    than a *declaration-absence* check.  A declaration that is
+    present in base and absent in result is only flagged if the
+    result *still references* the name — i.e. the removal created a
+    dangling reference.  A rename leaves the old name unreferenced
+    and passes; an accidental deletion that orphans a call site
+    still fails.
+
+The reference check uses word-bounded matching (`\bname\b`), so
+`_syncRotationWidget` does not match `_syncRotationWidgets` — the
+`t`/`s` boundary does not qualify.  This is the same "the check is
+conservative" reasoning as the rest of the module: a real dangling
+reference is flagged; a rename is not.
 """
 import ast
 import re
@@ -199,25 +300,33 @@ def _module_level_stmts_added(content: str, base: Optional[str]) -> list:
 # ---------------------------------------------------------------------------
 # Function / declaration presence
 # ---------------------------------------------------------------------------
+#
+# FIX (2026-11-05): patterns anchor at column 0.  A top-level
+# declaration starts at column 0 in both Python and JavaScript; an
+# indented one is a local, and locals are out of scope for this
+# check.  The prior `^\s*` also matched indented declarations (a
+# `  const deg = …` inside a JS function) and treated them as
+# top-level; when a patch rewrote such a function body, the local
+# "disappeared" and the check flagged a violation.
 
 _DECL_PATTERNS = (
     re.compile(
-        r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(",
+        r"^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(",
         re.MULTILINE),
     re.compile(
-        r"^\s*(?:export\s+)?(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(",
+        r"^(?:export\s+)?(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(",
         re.MULTILINE),
     re.compile(
-        r"^\s*(?:export\s+)?(?:async\s+)?class\s+([A-Za-z_$][\w$]*)",
+        r"^(?:export\s+)?(?:async\s+)?class\s+([A-Za-z_$][\w$]*)",
         re.MULTILINE),
     re.compile(
-        r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=",
+        r"^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=",
         re.MULTILINE),
 )
 
 
 def _declared_names(text: str) -> set:
-    """Return every declaration name found in text (any language)."""
+    """Return every column-0 declaration name found in text."""
     out = set()
     for pat in _DECL_PATTERNS:
         for m in pat.finditer(text):
@@ -229,8 +338,25 @@ def _function_presence_check(base: str, result: str,
                               label: str,
                               allow_missing: Optional[set] = None,
                               ) -> Optional[str]:
-    """Every top-level name declared in base must appear in result,
-    unless it is listed in `allow_missing`."""
+    """Flag declarations that were removed from `base` AND are still
+    referenced in `result`.
+
+    A declaration present in base and absent in result is a violation
+    only when the removal created a *dangling reference*.  A rename
+    (old name gone, new name present) leaves no dangling reference
+    and passes; a clean deletion (removal without remaining references)
+    also passes.
+
+    See the module docstring, REFERENCE-AWARE DECLARATION-PRESENCE
+    CHECK, for the two false-positive classes this replaces:
+
+      · locals (fixed by column-0 anchoring in `_DECL_PATTERNS`)
+      · renames (fixed here)
+
+    `allow_missing` opts specific names out of the check entirely —
+    used by callers that have already attributed a declaration's
+    disappearance to an explicit deletion patch.
+    """
     if not base:
         return None
     base_names = _declared_names(base)
@@ -240,12 +366,25 @@ def _function_presence_check(base: str, result: str,
     missing = base_names - result_names
     if allow_missing:
         missing = missing - set(allow_missing)
-    if missing:
-        listed = sorted(missing)[:6]
-        return (f"{label}: declaration(s) present in base but missing "
-                f"from result: {listed}"
-                + (" ..." if len(missing) > 6 else ""))
-    return None
+    if not missing:
+        return None
+
+    # Of the removed declarations, which are still referenced?
+    # Word-bounded matching, so a rename (e.g. `_syncRotationWidget`
+    # → `_syncRotationWidgets`) leaves the old name unreferenced and
+    # the check passes.
+    dangling = set()
+    for name in missing:
+        if re.search(r"\b" + re.escape(name) + r"\b", result):
+            dangling.add(name)
+
+    if not dangling:
+        return None
+
+    listed = sorted(dangling)[:6]
+    return (f"{label}: declaration(s) present in base but missing "
+            f"from result, and still referenced: {listed}"
+            + (" ..." if len(dangling) > 6 else ""))
 
 
 # ---------------------------------------------------------------------------
@@ -528,18 +667,59 @@ def _iter_triple_quoted(content: str):
 
 
 def _looks_like_js(text: str) -> bool:
+    """True iff `text` contains enough JS-specific code signals to
+    justify running the JS parser on it.
+
+    Previous threshold (signals >= 2) fired on docstrings that
+    happened to mention, e.g., "const", "function", or "document"
+    in prose.  The consequence: `_py_valid` ran `_js_structural_check`
+    on the docstring, tree-sitter reported a syntax error on plain
+    English, and the record was fail-closed for no valid reason.
+    `pg_panel_scrubs.py` (2026-10-29 run) surfaced this — the
+    docstring mentioned "function" and "const" and got parsed as JS,
+    producing "JavaScript parse error at line 2, col 1".
+
+    Two adjustments:
+
+      - Short-circuit positive on unmistakable code shapes:
+        `function ident(`, `const ident = function|{|[|document.|new |
+        async`.  Prose never produces these.
+
+      - Count moderate signals, but require 3, not 2, for the
+        ambiguous case.  A real playground JS block almost always
+        contains `function foo(...)` or `=>` or `export const`, so
+        the tighter threshold does not lose coverage.
+
+    The regexes are anchored with `\\b` and account for the common
+    backtick-identifier idiom (`const x = ...` where `x` is $/_-safe)
+    used throughout playground sources.
+    """
+    if not text:
+        return False
+
+    # Strong positive: patterns that cannot appear in prose.
+    if re.search(r'\bfunction\s+[A-Za-z_$]\w*\s*\(', text):
+        return True
+    if re.search(r'\b(?:const|let|var)\s+[A-Za-z_$]\w*\s*=\s*'
+                 r'(?:function|\{|\[|document\.|new\s|async\b)',
+                 text):
+        return True
+
+    # Moderate signals — but require 3, not 2.
     signals = 0
-    if re.search(r"\bexport\s+(?:function|const|class)\b", text):
+    if re.search(r"\bexport\s+(?:function|const|class|default)\b", text):
         signals += 2
-    if re.search(r"\bfunction\s+\w+\s*\(", text):
+    if re.search(r"\bconst\s+[A-Za-z_$]\w*\s*=", text):
         signals += 1
-    if re.search(r"\bconst\s+\w+\s*=", text):
+    if re.search(r"\b(?:let|var)\s+[A-Za-z_$]\w*\s*=", text):
         signals += 1
     if "=>" in text:
         signals += 1
-    if "document." in text:
+    if re.search(r"\bdocument\.[A-Za-z_$]\w*\s*\(", text):
         signals += 1
-    return signals >= 2
+    if re.search(r"\bwindow\.[A-Za-z_$]\w*\s*\(", text):
+        signals += 1
+    return signals >= 3
 
 
 def _looks_like_html(text: str) -> bool:
@@ -713,6 +893,41 @@ def _enclosing_scope_depth(content: str, pos: int) -> tuple:
                 stack.pop()
         i += 1
     return depth, (stack[-1] if stack else -1)
+
+
+def _js_scope_for_pos(content: str, path: str, pos: int) -> tuple:
+    """Return `(region_start, region_end, scope_open)` for `pos`.
+
+    See the module docstring, "REPEATED-STATEMENT DEDUP NOW RESPECTS
+    EMBEDDED-JS SCOPES" — this is the fix that stops the same
+    single-line statement, appearing in two different JS closures
+    inside the same Python string literal, from being treated as a
+    same-scope duplicate.
+
+    `region_start` / `region_end` are the outer-file span of the
+    enclosing string literal (for `.py` with embedded JS), or the
+    whole file for `.js`-family files, or `(pos, pos)` for positions
+    outside any string in a `.py` file.
+
+    `scope_open` is the JS scope-open offset *within that region*;
+    -1 for top-level of the region, or for positions that are not in
+    an embedded JS region at all.
+    """
+    ext = Path(path).suffix.lower() if path else ""
+    if ext in (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"):
+        _, scope_open = _enclosing_scope_depth(content, pos)
+        return (0, len(content), scope_open)
+    if ext == ".py":
+        spans = _python_string_spans(content)
+        for s, e in spans:
+            if s <= pos < e:
+                inner = content[s:e]
+                inner_pos = pos - s
+                _, scope_open = _enclosing_scope_depth(inner, inner_pos)
+                return (s, e, scope_open)
+        return (pos, pos, -1)
+    _, scope_open = _enclosing_scope_depth(content, pos)
+    return (0, len(content), scope_open)
 
 
 def _norm_lines(s: str) -> str:
@@ -928,7 +1143,7 @@ def _same_python_string(pos_a: int, pos_b: int, spans: list) -> bool:
 def _find_duplicate_string_calls(
         content: str,
         is_python: bool,
-        py_spans: list) -> list[tuple[int, int, str]]:
+        py_spans: list) -> list:
     """Return [(start_char, end_char, desc)] for duplicate
     `name("key", …)` registrations.
 
@@ -939,8 +1154,8 @@ def _find_duplicate_string_calls(
     For `.js` destinations, both occurrences must be in the same
     enclosing scope (per `_enclosing_scope_depth`).
     """
-    seen: dict[tuple, tuple[int, int]] = {}
-    removals: list[tuple[int, int, str]] = []
+    seen: dict = {}
+    removals: list = []
 
     for m in _STRING_LITERAL_CALL_RE.finditer(content):
         # Determine enclosing Python string, if relevant.
@@ -1163,7 +1378,18 @@ def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
 
 def _dedup_repeated_statements(content, path, base=None,
                                 patch_bodies=None, window=15):
-    """Remove duplicate single-line statements under tight conditions."""
+    """Remove duplicate single-line statements under tight conditions.
+
+    See the module docstring, "REPEATED-STATEMENT DEDUP NOW RESPECTS
+    EMBEDDED-JS SCOPES".  For `.py` destinations, `_js_scope_for_pos`
+    ensures two statements in different JS closures (or in different
+    triple-quoted string literals) never look same-scope.  The pre-fix
+    code called `_enclosing_scope_depth` directly on the whole file,
+    which could not see `{`/`}` inside a string literal and reported
+    every statement inside the literal as `scope_open = -1` — the
+    deletion bug that stripped `_applyRotation(v)` from
+    `pg_panel_scrubs.py`'s second listener.
+    """
     from pathlib import Path as _P
     ext = _P(path).suffix.lower()
     if ext not in frozenset({
@@ -1211,19 +1437,24 @@ def _dedup_repeated_statements(content, path, base=None,
             continue
         indent = len(line) - len(line.lstrip())
         try:
-            _, scope_open = _enclosing_scope_depth(content, line_starts[i])
+            region_start, region_end, scope_open = _js_scope_for_pos(
+                content, path, line_starts[i])
         except Exception:
             continue
         key = (indent, s)
-        candidates.setdefault(key, []).append((i, scope_open))
+        candidates.setdefault(key, []).append(
+            (i, region_start, region_end, scope_open))
 
     removals = []
     for key, occs in candidates.items():
         if len(occs) != 2:
             continue
-        (i1, scope1), (i2, scope2) = occs
+        (i1, r1_start, r1_end, scope1) = occs[0]
+        (i2, r2_start, r2_end, scope2) = occs[1]
+        if r1_start != r2_start or r1_end != r2_end:
+            continue                  # different string literals
         if scope1 != scope2:
-            continue
+            continue                  # different JS scopes
         if i2 - i1 > window:
             continue
         removals.append((i2, lines[i2].strip()))
@@ -1242,6 +1473,7 @@ def _dedup_repeated_statements(content, path, base=None,
         print(f"  [dedup-stmt] {path}: removed duplicate line "
               f"{text!r}", file=sys.stderr)
     return chr(10).join(out), len(removals)
+
 
 def _extract_object_literal_occurrences(content):
     """Return [(var_name, open_pos, close_pos, keys_set)] for every

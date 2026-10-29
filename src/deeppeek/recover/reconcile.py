@@ -5,98 +5,35 @@ excluding the minimum set of patches/pairs that caused the failure.
 See the pre-fix module docstring for the motivating cases and the
 "reconciled to base is not a rescue" invariant.
 
-STALE-WARNING CLEANUP
-=====================
-Pass 6 appends `patch idx={idx} could not be applied (...)` warnings
-for every failed patch.  When reconciliation excludes a patch and
-promotes the record, those warnings are now stale — the patch is
-`skipped_unplaceable` or `skipped_misattributed`, not "failed".
-`pass8_7_reconcile` removes the pass-6 warning for each excluded
-patch idx before adding its own reconciliation warning.
+PATH THREADING (2026-10-29)
+===========================
+`_replay_excluding` now passes `path=path` to `_apply_pairs`, so
+scope replaces executed during reconcile replay get AST-snapped
+boundaries and structural validation — the same treatment they got
+during the initial pass-6 application.  Without this, reconcile
+could not replay a scope-replace that pass 6 applied correctly, and
+would silently produce different results during its exclusion
+search.
 
-THREE MORE CLASSES OF STALE WARNING
-===================================
-`content validation failed` from pass 8, `replace pair(s) failed`
-from pass 6, and `patch compatibility check failed` (pass 8.5) get
-the same treatment: when reconcile rewrites their live state, the
-aggregate warning is removed.
+PRIOR-PASS ANNOTATION INTERACTION (2026-10-29)
+==============================================
+Pass 6 now downgrades `deterministic` patches to `failed` when the
+record's final content is structurally invalid (see
+`apply_patches.pass6_apply_patches`).  Reconcile's `_applied_keys`
+sees the failed status and its `_find_minimum_exclusions` can try
+excluding them.  When a single patch caused the corruption, this
+promotes the record; when multiple did, it stays LOW (correct
+fail-closed).
 
-PREFIX-MATCHING CORRECTION (2026-10-28e)
-========================================
-The stale-warning cleanup previously matched on
-`"unresolved symbol reference(s) introduced by patch:"` — a prefix
-that pass 8.5 never emits.  The actual warning text is
-`"patch compatibility check failed: unresolved symbol reference(s)..."`.
-The prefix mismatch meant a warning that a reconcile diagnostic on
-the *next* line contradicted survived reconcile in `warnings.txt`,
-producing an internally inconsistent report.
-
-The cleanup now matches the actual prefixes:
-  · "patch compatibility check failed:"   (pass 8.5)
-  · "unresolved symbol reference(s) introduced by patch:"  (legacy)
-  · "signature mismatch(es):"              (pass 8.5 sub-form)
-
-Each is cleared when the corresponding verification field
-(`unresolved_calls` / `signature_mismatches`) has been popped by
-reconcile.
-
-DIAGNOSTIC MESSAGE SPLIT (2026-10-28e)
-======================================
-`_diagnose_exclusion` used to prefix every patch exclusion with
-"introduces an unresolved symbol or structural failure" even when
-`_fuzzy_locate_elsewhere` had positively located the content in a
-different record.  That prefix contradicted the next clause
-("content matches X — likely misattributed").  Motivating case:
-pg_panel_scrubs.py idx=72, whose warning read "introduces an
-unresolved symbol or structural failure; content matches
-playgrounds/inpaint/pg_panel_bindings.py — likely misattributed".
-
-The three cases are now distinct:
-
-  1. `original_status == "failed"` — the patch never applied.
-     Message: "could not be placed; the rest of the record applies
-     cleanly without it."
-
-  2. `_fuzzy_locate_elsewhere` found a match — the patch applied
-     in-memory (it "compiled") but its content belongs in another
-     file.  Message: "content already exists in <other> — likely
-     misattributed, not written here."
-
-  3. Neither — the patch applied but produced a validation failure
-     that could not be attributed to a better file.  Message:
-     "introduces an unresolved symbol or structural failure; content
-     not found in any other file."
-
-ORDERING FIXES
-==============
-  · `_diagnose_exclusion` receives the pre-mutation status via
-    `original_status`.
-
-  · `_trust_cap(rec)` is called *after* `rec.verification
-    ["reconciled"]` is populated.
-
-WARN-ONLY PASSES EXCLUDED FROM FAILURE COUNTING (2026-10-28)
-============================================================
-An earlier version of `_count_failures` included the lint check
-(pass 8.4's unused-`@command`-arg detection).  That was wrong: lint
-is informational (see `lint.py`'s docstring).  Its presence in the
-failure counter blocked reconcile from promoting records whose only
-"defect" was a warn-only finding — a category error the wrong way
-around.  The counter now includes only demoting checks:
-`validate_content`, `find_unresolved_references`, and any surviving
-`applied_by == "failed"` patches/pairs.
-
-DISTINCTIVE SCOPE-NAME MISATTRIBUTION (2026-10-28b)
-===================================================
-`_fuzzy_locate_elsewhere`'s fast path: if the body declares exactly
-one top-level scope whose name is distinctive AND that scope is also
-declared in another record AND the bodies overlap at 0.4, return
-that other record's path.
-
-MISATTRIBUTION GUARD (raised thresholds)
-========================================
-Short bodies (< 500 chars) require verbatim substring match.
-Substantial bodies (>= 500 chars) use fuzzy match at 0.85.
+Prior docstring content (unchanged):
+- STALE-WARNING CLEANUP
+- THREE MORE CLASSES OF STALE WARNING
+- PREFIX-MATCHING CORRECTION (2026-10-28e)
+- DIAGNOSTIC MESSAGE SPLIT (2026-10-28e)
+- ORDERING FIXES
+- WARN-ONLY PASSES EXCLUDED FROM FAILURE COUNTING (2026-10-28)
+- DISTINCTIVE SCOPE-NAME MISATTRIBUTION (2026-10-28b)
+- MISATTRIBUTION GUARD (raised thresholds)
 """
 
 import re
@@ -144,6 +81,14 @@ def _applied_keys(rec):
 
 def _replay_excluding(rec, base, excluded_keys, path,
                       blocks_by_idx, records):
+    """Replay pass-6 application with `excluded_keys` removed.
+
+    `path` is passed to `_apply_pairs` so scope replaces executed
+    during replay get AST-snapped boundaries (the same treatment as
+    the initial application).  Without this, replay could not
+    reproduce the pass-6 result and reconcile's exclusion search
+    would fail for every pair-carrying record.
+    """
     content = base
 
     pairs_kept = [
@@ -151,7 +96,7 @@ def _replay_excluding(rec, base, excluded_keys, path,
         if _pair_key(pair) not in excluded_keys
     ]
     if pairs_kept:
-        content, _ = _apply_pairs(content, pairs_kept)
+        content, _ = _apply_pairs(content, pairs_kept, path=path)
 
     for patch in rec.patches:
         if _patch_key(patch) in excluded_keys:
@@ -261,20 +206,12 @@ def _find_minimum_exclusions(rec, base, records, path, blocks_by_idx):
 
 
 def _is_distinctive_scope_name(name):
-    """True iff `name` is long enough and distinctive enough that a
-    same-named scope in another file is a strong misattribution
-    signal."""
     if not name or len(name) < 8:
         return False
     return "_" in name or any(c.isupper() for c in name)
 
 
 def _scope_name_lives_elsewhere(body, current_path, records):
-    """If `body` declares *exactly one* top-level scope whose name is
-    distinctive AND that scope is also declared in another record AND
-    the two bodies overlap at 0.4, return the other record's path.
-    Else None.
-    """
     from .prose import _extract_scope_from_body
     from .patch_text import _content_present_in_base
     from .dedup import _top_level_decls
@@ -354,11 +291,7 @@ def _patch_first_line(patch):
 def _diagnose_exclusion(key, rec, records, original_status=None):
     """Produce a human-readable exclusion message.
 
-    `original_status` overrides `patch.get("applied_by")` when the
-    caller has already mutated the patch status.
-
-    Three distinct cases (see module docstring, DIAGNOSTIC MESSAGE
-    SPLIT section):
+    Three distinct cases:
 
       1. `original_status == "failed"` — never applied.  "Could not
          be placed."
@@ -398,11 +331,6 @@ def _diagnose_exclusion(key, rec, records, original_status=None):
 
 
 def _trust_cap(rec):
-    """Trust ceiling for a record after reconciliation.
-
-    A reconciled record caps at MEDIUM: reconciliation excluded the
-    evidence of a problem, not the problem itself.
-    """
     if rec.verification.get("reconciled"):
         return "MEDIUM"
     return "MEDIUM" if rec.dedup_reason == "last_full" else "HIGH"
@@ -420,14 +348,6 @@ def _base_content(rec, blocks_by_idx):
 
 
 def _clear_stale_pass6_warnings(rec, excluded_keys):
-    """Remove warnings that are stale after reconciliation.
-
-    PREFIX-MATCHING CORRECTION (2026-10-28e): the third class matches
-    `patch compatibility check failed:` (pass 8.5's actual output) as
-    well as the legacy `unresolved symbol reference(s) introduced by
-    patch:` prefix.  Both are cleared when the verification field has
-    been popped by reconcile.
-    """
     excluded_patch_idxs = set()
     for key in excluded_keys:
         if key[0] == "patch":

@@ -6,68 +6,67 @@ scope is (function/class/const-assignment/<details>) and the
 invariants around partial-splice balance, scope-signature integrity,
 and full-replace fail-closed.
 
-MULTI-SCOPE BODIES — REFINED
-=============================
-`_apply_scoped` splits multi-scope bodies via
-`_extract_top_level_scopes` and applies each scope separately, BUT
-only when *every* sub-scope exists in base.  Two cases:
+AST-SNAPPED BOUNDARIES (2026-10-29)
+===================================
+`_apply_scoped_single` now splices via `patch_bounds.splice_region`
+instead of the direct `base[:indent_pos] + reindented + base[m_end:]`.
+The splice candidate set is:
 
-  ALL sub-scopes exist (pg_pixels.py)
-    The body declares two functions that both already live in the
-    base.  Single-scope application would embed the second function
-    inside the first's span, while the base's original second copy
-    survived below — producing `Identifier already declared` at
-    load time.  Splitting into two scoped replaces fixes this.
+  1. The unmodified `[start_line, end_line)` computed from the scope
+     match.
+  2. AST-snapped boundaries — expanded outward to the enclosing
+     top-level statements (`ast` for `.py`, tree-sitter for `.js`/
+     `.ts`/etc. and for the dominant embedded JS string in a `.py`).
+     This is what catches off-by-one endings: a scope-match that stops
+     one line short of the closing `}` leaves the old brace as an
+     orphan `}`, and the AST snap expands `end` up to the enclosing
+     node's end.
+  3. A ±3-line sweep around the original boundaries as fallback when
+     the AST snap can't fire (tree-sitter missing, empty path, or the
+     scope is HTML `<details>` where the JS parser can't help).
 
-  SOME sub-scopes are NEW functions (pg_panel_bindings.py)
-    The body declares `_inpaintAction` (exists) plus two helper
-    functions that don't exist in base.  Attempting to scoped-replace
-    the new helpers fails (`_scope_in_base` returns False).  Splitting
-    propagates that failure and the whole pair is dropped.  The old
-    single-scope behavior — replace the first scope's span with the
-    whole new_body — correctly *inserts* the new helpers alongside
-    the replacement, which is what the AI intended.
+Each candidate goes through `patch_bounds.splice_region`, which
+validates structurally.  The first valid splice wins.  When none
+produces valid content, `_apply_scoped_single` returns None and
+fail-closed kicks in (the record lands in `low_trust/`).
 
-PLACEHOLDER MERGE (2026-10-28)
-==============================
-An AI block often replaces a function body with a *template* whose
-docstring contains a placeholder (`... (docstring unchanged) ...`).
-Applying the template verbatim replaces the real docstring with the
-marker string — the comfyui_krita.py corruption.
+PATH THREADING (2026-10-29)
+===========================
+`_apply_scoped` and `_apply_scoped_single` take an optional `path`
+argument so the AST snap can pick the right grammar.  Callers
+(`patch_dispatch._try_deterministic_patch_inner`,
+`patch_pairs._apply_pairs`) pass the record's path through.
 
-`_try_merge_placeholder_in_scope` is the fix: it locates the base
-scope, extracts its Python docstring, and merges it into the new
-body's placeholder (or prepends it if the new body has no docstring
-at all).  Called from `patch_dispatch._try_deterministic_patch_inner`
-before any other heuristic.
+EXCLUSIVE END-LINE (2026-10-30)
+===============================
+`end_line` is the position *one past* the scope's last line.  The
+pre-fix computation was `base.count("\n", 0, m_end)`, which yields the
+index of the line containing `base[m_end - 1]` — i.e. the scope's
+last line itself, not one past it.  Because `splice_region` replaces
+`base_lines[start:end]`, that `end` preserved the scope's last line
+into the new body.  Two failure shapes resulted:
 
-Handles only Python docstrings (FunctionDef/AsyncFunctionDef/ClassDef
-with a leading string constant).  JS comments, `<details>` inner
-text, and non-docstring placeholders fall through to the
-dispatcher's fail-closed refusal, which is the safe outcome.
+  • Whenever the new body re-stated the same trailing line (e.g. a
+    method that still ended with `return {'success': True}`), the
+    stale line was identical to the new one and the damage was
+    invisible.
 
-ALREADY-PRESENT SCOPED-REPLACE (2026-10-28f)
-============================================
-`_apply_scoped_single` used to *always* replace the scope's content
-with the patch body, even when the reindented body was token-
-equivalent to what was already there.  Re-running on an already-
-applied base then produced whitespace drift (bug 3: the `<details>`
-View section went from 10-space to 6-space indent in a second run,
-byte-identical after strip).
+  • Whenever the new body's last line differed from the old body's
+    last line, the old line survived as an *unreachable statement*
+    after the new `return`.  `ast.parse` accepts unreachable code, so
+    `validate_content` reported `ok` and the file shipped corrupted.
 
-Fix: after computing the reindented body and BEFORE the final
-assembly, check `_content_present_in_base(base_scope_text,
-reindented, threshold=0.99)`.  When 99%+ of the reindented body's
-lines are token-present in the existing scope, return `base` — the
-outer caller (`_apply_pairs` / `_try_deterministic_patch_inner`)
-treats it as `already-present`.
+  Concrete instance: `comfyui_krita.py`'s `_encode_alpha8_png` gained
+  `return _encode_grayscale_png(bytes(alpha), w, h)` from the OLD
+  body, which references the removed local `alpha`.  The file parses
+  fine and would raise `NameError` on the first call.
 
-Threshold 0.99 rather than 0.85 so a legitimate scoped-replace that
-changes even one substantive line still applies.  Specifically:
+  The fix is the `+ 1`.
 
-  · A rename (`foo` → `bar`): scope's line 1 mismatch → 0% match.
-  · A 1-line change in a 20-line scope: 19/20 = 95% < 99%.
-  · A reprint of an identical scope (whitespace-only drift): 100%.
+Prior docstring content (unchanged):
+- MULTI-SCOPE BODIES — REFINED
+- PLACEHOLDER MERGE (2026-10-28)
+- ALREADY-PRESENT SCOPED-REPLACE (2026-10-28f)
 """
 
 import re
@@ -706,9 +705,12 @@ def _try_scoped_partial_splice(base_scope_text, new_body):
     return result_text
 
 
-def _apply_scoped_single(base, scope_name, new_body):
-    """Apply a single-scope replacement (the original `_apply_scoped`
-    body, renamed).
+def _apply_scoped_single(base, scope_name, new_body, path=""):
+    """Apply a single-scope replacement.
+
+    AST-snapped boundaries + structural validation, per the module
+    docstring.  Returns None when no candidate splice produced valid
+    content.
     """
     if not scope_name or not new_body.strip():
         return None
@@ -758,27 +760,60 @@ def _apply_scoped_single(base, scope_name, new_body):
             m_end -= 1
         reindented = _reindent_body(base_indent, new_body)
 
-        # NEW (2026-10-28f): already-present scoped-replace.
-        # If 99%+ of the reindented body's lines are already token-
-        # present in the base scope, return base (no change).  The
-        # caller (outer patch loop or reconcile replay) marks the
-        # patch already-present.  Threshold 0.99 rather than 0.85 so
-        # a legitimate scoped-replace that changes even one
-        # substantive line still applies.  See the module docstring,
-        # ALREADY-PRESENT SCOPED-REPLACE section, and the motivating
-        # pg_base.py View-details whitespace-drift bug.
+        # Already-present scoped-replace (2026-10-28f).
         if _content_present_in_base(base_scope_text, reindented,
                                      threshold=0.99):
             return base
 
         if not _scope_signature_ok(reindented):
             return None
-        return base[:indent_pos] + reindented + base[m_end:]
+
+        # AST-snapped splice with structural validation (2026-10-29).
+        from .patch_bounds import (
+            try_boundary_pairs, try_ast_snapped_boundaries,
+            splice_region,
+        )
+        base_lines = base.splitlines()
+        start_line = base.count("\n", 0, indent_pos)
+        # EXCLUSIVE end-line.  `splice_region` replaces
+        # `base_lines[start:end]`, so `end` must be one past the
+        # scope's last line.  The pre-2026-10-30 computation —
+        # `base.count("\n", 0, m_end)` — returned the line index of
+        # `base[m_end - 1]` itself, i.e. the scope's last line.  That
+        # left the last line of every scope-replace intact in the new
+        # body.  When the new body re-stated the same last line, the
+        # damage was invisible; when it did not, the old last line
+        # survived as an unreachable statement (which `ast.parse`
+        # accepts).  See the module docstring, EXCLUSIVE END-LINE.
+        end_line = base.count("\n", 0, m_end) + 1
+        body_lines = reindented.split("\n")
+
+        candidates = [(start_line, end_line)]
+        snapped = try_ast_snapped_boundaries(
+            base, path or "", start_line, end_line)
+        if snapped is not None and snapped != (start_line, end_line):
+            candidates.append(snapped)
+        candidates.extend(try_boundary_pairs(
+            start_line, end_line, len(base_lines)))
+
+        for trial_start, trial_end in candidates:
+            # Scope replaces legitimately shrink (function body
+            # replaced with something smaller); 30% floor rather
+            # than 50%.
+            result = splice_region(
+                base, trial_start, trial_end, body_lines,
+                path or "", min_fraction=0.3)
+            if result is not None:
+                return result
+        return None
     return None
 
 
-def _apply_scoped(base, scope_name, new_body):
+def _apply_scoped(base, scope_name, new_body, path=""):
     """Apply a scoped replace, handling multi-scope bodies correctly.
+
+    `path` is forwarded to `_apply_scoped_single` for AST snapping
+    and structural validation.
     """
     if not scope_name or not new_body.strip():
         return None
@@ -795,10 +830,10 @@ def _apply_scoped(base, scope_name, new_body):
             current = base
             for sub_name, sub_body in scopes:
                 result = _apply_scoped_single(
-                    current, sub_name, sub_body)
+                    current, sub_name, sub_body, path=path)
                 if result is None:
                     return None
                 current = result
             return current
 
-    return _apply_scoped_single(base, scope_name, new_body)
+    return _apply_scoped_single(base, scope_name, new_body, path=path)

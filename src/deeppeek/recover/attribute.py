@@ -33,14 +33,14 @@ DIFFICULT.  Owns:
               Three scoring components, weighted equally (30/20/30),
               each normalized to [0, 1]:
 
-                · line density — fraction of the block's stripped
+                • line density — fraction of the block's stripped
                   lines that appear verbatim in the candidate's body.
 
-                · declaration overlap — fraction of the block's
+                • declaration overlap — fraction of the block's
                   top-level declaration names that the candidate
                   also declares.
 
-                · distinctive-token overlap — fraction of the
+                • distinctive-token overlap — fraction of the
                   block's *distinctive* tokens (filtered for common
                   code-machinery vocabulary) that share a stem with
                   some candidate token.  Stem matching is
@@ -67,6 +67,27 @@ DIFFICULT.  Owns:
               through from `pipeline.run`, which computes it once
               after classification.  No topic_weights = identical
               behaviour to the pre-2026-11-05 version.
+
+    FIX [7]   Ambiguity trace (2026-10-30).
+              `_pick_by_content` emits a `[pass 4]` line to stderr
+              whenever it (a) makes a topic-aided pick (i.e., the gap
+              was below the normal 5-point threshold but the topic
+              bonus was strong enough to lower it to 3), or (b)
+              fails-closed on an ambiguous gap.  Both cases involve a
+              close call that a human operator will want to see.  The
+              trace names every candidate, its content-only score, its
+              topic bonus, and its total, so the next time an
+              attribution goes wrong (e.g. `pg_base.py` →
+              `playgrounds/board/` when it should have gone to
+              `playgrounds/inpaint/`), the diagnostic is one re-run
+              away instead of a manual code trace.
+
+              No behaviour change.  The trace is unconditional (no
+              `verbose` argument) because `_pick_by_content` is called
+              from `pass4_attribute_orphans`, which is itself called
+              once per pipeline run; the print frequency is bounded by
+              the number of ambiguous attributions in that run, which
+              is small.
 """
 import os
 import re
@@ -154,19 +175,19 @@ def _stems_match(a: str, b: str, min_len: int = 4) -> bool:
     """True iff `a` and `b` name the same concept.
 
     Rules, in order:
-      · Identical strings match.
-      · One is a prefix of the other AND the shorter is at least
+      • Identical strings match.
+      • One is a prefix of the other AND the shorter is at least
         `min_len` characters AND the suffix has at least one
         "compound marker" (uppercase letter, underscore, or digit).
 
     The compound-marker requirement is what distinguishes:
-      · `inpaintPromptEl` ↔ `inpaintPrompt` (suffix "El", `E` is
+      • `inpaintPromptEl` ↔ `inpaintPrompt` (suffix "El", `E` is
         uppercase — compound, match)
-      · `inpaint` ↔ `inpainting` (suffix "ing", all lowercase — a
+      • `inpaint` ↔ `inpainting` (suffix "ing", all lowercase — a
         different word, no match)
-      · `board` ↔ `board_member` (suffix "_member", underscore —
+      • `board` ↔ `board_member` (suffix "_member", underscore —
         compound, match)
-      · `board` ↔ `boardroom` (suffix "room", all lowercase — no
+      • `board` ↔ `boardroom` (suffix "room", all lowercase — no
         match)
 
     `min_len=4` prevents matches on short generic prefixes (`id` ↔
@@ -431,6 +452,15 @@ def _pick_by_content(b: Block,
     strong (>= 20) topic bonus.  Fail-closed on ambiguity: 0 or 2+
     near-tied candidates returns None; the caller falls through to
     the next heuristic.
+
+    FIX [7]: every topic-aided pick and every fail-closed ambiguity
+    emits a `[pass 4]` trace to stderr naming all candidates with
+    their content-only score, topic bonus, and total.  See the module
+    docstring.  The trace exists precisely because the 2026-10-28 run
+    sent `pg_base.py` / `pg_panel_scrubs.py` / `pg_panel_bindings.py`
+    to `playgrounds/board/` instead of `playgrounds/inpaint/`, and
+    neither the manifest nor warnings.txt recorded enough detail to
+    diagnose it without a manual code trace.
     """
     if not candidates or not b.body.strip():
         return None
@@ -499,13 +529,38 @@ def _pick_by_content(b: Block,
 
     best_total, _bc, best_topic, best_path = scored[0]
     second_total = scored[1][0]
+    gap = best_total - second_total
 
-    if best_total - second_total >= threshold:
+    if gap >= threshold:
         return best_path
     # Topic-aided path: the topic signal alone is strong enough to
     # lower the gap threshold.
-    if best_topic >= 20.0 and best_total - second_total >= 3.0:
+    if best_topic >= 20.0 and gap >= 3.0:
+        print(
+            f"  [pass 4] _pick_by_content idx={b.idx}: "
+            f"topic-aided pick {best_path!r} "
+            f"(gap={gap:.1f} < threshold={threshold:.1f}, "
+            f"topic_bonus={best_topic:.1f})",
+            file=sys.stderr,
+        )
         return best_path
+
+    # Fail-closed on ambiguity.  Emit the full score table so the
+    # operator can see why the tiebreaker could not decide.  The
+    # 2026-10-28 run would have shown `board` winning on content
+    # while `inpaint` had a 52-point topic bonus that the code
+    # discarded because it was scoped to `dump_text` (which
+    # double-counts `board` in code bodies).  See `topic.py`'s
+    # PROSE-ONLY VOTING section.
+    print(
+        f"  [pass 4] _pick_by_content idx={b.idx}: ambiguous "
+        f"(gap={gap:.1f}, threshold={threshold:.1f}); scores: "
+        + ", ".join(
+            f"{p}={t:.1f} (content={c:.1f}, topic={bo:.1f})"
+            for t, c, bo, p in scored
+        ),
+        file=sys.stderr,
+    )
     return None
 
 

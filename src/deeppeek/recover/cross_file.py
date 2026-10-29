@@ -16,13 +16,41 @@ utility shims, intentional forks for micro-service separation,
 per-platform variants).  The MIN_LINES threshold is set high enough
 that only substantive bodies are compared, and the report names
 every affected file so a human can decide quickly.
+
+DEPENDENCY HYGIENE (2026-10-30)
+===============================
+The pre-fix version imported `_norm_lines` and `_find_matching_close_char`
+from `validate_output` at module level.  That made `cross_file` (a
+small, leaf-ish duplicate detector) depend on the whole
+structural-validation stack, and — critically — turned any
+**syntax error** in `validate_output.py` into a `pipeline.run()`
+crash.  The import lived inside `run()`'s `from .cross_file import
+find_cross_file_duplicates` line, which was not wrapped in any
+try/except, so one bad docstring in a downstream module cascaded
+into "every fixture fails" for 40 tests.
+
+Both helpers have safer homes:
+
+  • `_norm_lines` is three lines of `str.splitlines` +
+    `strip` + `join`.  It belongs locally.
+
+  • `_find_matching_close_char` (the char-based brace matcher) is
+    semantically identical to `patch_text._find_matching_brace`,
+    which `cross_file` can import without dragging in
+    `validate_output` at all.  `patch_text` is a genuinely
+    dependency-free leaf module; `validate_output` is not.
+
+The result: `cross_file` imports only `hashlib`, `re`, and
+`patch_text`.  `pipeline.run()`'s late import of `cross_file`
+becomes safe, and a future structural-validation bug can no longer
+crash a run before `pass9_write`.
 """
 from __future__ import annotations
 
 import hashlib
 import re
 
-from .validate_output import _norm_lines, _find_matching_close_char
+from .patch_text import _find_matching_brace
 
 
 MIN_LINES_FOR_CROSS_FILE = 10
@@ -35,6 +63,16 @@ _FUNC_DECL_RE = re.compile(
 _CLASS_DECL_RE = re.compile(
     r"^((?:export\s+)?class\s+([A-Za-z_$][\w$]*)\b)",
     re.MULTILINE)
+
+
+def _norm_lines(s: str) -> str:
+    """Strip each non-empty line and rejoin, dropping blank lines.
+
+    Local definition (rather than importing from `validate_output`) so
+    that `cross_file` does not depend on the structural-validation
+    stack.  See module docstring, DEPENDENCY HYGIENE.
+    """
+    return "\n".join(ln.strip() for ln in s.splitlines() if ln.strip())
 
 
 def _extract_top_level_signatures(content):
@@ -54,7 +92,7 @@ def _extract_top_level_signatures(content):
             open_brace = content.find("{", m.end(), header_end)
             if open_brace == -1:
                 continue
-            close_brace = _find_matching_close_char(content, open_brace)
+            close_brace = _find_matching_brace(content, open_brace)
             if close_brace == -1:
                 continue
             body = _norm_lines(content[m.start():close_brace + 1])

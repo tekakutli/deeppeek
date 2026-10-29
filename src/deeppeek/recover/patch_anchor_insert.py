@@ -61,6 +61,27 @@ COMMENT-AWARE ANCHORS (2026-10-28d)
 Every anchor branch consults `patch_comments.get_comment_spans(base,
 path)` and skips any candidate position inside a comment.
 
+FILENAME ANCHORS REJECTED (2026-10-29)
+======================================
+A prose backtick that resolves to a *filename* (`` `pg_base.py` ``,
+`` `some_module.js` ``, `` `data/config.toml` ``) is a reference to
+the destination file, not a code anchor.  Without a guard, the
+statement branch captures the filename (it passes the length and
+identifier checks), finds its unique occurrence in base — typically
+inside the module docstring, where the file names itself — and
+splices the patch body there.
+
+Motivating case: `pg_base.py`, patch 636 (HTML rotation widget).
+Prose is "In `pg_base.py`, replace the rotation field:".  The anchor
+`pg_base.py` matches line 2 of the module docstring; the HTML body
+gets spliced into the docstring, which is valid Python (a string
+literal), so every check (`ast.parse`, `validate_content`,
+`patch_presence`) reports success.  The file's `PG_PANEL_BODY` never
+receives the widget.
+
+`_FILENAME_ANCHOR_RE` rejects anchors whose whole text resolves to a
+source-file path.
+
 CLASS-TARGET + DECORATED-BODY (2026-11-02)
 ==========================================
 `_try_insert_after_def` refuses a `@`-decorated body when `ident`
@@ -72,13 +93,6 @@ class+decorated-body; if it declines for some reason, this branch
 declining lets the pipeline fall through to structural-append (which
 also declines class+decorated), and finally to fail-closed — a
 strictly better outcome than placing the method at module level.
-
-Motivating failure (test_40, comfyui.py method-insert): the body
-`@command(name="new")\ndef new_cmd(self, params): ...` was being
-placed AFTER `class MyHandler:` at module level via this branch
-when the scope-insert heuristic declined.  The method was valid
-Python (module-level def) but semantically misplaced.  The
-class-target check eliminates that fallback.
 """
 
 import re
@@ -314,9 +328,6 @@ def _try_insert_after_def(base, ident, body):
     if not first_stripped.startswith(_DECL_START_PREFIXES):
         return None
 
-    # Class + decorated body → refuse.  Scope-insert is the correct
-    # handler; if it declines, fail-closed beats module-level
-    # placement.
     if first_stripped.startswith("@"):
         _class_re = re.compile(
             r'(?m)^[ \t]*class\s+' + re.escape(ident) + r'\b')
@@ -513,6 +524,15 @@ _IDENT_ONLY_RE = re.compile(r'^[A-Za-z_$][\w$]*$')
 _CALL_ONLY_RE = re.compile(r'^[A-Za-z_$][\w$]*\s*\(')
 
 
+# A backtick content that resolves to a source-file path is a prose
+# reference to the destination file, not a code anchor.  See module
+# docstring, FILENAME ANCHORS REJECTED (2026-10-29).
+_FILENAME_ANCHOR_RE = re.compile(
+    r'^(?:[A-Za-z0-9_.\-]+/)*[A-Za-z0-9_.\-]+'
+    r'\.(py|js|mjs|ts|tsx|jsx|html|css|json|yaml|yml|toml|md|sh|rs|go|rb|php)$'
+)
+
+
 def _try_insert_after_anchor(base, body, context_before,
                               prior_insertions=None, path="",
                               prior_scopes=None):
@@ -617,6 +637,15 @@ def _try_insert_after_anchor(base, body, context_before,
             if len(stripped) < 6:
                 continue
             if _IDENT_ONLY_RE.match(stripped):
+                continue
+            # NEW (2026-10-29): skip filename-shaped anchors.
+            # `pg_base.py` from "In `pg_base.py`, replace…" is a
+            # reference to the destination file, not a code anchor.
+            # Without this guard the heuristic matches the first
+            # occurrence of the filename in base — typically inside
+            # the module docstring, where the file names itself — and
+            # splices the body into the docstring.
+            if _FILENAME_ANCHOR_RE.match(stripped):
                 continue
             positions = []
             start = 0
