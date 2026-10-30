@@ -1,6 +1,6 @@
 """`deeppeek prompt refine_deeppeek` — apply, review the aftermath,
-AND attach the input conversation and a dump of deeppeek's own source
-so the model can propose concrete refinements.
+merge all inputs into one file, and pipe the merged file so the model
+can propose concrete refinements.
 
 Pipeline (extends `review`):
 
@@ -10,31 +10,36 @@ Pipeline (extends `review`):
     apply      deeppeek recover <conversation> --apply-here
     require    hard: deeppeek/ must exist post-apply
     status     scripts/status.py in cwd → <ws>/diff.txt
-    dump       dump.py in the deeppeek source, restricted to an
-               explicit whitelist (recover/ pipeline, its tests,
-               the fixtures, pyproject.toml, test infrastructure)
+    dump       `dump.py -r` from <repo>/src/deeppeek/ with
+               DEFAULT_INCLUDE_DIRS = ['recover', 'write'] → covers
+               every .py under recover/ and recover/write/, plus the
+               three top-level deeppeek module files
     cwd-dump   (optional, --with-dump) dump_filtered.py in cwd,
                filtered to files whose basenames appear as `## File:`
-               headers in the conversation.  Attached as a file chip
-               alongside everything else.
-    pipe       diff.txt + meta files + conversation.md + deeppeek_dump.md
+               headers in the conversation
+    merge      diff.txt + meta files + conversation.md + deeppeek_dump.md
                [+ project_dump_<cwd>_filtered.md with --with-dump]
+               → a single refine_deeppeek_merged.md via
+               scripts/merge_md.py
+    pipe       the single merged.md as one file chip
     type       short templated prompt
+
+The four (or five) inputs are merged into one markdown file before
+they hit the pipe stage.  `merge_md.py` uses `+` separators and
+`MERGED FILE i/N:` headers, so the merged file remains unambiguous
+even when its inputs are themselves dump files.  The AI gets one
+file chip containing the conversation, the diff, the reports, and
+the deeppeek source dump, all in one.
 
 Differences from `review`:
 
-  · The original conversation markdown is attached as a file chip, so
-    the model can see what was actually applied (not just what happened
-    when applying it).
-  · A dump of deeppeek's own source is attached, so the model can
+  · The original conversation markdown is included in the merged
+    file, so the model can see what was actually applied (not just
+    what happened when applying it).
+  · A dump of deeppeek's own source is included, so the model can
     quote specific file paths and function names when proposing fixes.
-    The dump is restricted to the recovery pipeline and its tests —
-    everything else (browser-capture protocol, extension, CLI
-    dispatch, AI prompt pipelines, docs, README) is excluded, because
-    the refine prompt is about making `recover` general and robust,
-    not about the rest of the tool.
   · With `--with-dump`, a filtered dump of the current working
-    directory is attached too, so the model can see the actual current
+    directory is included too, so the model can see the actual current
     state of every file the conversation tries to edit.  The dump is
     produced by `scripts/dumps/dump_filtered.py`, which extracts every
     `## File:` basename from the conversation, scans cwd for matches,
@@ -44,24 +49,50 @@ Differences from `review`:
     layout, and a false positive costs one extra file while a false
     negative costs a file the model needs to see.
 
-Both the deeppeek-source dump and the cwd dump use `dump.py`'s
-FILE-args mode (an explicit file list) rather than scan mode.  In
-scan mode `dump.py` walks the tree and applies its own filters;
-FILE-args mode bypasses those filters entirely — "what you list is
-what you get."  That is what makes the whitelist deterministic:
-`_collect_refine_dump_files` returns exactly the files that should
-appear, and `dump.py` writes exactly those.
+What the deeppeek-source dump covers
+====================================
+Concretely: `dump.py -r` is run from `<repo>/src/deeppeek/` with
+`DEFAULT_INCLUDE_DIRS = ['recover', 'write']`.  The include-dirs
+filter matches basenames at every level of the walk, so:
 
-The cwd dump is a subprocess, not an import.  `dump_filtered.py` is
-deliberately standalone (no deeppeek import) so the user can run it
-directly from a terminal to preview the dump before wiring it into
-this pipeline.  Running it as a subprocess also keeps the argv/cwd
-context clean — we've just invoked dump.py in `_stage_dump_deeppeek`,
-and the module-level state dump.py caches (parser cache, etc.) stays
-out of this stage.
+  · `src/deeppeek/recover/` — every `.py` file: all 9 passes
+    (extract, classify, resolve, attribute, dedup, apply_patches,
+    validate, verify, reconcile, reverify, write, pipeline, and
+    their helper modules), every patch_*.py heuristic, every
+    structural helper, and the supporting passes.
+  · `src/deeppeek/recover/write/` — every `.py` file: pass 9's
+    implementation (pass9.py) and its six helper modules
+    (_manifest, _scan, _text, _delete, _disposition, _summary).
+  · `src/deeppeek/*.py` — the three top-level module files
+    (__init__.py, __main__.py, cli.py).  Included because
+    include_dirs only prunes subdirectories, not files at the
+    scan root.  They're tiny and contextual.
+
+That's ~80 files.
+
+What it deliberately does NOT cover
+===================================
+Tests: `deeppeek prompt send_tests` is the workflow for test
+regressions.  It attaches the failing test files, their fixtures,
+their expected output trees, their pre-existing baselines, and the
+test-runner log — precisely scoped to what failed.  That's a
+separate command for a separate task.
+
+Non-recover code (`capture/`, `commands/`, `extension/`,
+`prompts/`) is not covered because the refine prompt is about
+making `recover` general and robust, not about the browser bridge,
+CLI dispatch, or AI prompt pipelines.
+
+Docs, README, pyproject.toml, and scripts/ are not covered.  They
+contribute signal the model can reason about without (the README's
+architecture summary; the `[ast]` extras list), but including them
+means the AI spends attention on material that isn't the source of
+a `--apply-to` bug.  If a specific fix needs one of those files,
+that's a case for attaching it manually to the conversation rather
+than shipping it in every refine run.
 
 `--text STR` behaves exactly as in `review`: it replaces the composer
-text verbatim, and the attachments are still piped unless `--no-pipe`
+text verbatim, and the merged file is still piped unless `--no-pipe`
 is also given.
 """
 
@@ -86,38 +117,29 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _STATUS_PY_SCRIPT = _PROJECT_ROOT / "scripts" / "status.py"
 _DUMP_PY_SCRIPT = _PROJECT_ROOT / "scripts" / "dumps" / "dump.py"
 _DUMP_FILTERED_PY_SCRIPT = _PROJECT_ROOT / "scripts" / "dumps" / "dump_filtered.py"
+_MERGE_MD_SCRIPT = _PROJECT_ROOT / "scripts" / "merge_md.py"
 _DUMP_FILTERED_TIMEOUT = 300.0  # seconds, for the dump_filtered.py subprocess
 DEFAULT_CONVERSATION = Path("/tmp/conversation.md")
 
-# The refine prompt asks the AI to make the recovery pipeline robust
-# enough to ingest any script in the wild.  That requires the
-# pipeline itself, the test fixtures that pin down expected
-# behaviour, and the dependency list — nothing else.  The
-# browser-capture protocol, the extension, the CLI dispatcher, the
-# AI prompt pipelines, the docs, and the general README are all
-# context the model does not need, and their inclusion dilutes
-# attention on the actual pipeline.
-#
-# Directories are collected recursively; individual files are added
-# verbatim.  `tests/helpers.py` is imported by `test_schema.py`;
-# `tests/conftest.py` puts `src/` on sys.path for pytest.
-_REFINE_DUMP_KEEP_DIRS = (
-    "src/deeppeek/recover",
-    "tests/recover",
-)
-_REFINE_DUMP_KEEP_FILES = (
-    "pyproject.toml",
-    "tests/conftest.py",
-    "tests/helpers.py",
-)
+# `DEFAULT_INCLUDE_DIRS` matches directory *basenames* at every level
+# of the walk.  From `<repo>/src/deeppeek/`, this whitelist keeps
+# `recover/` and prunes every other subdirectory.  Within `recover/`,
+# it keeps `write/` and prunes `__pycache__/` and any stray hidden
+# directory.  Result: recover/*.py + recover/write/*.py, plus the
+# three top-level deeppeek module files.
+_DUMP_INCLUDE_DIRS = ["recover", "write"]
 
 
 DEFAULT_PROMPT_TEMPLATE = """\
 This is the outcome of my deeppeek utility trying to apply the patches
 you just printed through: "deeppeek recover {conversation_name} --apply-here".
-Attached: {conversation_name} (what recover was
-given), diff.txt (what actually changed on disk), the reports under
-deeppeek/, and {deeppeek_dump_name} (a dump of deeppeek's own source).
+
+I've attached a single merged markdown file ({merged_name}) that
+bundles, in order: the original conversation markdown,
+diff.txt (what actually changed on disk), the reports under
+deeppeek/, and a dump of deeppeek's own source
+({deeppeek_dump_name}).  The merge uses per-file headers so you can
+locate each piece.
 
 Help me evaluate the results.  If you detect bugs, propose robust
 fixes.  Better still, build infrastructure, further abstractions, or
@@ -329,58 +351,28 @@ def _stage_status(cwd: Path, ws: Path,
 
 
 # ---------------------------------------------------------------------------
-# deeppeek source dump — restricted to the recovery pipeline
+# deeppeek source dump — scan mode with DEFAULT_INCLUDE_DIRS override
 # ---------------------------------------------------------------------------
 
-def _collect_refine_dump_files(source: Path) -> list[Path]:
-    """Return the explicit file list the refine dump should include.
-
-    Explicit-file mode (not scan mode) is what keeps the dump
-    focused.  `dump.py` in scan mode would emit every source file
-    under the tree; the refine prompt only cares about the recovery
-    pipeline, so we list exactly those paths and pass them to
-    `dump.py`'s FILE-args mode.
-
-    In FILE-args mode `dump.py` bypasses its extension / affix /
-    include / exclude filters entirely — what we list is what gets
-    dumped — so the resulting markdown has no files outside the
-    whitelist above.
-    """
-    keep: list[Path] = []
-
-    for keep_dir in _REFINE_DUMP_KEEP_DIRS:
-        d = source / keep_dir
-        if not d.is_dir():
-            continue
-        for p in sorted(d.rglob("*")):
-            if not p.is_file():
-                continue
-            rel_parts = p.relative_to(source).parts
-            if any(part.startswith(".") or part == "__pycache__"
-                   for part in rel_parts):
-                continue
-            keep.append(p)
-
-    for keep_file in _REFINE_DUMP_KEEP_FILES:
-        p = source / keep_file
-        if p.is_file():
-            keep.append(p)
-
-    return keep
-
-
 def _stage_dump_deeppeek(source: Path, ws: Path) -> Path:
-    """Dump the refine-relevant subset of `source` to
-    <ws>/deeppeek_dump.md.
+    """Dump the recovery pipeline from `<source>/src/deeppeek/`.
 
-    Uses `dump.py`'s FILE-args mode with an explicit file list
-    (see `_collect_refine_dump_files`).  Explicit-file mode is what
-    keeps the dump focused — the AI is being asked to fix the
-    recovery pipeline, not to read the whole project.
+    Runs `dump.py -r` with its module-level `DEFAULT_INCLUDE_DIRS`
+    overridden to `_DUMP_INCLUDE_DIRS` (`['recover', 'write']`),
+    chdir'd to the deeppeek package root so `DEFAULT_DIR = "."`
+    scans exactly that tree.
 
-    Loading `dump.py` as a module (rather than shelling out) lets
-    the process reuse the running interpreter and avoids an extra
-    Python startup.
+    The include-dirs filter matches basenames at every level, so
+    'recover' keeps `src/deeppeek/recover/` and prunes every other
+    subdirectory at the top; 'write' keeps `recover/write/` and
+    prunes `__pycache__/` inside recover/.  Files at the scan root
+    (`__init__.py`, `__main__.py`, `cli.py`) are also collected,
+    since include_dirs only prunes directories.  ~80 files total.
+
+    Loading dump.py as a module (rather than shelling out) lets us
+    override the module-level config without needing a CLI flag
+    that doesn't exist.  Same pattern as `dumps_compare.py`'s
+    OVERRIDES dict.
     """
     dump_py = _DUMP_PY_SCRIPT
     if not dump_py.is_file():
@@ -391,16 +383,13 @@ def _stage_dump_deeppeek(source: Path, ws: Path) -> Path:
             f"  reinstall from a source checkout "
             f"(`pipx install --editable /path/to/deeppeek --force`)"
         )
-    if not source.is_dir():
-        raise SystemExit(
-            f"error: deeppeek source is not a directory: {source}")
 
-    files = _collect_refine_dump_files(source)
-    if not files:
+    scan_root = source / "src" / "deeppeek"
+    if not scan_root.is_dir():
         raise SystemExit(
-            f"error: refine dump would be empty — none of "
-            f"{_REFINE_DUMP_KEEP_DIRS} or {_REFINE_DUMP_KEEP_FILES} "
-            f"exist under {source}")
+            f"error: expected deeppeek package at {scan_root}\n"
+            f"  (source tree layout: <root>/src/deeppeek/)"
+        )
 
     out = ws / "deeppeek_dump.md"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -412,20 +401,21 @@ def _stage_dump_deeppeek(source: Path, ws: Path) -> Path:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
-    print(f"[dump] dump.py (explicit file list) in {source}",
+    # The refine prompt's target is the recovery pipeline.  Everything
+    # else under src/deeppeek/ (capture, commands, extension, prompts)
+    # is out of scope, and the include-dirs whitelist is the mechanism
+    # that keeps the dump focused on this.
+    mod.DEFAULT_INCLUDE_DIRS = list(_DUMP_INCLUDE_DIRS)
+
+    print(f"[dump] dump.py -r in {scan_root}", file=sys.stderr)
+    print(f"  include dirs: {mod.DEFAULT_INCLUDE_DIRS}",
           file=sys.stderr)
-    print(f"  keep dirs:  {list(_REFINE_DUMP_KEEP_DIRS)}",
-          file=sys.stderr)
-    print(f"  keep files: {list(_REFINE_DUMP_KEEP_FILES)}",
-          file=sys.stderr)
-    print(f"  {len(files)} file(s) selected", file=sys.stderr)
 
     old_cwd = Path.cwd()
     saved_argv = sys.argv
     try:
-        os.chdir(str(source))
-        rel_paths = [str(f.relative_to(source)) for f in files]
-        sys.argv = [str(dump_py), "-o", str(out)] + rel_paths
+        os.chdir(str(scan_root))
+        sys.argv = [str(dump_py), "-r", "-o", str(out)]
         rc = mod.main()
     finally:
         sys.argv = saved_argv
@@ -435,8 +425,10 @@ def _stage_dump_deeppeek(source: Path, ws: Path) -> Path:
         raise SystemExit(f"error: dump.py exited {rc}")
     if not out.is_file() or not out.read_text(encoding="utf-8").strip():
         raise SystemExit(f"error: dump.py did not produce {out}")
-    print(f"  wrote {out} ({out.stat().st_size:,} bytes)",
-          file=sys.stderr)
+
+    n_files = out.read_text(encoding="utf-8").count("\nFILE ")
+    print(f"  wrote {out} ({out.stat().st_size:,} bytes, "
+          f"{n_files} file(s))", file=sys.stderr)
     return out
 
 
@@ -516,23 +508,90 @@ def _stage_dump_cwd_filtered(cwd: Path, ws: Path,
 
 
 # ---------------------------------------------------------------------------
+# Merge — bundle every input into one file via scripts/merge_md.py
+# ---------------------------------------------------------------------------
+
+def _stage_merge(ws: Path, files: list[Path],
+                 args: argparse.Namespace) -> Path:
+    """Merge `files` into a single markdown file using merge_md.py.
+
+    The merge_md.py script uses `+` separators and `MERGED FILE i/N:`
+    headers, which stay unambiguous even when the inputs are
+    themselves dump files (which use `===` and `FILE i/N:`).  The
+    output lands in the workspace as `refine_deeppeek_merged.md`
+    and is what the pipe stage attaches to the chat.
+    """
+    script = args.merge_md or _MERGE_MD_SCRIPT
+    if not script.is_file():
+        raise SystemExit(
+            f"error: merge_md.py not found at {script}\n"
+            f"  this file ships with deeppeek at "
+            f"`scripts/merge_md.py`;\n"
+            f"  reinstall from a source checkout "
+            f"(`pipx install --editable /path/to/deeppeek --force`)"
+        )
+
+    out = ws / "refine_deeppeek_merged.md"
+    existing = [f for f in files if f.is_file()]
+    if not existing:
+        raise SystemExit(
+            "error: no input files to merge — this should not happen; "
+            "check that the earlier stages produced their outputs"
+        )
+
+    cmd = [
+        sys.executable, str(script),
+        "-o", str(out),
+        "-t", "refine_deeppeek — merged inputs",
+    ] + [str(f) for f in existing]
+
+    print(f"[merge] merging {len(existing)} file(s) -> {out}",
+          file=sys.stderr)
+    for f in existing:
+        try:
+            print(f"  {f}  ({f.stat().st_size:,} bytes)",
+                  file=sys.stderr)
+        except OSError:
+            print(f"  {f}", file=sys.stderr)
+
+    rc, _, stderr = _run_cmd(
+        cmd, timeout=args.merge_timeout, allow_failure=False,
+    )
+    for line in (stderr or "").splitlines():
+        if line.strip():
+            print(f"    {line.strip()}", file=sys.stderr)
+
+    if not out.is_file():
+        raise SystemExit(
+            f"error: merge_md.py reported success but {out} is missing")
+    print(f"  wrote {out} ({out.stat().st_size:,} bytes)",
+          file=sys.stderr)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Prompt assembly
 # ---------------------------------------------------------------------------
 
 def _resolve_composer_text(args: argparse.Namespace,
                            conversation: Path,
-                           dump_path: Path) -> tuple[str, str]:
+                           dump_path: Path,
+                           merged_path: Optional[Path]
+                           ) -> tuple[str, str]:
     """Return (text, source_tag) for the composer.
 
     When `--text STR` is given, STR is returned verbatim — no
     formatting, no wrapping.  Otherwise the short templated default
-    is built from the conversation filename and the dump filename.
+    is built from the conversation filename, the deeppeek dump
+    filename, and the merged-file filename.
     """
     if args.text is not None:
         return args.text, "--text override"
     text = DEFAULT_PROMPT_TEMPLATE.format(
         conversation_name=conversation.name,
         deeppeek_dump_name=dump_path.name,
+        merged_name=(merged_path.name if merged_path is not None
+                     else "(merged inputs)"),
     )
     return text, "default template"
 
@@ -697,39 +756,50 @@ def run(args: argparse.Namespace) -> int:
         cwd_dump_path = _stage_dump_cwd_filtered(
             cwd, ws, args.conversation)
 
-    # 7. Build the composer text.
-    composer_text, source_tag = _resolve_composer_text(
-        args, args.conversation, dump_path,
-    )
-    print(f"[build] composer text: {len(composer_text):,} chars "
-          f"({source_tag})", file=sys.stderr)
+    # 7. Assemble the inputs that will be merged (and then piped as
+    #    one file chip).
+    to_merge: list[Path] = [
+        status_path,
+        *meta_files,
+        args.conversation,
+        dump_path,
+    ]
+    if cwd_dump_path is not None:
+        to_merge.append(cwd_dump_path)
 
+    # 8. Dry-run: show what would be merged and the composer text.
     if args.dry_run:
-        print("\n[dry-run] would pipe:", file=sys.stderr)
-        print(f"  {status_path}", file=sys.stderr)
-        for f in meta_files:
+        existing = [f for f in to_merge if f.is_file()]
+        merged_name = "refine_deeppeek_merged.md"
+        composer_text, source_tag = _resolve_composer_text(
+            args, args.conversation, dump_path, Path(merged_name),
+        )
+        print("\n[dry-run] would merge:", file=sys.stderr)
+        for f in existing:
             print(f"  {f}", file=sys.stderr)
-        print(f"  {args.conversation}", file=sys.stderr)
-        print(f"  {dump_path}", file=sys.stderr)
-        if cwd_dump_path is not None:
-            print(f"  {cwd_dump_path}", file=sys.stderr)
+        print(f"[dry-run] then pipe the single merged file "
+              f"({merged_name}) as one chip", file=sys.stderr)
         print(f"\n[dry-run] recover exited {recover_rc}", file=sys.stderr)
         print(f"[dry-run] composer text ({source_tag}) below; not typed.",
               file=sys.stderr)
         print(composer_text)
         return 0
 
+    # 9. Merge inputs into one file chip (skipped with --no-pipe).
     if args.no_pipe:
-        files = []
+        merged_path: Optional[Path] = None
+        files: list[Path] = []
     else:
-        files = [
-            status_path,
-            *meta_files,
-            args.conversation,
-            dump_path,
-        ]
-        if cwd_dump_path is not None:
-            files.append(cwd_dump_path)
+        merged_path = _stage_merge(ws, to_merge, args)
+        files = [merged_path]
+
+    # 10. Build composer text and pipe.
+    composer_text, source_tag = _resolve_composer_text(
+        args, args.conversation, dump_path, merged_path,
+    )
+    print(f"[build] composer text: {len(composer_text):,} chars "
+          f"({source_tag})", file=sys.stderr)
+
     return _stage_emit_parallel(composer_text, files, args)
 
 
@@ -741,8 +811,8 @@ def register(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "refine_deeppeek",
         help="Reset, re-apply the conversation, capture the aftermath, "
-             "and pipe the conversation + a dump of deeppeek itself "
-             "for refinement",
+             "merge the conversation + diff + reports + a dump of "
+             "deeppeek itself into one file, and pipe that merged file",
     )
 
     p.add_argument(
@@ -756,17 +826,17 @@ def register(sub: argparse._SubParsersAction) -> None:
              "into the DeepSeek composer verbatim — exactly that "
              "string, no concatenation with the default template.  "
              "The rest of the pipeline (reset, apply, status, "
-             "deeppeek dump, pipe) still runs and the attachments "
-             "are still piped unless --no-pipe is also given.  The "
-             "string is NOT str.format-ed; run --dry-run first to "
+             "deeppeek dump, merge, pipe) still runs and the merged "
+             "file is still piped unless --no-pipe is also given.  "
+             "The string is NOT str.format-ed; run --dry-run first to "
              "see what's available.",
     )
     p.add_argument(
         "--workspace", type=Path, default=None,
-        help="directory for the captured diff.txt and deeppeek dump.  "
-             "Default: a fresh temp dir in /tmp.  Point this at a "
-             "stable location to keep the artefacts around for "
-             "inspection.",
+        help="directory for the captured diff.txt, deeppeek dump, and "
+             "merged output.  Default: a fresh temp dir in /tmp.  "
+             "Point this at a stable location to keep the artefacts "
+             "around for inspection.",
     )
     p.add_argument(
         "--status-py", type=Path, default=None,
@@ -775,9 +845,19 @@ def register(sub: argparse._SubParsersAction) -> None:
              f"arguments and print a diff-style view to stdout.",
     )
     p.add_argument(
+        "--merge-md", type=Path, default=None,
+        help=f"override the merge_md.py path "
+             f"(default: {_MERGE_MD_SCRIPT}).  Must accept "
+             f"`-o PATH FILE [FILE ...]`.",
+    )
+    p.add_argument(
+        "--merge-timeout", type=float, default=120.0,
+        help="seconds for `merge_md.py` (default: 120)",
+    )
+    p.add_argument(
         "--with-dump", action="store_true",
         help="also dump the current working directory (the project "
-             "being reviewed) and attach it as a file chip.  The "
+             "being reviewed) and include it in the merged file.  The "
              "dump is filtered to files whose basenames appear as "
              "`## File:` headers in the conversation — this keeps "
              "it small enough for the model to actually read, "
@@ -791,15 +871,15 @@ def register(sub: argparse._SubParsersAction) -> None:
     )
     p.add_argument(
         "--no-pipe", action="store_true",
-        help="skip the pipe step; only type the composer text.  "
-             "Useful when you want only --text in the composer with "
-             "no file chips at all.",
+        help="skip the merge and pipe steps; only type the composer "
+             "text.  Useful when you want only --text in the "
+             "composer with no file chip at all.",
     )
     p.add_argument(
         "--dry-run", action="store_true",
         help="run the reset + apply, capture the status, dump "
-             "deeppeek, print the file list and the composer text, "
-             "then stop — no pipe, no type",
+             "deeppeek, list what would be merged, print the "
+             "composer text, then stop — no merge, no pipe, no type",
     )
     p.add_argument(
         "--recover-timeout", type=float, default=1800.0,

@@ -33,8 +33,19 @@ Set DEEPPEEK_TEST_KEEP=1 to preserve the temp directory on failure
 for manual inspection.
 
 Exits 0 on success, 1 on any failure.
+
+Structured reporting (2026-11-05)
+=================================
+Each test emits one `::DSX_TEST::<json>` line on stdout alongside
+the human-readable `test_XX: PASS|FAIL|ERROR` line.  The JSON line
+carries the test name, the fixture ID that test operates on, and the
+status.  This is the contract `deeppeek test -o` reads to build its
+own JSON report, which in turn is what `deeppeek prompt send_tests`
+consumes.  See the block comment above `_PROTOCOL_PREFIX` for
+details.
 """
 
+import ast
 import difflib
 import json
 import os
@@ -42,6 +53,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 HERE = Path(__file__).resolve().parent
 FIXTURES = HERE / "fixtures"
@@ -1937,6 +1949,89 @@ def test_42():
                 skip_file_compare=True, min_trust="MEDIUM")
 
 
+# ---------------------------------------------------------------------------
+# Structured test reporting
+# ---------------------------------------------------------------------------
+#
+# Each test emits one `::DSX_TEST::<json>` line on stdout.  The line
+# carries the test's name, the fixture ID it operates on (derived
+# from the test body — see `_build_fixtures_map`), and its status.
+#
+# This is the contract between this file and `deeppeek test`'s
+# JSON-report writer (see `commands/test.py`).  Anything parsing
+# test output downstream parses THAT, not the human-readable
+# `test_XX: FAIL` lines.  The human-readable lines are unchanged and
+# still printed for humans.
+#
+# The mapping is derived, not hand-maintained: each `test_XX`
+# function already calls `check(...)` or `check_apply(...)` with the
+# fixture ID as its first string argument, so `_build_fixtures_map`
+# reads that literal from the AST.  Refactoring a test that drops
+# the fixture call (or uses a variable) surfaces as `"fixture": null`
+# for that test only — a local, visible failure that `send_tests`
+# reports, not a silent misattachment.
+
+_PROTOCOL_PREFIX = "::DSX_TEST::"
+
+
+def _build_fixtures_map() -> dict[str, str]:
+    """Return {test_name: fixture_id} derived from this file's AST.
+
+    Scans every top-level `def test_XX` for the first `check(...)` /
+    `check_apply(...)` call whose first argument is a string literal.
+    Test names that don't match that shape are absent from the map
+    (their emitted protocol line will have `"fixture": null`).
+    """
+    try:
+        src = Path(__file__).read_text(encoding="utf-8")
+        tree = ast.parse(src)
+    except (OSError, SyntaxError):
+        return {}
+
+    out: dict[str, str] = {}
+    for node in tree.body:
+        if not (isinstance(node, ast.FunctionDef)
+                and node.name.startswith("test_")):
+            continue
+        test_name = node.name[len("test_"):]
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Call):
+                continue
+            fname = None
+            if isinstance(child.func, ast.Name):
+                fname = child.func.id
+            elif isinstance(child.func, ast.Attribute):
+                fname = child.func.attr
+            if fname in ("check", "check_apply") and child.args:
+                first = child.args[0]
+                if (isinstance(first, ast.Constant)
+                        and isinstance(first.value, str)):
+                    out[test_name] = first.value
+                    break
+    return out
+
+
+_FIXTURES_MAP = _build_fixtures_map()
+
+
+def _emit_test_result(name: str, status: str,
+                       error: Optional[str] = None) -> None:
+    """Emit one machine-readable test record on stdout.
+
+    The prefix is unambiguous (won't appear in normal test output)
+    so `commands/test.py` can extract the JSON payload with a
+    `startswith` check.  The report schema is documented in
+    `commands/test.py`.
+    """
+    record = {
+        "name": name,
+        "fixture": _FIXTURES_MAP.get(name),
+        "status": status,
+        "error": error or None,
+    }
+    print(f"{_PROTOCOL_PREFIX}{json.dumps(record)}")
+
+
 def main():
 
     tests = [
@@ -1945,8 +2040,13 @@ def main():
         ("07", test_07), ("08", test_08), ("09", test_09),
         ("10", test_10), ("11", test_11),
         ("12", test_12), ("13", test_13), ("14", test_14),
-        ("15", test_15), ("16", test_16), ("17", test_17), ("19", test_19), ("20", test_20), ("21", test_21),
-        ("18", test_18), ("22", test_22), ("23", test_23), ("24", test_24), ("25", test_25), ("26", test_26), ("27", test_27), ("28", test_28), ("29", test_29), ("30", test_30), ("31", test_31), ("32", test_32), ("33", test_33),
+        ("15", test_15), ("16", test_16), ("17", test_17),
+        ("19", test_19), ("20", test_20), ("21", test_21),
+        ("18", test_18), ("22", test_22), ("23", test_23),
+        ("24", test_24), ("25", test_25), ("26", test_26),
+        ("27", test_27), ("28", test_28), ("29", test_29),
+        ("30", test_30), ("31", test_31), ("32", test_32),
+        ("33", test_33),
         ("34", test_34), ("35", test_35), ("36", test_36),
         ("37", test_37), ("38", test_38),
         ("40", test_40), ("41", test_41), ("42", test_42)]
@@ -1955,12 +2055,26 @@ def main():
         try:
             fn()
             print(f"test_{name}: PASS")
+            _emit_test_result(name, "PASS")
         except AssertionError as e:
             failed += 1
             print(f"test_{name}: FAIL\n  {e}")
+            _emit_test_result(name, "FAIL", str(e))
         except RuntimeError as e:
             failed += 1
             print(f"test_{name}: ERROR\n  {e}")
+            _emit_test_result(name, "ERROR", str(e))
+        except Exception as e:
+            # Catch-all for the shape this file's own harness could
+            # not have anticipated — a refactored helper raising
+            # TypeError, a missing attribute, etc.  Without this,
+            # such a bug aborts the whole runner and its failure is
+            # invisible to `send_tests`; with it, the failing test
+            # is named and the rest of the suite still runs.
+            failed += 1
+            print(f"test_{name}: ERROR\n  {type(e).__name__}: {e}")
+            _emit_test_result(
+                name, "ERROR", f"{type(e).__name__}: {e}")
     if failed:
         print(f"\n{failed}/{len(tests)} test(s) failed")
         return 1

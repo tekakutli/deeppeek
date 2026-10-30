@@ -1,28 +1,68 @@
 """`deeppeek prompt` — AI prompt pipelines.
 
-Each prompt gets its own subcommand:
+Subcommands are auto-discovered.  Every module under
+`deeppeek.prompts` that:
+  · does not start with `_` (private helper convention)
+  · is a `.py` file (not a subpackage)
+  · exposes a `register(subparsers)` function
 
-    deeppeek prompt evolve <flags>             — evolve deeppeek via a conversation
-    deeppeek prompt new [flags]                — seed a prompt about the current dir
-    deeppeek prompt last-thought [flags]       — extract the last thought process
-    deeppeek prompt heredoc [flags]            — install a standing heredoc-emission order
-    deeppeek prompt reprint-markdown [flags]   — ask the AI to reprint all edited markdowns
-    deeppeek prompt review [flags]             — reset, re-apply the conversation, and pipe the aftermath
-    deeppeek prompt refine_deeppeek [flags]    — like review, plus a dump of deeppeek itself
-    deeppeek prompt delete [flags]             — remove all attached files and clear the composer textarea
-    deeppeek prompt attachments [flags]        — download files attached to messages
-                                                 (composer draft/edit, prompt regex, message id,
-                                                 last N, or all)
-    deeppeek prompt retry [flags]              — reset the composer with the last
-                                                 prompt-with-attachments (clears, re-attaches,
-                                                 retypes the text)
+becomes a `deeppeek prompt <module-name>` subcommand.  Adding a new
+prompt is a one-file operation: drop `foo.py` into `prompts/` with
+`register(subparsers)` and `run(args)` defined, and
+`deeppeek prompt foo` becomes available on the next CLI invocation.
+No edit to this file.
 
-Every prompt module under `deeppeek.prompts.*` provides:
+If a module cannot be imported or its `register()` raises, the
+whole `deeppeek prompt` subcommand tree fails loudly with the
+module path and the original exception.  A silent skip would leave
+the operator staring at a missing subcommand with no clue why.
 
-    register(subparsers)          — add its subcommand
-    run(args) -> int              — orchestrate the pipeline
+Adding a helper module shared between prompts?  Prefix it with `_`
+(e.g. `_common.py`) — the underscore convention excludes it from
+discovery.
+
+The order in `deeppeek prompt --help` is alphabetical (deterministic
+across machines and filesystems); if a semantic order becomes
+important later, the discovery loop can sort by a module-level
+`ORDER = N` attribute.
 """
 import argparse
+import importlib
+import pkgutil
+import sys
+
+
+def _discover_prompts():
+    """Yield `(name, module)` for each registerable prompt module.
+
+    Skips `_`-prefixed helpers and subpackages; skips modules whose
+    `register` attribute is missing or not callable (a helper that
+    didn't follow the underscore convention).  Raises on import
+    failure so the caller can surface the module path.
+    """
+    from .. import prompts as prompts_pkg
+    for mod_info in sorted(
+            pkgutil.iter_modules(prompts_pkg.__path__),
+            key=lambda m: m.name):
+        if mod_info.name.startswith("_"):
+            continue
+        if mod_info.ispkg:
+            continue
+        try:
+            module = importlib.import_module(
+                f"{prompts_pkg.__name__}.{mod_info.name}")
+        except Exception as e:
+            print(
+                f"error: failed to import prompt module "
+                f"`{prompts_pkg.__name__}.{mod_info.name}`: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+            raise
+        register = getattr(module, "register", None)
+        if not callable(register):
+            continue
+        yield mod_info.name, module
 
 
 def register(sub: argparse._SubParsersAction) -> None:
@@ -32,24 +72,17 @@ def register(sub: argparse._SubParsersAction) -> None:
     )
     psub = p.add_subparsers(dest="prompt_cmd", required=True)
 
-    from ..prompts import (
-        evolve, new, last_thought, heredoc, reprint_markdown, review,
-        refine_deeppeek, delete, attachments, retry,
-        reprint,
-        snippet,
-    )
-    evolve.register(psub)
-    new.register(psub)
-    last_thought.register(psub)
-    heredoc.register(psub)
-    reprint_markdown.register(psub)
-    review.register(psub)
-    refine_deeppeek.register(psub)
-    delete.register(psub)
-    attachments.register(psub)
-    retry.register(psub)
-    reprint.register(psub)
-    snippet.register(psub)
+    for name, module in _discover_prompts():
+        try:
+            module.register(psub)
+        except Exception as e:
+            print(
+                f"error: `{module.__name__}.register()` failed: "
+                f"{type(e).__name__}: {e}\n"
+                f"  module: {getattr(module, '__file__', '<unknown>')}",
+                file=sys.stderr,
+            )
+            raise
 
     p.set_defaults(func=run)
 
