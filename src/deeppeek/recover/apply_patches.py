@@ -64,6 +64,22 @@ PATH THREADING (2026-10-29)
 structural validation on their splice.  Reconcile's
 `_replay_excluding` does the same.
 
+TOOL-BUG SURFACING (2026-10-29)
+===============================
+When `_try_deterministic_patch` catches a `_TOOL_BUG_EXCEPTIONS`
+raise it records `patch["tool_bug"] = "..."` and returns None
+(unchanged contract).  The failure-diagnostic loop in
+`pass6_apply_patches` now checks for that field first: if present,
+it uses the recorded exception as `failure_reason` (skipping
+`_diagnose_patch_failure`, which would produce a generic "no
+heuristic matched" that hides the actual bug), and emits a
+`deeppeek bug:` warning naming the exception type and message.
+After the loop, `rec.verification["tool_bug"]` is populated from
+every patch that carries the field.
+
+Trust policy is unchanged (LOW on non-application); the goal is a
+distinguishable status, not a different outcome.
+
 Prior docstring content (unchanged):
 - REPLACE-INTENT DETECTION
 - Blockquoted structural check
@@ -808,13 +824,23 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
             ):
                 continue
             patch["applied_by"] = "failed"
-            try:
-                patch["failure_reason"] = _diagnose_patch_failure(
-                    patch, content, base)
-            except Exception as _diag_exc:
+            # NEW (2026-10-29): if the failure was a tool bug
+            # (recorded by `_try_deterministic_patch`'s
+            # `_TOOL_BUG_EXCEPTIONS` branch), use the recorded
+            # exception as `failure_reason` — `_diagnose_patch_failure`
+            # would produce a generic "no heuristic matched" message
+            # that hides the actual deeppeek bug.
+            if patch.get("tool_bug"):
                 patch["failure_reason"] = (
-                    f"diagnostic raised {type(_diag_exc).__name__}: "
-                    f"{_diag_exc}; patch could not be applied")
+                    f"deeppeek bug: {patch['tool_bug']}")
+            else:
+                try:
+                    patch["failure_reason"] = _diagnose_patch_failure(
+                        patch, content, base)
+                except Exception as _diag_exc:
+                    patch["failure_reason"] = (
+                        f"diagnostic raised {type(_diag_exc).__name__}: "
+                        f"{_diag_exc}; patch could not be applied")
             rec.warnings.append(
                 f"patch idx={patch['idx']} could not be applied "
                 f"({patch['failure_reason']})")
@@ -832,6 +858,26 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                     f"(record not failed)")
             else:
                 all_ok = False
+
+        # NEW (2026-10-29): record tool bugs distinctly.  A patch that
+        # failed because a heuristic *raised* a code-level exception
+        # (missing module, undefined name) is a deeppeek bug, not a
+        # body-shape failure.  Surface it in verification so the
+        # manifest and warnings.txt name the failure class explicitly,
+        # without changing trust policy (still LOW on non-application,
+        # which is the correct safety response to a bug).
+        _tool_bug_patches = [p for p in rec.patches if p.get("tool_bug")]
+        if _tool_bug_patches:
+            rec.verification["tool_bug"] = [
+                {"idx": p["idx"], "error": p["tool_bug"]}
+                for p in _tool_bug_patches
+            ]
+            for p in _tool_bug_patches:
+                rec.warnings.append(
+                    f"deeppeek bug: patch idx={p['idx']} failed "
+                    f"with {p['tool_bug']} — this is a tooling "
+                    f"failure, not a data-shape failure; report the "
+                    f"exception type and the message to deeppeek")
 
         # ==================================================================
         #  FAILED-STATUS ANNOTATION (2026-10-29, revised)

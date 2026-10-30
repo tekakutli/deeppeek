@@ -413,6 +413,49 @@ def _check_structural_equivalence(records, blocks_by_idx):
 # Orchestrator
 # ---------------------------------------------------------------------------
 
+
+
+def _validate_pipeline_imports() -> list:
+    """Import every module in `deeppeek.recover` and collect any
+    ImportError.  A broken pipeline module (missing sibling, renamed
+    symbol, stale import, module landed in the wrong directory)
+    surfaces here at startup, not after the first heuristic that uses
+    it raises a swallowed exception deep inside `_try_deterministic_
+    patch`.
+
+    Motivating case (2026-10-29): two new modules `statement_sig.py`
+    and `patch_statement_replace.py` landed under `tests/recover/`
+    instead of `src/deeppeek/recover/`.  Every `_try_region_replace`
+    call raised `ModuleNotFoundError`, which was caught by the
+    wrapper, cascading 37 test failures across 8 test files.  With
+    this check, `pipeline.run` prints the missing-module message at
+    startup and exits 1 before pass 1 touches a single patch.
+
+    Fails open: if `pkgutil` itself raises (defensive), the function
+    returns `[]` and the pipeline proceeds under the old contract —
+    a validation-check bug must not block a run.
+    """
+    from importlib import import_module
+    import pkgutil
+
+    failures: list = []
+    try:
+        import deeppeek.recover as pkg
+        modules = list(pkgutil.iter_modules(
+            pkg.__path__, pkg.__name__ + "."))
+    except Exception as e:
+        print(f"[startup] pipeline-import enumeration raised: "
+              f"{type(e).__name__}: {e} (proceeding)",
+              file=sys.stderr)
+        return failures
+
+    for _, name, _ in modules:
+        try:
+            import_module(name)
+        except Exception as e:
+            failures.append(f"{name}: {type(e).__name__}: {e}")
+    return failures
+
 def run(cfg: RecoverConfig) -> int:
     try:
         dump_text, dump_display, dump_size = _resolve_dump(cfg)
@@ -500,6 +543,23 @@ def run(cfg: RecoverConfig) -> int:
                   file=sys.stderr)
     except Exception:
         pass
+
+    # NEW (2026-10-29): startup import sanity check.  Refuse to
+    # run if any deeppeek.recover module fails to import — a
+    # swallowed ModuleNotFoundError deep in a heuristic becomes
+    # a per-file silent failure that cascades into dozens of
+    # test failures before anyone reads the log.  Surface it up
+    # front.
+    _import_failures = _validate_pipeline_imports()
+    if _import_failures:
+        print(f"[startup] {len(_import_failures)} pipeline "
+              f"module(s) failed to import \u2014 pipeline "
+              f"will not run:", file=sys.stderr)
+        for _f in _import_failures:
+            print(f"  {_f}", file=sys.stderr)
+        print("[startup] fix the modules above, then re-run.",
+              file=sys.stderr)
+        return 1
 
     t_start = time.monotonic()
     run_errors: list = []

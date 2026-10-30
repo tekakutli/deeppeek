@@ -119,6 +119,42 @@ structural change in `_discriminate` is the real invariant: no
 prior may dominate content.  Even a future bug in `topic.py` should
 not be able to misroute a file whose content is clearly a match for
 one candidate.
+
+BASENAME-DIRECTORY COMPATIBILITY PRUNING (2026-11-05)
+====================================================
+When a block's header carries an explicit directory AND the basename
+has candidates whose directory is unrelated, the resolver prunes
+those candidates before the "unique basename" branch fires.  The
+header's directory is strong evidence; matching on basename alone is
+only legitimate when the header has no directory, or when the
+candidate's directory is a suffix of (or equal to) the header's.
+
+Motivating bug (2026-10-29): a header `src/deeppeek/recover/
+statement_sig.py` resolved to `tests/recover/statement_sig.py`
+because the basename matched a single candidate in tests/ and the
+`src/deeppeek/` prefix was silently discarded.  The two new modules
+landed in `tests/recover/`; every later `from .statement_sig import`
+failed with ModuleNotFoundError, cascading 37 test failures.
+
+RESOLUTION INVARIANT CHECK (2026-11-05)
+=======================================
+`resolve_paths` calls `_validate_resolution(header_path,
+output_path, reason)` before writing each resolved path.  Three
+invariants:
+
+  · `reason` starting with "unresolved" → output_path MUST equal
+    header_path (the fallback contract is "write it verbatim").
+
+  · Resolved basenames MUST match header basenames (no renames).
+
+  · When the header carries an explicit directory, the resolved
+    path's directory MUST be compatible (equal, suffix-of, or a
+    deeper-suffix-of).
+
+A violation demotes the resolution to the literal-header fallback
+and records the violation in the resolutions manifest, so a future
+misrouting is visible on the first run rather than inferred from
+test failures.
 """
 import os
 import re
@@ -219,6 +255,28 @@ def resolve_paths(blocks: list[Block],
             b, preexisting_by_full, preexisting_by_basename, verbose,
             dir_votes=dir_votes, topic_weights=topic_weights)
         if resolved is not None:
+            # NEW (2026-11-05): resolution invariant check.  When
+            # the resolver claims a confident match but the matched
+            # path has a directory incompatible with an explicit
+            # header, fall back to the literal header and warn.
+            # Defense-in-depth: the pruning in `_resolve_one`
+            # closes the motivating case; this invariant catches
+            # any future case where evidence-loss recovers via a
+            # different heuristic.
+            _invariant_warn = _validate_resolution(hp, resolved, reason)
+            if _invariant_warn:
+                print(f"  [resolve] idx={b.idx}: {_invariant_warn}",
+                      file=sys.stderr)
+                b.output_path = hp
+                resolutions.append({
+                    "idx": b.idx,
+                    "header_path": hp,
+                    "resolved_to": resolved,
+                    "reason": f"{reason} (INVARIANT VIOLATION; "
+                              f"fallback to literal)",
+                    "warning": _invariant_warn,
+                })
+                continue
             b.output_path = resolved
             entry = {
                 "idx": b.idx,
@@ -245,6 +303,61 @@ def resolve_paths(blocks: list[Block],
                       f"writing to {hp!r} verbatim", file=sys.stderr)
 
     return resolutions
+
+
+def _validate_resolution(header_path: str,
+                         output_path: str,
+                         reason: str) -> Optional[str]:
+    """Return a warning string if the resolution is structurally
+    implausible, else None.
+
+    Three invariants:
+
+      · When `reason` starts with "unresolved", `output_path` MUST
+        equal `header_path`.  The fallback's contract is "write it
+        verbatim"; divergence means an upstream pass rewrote the
+        path without the resolver knowing.
+
+      · Resolved basenames MUST match header basenames.  A rename
+        is not something this resolver supports.
+
+      · When the header carries an explicit directory, the resolved
+        path's directory MUST be compatible (equal, suffix-of, or a
+        deeper-suffix-of).  An explicit `src/deeppeek/` in the
+        header is strong evidence; a match that discards it has
+        lost information.
+
+    Motivating bug (2026-10-29): header `src/deeppeek/recover/
+    statement_sig.py` resolved to `tests/recover/statement_sig.py`
+    because the basename matched a single candidate in tests/ and
+    the `src/deeppeek/` prefix was silently discarded.  The pruning
+    in `_resolve_one` closes the specific case; this invariant is
+    defense-in-depth for any future evidence-loss.
+    """
+    # NEW (2026-10-29): caller (`resolve_paths`) only invokes
+    # this on real matches (`resolved is not None`); the
+    # pre-fix "unresolved" branch was dead code.  The two
+    # structural invariants below are what matter for a
+    # successful resolution.
+    if not header_path or not output_path:
+        return None
+
+    if _basename(header_path) != _basename(output_path):
+        return (f"resolved basename differs from header: "
+                f"{header_path!r} -> {output_path!r}")
+
+    header_dir = os.path.dirname(header_path)
+    output_dir = os.path.dirname(output_path)
+    if not header_dir:
+        return None
+    if (output_dir == header_dir
+            or output_dir.endswith("/" + header_dir)
+            or header_dir.endswith("/" + output_dir)):
+        return None
+    return (f"resolved directory incompatible with header: "
+            f"{header_path!r} -> {output_path!r} "
+            f"(header dir {header_dir!r}, output dir "
+            f"{output_dir!r} are unrelated)")
 
 
 def _resolve_one(block: Block,
@@ -285,6 +398,36 @@ def _resolve_one(block: Block,
 
     # 3. Basename
     candidates = preexisting_by_basename.get(hp_base, [])
+
+    # NEW (2026-11-05): prune basename candidates whose directory is
+    # incompatible with an explicit header directory.  Motivating
+    # bug: header `src/deeppeek/recover/statement_sig.py` resolved
+    # to `tests/recover/statement_sig.py` because the basename
+    # matched a single candidate in tests/ and the header's
+    # `src/deeppeek/` prefix was silently discarded.  An explicit
+    # directory is strong evidence; basename match alone is only
+    # legitimate when the header has no directory, or the
+    # candidate's directory is a suffix of (or equal to) the
+    # header's.
+    if candidates and hp != hp_base:
+        header_dir = os.path.dirname(hp)
+        compatible = []
+        for c in candidates:
+            c_dir = os.path.dirname(c)
+            if (c_dir == header_dir
+                    or c_dir.endswith("/" + header_dir)
+                    or header_dir.endswith("/" + c_dir)):
+                compatible.append(c)
+        if compatible:
+            candidates = compatible
+        else:
+            # No candidate is compatible — this is a "no match", not
+            # an "ambiguous basename".  Returning zero candidates
+            # pushes the caller to the literal-header fallback, which
+            # is what we want: a header naming `src/.../X.py` should
+            # never silently resolve to `tests/.../X.py`.
+            candidates = []
+
     if len(candidates) == 1:
         if verbose:
             print(f"  [resolve] idx={block.idx} {hp!r} → "

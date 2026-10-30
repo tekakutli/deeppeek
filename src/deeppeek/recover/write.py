@@ -79,6 +79,17 @@ files, but they are excluded from the MISSING report because they
 are almost always invoked rather than imported.  An imported-from
 shell script is not a thing; if you want to recover a specific one,
 name it explicitly in the conversation.
+
+TOOL_BUG WARNINGS TAG (2026-10-29)
+==================================
+When a patch carries `patch["tool_bug"]` (recorded by
+`_try_deterministic_patch`'s `_TOOL_BUG_EXCEPTIONS` branch), the
+warnings writer emits `[TOOL_BUG]` instead of `[PATCH_FAILED]`, and
+the manifest's `patch_failure_reasons` entry gains a `tool_bug`
+field.  The fail-closed summary uses `TOOL_BUG` as its tag.  This
+distinguishes "body shape the heuristics couldn't place" from
+"deeppeek module raised" in both the human-readable warnings and
+the machine-readable manifest.
 """
 
 import hashlib
@@ -545,6 +556,21 @@ def pass9_write(records: dict,
                 warnings_lines.append(
                     f"[{path}] [STRUCT_DAMAGE] idx={p['idx']} "
                     f"(first line: {first_line!r}): {reason}")
+                continue
+            # NEW (2026-10-29): tool bugs are code-level failures —
+            # missing module, renamed function, undefined name —
+            # that aborted the heuristic chain.  Distinguish them
+            # from body-shape failures so the user knows whether to
+            # look at the conversation or at deeppeek itself.
+            if p.get("tool_bug"):
+                first_line = _patch_first_line(p, limit=70)
+                reason = p["tool_bug"]
+                warnings_lines.append(
+                    f"[{path}] [TOOL_BUG] idx={p['idx']} "
+                    f"(first line: {first_line!r}): {reason} "
+                    f"— this is a deeppeek internal error, not a "
+                    f"body-shape failure; report the exception "
+                    f"type and message to deeppeek")
                 continue
             first_line = _patch_first_line(p, limit=70)
             reason = p.get("failure_reason", "unknown")
@@ -1061,6 +1087,8 @@ def pass9_write(records: dict,
                 "first_line": _patch_first_line(p, limit=70),
                 "context_before": _patch_context(p, limit=800),
                 "reason": p.get("failure_reason", "unknown"),
+                **({"tool_bug": p["tool_bug"]}
+                   if p.get("tool_bug") else {}),
             }
             for p in rec.patches
             if p.get("applied_by") in _PLACEMENT_FAILURES
@@ -1245,11 +1273,15 @@ def pass9_write(records: dict,
                 if pf.get("applied_by") not in _PLACEMENT_FAILURES:
                     continue
                 first_line = _patch_first_line(pf, limit=60)
-                reason = pf.get("failure_reason", "unknown")
-                tag = ("STRUCT_DAMAGE"
-                       if pf.get("applied_by")
-                       == "skipped_structural_damage"
-                       else "PATCH_FAILED")
+                if pf.get("tool_bug"):
+                    tag = "TOOL_BUG"
+                    reason = pf["tool_bug"]
+                elif pf.get("applied_by") == "skipped_structural_damage":
+                    tag = "STRUCT_DAMAGE"
+                    reason = pf.get("failure_reason", "unknown")
+                else:
+                    tag = "PATCH_FAILED"
+                    reason = pf.get("failure_reason", "unknown")
                 print(f"    {tag} {fpath} idx={pf['idx']}: "
                       f"{first_line!r} — {reason}",
                       file=sys.stderr)

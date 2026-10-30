@@ -18,7 +18,8 @@ loop calls for each patch.  It dispatches, in order:
    7. scoped replaces
    8. ellipsis splices, with fallback
    9. object-literal splices (with trailing-content refusal)
-   9a. region replaces (2026-10-29) — see below
+   9a. region replaces (2026-10-29) — with an internal statement-level
+       pre-check (2026-10-29b), see below
   10. named-dict inserts
   11. context inserts
   12. object-entry inserts
@@ -52,6 +53,79 @@ in `pg_panel_scrubs.py` and `pg_panel_bindings.py` on 2026-10-28:
 a line-based window that stopped one line short of the closing `}`,
 leaving a stray `}` as an orphan, which `validate_content` caught
 too late (in pass 8, not at heuristic time).
+
+STRUCTURAL STATEMENT REPLACE PRE-CHECK (2026-10-29b)
+====================================================
+`_try_region_replace` now runs `patch_statement_replace.try_statement_replace`
+on `(base, body_stripped, path)` after the `_prose_names_scope` gate
+and before the similarity sweep.  The statement matcher uses AST-
+level identity (dict keys, target names, call arg names) rather
+than line-level token overlap, so it correctly discriminates between
+statements that share lines but mean different things.
+
+Motivating shape (`inpaint_server.py`, 2026-11-05): a body whose AST
+is
+
+    return {"success": False, "message": detail,
+            "errors": captured["errors"], "timing": round(elapsed, 3)}
+
+must replace the base's
+
+    return {"success": False, "message": detail,
+            "timing": round(elapsed, 3)}
+
+and NOT the base's
+
+    return {"success": True, "image_b64": ..., "timing": ...}
+
+Both base returns share lines (`return {`, `"timing": round(elapsed, 3),`,
+`}`) and the *first* one is what the body was written to modify, but
+`difflib.SequenceMatcher` on stripped lines scores them similarly — the
+`success: True` return scored higher against the body because it had a
+matching "message is a name" structure where the `success: False` one
+did not.  The `statement_sig`-based matcher uses dict-key identity and
+value-exact-match counts, which separate the two cleanly:
+
+    image_b64 return:  keys {success,message,timing}∩{success,message,errors,timing}=3
+                       values exact: success + message + timing = 3
+                       score = 0.4·(3/4) + 0.6·(3/4) = 0.75
+
+    error-path returns (daemon/error message):
+                       keys ∩ = 3
+                       values exact: success + timing = 2
+                       score = 0.4·(3/4) + 0.6·(2/4) = 0.60
+
+    success: True return:
+                       keys ∩ = 2
+                       values exact: timing = 1
+                       score = 0.4·(2/4) + 0.6·(1/4) = 0.35
+
+    → 0.75 wins by 0.15 over the next candidate; `_MIN_GAP=0.10`
+      accepts the match; `_try_region_replace` returns the correct
+      splice before the similarity sweep can pick the wrong window.
+
+Note: the `statement_sig.score` function from the original proposal
+(0.30·kind + 0.40·key-overlap + 0.30·value-overlap) does *not*
+suffice — the 0.30 base reward for `kind` match makes the two
+error-path returns (score 0.75) and the image_b64 return (score
+0.825) too close.  The 0.4·key + 0.6·value formula above is the one
+required.  The two formulas live in `statement_sig.py`; the switch
+is a one-line change in `score()` and is required for the working
+shape.
+
+Gating order matters: the pre-check fires *inside*
+`_try_region_replace`, after the `_prose_names_scope` gate.  The
+gate distinguishes "insert into scope X" (prose names X + add-verb)
+from "replace in scope X" (prose names X + replace-verb).  Insert
+prose must NOT be intercepted by a structural replace; replace prose
+MUST be, because the body is a modified statement and the intent is
+to replace it, not to append it.  Placing the pre-check before the
+gate would defeat the distinction; placing it after preserves it.
+
+Cross-language: `.py` via `ast`, JS/TS via tree-sitter (when the
+grammar is available).  When the grammar is missing,
+`try_statement_replace` returns None and the similarity sweep runs —
+same graceful degradation as `ast_anchor`.
 
 SIZE-AWARE SIMILARITY (2026-11-05)
 ==================================
@@ -132,9 +206,38 @@ this, `<div class="field" style="align-items:center;">` matched a
 window opening `<input type="range" id="viewRotation"` — both start
 with `<`.  The looser "first word" check is retained for JS/Python.
 
-PROSE-NAMED-SCOPE — unchanged
-=============================
-Insertion vs replacement distinction preserved exactly.
+TOOL-BUG DETECTION (2026-10-29)
+===============================
+`_try_deterministic_patch` is the entry point for the whole heuristic
+chain.  Its historical `except Exception` caught every raise and
+returned None, meaning "the heuristics declined this body."  That is
+correct for the common case: an `AttributeError` in a heuristic that
+mis-parsed a weird body shape, a `ValueError` from text manipulation,
+a `SyntaxError` from user-supplied content.
+
+It is WRONG for the case where the heuristic module itself is broken
+— a stale import, a renamed function referenced by name, a module
+that landed in the wrong directory.  Those are bugs in deeppeek, not
+failures of the body, and they abort the entire remaining chain.
+Motivating case (2026-10-29): two new modules `statement_sig` and
+`patch_statement_replace` were placed under `tests/recover/`
+instead of `src/deeppeek/recover/`; every `_try_region_replace`
+call raised `ModuleNotFoundError`, which the wrapper silently
+caught, cascading 37 test failures across 8 test files before the
+log was read.
+
+`_TOOL_BUG_EXCEPTIONS` marks the types that are code invariants
+rather than data conditions.  When the wrapper catches one, it
+records `patch["tool_bug"] = "..."` on the patch dict and returns
+None (same fail-closed behavior).  Downstream passes now see a
+distinguishable signal: `pass6_apply_patches` uses the recorded
+exception as `failure_reason` (skipping `_diagnose_patch_failure`,
+which would produce an unhelpful "no heuristic matched" message),
+adds a "deeppeek bug" warning to `rec.warnings`, and sets
+`rec.verification["tool_bug"]`; `pass9_write` surfaces a
+`[TOOL_BUG]` line in `warnings.txt`.  A reader of the log
+immediately knows which failures are recoverable (body shape) and
+which are deeppeek bugs (tooling).
 
 Prior docstring content (unchanged):
 - MULTI-STATEMENT APPLY (2026-10-28g)
@@ -551,7 +654,8 @@ def _is_already_applied(body_stripped, base):
 
 # ============================================================================
 #  Region replace (2026-10-29; size-aware 2026-11-05;
-#                 snap-first ordering 2026-11-05)
+#                 snap-first ordering 2026-11-05;
+#                 structural statement pre-check 2026-10-29b)
 # ============================================================================
 
 def _try_region_replace(base: str, body_stripped: str,
@@ -563,38 +667,56 @@ def _try_region_replace(base: str, body_stripped: str,
     """Replace a region of `base` with `body_stripped` when the body
     is a modified version of that region.
 
-    The similarity sweep selects the best-scoring window (score =
-    overlap_fraction + ratio), then `splice_region` tries the raw
-    boundaries, the AST-snapped boundaries, and a ±3-line sweep.
-    Each candidate is validated structurally; the first valid
-    splice wins.
+    Three phases, tried in order:
+
+      1. Structural statement replace.  If the body parses as exactly
+         one statement and a unique base statement matches it by
+         structural signature (dict keys + literal values, or
+         assignment targets, or call arg names), splice there.  This
+         is the semantically-correct path: a body that *is* a
+         modified statement lands on its structural match, not a
+         token-coincidental one.  See
+         `patch_statement_replace.try_statement_replace` and the
+         module docstring section
+         STRUCTURAL STATEMENT REPLACE PRE-CHECK (2026-10-29b).
+
+      2. Similarity sweep.  Score each `body_lines × factor` window
+         by (overlap_fraction + ratio), pick the best, splice via
+         `splice_region` (structural validation).
+
+      3. Candidate ordering within the sweep: AST-snapped boundaries
+         first, then the raw window, then a ±3-line pair-sweep.
+         Each candidate is validated; first valid wins.
 
     Gated on `context_before`: when the surrounding prose names a
     scope as an *insertion target* (see `_prose_names_scope`), this
-    returns None so `_try_insert_into_named_scope` can place the
-    body without region-replace overriding it.  When the prose
-    names a scope as a *replacement target* (e.g. "In `pg_base.py`,
-    replace ..."), region-replace is not gated — it is the correct
-    handler for that shape.
-
-    Per-window similarity threshold (2026-11-05): the flat
-    `min_ratio` is scaled down by the size ratio between window and
-    body, so expand-shaped edits (body larger than base region) are
-    not structurally penalised.  See the module docstring,
-    SIZE-AWARE SIMILARITY.
-
-    Snap-first candidate ordering (2026-11-05): the AST-snapped
-    boundaries are tried BEFORE the raw similarity window.  Combined
-    with the HTML opening-signature strictness below, this ensures
-    that a body which reopens a wrapper (e.g. `<div class="field">`)
-    expands to the enclosing element rather than being spliced over
-    a mid-element window.
+    returns None so `_try_insert_into_named_scope` can place the body
+    without region-replace overriding it.  When the prose names a
+    scope as a *replacement target* (e.g. "In `pg_base.py`, replace
+    ..."), region-replace is not gated — it is the correct handler
+    for that shape.  The structural pre-check runs *after* this gate
+    so the insert-vs-replace distinction is preserved.
     """
     if not body_stripped or not base:
         return None
 
     if _prose_names_scope(context_before):
         return None
+
+    # ------------------------------------------------------------------
+    #  Phase 1: structural statement replace.
+    #
+    #  Runs AFTER the prose-scope gate (so insertion intent is not
+    #  intercepted) and BEFORE the similarity sweep (so a structurally
+    #  clean match pre-empts a token-coincidental one).  When the body
+    #  isn't a single statement, or the destination is a language
+    #  without a signature extractor, or the match is ambiguous, this
+    #  returns None and we fall through to the line-similarity sweep.
+    # ------------------------------------------------------------------
+    from .patch_statement_replace import try_statement_replace
+    stmt_result = try_statement_replace(base, body_stripped, path)
+    if stmt_result is not None:
+        return stmt_result
 
     body_lines = body_stripped.splitlines()
     if len(body_lines) < 3:
@@ -707,6 +829,41 @@ def _try_region_replace(base: str, body_stripped: str,
     return None
 
 
+# ============================================================================
+#  Tool-bug detection (2026-10-29)
+# ============================================================================
+#
+# `_try_deterministic_patch` is the entry point for the whole heuristic
+# chain.  Its historical `except Exception` caught every raise and
+# returned None, meaning "the heuristics declined this body."  That is
+# correct for the common case: an `AttributeError` in a heuristic that
+# mis-parsed a weird body shape, a `ValueError` from text manipulation,
+# a `SyntaxError` from user-supplied content.
+#
+# It is WRONG for the case where the heuristic module itself is broken
+# — a stale import, a renamed function referenced by name, a module
+# that landed in the wrong directory.  Those are bugs in deeppeek, not
+# failures of the body, and they abort the entire remaining chain.
+# Motivating case (2026-10-29): two new modules `statement_sig` and
+# `patch_statement_replace` were placed under `tests/recover/`
+# instead of `src/deeppeek/recover/`; every `_try_region_replace`
+# call raised `ModuleNotFoundError`, which the wrapper silently
+# caught, cascading 37 test failures across 8 test files before the
+# log was read.
+#
+# `_TOOL_BUG_EXCEPTIONS` marks the types that are code invariants
+# rather than data conditions.  When the wrapper catches one, it
+# records `patch["tool_bug"] = "..."` on the patch dict and returns
+# None (same fail-closed behavior).  Downstream passes now see a
+# distinguishable signal: `pass6_apply_patches` uses the recorded
+# exception as `failure_reason` (skipping `_diagnose_patch_failure`,
+# which would produce an unhelpful "no heuristic matched" message),
+# adds a "deeppeek bug" warning to `rec.warnings`, and sets
+# `rec.verification["tool_bug"]`; `pass9_write` surfaces a
+# `[TOOL_BUG]` line in `warnings.txt`.
+_TOOL_BUG_EXCEPTIONS = (ImportError, ModuleNotFoundError, NameError)
+
+
 def _try_deterministic_patch(base, patch, path="",
                               prior_insertions=None, prior_scopes=None):
     try:
@@ -715,6 +872,13 @@ def _try_deterministic_patch(base, patch, path="",
             prior_insertions=prior_insertions,
             prior_scopes=prior_scopes,
         )
+    except _TOOL_BUG_EXCEPTIONS as e:
+        import sys
+        patch["tool_bug"] = f"{type(e).__name__}: {e}"
+        print(f"  [tool-bug] deterministic attempt raised "
+              f"{type(e).__name__}: {e} — this is a deeppeek bug, "
+              f"not a body-shape failure", file=sys.stderr)
+        return None
     except Exception as e:
         import sys
         print(f"  [patch] deterministic attempt raised: "

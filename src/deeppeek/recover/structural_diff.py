@@ -42,6 +42,35 @@ class SignatureChange:
     detail:    str   # human-readable hint
 
 
+def _python_statement_sigs(content):
+    """Return {"python_stmt": {sig_repr, ...}} for every top-level
+    statement inside function bodies, keyed by a one-line repr of the
+    statement's signature dict.  The `repr` is what the divergance
+    list reports; the point is that `return {"success": False, ...}`
+    and `return {"success": True, ...}` produce *different* entries
+    and the pass can therefore see one was removed and the other
+    added.
+    """
+    from .statement_sig import _python_sig
+    import ast, textwrap
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return set()
+    out = set()
+    def _walk(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.Return, ast.Assign, ast.AnnAssign,
+                                  ast.Expr)):
+                sig = _python_sig(child)
+                if sig is not None:
+                    out.add(repr(sig))
+            if hasattr(child, "body"):
+                _walk(child)
+    _walk(tree)
+    return out
+
+
 def extract_signatures(content: str, path: str) -> dict[str, set[str]]:
     """Return `{lang: {signature, ...}}` for the content.
 
@@ -55,7 +84,8 @@ def extract_signatures(content: str, path: str) -> dict[str, set[str]]:
 
     if ext == ".py":
         out["python"] = _python_signatures(content)
-        out["html"]   = _embedded_html_signatures(content)
+        out["python_stmt"] = _python_statement_sigs(content)
+        out["html"] = _embedded_html_signatures(content)
     elif ext == ".html":
         out["html"]   = _html_signatures(content)
     elif ext in (".js", ".mjs", ".ts", ".tsx", ".jsx"):

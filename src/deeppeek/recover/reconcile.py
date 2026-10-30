@@ -78,6 +78,31 @@ then saw `key` as already-applied and returned unchanged — so the
 diagnostic always said "applies cleanly" for every single-exclusion
 record, regardless of the actual applicability. Fixed to `{key}`.
 
+POST-EXCLUDE STATEMENT AUDIT (2026-10-29, this revision)
+=======================================================
+`pass8_7_reconcile` now runs `structural_diff(base, new_content,
+path, "")` after successful promotion and reports any statement-level
+divergence to `rec.warnings`.  Advisory only — does not change trust.
+
+Motivating shape (inpaint_server.py): the excluded patch 634 was a
+*modified version of one statement* — the failure return — but
+reconcile's only check (`validate_content` + `find_unresolved_
+references`) confirms the resulting file parses and resolves.  It
+does not notice that a body shaped like a modified return landed as
+a duplicate (the excluded patch's contributions arriving through
+some other heuristic as dead code).  The statement-level diff names
+the divergence: "return {...errors...}" is a signature present in
+base? no — present only in the pre-exclusion state; absent from
+result.  Combined with the pass-8.10 check on the *unreconciled*
+content, this closes the loop: divergence is caught either before
+reconcile (reject the patch) or after (warn the user).
+
+The invariant this audit surfaces, without enforcing:
+"reconcile promoted, but the promoted content does not carry the
+statement shape the excluded patch was trying to introduce, and may
+carry a look-alike that parses."  That sentence, as a warning, is
+what a user reading `warnings.txt` actually needs.
+
 Prior docstring content (unchanged):
 - STALE-WARNING CLEANUP
 - THREE MORE CLASSES OF STALE WARNING
@@ -775,6 +800,16 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
         if unresolved or mismatched:
             continue
 
+        # NEW (2026-10-29): capture pre-reconcile content for
+        # the post-exclude statement audit below.  The audit's
+        # intent is to name what reconcile *changed by
+        # excluding* — which requires comparing the
+        # pre-exclusion state against the promoted state, not
+        # the original base against the promoted state.  The
+        # difference between base and post-promote includes
+        # every applied patch's contribution, which drowns the
+        # excluded items in noise.
+        _pre_reconcile_content = rec.content
         rec.content = new_content
 
         rec.verification["patches_applied"] = sum(
@@ -853,6 +888,46 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
             rec.warnings.append(diag)
             if verbose:
                 print(f"  [reconcile] {path}: {diag}", file=sys.stderr)
+
+        # NEW (2026-10-29): post-exclude statement-level audit.
+        # Reconcile's job is to *promote* content that parses and
+        # resolves.  It does not — cannot, given its inputs — notice
+        # that the promotion leaves behind a shape the excluded patch
+        # was trying to eliminate.  The concrete case: a body shaped
+        # like `return {"success": False, ..., "errors": ...}`
+        # (the excluded patch) was applied by the pipeline through an
+        # alternative heuristic as a *duplicate* return; parse passes,
+        # no dangling symbol, but the file has a dead statement.  A
+        # statement-level `structural_diff` names it.  Advisory only
+        # — the promoted content is still what gets written, and the
+        # user is told what shape drift to look for in the diff.
+        try:
+            from .structural_diff import structural_diff
+            stmt_divergence = structural_diff(
+                _pre_reconcile_content, new_content, path, "")
+            if stmt_divergence:
+                rec.warnings.append(
+                    "reconcile: statement-level divergence after "
+                    "exclusion — review the residual for shape drift: "
+                    + "; ".join(
+                        f"{c.kind} {c.signature!r}"
+                        for c in stmt_divergence[:5]
+                    )
+                )
+                if verbose:
+                    print(
+                        f"  [reconcile] {path}: statement-level "
+                        f"divergence after exclusion "
+                        f"({len(stmt_divergence)} change(s))",
+                        file=sys.stderr,
+                    )
+        except Exception as _e:
+            # The audit is advisory; a raise here must not undo a
+            # successful promotion.
+            rec.warnings.append(
+                f"reconcile: statement-level audit raised "
+                f"{type(_e).__name__}: {_e}"
+            )
 
         n_reconciled += 1
         if verbose:
