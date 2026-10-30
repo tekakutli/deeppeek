@@ -32,7 +32,8 @@ loop calls for each patch.  It dispatches, in order:
 
 AST-SNAPPED REGION-REPLACE (2026-10-29)
 =======================================
-`_try_region_replace` now splices via `patch_bounds.splice_region`
+`_try_region_replace_lines` (formerly the body of
+`_try_region_replace`) splices via `patch_bounds.splice_region`
 instead of the raw `"\n".join(base_lines[:start] + body + base_lines[end:])`.
 The candidate set is:
 
@@ -44,9 +45,9 @@ The candidate set is:
 
 Each candidate goes through `splice_region`, which validates
 structurally.  The first valid splice wins.  When none produces
-valid content, `_try_region_replace` returns None and the caller
-falls through to the insert heuristics (which may fail-closed
-cleanly) or to fail-closed at the record level.
+valid content, the phase returns None and the caller falls through
+to the insert heuristics (which may fail-closed cleanly) or to
+fail-closed at the record level.
 
 This closes the class of failure that produced invalid embedded JS
 in `pg_panel_scrubs.py` and `pg_panel_bindings.py` on 2026-10-28:
@@ -54,14 +55,49 @@ a line-based window that stopped one line short of the closing `}`,
 leaving a stray `}` as an orphan, which `validate_content` caught
 too late (in pass 8, not at heuristic time).
 
+STRUCTURAL REGION-REPLACE (2026-11-05)
+=====================================
+`_try_region_replace` is now a three-phase dispatcher:
+
+  1. `try_statement_replace` — specific single-statement replacement.
+     Handles Return / Assign / AnnAssign / Call bodies by AST-level
+     statement signature.  Existed before this change; unchanged.
+
+  2. `_try_region_replace_structural` — NEW.  Multi-statement
+     AST-based region match.  Fires when a window of `base`'s
+     top-level statements has high AST node-type similarity to
+     `body`'s top-level statements *and* shares at least one
+     identifier.  Python-only (`.py` / `.pyi`).
+
+     The identifier gate rejects structurally-coincident false
+     positives: `foo()` and `bar()` have identical node types but
+     no shared identifier, and would otherwise splice `bar()` over
+     `foo()`.
+
+     Motivating case: `if flag: do_old()` → `if flag: do_new()`.
+     Line-based similarity is 0.5 (1 of 2 lines matches), below the
+     0.55 threshold, so line-based declines.  Structural similarity
+     is 1.0 (identical node types), and `flag` is shared, so
+     structural fires.
+
+  3. `_try_region_replace_lines` — the pre-2026-11-05 line-based
+     sweep.  Unchanged.  The fallback for HTML fragments (whose
+     content lives inside a Python string literal, invisible to
+     `ast`), JS/TS destinations (structural is Python-only), and
+     Python bodies whose identifiers are all renamed from the base
+     (no shared identifier → structural declines → line-based, which
+     also declines, → fail-closed with the target preserved).
+
+  All three phases respect the same `_prose_names_scope` gate at the
+  dispatcher: a prose instruction like "in `X`, add:" routes to the
+  insert heuristics, not to any replace phase.
+
 STRUCTURAL STATEMENT REPLACE PRE-CHECK (2026-10-29b)
 ====================================================
-`_try_region_replace` now runs `patch_statement_replace.try_statement_replace`
-on `(base, body_stripped, path)` after the `_prose_names_scope` gate
-and before the similarity sweep.  The statement matcher uses AST-
-level identity (dict keys, target names, call arg names) rather
-than line-level token overlap, so it correctly discriminates between
-statements that share lines but mean different things.
+Phase 1 (`try_statement_replace`) uses AST-level identity (dict
+keys, target names, call arg names) rather than line-level token
+overlap, so it correctly discriminates between statements that
+share lines but mean different things.
 
 Motivating shape (`inpaint_server.py`, 2026-11-05): a body whose AST
 is
@@ -84,34 +120,7 @@ Both base returns share lines (`return {`, `"timing": round(elapsed, 3),`,
 `success: True` return scored higher against the body because it had a
 matching "message is a name" structure where the `success: False` one
 did not.  The `statement_sig`-based matcher uses dict-key identity and
-value-exact-match counts, which separate the two cleanly:
-
-    image_b64 return:  keys {success,message,timing}∩{success,message,errors,timing}=3
-                       values exact: success + message + timing = 3
-                       score = 0.4·(3/4) + 0.6·(3/4) = 0.75
-
-    error-path returns (daemon/error message):
-                       keys ∩ = 3
-                       values exact: success + timing = 2
-                       score = 0.4·(3/4) + 0.6·(2/4) = 0.60
-
-    success: True return:
-                       keys ∩ = 2
-                       values exact: timing = 1
-                       score = 0.4·(2/4) + 0.6·(1/4) = 0.35
-
-    → 0.75 wins by 0.15 over the next candidate; `_MIN_GAP=0.10`
-      accepts the match; `_try_region_replace` returns the correct
-      splice before the similarity sweep can pick the wrong window.
-
-Note: the `statement_sig.score` function from the original proposal
-(0.30·kind + 0.40·key-overlap + 0.30·value-overlap) does *not*
-suffice — the 0.30 base reward for `kind` match makes the two
-error-path returns (score 0.75) and the image_b64 return (score
-0.825) too close.  The 0.4·key + 0.6·value formula above is the one
-required.  The two formulas live in `statement_sig.py`; the switch
-is a one-line change in `score()` and is required for the working
-shape.
+value-exact-match counts, which separate the two cleanly.
 
 Gating order matters: the pre-check fires *inside*
 `_try_region_replace`, after the `_prose_names_scope` gate.  The
@@ -129,7 +138,7 @@ same graceful degradation as `ast_anchor`.
 
 SIZE-AWARE SIMILARITY (2026-11-05)
 ==================================
-`_try_region_replace` used a flat `min_ratio=0.55` gate before
+`_try_region_replace_lines` used a flat `min_ratio=0.55` gate before
 running the splice.  For a patch whose body is *larger* than the
 base region it replaces (expand-shaped edit — the
 `pg_base.py` rotation widget goes from 10 lines to 17), the ratio
@@ -182,7 +191,7 @@ The regex also now accepts dots in the backticked identifier, so
 
 SNAP-FIRST CANDIDATE ORDERING (2026-11-05)
 ==========================================
-The candidate set used to try the RAW similarity window first,
+The line-based phase used to try the RAW similarity window first,
 appending the AST-snapped and pair-swept candidates after.  That
 worked when the raw window was small enough to be a legitimate
 statement, but produced silent corruption on the pg_base.py shape:
@@ -200,11 +209,12 @@ mid-element window.
 HTML OPENING-SIGNATURE STRICTNESS (2026-11-05)
 ==============================================
 For `.py`/`.html` destinations where the body's first line starts
-with `<`, the similarity sweep requires the window's first line to
-match the body's first line *exactly* (after stripping).  Without
-this, `<div class="field" style="align-items:center;">` matched a
-window opening `<input type="range" id="viewRotation"` — both start
-with `<`.  The looser "first word" check is retained for JS/Python.
+with `<`, the line-based similarity sweep requires the window's
+first line to match the body's first line *exactly* (after
+stripping).  Without this, `<div class="field" style="align-items:center;">`
+matched a window opening `<input type="range" id="viewRotation"` —
+both start with `<`.  The looser "first word" check is retained for
+JS/Python.
 
 TOOL-BUG DETECTION (2026-10-29)
 ===============================
@@ -219,12 +229,6 @@ It is WRONG for the case where the heuristic module itself is broken
 — a stale import, a renamed function referenced by name, a module
 that landed in the wrong directory.  Those are bugs in deeppeek, not
 failures of the body, and they abort the entire remaining chain.
-Motivating case (2026-10-29): two new modules `statement_sig` and
-`patch_statement_replace` were placed under `tests/recover/`
-instead of `src/deeppeek/recover/`; every `_try_region_replace`
-call raised `ModuleNotFoundError`, which the wrapper silently
-caught, cascading 37 test failures across 8 test files before the
-log was read.
 
 `_TOOL_BUG_EXCEPTIONS` marks the types that are code invariants
 rather than data conditions.  When the wrapper catches one, it
@@ -235,26 +239,16 @@ exception as `failure_reason` (skipping `_diagnose_patch_failure`,
 which would produce an unhelpful "no heuristic matched" message),
 adds a "deeppeek bug" warning to `rec.warnings`, and sets
 `rec.verification["tool_bug"]`; `pass9_write` surfaces a
-`[TOOL_BUG]` line in `warnings.txt`.  A reader of the log
-immediately knows which failures are recoverable (body shape) and
-which are deeppeek bugs (tooling).
-
-Prior docstring content (unchanged):
-- MULTI-STATEMENT APPLY (2026-10-28g)
-- INDENTED DEF/CLASS REPLACE (2026-10-28g)
-- INDENTED-DEF REINDENT BUG (2026-11-01)
-- MULTI-STATEMENT DEDENT (2026-11-01b)
-- DECORATOR MERGE (2026-11-02)
-- LANGUAGE-AWARE STRUCTURAL CHECK (2026-11-01b)
-- DECORATED-SCOPE ROUTING (2026-11-02)
-- REGION REPLACE (2026-10-29)
+`[TOOL_BUG]` line in `warnings.txt`.
 """
 
+import ast
 import difflib
 import re
 import textwrap
 from typing import Optional
 
+from ._ast import parse_source
 from .core import _is_deletion_instruction, _looks_like_diff_body
 from .patch_text import (
     _has_ellipsis_marker, _strip_ellipsis_lines,
@@ -631,10 +625,9 @@ def _is_syntactically_complete_python(body, path):
         return True
     if w not in _PY_COMPLETE_VERBS:
         return True
-    import ast as _ast
-    import textwrap as _tw
     try:
-        _ast.parse(_tw.dedent(body))
+        parse_source(textwrap.dedent(body),
+                     filename=path or "<body>")
     except SyntaxError:
         return False
     return True
@@ -653,10 +646,20 @@ def _is_already_applied(body_stripped, base):
 
 
 # ============================================================================
-#  Region replace (2026-10-29; size-aware 2026-11-05;
-#                 snap-first ordering 2026-11-05;
-#                 structural statement pre-check 2026-10-29b)
+#  Region replace — dispatcher (2026-10-29; three-phase 2026-11-05)
 # ============================================================================
+#
+# Three phases, tried in order:
+#
+#   1. try_statement_replace   specific single-statement match
+#   2. _try_region_replace_structural   generic multi-statement AST match
+#   3. _try_region_replace_lines        line-based similarity sweep
+#
+# All three honour the same _prose_names_scope gate at the top: prose
+# that names a scope as an *insertion* target routes to the insert
+# heuristics and none of the replace phases fire.
+#
+# See the module docstring, STRUCTURAL REGION-REPLACE (2026-11-05).
 
 def _try_region_replace(base: str, body_stripped: str,
                         path: str = "",
@@ -667,35 +670,13 @@ def _try_region_replace(base: str, body_stripped: str,
     """Replace a region of `base` with `body_stripped` when the body
     is a modified version of that region.
 
-    Three phases, tried in order:
+    Phase 1: structural statement replace (single statement only).
+    Phase 2: structural multi-statement region match (Python only).
+    Phase 3: line-based similarity sweep.
 
-      1. Structural statement replace.  If the body parses as exactly
-         one statement and a unique base statement matches it by
-         structural signature (dict keys + literal values, or
-         assignment targets, or call arg names), splice there.  This
-         is the semantically-correct path: a body that *is* a
-         modified statement lands on its structural match, not a
-         token-coincidental one.  See
-         `patch_statement_replace.try_statement_replace` and the
-         module docstring section
-         STRUCTURAL STATEMENT REPLACE PRE-CHECK (2026-10-29b).
-
-      2. Similarity sweep.  Score each `body_lines × factor` window
-         by (overlap_fraction + ratio), pick the best, splice via
-         `splice_region` (structural validation).
-
-      3. Candidate ordering within the sweep: AST-snapped boundaries
-         first, then the raw window, then a ±3-line pair-sweep.
-         Each candidate is validated; first valid wins.
-
-    Gated on `context_before`: when the surrounding prose names a
-    scope as an *insertion target* (see `_prose_names_scope`), this
-    returns None so `_try_insert_into_named_scope` can place the body
-    without region-replace overriding it.  When the prose names a
-    scope as a *replacement target* (e.g. "In `pg_base.py`, replace
-    ..."), region-replace is not gated — it is the correct handler
-    for that shape.  The structural pre-check runs *after* this gate
-    so the insert-vs-replace distinction is preserved.
+    Returns the patched content, or None.  The prose-scope gate
+    applies before any phase: an "insert into scope" instruction
+    must not be intercepted by a replace handler.
     """
     if not body_stripped or not base:
         return None
@@ -707,17 +688,237 @@ def _try_region_replace(base: str, body_stripped: str,
     #  Phase 1: structural statement replace.
     #
     #  Runs AFTER the prose-scope gate (so insertion intent is not
-    #  intercepted) and BEFORE the similarity sweep (so a structurally
-    #  clean match pre-empts a token-coincidental one).  When the body
-    #  isn't a single statement, or the destination is a language
-    #  without a signature extractor, or the match is ambiguous, this
-    #  returns None and we fall through to the line-similarity sweep.
+    #  intercepted) and BEFORE the multi-statement structural matcher
+    #  (so a specific signature match pre-empts the generic node-type
+    #  match).  When the body isn't a single statement, or the
+    #  destination is a language without a signature extractor, or
+    #  the match is ambiguous, this returns None and the dispatcher
+    #  falls through to phase 2.
     # ------------------------------------------------------------------
     from .patch_statement_replace import try_statement_replace
     stmt_result = try_statement_replace(base, body_stripped, path)
     if stmt_result is not None:
         return stmt_result
 
+    # ------------------------------------------------------------------
+    #  Phase 2: structural multi-statement region match.
+    #
+    #  Python-only.  Declines cleanly when:
+    #    · the destination isn't `.py`/`.pyi`
+    #    · the body doesn't parse as Python (even after dedent)
+    #    · the base doesn't parse as Python
+    #    · no candidate window shares an identifier with the body
+    #    · the best window's node-type Jaccard is below 0.55
+    #    · the best window doesn't beat the runner-up by 0.10
+    #
+    #  All declines are fail-closed: the dispatcher falls through to
+    #  phase 3, which handles the .js / HTML-fragment / renamed-
+    #  identifier cases the structural matcher cannot judge.
+    # ------------------------------------------------------------------
+    structural_result = _try_region_replace_structural(
+        base, body_stripped, path)
+    if structural_result is not None:
+        return structural_result
+
+    # ------------------------------------------------------------------
+    #  Phase 3: line-based similarity sweep.
+    #
+    #  The pre-2026-11-05 heuristic, unchanged.  Handles everything
+    #  phase 2 declines.  See the module docstring,
+    #  SNAP-FIRST CANDIDATE ORDERING and HTML OPENING-SIGNATURE
+    #  STRICTNESS.
+    # ------------------------------------------------------------------
+    return _try_region_replace_lines(
+        base, body_stripped, path,
+        min_ratio=min_ratio, min_overlap=min_overlap)
+
+
+# ============================================================================
+#  Region replace — structural phase (2026-11-05)
+# ============================================================================
+
+def _try_region_replace_structural(base: str, body_stripped: str,
+                                    path: str) -> Optional[str]:
+    """Multi-statement AST region match.  Python-only.
+
+    See the module docstring, STRUCTURAL REGION-REPLACE (2026-11-05)
+    for the full design rationale.
+
+    Fires when all of:
+      · `path` is `.py` or `.pyi`
+      · `body_stripped` parses as Python (with dedent fallback)
+      · `base` parses as Python
+      · a window of `len(body_stmts)` consecutive top-level statements
+        in `base` shares at least one identifier with the body
+      · node-type multiset Jaccard for the best window is >= 0.55
+      · the best window beats the runner-up by >= 0.10
+
+    Returns the spliced content, or None.
+    """
+    if not path.endswith((".py", ".pyi")):
+        return None
+
+    body_tree = _parse_python_body(body_stripped, path)
+    if body_tree is None:
+        return None
+
+    try:
+        base_tree = parse_source(base, filename=path or "<base>")
+    except SyntaxError:
+        return None
+
+    body_stmts = [n for n in body_tree.body
+                  if hasattr(n, "lineno") and hasattr(n, "end_lineno")]
+    base_stmts = [n for n in base_tree.body
+                  if hasattr(n, "lineno") and hasattr(n, "end_lineno")]
+
+    if not body_stmts or not base_stmts:
+        return None
+
+    n = len(body_stmts)
+    if n > len(base_stmts):
+        return None
+
+    body_ident = [_stmt_identifiers(s) for s in body_stmts]
+    body_all = set().union(*body_ident)
+    base_ident = [_stmt_identifiers(s) for s in base_stmts]
+
+    scored = []
+    for i in range(len(base_stmts) - n + 1):
+        window_idents = set().union(*base_ident[i:i + n])
+        if not _shares_identifier_sets(body_all, window_idents):
+            continue
+        window = base_stmts[i:i + n]
+        total = sum(_node_type_similarity(b, w)
+                    for b, w in zip(body_stmts, window))
+        scored.append((total / n, i))
+
+    if not scored:
+        return None
+
+    scored.sort(reverse=True)
+    best_ratio, best_idx = scored[0]
+    if best_ratio < 0.55:
+        return None
+    if len(scored) > 1 and scored[0][0] - scored[1][0] < 0.10:
+        return None
+
+    start_line = base_stmts[best_idx].lineno - 1
+    end_line = base_stmts[best_idx + n - 1].end_lineno
+
+    from .patch_bounds import (
+        try_ast_snapped_boundaries, splice_region,
+    )
+    snapped = try_ast_snapped_boundaries(
+        base, path, start_line, end_line, body_stripped)
+    if snapped is not None:
+        start_line, end_line = snapped
+
+    return splice_region(
+        base, start_line, end_line,
+        body_stripped.split("\n"), path)
+
+
+def _parse_python_body(body: str, path: str) -> Optional[ast.AST]:
+    """Parse a Python body, with dedent fallback for fragments.
+
+    Returns the `ast.Module`, or None.  Motivating case (fixture 40):
+    an indented `try: ... except: ...` body parses only after dedent.
+    """
+    candidates = [body]
+    dedented = textwrap.dedent(body)
+    if dedented != body:
+        candidates.append(dedented)
+    for cand in candidates:
+        try:
+            return parse_source(cand, filename=path or "<body>")
+        except SyntaxError:
+            continue
+    return None
+
+
+def _stmt_identifiers(stmt) -> set:
+    """Set of identifier-shaped tokens in `stmt`: `ast.Name.id` and
+    string-constant values.
+
+    The string-constant inclusion catches dict-key literals and
+    command-arg names, both of which are load-bearing discriminators
+    for the region matcher even though they are not `Name` nodes.
+    """
+    out: set = set()
+    for node in ast.walk(stmt):
+        if isinstance(node, ast.Name):
+            out.add(node.id)
+        elif (isinstance(node, ast.Constant)
+              and isinstance(node.value, str)):
+            out.add(node.value)
+    return out
+
+
+def _shares_identifier_sets(a: set, b: set) -> bool:
+    """True iff `a` and `b` share at least one identifier, or both are
+    empty.
+
+    Empty-empty passes because a body with no identifiers (e.g. bare
+    `pass` or a small literal) can legitimately match a base window
+    with no identifiers — the shape alone is the signal.
+
+    Body-has-identifiers-but-window-has-none (or vice versa) fails:
+    it is a structural coincidence, not a modified version.  Motivating
+    case: `foo()` and `bar()` have identical node types but share no
+    identifier.  Without the gate, the structural matcher would splice
+    `bar()` over `foo()`.
+    """
+    if not a and not b:
+        return True
+    return bool(a & b)
+
+
+def _node_type_similarity(a, b) -> float:
+    """Jaccard over node-type multisets.  Range [0, 1].
+
+    Shape, not content.  Two `if x: foo()` blocks score 1.0 regardless
+    of `x` and `foo`.  The identifier gate (`_shares_identifier_sets`)
+    prevents that from being a false positive when they share nothing.
+
+    Multiset, not set: `if a and a:` has two `Name` nodes vs `if a:`
+    which has one, so the two do not score 1.0.  This is the
+    load-bearing difference from a set-based Jaccard — a body that
+    accidentally duplicates an expression is not "identical structure"
+    to one that does not.
+    """
+    from collections import Counter
+
+    def _fp(node):
+        return Counter(type(n).__name__ for n in ast.walk(node))
+
+    ca, cb = _fp(a), _fp(b)
+    inter = sum((ca & cb).values())
+    union = sum((ca | cb).values())
+    return inter / union if union else 0.0
+
+
+# ============================================================================
+#  Region replace — line-based phase (2026-10-29)
+# ============================================================================
+#
+# The pre-2026-11-05 heuristic, unchanged.  See the module docstring,
+# AST-SNAPPED REGION-REPLACE, SIZE-AWARE SIMILARITY, SNAP-FIRST
+# CANDIDATE ORDERING, and HTML OPENING-SIGNATURE STRICTNESS.
+
+def _try_region_replace_lines(base: str, body_stripped: str,
+                              path: str = "",
+                              min_ratio: float = 0.55,
+                              min_overlap: float = 0.4,
+                              ) -> Optional[str]:
+    """Line-based similarity sweep, with AST-snapped boundaries and
+    structural validation.
+
+    Called from `_try_region_replace` after the prose-scope gate,
+    `try_statement_replace`, and the structural matcher have all
+    declined.  See the parent dispatcher's docstring for the phase
+    ordering rationale.
+    """
     body_lines = body_stripped.splitlines()
     if len(body_lines) < 3:
         return None
@@ -844,12 +1045,6 @@ def _try_region_replace(base: str, body_stripped: str,
 # — a stale import, a renamed function referenced by name, a module
 # that landed in the wrong directory.  Those are bugs in deeppeek, not
 # failures of the body, and they abort the entire remaining chain.
-# Motivating case (2026-10-29): two new modules `statement_sig` and
-# `patch_statement_replace` were placed under `tests/recover/`
-# instead of `src/deeppeek/recover/`; every `_try_region_replace`
-# call raised `ModuleNotFoundError`, which the wrapper silently
-# caught, cascading 37 test failures across 8 test files before the
-# log was read.
 #
 # `_TOOL_BUG_EXCEPTIONS` marks the types that are code invariants
 # rather than data conditions.  When the wrapper catches one, it
@@ -965,7 +1160,8 @@ def _try_deterministic_patch_inner(base, patch, path="",
     if imported is not None:
         return imported
 
-    single_line = _try_single_line_replace(base, raw_body, context_before)
+    single_line = _try_single_line_replace(
+        base, raw_body, context_before, path=path)
     if single_line is not None:
         return single_line
 

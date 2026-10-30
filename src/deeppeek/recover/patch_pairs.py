@@ -268,7 +268,7 @@ def _try_replace_pair(base, old, new, path=""):
             return _validated(result)
 
     # Fuzzy line-level match (token-equivalent lines, superset lines).
-    fuzzy = _try_fuzzy_replace(base, old, new)
+    fuzzy = _try_fuzzy_replace(base, old, new, path=path)
     if fuzzy is not None:
         return _validated(fuzzy)
 

@@ -128,6 +128,7 @@ the AST snap + the pair sweep, try each, return the first valid one.
 import re
 from pathlib import Path
 from typing import Optional
+from ._ast import parse_source
 
 
 # ── structural validation ──────────────────────────────────────────
@@ -157,7 +158,7 @@ def structural_valid(content: str, path: str) -> bool:
     import ast
     import textwrap
     try:
-        ast.parse(textwrap.dedent(content))
+        parse_source(textwrap.dedent(content))
         return True
     except SyntaxError:
         pass
@@ -169,7 +170,7 @@ def structural_valid(content: str, path: str) -> bool:
 def _py_valid(content: str, path: str) -> bool:
     import ast
     try:
-        ast.parse(content)
+        parse_source(content)
     except SyntaxError:
         return False
     from .validate_output import (
@@ -628,7 +629,7 @@ def _html_signature_matches(opening_line, sig):
 def _python_top_level_stmt_ranges(content):
     import ast
     try:
-        tree = ast.parse(content)
+        tree = parse_source(content)
     except SyntaxError:
         return []
     out = []

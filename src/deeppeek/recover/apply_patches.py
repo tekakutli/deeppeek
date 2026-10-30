@@ -2,9 +2,28 @@
 apply_patches — pass 6 (apply patches, then sanity-check the result).
 
 This module is the *orchestrator*: it owns `pass6_apply_patches`
-(the main loop over records/patches), the sanity gate, and the
-per-record insertion filter.  The actual heuristics live in their
-own modules.
+(the main loop over records/patches), the broader-context retry
+helper, replace-intent detection, and the pass-6 diagnostic
+wrappers.
+
+The gates it consults live in sibling modules:
+
+  · `pass6_sanity.py` — structural-damage and sanity rejection
+    (`_body_is_wellformed`, `_check_structural_sanity`,
+    `_enrich_structural_damage`, `_sanity_gate`).
+
+  · `pass6_gates.py` — insertion filters, dedup gates, blockquote
+    policy, anchor recording (`_filter_body_by_blocks`,
+    `_verify_no_duplicate_insertion`,
+    `_is_duplicate_assignment_insert`, `_is_blockquoted_strong`,
+    `_try_blockquoted_patch`, `_record_single_line_anchor`,
+    `_mark_already_present`).
+
+The actual patch heuristics live in `patch_dispatch` /
+`patch_heuristics` / `patch_scope` / `patch_pairs` / `patch_llm`.
+Every name from those modules is re-exported via the `_mod` loop
+below, so `from deeppeek.recover.apply_patches import X` keeps
+resolving for every X that lived here pre-split.
 
 STRUCTURAL SANITY GATE (2026-10-29, revised)
 ============================================
@@ -21,21 +40,14 @@ body that is balanced but whose result is not is *heuristic misfire*:
 the boundary was wrong, and we reject so the next heuristic gets a
 chance.
 
-This conditional gate is what lets test_28 / test_29 (which use
-intentionally-truncated bodies) exercise the repair path, while
-pg_panel_scrubs.py / pg_panel_bindings.py (which use complete bodies
-that were mis-spliced) get rejected at heuristic time.
-
 DUPLICATE-NESTING GATE (2026-11-05)
 ===================================
-`_check_structural_sanity` now also rejects patches that introduce
-the same HTML element (same `tag` + same `class`) nested inside
-itself, when the base did not already have that nesting.  Motivating
-case: pg_base.py, where `_try_region_replace` spliced a 17-line body
-over a 3-line `<input>` window, producing `<div class="field">`
-nested inside another `<div class="field">`.  Every existing gate
-(`ast.parse`, `js_balance`, `patch_presence`) reported success
-because the tag counts balanced.
+`_check_structural_sanity` also rejects patches that introduce the
+same HTML element (same `tag` + same `class`) nested inside itself,
+when the base did not already have that nesting.  Motivating case:
+pg_base.py, where `_try_region_replace` spliced a 17-line body over
+a 3-line `<input>` window, producing `<div class="field">` nested
+inside another `<div class="field">`.
 
 PASS-6 FAILED-STATUS ANNOTATION (2026-10-29)
 ============================================
@@ -43,42 +55,67 @@ After the apply loop, if the record's *final* content is structurally
 invalid AND the base was structurally clean AND no applied patch had
 an unbalanced body, every patch marked `deterministic` is downgraded
 to `failed`.  Reconcile (pass 8.7) sees the failed status and its
-`_find_minimum_exclusions` can propose exclusions.  The
-`no-unbalanced-body` guard prevents this from firing on user-provided
-truncation, where pass 8's `try_repair` is the correct handler.
+`_find_minimum_exclusions` can propose exclusions.
 
 SCOPE-HINT PROPAGATION (2026-11-05)
 ===================================
-`pass6_apply_patches` now copies each trailing block's `scope_hint`
-onto the patch dict it builds.  Without it, `_try_insert_into_named_
-scope` — which resolves the target scope from prose — had no way to
-find the scope for block 634's shape (prose: "And in every failure
-return:", H2: "## Fix 3 — surface per-command errors in
-`handle_inpaint`").  The scope was attached to the Block by pass 1's
-extractor and read by pass 4's scope-name attribution, but the patch
-dict lost it, so the dispatcher could not place the block.
+`pass6_apply_patches` copies each trailing block's `scope_hint` onto
+the patch dict it builds.  Without it, `_try_insert_into_named_scope`
+— which resolves the target scope from prose — had no way to find the
+scope for block 634's shape (prose: "And in every failure return:",
+H2: "## Fix 3 — surface per-command errors in `handle_inpaint`").
 
 PATH THREADING (2026-10-29)
 ===========================
 `_apply_pairs` is called with `path=path` so pairs get AST snapping +
-structural validation on their splice.  Reconcile's
-`_replay_excluding` does the same.
+structural validation on their splice.
 
 TOOL-BUG SURFACING (2026-10-29)
 ===============================
 When `_try_deterministic_patch` catches a `_TOOL_BUG_EXCEPTIONS`
 raise it records `patch["tool_bug"] = "..."` and returns None
 (unchanged contract).  The failure-diagnostic loop in
-`pass6_apply_patches` now checks for that field first: if present,
-it uses the recorded exception as `failure_reason` (skipping
-`_diagnose_patch_failure`, which would produce a generic "no
-heuristic matched" that hides the actual bug), and emits a
-`deeppeek bug:` warning naming the exception type and message.
-After the loop, `rec.verification["tool_bug"]` is populated from
-every patch that carries the field.
+`pass6_apply_patches` now checks for that field first.
 
-Trust policy is unchanged (LOW on non-application); the goal is a
-distinguishable status, not a different outcome.
+PRE-EXISTING SHORT-CIRCUIT (2026-11-05)
+=======================================
+A pre-existing record with no patches and no pairs has nothing for
+pass 6 to do: the base IS the content, no heuristics can place
+anything, and the sanity gate costs a string encode + compare.  On
+large `--apply-to` trees (hundreds of untouched pre-existing files)
+that overhead dominated the run.
+
+`pass6_apply_patches` now short-circuits such records before the
+pending-patch loop: `content = base`, `verification["preexisting_
+unchanged"] = True`, and `continue`.  Pass 8 skips structural
+validation for records carrying that flag (`verify.pass8_verify`).
+Pass 9's `preexisting_unmodified` branch already handles them.
+
+The flag is a *derived* fact — computed in one place (pass 6), read
+in one place per downstream pass.  It does not depend on any field
+written by a later pass.  That is what makes it safe where the
+pruning loop was not: `preexisting_base` was set by pass 5, but the
+pruning lived *before* pass 5 and consumed it, so the check always
+saw False.
+
+STRUCTURAL DIVERGENCE ENRICHMENT (2026-11-05)
+=============================================
+Every `_check_structural_sanity` rejection site now calls
+`_enrich_structural_damage`, which appends the AST-level divergence
+`structural_diff` observed to the parser-level `failure_reason`.
+
+The parser-level reason names *that* the result is malformed
+("patch produced structurally-invalid .js content").  The structural
+divergence names *what* changed beyond what the patch declared
+("removed 'function _pickMaskAction'").  Both together tell the
+operator whether the tool silently dropped a sibling or introduced
+an element that shouldn't be there.
+
+Three call sites because the patch loop advances state between
+them: the filtered-body path, the unfiltered-fallback path, and the
+broader-context-retry path each need the exact `(base, attempted,
+patch_body)` tuple `_check_structural_sanity` was called with, or
+`structural_diff` compares the wrong things.
 
 Prior docstring content (unchanged):
 - REPLACE-INTENT DETECTION
@@ -88,7 +125,8 @@ Prior docstring content (unchanged):
 - Prior-line recording / prior-insertions scope context
 - Broader-context retry
 """
-import re
+
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Optional
@@ -115,6 +153,27 @@ for _mod in (patch_text, patch_scope, patch_llm, patch_heuristics,
             continue
         globals()[_name] = getattr(_mod, _name)
 del _mod, _name
+
+# Gates and helpers (extracted 2026-11-05).  Re-exported so
+# `from deeppeek.recover.apply_patches import X` keeps resolving for
+# every X that lived here pre-split.
+from .pass6_sanity import (
+    _body_is_wellformed,
+    _check_structural_sanity,
+    _enrich_structural_damage,
+    _sanity_gate,
+)
+from .pass6_gates import (
+    _DUP_ASSIGN_LINE_RE,
+    _CONTINUATION_ENDINGS,
+    _is_duplicate_assignment_insert,
+    _filter_body_by_blocks,
+    _verify_no_duplicate_insertion,
+    _is_blockquoted_strong,
+    _try_blockquoted_patch,
+    _record_single_line_anchor,
+    _mark_already_present,
+)
 
 
 def _diagnose_patch_failure_inner(patch, content, base):
@@ -154,305 +213,12 @@ def _broader_context_for(patch, blocks_by_idx, records, path):
 
 
 # ===========================================================================
-#  Blockquoted structural check
-# ===========================================================================
-
-def _is_blockquoted_strong(b_idx, blocks_by_idx):
-    b = blocks_by_idx.get(b_idx) if blocks_by_idx else None
-    if b is None:
-        return False
-    if not b.in_blockquote:
-        return False
-    from .dedup import _has_strong_blockquote_attribution
-    try:
-        return _has_strong_blockquote_attribution(b)
-    except Exception:
-        return False
-
-
-def _try_blockquoted_patch(content, patch, path, prior_insertions=None,
-                            prior_scopes=None):
-    from .validate_output import validate_content
-    result = _try_deterministic_patch(
-        content, patch, path,
-        prior_insertions=prior_insertions,
-        prior_scopes=prior_scopes,
-    )
-    if result is None:
-        return None
-    if result == content:
-        return result
-    trial = validate_content(result, path)
-    if trial is not None:
-        patch["structural_check"] = f"failed: {trial}"
-        return None
-    patch["structural_check"] = "ok"
-    return result
-
-
-# ===========================================================================
-#  Insertion-filter helper
-# ===========================================================================
-
-def _filter_body_by_blocks(body, base_stripped_set, record_inserted):
-    if not body.strip():
-        return body, False
-    blocks = _split_body_into_blocks(body)
-    kept = []
-    any_removed = False
-    for block in blocks:
-        non_context = [
-            ln.strip() for ln in block.split("\n")
-            if ln.strip() and ln.strip() not in base_stripped_set
-        ]
-        if non_context and all(
-            ln in record_inserted for ln in non_context
-        ):
-            any_removed = True
-            continue
-        kept.append(block)
-    return "\n".join(kept), any_removed
-
-
-def _sanity_gate(base, result):
-    from .sanity import is_suspicious
-    return is_suspicious(base, result)
-
-
-# ===========================================================================
-#  Duplicate-insertion gate
-# ===========================================================================
-
-def _verify_no_duplicate_insertion(old_content, new_content, patch, path):
-    old_lines = [ln.strip() for ln in old_content.splitlines()
-                 if ln.strip()]
-    new_lines = [ln.strip() for ln in new_content.splitlines()
-                 if ln.strip()]
-    old_counts = Counter(old_lines)
-    new_counts = Counter(new_lines)
-
-    body_lines = [ln.strip() for ln in patch.get("body", "").splitlines()
-                  if ln.strip()]
-    body_counts = Counter(body_lines)
-    for line, count in body_counts.items():
-        new_counts[line] -= count
-        if new_counts[line] < 0:
-            new_counts[line] = 0
-
-    unexpected = {
-        line: new_counts[line] - old_counts[line]
-        for line in old_counts
-        if new_counts[line] > old_counts[line]
-    }
-    if not unexpected:
-        return True
-
-    patch["duplicate_insertion"] = dict(unexpected)
-    print(f"  [verify] {path}: patch idx={patch.get('idx')} produced "
-          f"unexpected duplicate pre-existing line(s) "
-          f"{dict(unexpected)}",
-          file=__import__("sys").stderr)
-    return False
-
-
-# ===========================================================================
-#  Body wellformedness probe (2026-10-29)
-# ===========================================================================
-#
-# Distinguishes heuristic misfire from user-provided truncation:
-#
-#   · body well-formed + result broken  →  heuristic misfire.  Reject
-#     (so the next heuristic gets a chance).
-#   · body truncated + result truncated  →  user-provided truncation.
-#     Apply, let pass 8's `try_repair` handle it (test_28, test_29).
-#
-# Structural check skips diff bodies and deletion instructions — their
-# syntax isn't well-formed code, and those classes are handled by their
-# own validators.
-
-def _body_is_wellformed(body: str, path: str) -> bool:
-    """True iff `body` is well-formed for `path`'s destination language.
-
-    - diff bodies, deletion instructions: True (handled elsewhere)
-    - `.py` bodies: try `ast.parse`.  On failure, try `_js_balance`
-      (may be embedded JS the caller will re-wrap).
-    - `.js`/`.ts`/`.html` bodies: `_js_balance`.
-    - unknown/empty path: `_js_balance`.
-    """
-    if not body or not body.strip():
-        return True
-    if _looks_like_diff_body(body):
-        return True
-    if _is_deletion_instruction(body, ""):
-        return True
-    ext = Path(path).suffix.lower() if path else ""
-    if ext == ".py":
-        import ast
-        import textwrap
-        try:
-            ast.parse(textwrap.dedent(body))
-            return True
-        except SyntaxError:
-            pass
-        # Not valid Python — may be embedded JS/HTML content.
-        # Fall through to the balance check.
-    from .validate_output import _js_balance
-    b, p, k, u = _js_balance(body)
-    return (b, p, k, u) == (0, 0, 0, 0)
-
-
-# ===========================================================================
-#  Structural sanity gate
-# ===========================================================================
-
-def _check_structural_sanity(old_content, new_content, path,
-                              patch_body=""):
-    """Refuse a patch that introduces unfixable structural damage.
-
-    For `.py` destinations: `ast.parse` plus the module-level-stmt
-    check, PLUS embedded-JS/HTML validation.  The embedded check is
-    what catches broken playground JS (outer Python parses fine).
-
-    For `.js`/`.ts`/`.html` destinations: validated only when the
-    patch body was itself well-formed.  A truncated body is user-
-    provided truncation and is applied as-is so pass 8's
-    `try_repair` can suggest a fix.
-
-    Returns None when the gate does not fire, or a short reason
-    string when it does.
-    """
-    if not old_content:
-        return None
-    ext = Path(path).suffix.lower()
-
-    if ext == ".py":
-        import ast
-        try:
-            ast.parse(new_content)
-        except SyntaxError as e:
-            return (f"patch introduced Python syntax error at "
-                    f"line {e.lineno}: {e.msg}")
-        from .validate_output import _module_level_stmts_added
-        added = _module_level_stmts_added(new_content, old_content)
-        if added:
-            return (f"patch injected module-level statement(s) at "
-                    f"column 0: {added}")
-        # Duplicate-nesting gate (2026-11-05): reject a patch that
-        # introduced the same (tag, class) nested inside itself,
-        # when the base did not already have that nesting.
-        # Motivating case: pg_base.py, where a 3-line window was
-        # spliced with a 17-line body producing `<div class="field">`
-        # inside another `<div class="field">`.  Structural validation
-        # alone misses this — the tags balance.
-        from .validate_output import (
-            _extract_embedded_html, _has_duplicate_class_nesting,
-        )
-        base_html = _extract_embedded_html(old_content)
-        result_html = _extract_embedded_html(new_content)
-        if base_html and result_html:
-            if (not _has_duplicate_class_nesting(base_html)
-                    and _has_duplicate_class_nesting(result_html)):
-                return (
-                    "patch introduced a duplicate element nested "
-                    "inside itself (same `class=` value): the body "
-                    "re-opened a wrapper the splice was supposed to "
-                    "replace"
-                )
-        from .patch_bounds import structural_valid
-        if not structural_valid(new_content, path):
-            return ("patch produced structurally-invalid embedded "
-                    "content (JS/HTML parse error inside a Python "
-                    "string literal)")
-        return None
-
-    if ext in (".js", ".mjs", ".jsx", ".ts", ".tsx", ".html"):
-        from .patch_bounds import structural_valid
-        if not structural_valid(new_content, path):
-            if _body_is_wellformed(patch_body, path):
-                return f"patch produced structurally-invalid {ext} content"
-        return None
-    return None
-
-
-# ===========================================================================
-#  Prior-line recording
-# ===========================================================================
-
-def _record_single_line_anchor(patch, body, record_inserted,
-                                prior_scopes=None, broader_ctx=None):
-    if not isinstance(patch, dict):
-        return
-    body_lines = [ln for ln in body.splitlines() if ln.strip()]
-    if len(body_lines) != 1:
-        return
-    line = body_lines[0].strip()
-    if not line:
-        return
-    record_inserted.add(line)
-
-    if prior_scopes is None:
-        return
-    try:
-        from .patch_scope_insert import _extract_scope_name_from_prose
-    except ImportError:
-        return
-    scope = _extract_scope_name_from_prose(patch.get("context_before") or "")
-    if not scope and broader_ctx:
-        scope = _extract_scope_name_from_prose(broader_ctx)
-    if scope:
-        prior_scopes[line] = scope
-
-
-# ===========================================================================
-#  Already-present anchoring
-# ===========================================================================
-
-def _mark_already_present(patch, body, record_inserted,
-                          prior_scopes=None, broader_ctx=None):
-    patch["applied_by"] = "already-present"
-    _record_single_line_anchor(patch, body, record_inserted,
-                                prior_scopes=prior_scopes,
-                                broader_ctx=broader_ctx)
-
-
-# ===========================================================================
-#  Duplicate-assignment pre-gate
-# ===========================================================================
-
-_DUP_ASSIGN_LINE_RE = re.compile(r'^[A-Za-z_$][\w$]*\s*=\s*[^=]')
-
-_CONTINUATION_ENDINGS = (
-    "(", "[", "{", "\\", ",", "+", "-", "*", "/", "=", "|", "&",
-    " and", " or",
-)
-
-
-def _is_duplicate_assignment_insert(old_content, patch):
-    body = patch.get("body") or ""
-    body_lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
-    if len(body_lines) != 1:
-        return False
-    line = body_lines[0]
-    if not _DUP_ASSIGN_LINE_RE.match(line):
-        return False
-    if line.endswith(_CONTINUATION_ENDINGS):
-        return False
-    return any(ln.strip() == line for ln in old_content.splitlines())
-
-
-# ===========================================================================
 #  Replace-intent application
 # ===========================================================================
 
 def _try_replace_intent(content: str, patch, path: str,
                         record_inserted: set):
-    """Attempt to apply `patch` as a region replacement.
-
-    Candidate regions: unmodified `(start, end)` from
-    `detect_replace_intent`, AST-snapped boundaries, ±N-line sweep.
-    Each spliced via `patch_bounds.splice_region`, which validates
-    structurally.  The first valid splice wins.
-    """
+    """Attempt to apply `patch` as a region replacement."""
     body = patch.get("body") or ""
     intent = detect_replace_intent(content, body)
     if intent is None:
@@ -504,8 +270,6 @@ def _try_replace_intent(content: str, patch, path: str,
 # ===========================================================================
 
 def pass6_apply_patches(records, blocks_by_idx, llm):
-    import sys
-
     for path, rec in records.items():
         if rec.state not in ("SINGLE_FULL", "MULTI_FULL", "FULL_PLUS_PATCH"):
             continue
@@ -519,6 +283,24 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
             rec.trust = "LOW"
             continue
         base = base_block.body
+
+        # NEW (2026-11-05): pre-existing record with nothing to
+        # apply.  Skip the sanity gate and the pending-patch loop —
+        # they have no work to do and their cost (string encode for
+        # the sanity gate, fixpoint loop setup) is nontrivial on
+        # large trees.  Set `content` so pass 9 can identify this
+        # record as preexisting_unmodified, and set a verification
+        # flag pass 8 consults to skip validation.
+        if (rec.preexisting_base
+                and not rec.patches
+                and not rec.pairs):
+            rec.content = base
+            rec.verification["preexisting_unchanged"] = True
+            rec.verification["patches_applied"] = 0
+            rec.verification["patches_noop"] = 0
+            rec.verification["patches_failed"] = 0
+            rec.verification["pairs_applied"] = 0
+            continue
 
         if rec.source_blocks:
             for _idx in rec.source_blocks:
@@ -647,10 +429,13 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                         patch_body=patch_to_apply["body"])
                     if _struct_err is not None:
                         patch["applied_by"] = "skipped_structural_damage"
-                        patch["failure_reason"] = _struct_err
+                        patch["failure_reason"] = _enrich_structural_damage(
+                            _struct_err, content, result, path,
+                            patch_to_apply["body"],
+                        )
                         print(
                             f"  [struct-gate] {path} idx={patch['idx']}: "
-                            f"{_struct_err}",
+                            f"{patch['failure_reason']}",
                             file=sys.stderr,
                         )
                         continue
@@ -694,7 +479,10 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                         if _struct_err is not None:
                             patch["applied_by"] = \
                                 "skipped_structural_damage"
-                            patch["failure_reason"] = _struct_err
+                            patch["failure_reason"] = _enrich_structural_damage(
+                                _struct_err, content, result, path,
+                                patch["body"],
+                            )
                             continue
                         record_inserted |= _collect_inserted_lines(
                             content, result)
@@ -776,7 +564,10 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                         if _struct_err is not None:
                             patch["applied_by"] = \
                                 "skipped_structural_damage"
-                            patch["failure_reason"] = _struct_err
+                            patch["failure_reason"] = _enrich_structural_damage(
+                                _struct_err, content, retry_result, path,
+                                broader_patch["body"],
+                            )
                             continue
                         record_inserted |= _collect_inserted_lines(
                             content, retry_result)
@@ -824,12 +615,6 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
             ):
                 continue
             patch["applied_by"] = "failed"
-            # NEW (2026-10-29): if the failure was a tool bug
-            # (recorded by `_try_deterministic_patch`'s
-            # `_TOOL_BUG_EXCEPTIONS` branch), use the recorded
-            # exception as `failure_reason` — `_diagnose_patch_failure`
-            # would produce a generic "no heuristic matched" message
-            # that hides the actual deeppeek bug.
             if patch.get("tool_bug"):
                 patch["failure_reason"] = (
                     f"deeppeek bug: {patch['tool_bug']}")
@@ -859,13 +644,6 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
             else:
                 all_ok = False
 
-        # NEW (2026-10-29): record tool bugs distinctly.  A patch that
-        # failed because a heuristic *raised* a code-level exception
-        # (missing module, undefined name) is a deeppeek bug, not a
-        # body-shape failure.  Surface it in verification so the
-        # manifest and warnings.txt name the failure class explicitly,
-        # without changing trust policy (still LOW on non-application,
-        # which is the correct safety response to a bug).
         _tool_bug_patches = [p for p in rec.patches if p.get("tool_bug")]
         if _tool_bug_patches:
             rec.verification["tool_bug"] = [
@@ -879,18 +657,6 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
                     f"failure, not a data-shape failure; report the "
                     f"exception type and the message to deeppeek")
 
-        # ==================================================================
-        #  FAILED-STATUS ANNOTATION (2026-10-29, revised)
-        # ==================================================================
-        # If content is structurally invalid AND base was clean AND no
-        # applied patch had an unbalanced body, downgrade every
-        # `deterministic` patch to `failed`.  Reconcile can then
-        # exclude them.
-        #
-        # The `no-unbalanced-body` guard is what distinguishes
-        # heuristic misfire (reject, downgrade, let reconcile clean
-        # up) from user-provided truncation (apply broken, let pass 8
-        # try_repair suggest a fix — tests 28, 29).
         from .patch_bounds import structural_valid as _structural_valid
         applied_patches = [p for p in rec.patches
                            if p.get("applied_by") == "deterministic"]
@@ -1020,3 +786,37 @@ def pass6_apply_patches(records, blocks_by_idx, llm):
         if total_noop:
             print(f"  {total_noop} patch(es) already-present "
                   f"(no-op, not failures)", file=sys.stderr)
+
+
+def attribute_sanity_failure(rec, blocks_by_idx, validate_fn=None):
+    if validate_fn is None:
+        from .validate_output import validate_content as validate_fn
+
+    if not rec.patches:
+        return None
+    base_block = (blocks_by_idx.get(rec.last_full_idx)
+                  if rec.last_full_idx is not None else None)
+    if base_block is None:
+        return None
+    base_content = base_block.body
+    if base_content is None:
+        return None
+
+    current = base_content
+    for patch_dict in rec.patches:
+        applied_by = patch_dict.get("applied_by")
+        if applied_by == "already-present":
+            continue
+        if applied_by == "failed":
+            continue
+        if applied_by != "deterministic":
+            return None
+        result = _try_deterministic_patch(current, patch_dict, rec.path)
+        if result is None:
+            continue
+        if result == current:
+            continue
+        current = result
+        if validate_fn(current, rec.path) is not None:
+            return patch_dict["idx"]
+    return None

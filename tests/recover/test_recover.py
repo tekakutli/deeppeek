@@ -1887,6 +1887,56 @@ def test_41():
                 skip_file_compare=True, min_trust="MEDIUM")
 
 
+def test_42():
+    """Between-anchors on embedded HTML.
+
+    Exercises `_try_insert_between_anchors` with prose that names two
+    `<details>` blocks inside a `.py` file's embedded HTML string.
+    The between-anchors prose names blocks by *label* (Image, Masks)
+    without naming their language, so `_find_named_block_end` must
+    use the empty-path fallback (Python → JS → HTML) — not the outer
+    file's `.py` path, which would stop at the Python parser and
+    return None.
+
+    Pre-fix (path threaded through to `find_scope`), the heuristic
+    declined and the record fell through to fail-closed.  Post-fix,
+    the between-anchors insert fires and places the divider before
+    the Masks block.
+    """
+
+    def extra(target, run):
+        dec = run["manifest"].get("decisions", {}).get("pg_base.py", {})
+        assert dec, (
+            "pg_base.py missing from manifest decisions; "
+            "decisions keys: "
+            + repr(list(run["manifest"].get("decisions", {}))))
+        assert dec.get("trust") in ("MEDIUM", "HIGH"), (
+            "expected trust in {MEDIUM, HIGH}, got "
+            + repr(dec.get("trust"))
+            + "; verification=" + repr(dec.get("verification")))
+        assert dec.get("written") is True, (
+            "expected written=True, got " + repr(dec.get("written")))
+
+        content = (target / "pg_base.py").read_text()
+        assert "image controls" in content, (
+            "Image block lost:\n" + content)
+        assert "mask controls" in content, (
+            "Masks block lost:\n" + content)
+        assert "divider" in content, (
+            "between-anchors insert did not fire; the divider is "
+            "not in the output:\n" + content)
+
+        img_pos = content.index("image controls")
+        div_pos = content.index("divider")
+        mask_pos = content.index("mask controls")
+        assert img_pos < div_pos < mask_pos, (
+            "expected order: image < divider < mask, got:\n"
+            + content)
+
+    check_apply("42_between_anchors_embedded_html", extra,
+                skip_file_compare=True, min_trust="MEDIUM")
+
+
 def main():
 
     tests = [
@@ -1899,7 +1949,7 @@ def main():
         ("18", test_18), ("22", test_22), ("23", test_23), ("24", test_24), ("25", test_25), ("26", test_26), ("27", test_27), ("28", test_28), ("29", test_29), ("30", test_30), ("31", test_31), ("32", test_32), ("33", test_33),
         ("34", test_34), ("35", test_35), ("36", test_36),
         ("37", test_37), ("38", test_38),
-        ("40", test_40), ("41", test_41)]
+        ("40", test_40), ("41", test_41), ("42", test_42)]
     failed = 0
     for name, fn in tests:
         try:

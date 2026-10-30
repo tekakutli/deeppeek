@@ -2214,7 +2214,17 @@
     return btoa(binary);
   }
 
-  async function _postDownload(filename, text, source) {
+  // MODIFIED (2026-11-05): `lang` is now forwarded in the payload
+  // so the CLI can use the correct parser when it needs to fall
+  // back to structural derivation of the filename.  When the
+  // extension's prose-based derivation succeeded, `source` will be
+  // one of `prose-header` / `prose-single` / `prose-backtick` /
+  // `body-comment` and the CLI uses the filename as-is.  When the
+  // extension fell through to `lang-fallback` (timestamped name),
+  // the CLI runs structural analysis on the decoded bytes with the
+  // correct language hint and derives the real filename from the
+  // module docstring / leading comment.
+  async function _postDownload(filename, text, source, lang) {
     const bytes = new TextEncoder().encode(text);
     const base64 = _bytesToBase64(bytes);
     try {
@@ -2226,6 +2236,7 @@
           filename,
           base64,
           source: source || 'code-block',
+          lang: lang || '',
           size: bytes.length,
         }),
       });
@@ -2275,7 +2286,9 @@
       `[deeppeek:hijack] ${derived.path} (${text.length} chars, `
       + `lang=${langLabel || '?'}, source=${derived.source})`);
 
-    _postDownload(derived.path, text, derived.source).then((ok) => {
+    // MODIFIED (2026-11-05): pass langLabel through so the CLI can
+    // run structural derivation on lang-fallback blocks.
+    _postDownload(derived.path, text, derived.source, langLabel).then((ok) => {
       if (!ok) {
         console.warn(
           '[deeppeek:hijack] CLI not reachable — file NOT saved. '

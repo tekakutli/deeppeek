@@ -399,8 +399,147 @@ def test_region_replace_ast_skips_unmatched_names():
     )
 
 
+def test_structural_region_replace_helps_if_flag():
+    """Line-based declines: `if flag:` matches, `do_old()` vs
+    `do_new()` doesn't, so 1/2 = 0.5 < 0.55 threshold.
+
+    Structural fires: `flag` is shared, node-type multisets are
+    identical (`If, Name, Expr, Call, Name`).  Splices correctly.
+    """
+    from deeppeek.recover.patch_dispatch import _try_region_replace
+
+    base = (
+        "if flag:\n"
+        "    do_old()\n"
+    )
+    body = (
+        "if flag:\n"
+        "    do_new()\n"
+    )
+    result = _try_region_replace(base, body.strip(), "x.py")
+    assert result is not None, (
+        "structural should fire — shared `flag` + identical node types")
+    assert "do_new()" in result
+    assert "do_old()" not in result
+
+
+def test_structural_region_replace_rejects_no_shared_identifier():
+    """Line-based and structural both decline: `foo()` and `bar()`
+    are both `[Expr, Call, Name]` but share no identifier.  The
+    identifier gate rejects the structural match; line-based's
+    threshold rejects `foo()` vs `bar()`.
+    """
+    from deeppeek.recover.patch_dispatch import _try_region_replace
+
+    base = "bar()\n"
+    body = "foo()\n"
+    result = _try_region_replace(base, body.strip(), "x.py")
+    assert result is None, (
+        "identifier gate should reject: no shared identifier")
+
+
+def test_structural_region_replace_rejects_ambiguous():
+    """Two base `if flag:` blocks with different bodies.  Both share
+    `flag` and have identical node types.  Near-tie (margin 0) fails
+    closed at both phases.
+    """
+    from deeppeek.recover.patch_dispatch import _try_region_replace
+
+    base = (
+        "if flag:\n"
+        "    do_a()\n"
+        "if flag:\n"
+        "    do_b()\n"
+    )
+    body = "if flag:\n    do_c()\n"
+    result = _try_region_replace(base, body.strip(), "x.py")
+    assert result is None, (
+        "near-tie must fail closed")
+
+
+def test_structural_region_replace_multistatement_body():
+    """Multi-statement body where line overlap is low but structure
+    and shared identifiers are high."""
+    from deeppeek.recover.patch_dispatch import _try_region_replace
+
+    base = (
+        "data = fetch()\n"
+        "process_old(data)\n"
+    )
+    body = (
+        "data = fetch()\n"
+        "process_new(data)\n"
+    )
+    result = _try_region_replace(base, body.strip(), "x.py")
+    assert result is not None, (
+        "shared identifiers (data, fetch) + identical shapes should "
+        "fire")
+    assert "process_new(data)" in result
+    assert "process_old(data)" not in result
+
+
+def test_structural_region_replace_skips_js():
+    """JS destinations fall through structural and use line-based
+    (same as pre-2026-11-05)."""
+    from deeppeek.recover.patch_dispatch import _try_region_replace
+
+    base = (
+        "if (flag) {\n"
+        "  doOld();\n"
+        "}\n"
+    )
+    body = (
+        "if (flag) {\n"
+        "  doNew();\n"
+        "}\n"
+    )
+    # Line-based fires here (line similarity is high enough at .js).
+    # Structural skips because path isn't .py.
+    result = _try_region_replace(base, body.strip(), "x.js")
+    # Whatever happens, must be either line-based result or None.
+    # Must NOT crash.
+    if result is not None:
+        assert "doNew()" in result
+
+
+def test_structural_region_replace_skips_unparseable_body():
+    """HTML fragment body: structural declines (doesn't parse as
+    Python), line-based handles (unchanged behavior)."""
+    from deeppeek.recover.patch_dispatch import _try_region_replace
+
+    base = (
+        '<div class="field">\n'
+        '  <label>Rotation</label>\n'
+        '</div>\n'
+    )
+    body = (
+        '<div class="field">\n'
+        '  <label>Rotation</label>\n'
+        '  <input type="range">\n'
+        '</div>\n'
+    )
+    # Structural: `_parse_python_body(body, "x.py")` — body doesn't
+    # parse as Python.  Returns None.  Line-based fires.
+    result = _try_region_replace(base, body.strip(), "x.py")
+    if result is not None:
+        assert '<input type="range">' in result
+
+
+def test_structural_region_replace_falls_through_on_dedent_failure():
+    """A body that can't parse even after dedent → structural declines,
+    no exception."""
+    from deeppeek.recover.patch_dispatch import _try_region_replace
+
+    base = "def f():\n    pass\n"
+    body = "def f(:\n    pass\n"   # syntactically invalid
+    result = _try_region_replace(base, body.strip(), "x.py")
+    # No assertion on result — just verify no crash.
+    assert result is None or isinstance(result, str)
+
+
 def main():
     tests = [
+        # ── pre-existing line-based cases ───────────────────────────
         ("region replace scrubs shape direct",
          test_region_replace_scrubs_shape_direct),
         ("region replace does not fire on pure insertion",
@@ -417,6 +556,20 @@ def main():
          test_region_replace_ast_replaces_by_name),
         ("region replace ast skips unmatched names",
          test_region_replace_ast_skips_unmatched_names),
+        ("structural region replace helps if flag",
+         test_structural_region_replace_helps_if_flag),
+        ("structural region replace rejects no shared identifier",
+         test_structural_region_replace_rejects_no_shared_identifier),
+        ("structural region replace rejects ambiguous",
+         test_structural_region_replace_rejects_ambiguous),
+        ("structural region replace multistatement body",
+         test_structural_region_replace_multistatement_body),
+        ("structural region replace skips js",
+         test_structural_region_replace_skips_js),
+        ("structural region replace skips unparseable body",
+         test_structural_region_replace_skips_unparseable_body),
+        ("structural region replace falls through on dedent failure",
+         test_structural_region_replace_falls_through_on_dedent_failure),
     ]
     failed = 0
     for name, fn in tests:

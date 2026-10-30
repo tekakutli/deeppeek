@@ -34,7 +34,7 @@ def reverify_reconciled(records, blocks_by_idx):
         pass8_4_lint_command_args,
         pass8_4b_check_added_unused_params,
     )
-    from .validate import pass8_5_check_symbols
+    from .verify import pass8_5_check_symbols
 
     promoted = {
         path: rec for path, rec in records.items()

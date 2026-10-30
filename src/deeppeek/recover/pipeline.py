@@ -1,4 +1,4 @@
-"""recover.pipeline — orchestration of passes 1-9.
+"""recover.pipeline — the 9-pass orchestrator.
 
 Input is either a dump file on disk (dump_path) or a string already
 in memory (dump_text).  The manifest records `<in-memory>` when the
@@ -10,41 +10,46 @@ an in-place apply against an existing directory: recovered files go
 directly into apply_to, files marked [DEL] are deleted from it, and
 all reports are written into `apply_to/deeppeek/`.
 
-LAST-CONVERSATION SAVE
+PARTS
+=====
+  orchestration.py    RecoverConfig, pass-runner with timing hook,
+                      dump I/O, apply_to validation.
+  preexisting.py      pre-existing baseline loader, target-tree
+                      directory scan.
+  startup_check.py    import-failure + unresolved-name detection at
+                      pipeline startup.  Skippable via
+                      `--skip-import-check` for latency.
+  equivalence.py      Pass 8.10 structural-equivalence check.
+
+Everything below this docstring is `run()` — the sequential
+invocation of passes 1-9 with the appropriate exception boundary,
+timing, and reporting.
+
+PRE-EXISTING BASELINES
 ======================
-When the input came from a file (cfg.dump_path is not None), the
-dump text is saved to `<cwd>/.deeppeek/last.md` before recovery
-begins, so `deeppeek restore` can copy it back later.  The
-`.deeppeek/` directory is self-gitignored (it contains its own
-`.gitignore` with `*`).  Only the most recent dump is kept — each
-run overwrites the previous one.  In-memory inputs (`capture`
-without `-o`) do not trigger the save: there is nothing on disk to
-round-trip.  See `recover/last_conversation.py`.
+When `--apply-to` is provided, `preexisting.load_preexisting_blocks`
+walks the target tree and synthesises one `Block` per source file
+with `classified_by="preexisting"` and `kind="full"`.  Those
+baselines are prepended to the conversation's blocks and act as the
+base content for the matching records.
 
-CONVERSATION TOPIC INFERENCE (2026-11-05)
-=========================================
-After classification, before path resolution, the pipeline computes
-`topic_weights = infer_topic_weights(dump_text, blocks,
-existing_dirs)` — a `{relative_dir: weight}` dict derived from the
-whole dump's directory and file mentions.  Both `resolve_paths` and
-`pass4_attribute_orphans` accept it and use it as a bonus when
-breaking ambiguous-content-score ties (see `resolve._discriminate`
-and `attribute._pick_by_content`).
+Earlier revisions tried to prune untouched pre-existing baselines
+between pass 4 and pass 5 to save memory.  The pruning loop was
+broken: it checked `rec.preexisting_base`, a field set by pass 5's
+`pass5_deduplicate`, from code that runs *before* pass 5.  On the
+first pass every pre-existing record has `preexisting_base=False`,
+so `del records[path]` never fired — but the pruning of the
+underlying `blocks` list did.  The records survived with empty
+`source_blocks`, landed as `state=MISSING` in pass 5, and produced
+one `[MISSING] no full print` warning per untouched pre-existing
+file (hundreds in the 2026-10-29 run).
 
-Motivating case: the whole "inpaint-playground" conversation names
-that playground eight ways (inpaint_server.py, inpaint_prompt,
-context rectangle, …), but 3 of the patch blocks target ambiguous
-basenames (pg_state.py, pg_base.py, pg_panel_bindings.py) whose
-sibling files are only mentioned in `kritomatic_daemon/`.  Without
-topic inference, `dir_votes` has no entry for `playgrounds/inpaint`
-and the resolver falls back to the literal header, losing the
-pre-existing baseline.  With it, the tie is broken toward the
-correct directory.
-
-TOPIC INFERENCE IS O(N) IN TARGET-TREE SIZE, O(M) IN BLOCK COUNT.
-One `rglob` for `_existing_dirs_for`, one pass over blocks for
-unique-basename votes, one dict lookup per candidate in
-`_discriminate`.  No deep text scanning at resolve time.
+The pruning is now removed.  Untouched pre-existing files go
+through passes 5–9 normally; `write.preexisting_unmodified` in
+pass 9 identifies them and skips the write.  Total cost: one extra
+`ast.parse`/memory copy per pre-existing file — a few hundred
+milliseconds for a mid-size repo, versus a manifest that was ~95%
+noise.
 
 PER-PASS EXCEPTION BOUNDARIES
 =============================
@@ -59,44 +64,25 @@ abort.
 `pass9_write` is wrapped in its own try/except so a bug in the
 writer never produces a silent no-op.
 
-STRUCTURAL-EQUIVALENCE PASS (2026-11-05)
-========================================
-New pass 8.10 runs before shield.  For every written-or-writable
-record with patches applied, it diffs base and result at the
-structural level — Python declarations, JS declarations, HTML
-elements keyed by (tag, class) — and reports any signature that was
-*added* that wasn't declared by the patch body, or *removed* that
-wasn't declared as removed.  It also runs the duplicate-nesting
-check on embedded HTML (the pg_base.py shape).
+PROFILE (2026-11-05)
+====================
+When `--profile` is set, `run()` records each pass's wall-clock time
+into a local dict.  It prints the top 8 passes to stderr at end and
+persists the full dict to `manifest.json` under
+`run.pass_timings` (flows through `pass9_write(pass_timings=timings)`).
 
-Any divergence demotes the record to LOW.  This is the last line of
-defence against a heuristic that structurally "worked" (everything
-parses, everything balances) but produced a semantically wrong
-result — the failure class that motivated it (pg_base.py's nested
-duplicate `<div class="field">`) was invisible to every downstream
-check because tag counts balance.
-
-See the pre-fix module docstring for the rest of the pass
-descriptions, ROBUSTNESS, PRE-EXISTING BASELINE PRUNING, CROSS-
-VALIDATE TRUST DEMOTION, SHIELD, RE-VERIFY, VERIFY-APPLIED,
-VERIFY-ALREADY-PRESENT, ADDED-PARAMETER LINT, PROSE-PROMISE,
-WHAT DEMOTES TODAY, RESIDUAL EMISSION, RESIDUAL FILE LIST ON
-STDOUT, and CRASH REPORTING sections.
+Pass 9 (write) is timed by the outer `try/finally` but is *not* in
+the manifest's `pass_timings` (the manifest is written *by* pass 9,
+before its own duration is known).  It appears in the `total time`
+line and in the stderr profile printout.
 """
+
 import hashlib
-import shutil
 import sys
 import time
 import traceback
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
-from .core import (
-    Block,
-    DEFAULT_ESCALATE, DEFAULT_LLM_MODEL, DEFAULT_LLM_TIMEOUT, DEFAULT_LLM_URL,
-    SOURCE_EXTENSIONS,
-)
 from .llm import LLMClient
 from .extract import pass1_extract, pass3_group
 from .classify import pass2_classify
@@ -110,351 +96,40 @@ from .validate import (
     pass7_6b_demote_on_missing_python_export,
     pass7_7_repair_js_imports,
     pass7_8_demote_on_any_finding,
-    pass8_verify, pass8_5_check_symbols,
 )
+from .verify import pass8_verify, pass8_5_check_symbols
 from .reconcile import pass8_7_reconcile
 from .reverify import reverify_reconciled
 from .shield import pass8_8_shield_preexisting
 from .write import pass9_write
 from .topic import infer_topic_weights
 
+# New pipeline structure
+from .orchestration import (
+    RecoverConfig,
+    _run_pass, _run_pass_no_return,
+    _resolve_dump, _validate_apply_to, _wipe_deeppeek_dir,
+)
+from .preexisting import (
+    load_preexisting_blocks, existing_dirs_for,
+)
+from .startup_check import validate_pipeline_imports
+from .equivalence import check_structural_equivalence
+# Re-export the moved startup helpers under their pre-refactor names.
+# These lived in this module before the 2026-11-05 split; tests and
+# any out-of-tree callers import them from here.  Keep the aliases
+# stable even as the modules they live in grow.
+from .startup_check import (
+    validate_pipeline_imports as _validate_pipeline_imports,
+    _find_unresolved_module_names,
+)
+from .equivalence import (
+    check_structural_equivalence as _check_structural_equivalence,
+)
 
-@dataclass
-class RecoverConfig:
-    dump_path: Optional[Path] = None
-    dump_text: Optional[str] = None
-    out_dir: Path = field(default_factory=lambda: Path("./deeppeek_recovered"))
-    apply_to: Optional[Path] = None
-    min_trust: str = "MEDIUM"
-    llm_mode: str = "off"
-    llm_url: str = DEFAULT_LLM_URL
-    llm_model: str = DEFAULT_LLM_MODEL
-    llm_timeout: int = DEFAULT_LLM_TIMEOUT
-    escalate_below: float = DEFAULT_ESCALATE
-    llm_max_calls: Optional[int] = None
-    llm_ping: bool = True
-    cache_dir: Optional[Path] = None
-    verbose: bool = False
-    trace: bool = False
-    llm_verbose: bool = False
-    residual_path: Optional[Path] = None
-    shield_preexisting: bool = True
+# Re-export RecoverConfig for `from deeppeek.recover.pipeline import RecoverConfig`.
+__all__ = ["RecoverConfig", "run"]
 
-
-# ---------------------------------------------------------------------------
-# Per-pass exception boundary
-# ---------------------------------------------------------------------------
-
-def _run_pass(pass_name: str,
-              pass_fn: Callable,
-              default,
-              errors: list,
-              *args,
-              **kwargs):
-    """Run `pass_fn(*args, **kwargs)`.  If it raises, log a traceback
-    to stderr, record the error in `errors`, and return `default`.
-
-    The whole point of this wrapper: a pass that crashes on one
-    pathological input must not stop the pipeline from writing the
-    files it has already decided on.  See the module docstring.
-    """
-    try:
-        return pass_fn(*args, **kwargs)
-    except Exception as e:
-        msg = f"pass {pass_name} raised: {type(e).__name__}: {e}"
-        print(f"  [!] {msg}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
-        print(f"  [!] continuing with a safe default; downstream "
-              f"passes will see the pre-pass state", file=sys.stderr)
-        errors.append({
-            "pass": pass_name,
-            "error": f"{type(e).__name__}: {e}",
-            "traceback": traceback.format_exc(),
-        })
-        return default
-
-
-def _run_pass_no_return(pass_name: str,
-                        pass_fn: Callable,
-                        errors: list,
-                        *args,
-                        **kwargs) -> None:
-    """Same as `_run_pass` but for no-op passes (mutate in place)."""
-    try:
-        pass_fn(*args, **kwargs)
-    except Exception as e:
-        msg = f"pass {pass_name} raised: {type(e).__name__}: {e}"
-        print(f"  [!] {msg}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
-        print(f"  [!] continuing with a safe default; downstream "
-              f"passes will see the pre-pass state", file=sys.stderr)
-        errors.append({
-            "pass": pass_name,
-            "error": f"{type(e).__name__}: {e}",
-            "traceback": traceback.format_exc(),
-        })
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _resolve_dump(cfg: RecoverConfig) -> tuple[str, str, int]:
-    if cfg.dump_text is not None:
-        text = cfg.dump_text
-        return text, "<in-memory>", len(text.encode("utf-8"))
-    if cfg.dump_path is None:
-        raise SystemExit(
-            "error: RecoverConfig needs either dump_path or dump_text"
-        )
-    if not cfg.dump_path.exists():
-        raise SystemExit(f"error: dump not found: {cfg.dump_path}")
-    text = cfg.dump_path.read_text()
-    return text, str(cfg.dump_path), cfg.dump_path.stat().st_size
-
-
-def _validate_apply_to(cfg: RecoverConfig) -> Optional[int]:
-    if cfg.apply_to is None:
-        return None
-    if not cfg.apply_to.exists():
-        print(f"error: --apply-to directory does not exist: {cfg.apply_to}",
-              file=sys.stderr)
-        print("  (create it first, or omit --apply-to to use "
-              "./deeppeek_recovered/)",
-              file=sys.stderr)
-        return 3
-    if not cfg.apply_to.is_dir():
-        print(f"error: --apply-to path is not a directory: {cfg.apply_to}",
-              file=sys.stderr)
-        return 3
-    return None
-
-
-def _wipe_deeppeek_dir(aux_base: Path) -> None:
-    """Empty the reports directory, preserving `cache/`."""
-    if not aux_base.exists():
-        return
-    for child in aux_base.iterdir():
-        if child.name == "cache":
-            continue
-        try:
-            if child.is_dir():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
-        except OSError:
-            pass
-
-
-# NEW (2026-11-05): topic-inference helper.
-def _existing_dirs_for(apply_to: Optional[Path]) -> set:
-    """Return the set of relative directory paths under `apply_to`.
-
-    Used by `topic.infer_topic_weights` to filter its output to
-    directories that actually exist in the target tree.  Returns
-    the empty set when `apply_to` is None or missing.
-    """
-    if apply_to is None or not apply_to.is_dir():
-        return set()
-    out: set = set()
-    for p in apply_to.rglob("*"):
-        if not p.is_dir():
-            continue
-        try:
-            rel = p.relative_to(apply_to)
-        except ValueError:
-            continue
-        parts = rel.parts
-        if any(part.startswith(".") for part in parts):
-            continue
-        if any(part in _PREEXISTING_EXCLUDE_DIRS for part in parts):
-            continue
-        out.add("/".join(parts))
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Pre-existing baseline loader
-# ---------------------------------------------------------------------------
-
-_PREEXISTING_EXCLUDE_DIRS = {
-    "node_modules", "__pycache__", "dist", "build", "target",
-    "venv", ".venv", ".tox", ".nox", ".git",
-    "deeppeek",
-    ".deeppeek",
-}
-_PREEXISTING_MAX_FILE_SIZE = 1_048_576  # 1 MiB
-
-_PREEXISTING_EXCLUDE_EXTENSIONS = frozenset({".md", ".rst", ".txt"})
-
-
-def _load_preexisting_blocks(apply_to: Path) -> list[Block]:
-    """Scan `apply_to` and return one synthetic 'full print' block per
-    source-like file, ready to be prepended to the conversation's
-    blocks."""
-    blocks: list[Block] = []
-    if not apply_to.is_dir():
-        return blocks
-
-    for p in sorted(apply_to.rglob("*")):
-        if not p.is_file():
-            continue
-        rel = p.relative_to(apply_to)
-        rel_parts = rel.parts
-
-        if any(part.startswith(".") for part in rel_parts):
-            continue
-        if any(part in _PREEXISTING_EXCLUDE_DIRS for part in rel_parts):
-            continue
-        if p.suffix.lower() not in SOURCE_EXTENSIONS:
-            continue
-        if p.suffix.lower() in _PREEXISTING_EXCLUDE_EXTENSIONS:
-            continue
-        try:
-            if p.stat().st_size > _PREEXISTING_MAX_FILE_SIZE:
-                continue
-        except OSError:
-            continue
-        try:
-            raw = p.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
-            continue
-        body = raw.replace("\r\n", "\n")
-        if body.endswith("\n"):
-            body = body[:-1]
-
-        rel_str = rel.as_posix()
-        blocks.append(Block(
-            idx=0,
-            header_path=rel_str,
-            modifier=None,
-            fence_lang="",
-            body=body,
-            body_line_count=body.count("\n") + 1,
-            context_before="",
-            line_start=-1,
-            line_end=-1,
-            is_orphan=False,
-            is_code_file=True,
-            kind="full",
-            canonical_path=rel_str,
-            output_path=rel_str,
-            confidence=1.0,
-            classified_by="preexisting",
-            heuristic_kind="full",
-        ))
-    return blocks
-
-
-# ---------------------------------------------------------------------------
-# Structural-equivalence pass (2026-11-05)
-# ---------------------------------------------------------------------------
-
-def _check_structural_equivalence(records, blocks_by_idx):
-    """Return {path: [SignatureChange, ...]} for every record with
-    structural divergences introduced by its patches.
-
-    A "structural divergence" is a top-level declaration or HTML
-    element that was *added* or *removed* by the patch, beyond what
-    the patch body declared.  The motivating case: pg_base.py, where
-    `_try_region_replace` spliced a body over a mid-element window
-    and produced a nested `<div class="field">` inside `<div
-    class="field">`.  Tag counts balance; ast.parse passes; the only
-    signal is that the DOM shape changed.
-
-    Fail-closed: a record with any divergence is demoted to LOW.
-    Every change is recorded on `verification["structural_divergence"]`
-    and the record's warnings so the user sees exactly what went
-    wrong.
-    """
-    from .structural_diff import structural_diff
-
-    out: dict = {}
-    for path, rec in records.items():
-        if rec.content is None or rec.is_deleted:
-            continue
-        if rec.state not in ("SINGLE_FULL", "FULL_PLUS_PATCH",
-                             "MULTI_FULL"):
-            continue
-        if rec.trust == "LOW":
-            continue    # already fail-closed
-        if blocks_by_idx is None or rec.last_full_idx is None:
-            continue
-        base_block = blocks_by_idx.get(rec.last_full_idx)
-        if base_block is None:
-            continue
-
-        body_text = "\n".join(
-            p.get("body", "") for p in rec.patches)
-        try:
-            changes = structural_diff(
-                base_block.body, rec.content, path, body_text)
-        except Exception as e:
-            rec.warnings.append(
-                f"structural-equivalence check raised: {e}")
-            continue
-        if not changes:
-            continue
-
-        rec.trust = "LOW"
-        rec.verification["structural_divergence"] = [
-            {"kind": c.kind, "lang": c.lang,
-             "signature": c.signature, "detail": c.detail}
-            for c in changes
-        ]
-        for c in changes:
-            rec.warnings.append(
-                f"structural: {c.kind} {c.signature!r} ({c.detail})")
-        out[path] = changes
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Orchestrator
-# ---------------------------------------------------------------------------
-
-
-
-def _validate_pipeline_imports() -> list:
-    """Import every module in `deeppeek.recover` and collect any
-    ImportError.  A broken pipeline module (missing sibling, renamed
-    symbol, stale import, module landed in the wrong directory)
-    surfaces here at startup, not after the first heuristic that uses
-    it raises a swallowed exception deep inside `_try_deterministic_
-    patch`.
-
-    Motivating case (2026-10-29): two new modules `statement_sig.py`
-    and `patch_statement_replace.py` landed under `tests/recover/`
-    instead of `src/deeppeek/recover/`.  Every `_try_region_replace`
-    call raised `ModuleNotFoundError`, which was caught by the
-    wrapper, cascading 37 test failures across 8 test files.  With
-    this check, `pipeline.run` prints the missing-module message at
-    startup and exits 1 before pass 1 touches a single patch.
-
-    Fails open: if `pkgutil` itself raises (defensive), the function
-    returns `[]` and the pipeline proceeds under the old contract —
-    a validation-check bug must not block a run.
-    """
-    from importlib import import_module
-    import pkgutil
-
-    failures: list = []
-    try:
-        import deeppeek.recover as pkg
-        modules = list(pkgutil.iter_modules(
-            pkg.__path__, pkg.__name__ + "."))
-    except Exception as e:
-        print(f"[startup] pipeline-import enumeration raised: "
-              f"{type(e).__name__}: {e} (proceeding)",
-              file=sys.stderr)
-        return failures
-
-    for _, name, _ in modules:
-        try:
-            import_module(name)
-        except Exception as e:
-            failures.append(f"{name}: {type(e).__name__}: {e}")
-    return failures
 
 def run(cfg: RecoverConfig) -> int:
     try:
@@ -522,12 +197,7 @@ def run(cfg: RecoverConfig) -> int:
     else:
         print(f"[startup] layout: {layout}", file=sys.stderr)
 
-    # Grammar availability diagnostic.  Report which tree-sitter
-    # grammars are importable so a user with a partial grammar install
-    # sees why structural checks might be degrading to line-based
-    # heuristics.  Motivating case: pg_base.py's duplicate-`<div>`
-    # corruption, which was invisible because tree-sitter-html was
-    # missing and `_try_embedded_html_snap` silently no-opped.
+    # Grammar availability diagnostic.
     try:
         from .ast_anchor import ast_status
         _ast = ast_status()
@@ -544,24 +214,25 @@ def run(cfg: RecoverConfig) -> int:
     except Exception:
         pass
 
-    # NEW (2026-10-29): startup import sanity check.  Refuse to
-    # run if any deeppeek.recover module fails to import — a
-    # swallowed ModuleNotFoundError deep in a heuristic becomes
-    # a per-file silent failure that cascades into dozens of
-    # test failures before anyone reads the log.  Surface it up
-    # front.
-    _import_failures = _validate_pipeline_imports()
-    if _import_failures:
-        print(f"[startup] {len(_import_failures)} pipeline "
-              f"module(s) failed to import \u2014 pipeline "
-              f"will not run:", file=sys.stderr)
-        for _f in _import_failures:
-            print(f"  {_f}", file=sys.stderr)
-        print("[startup] fix the modules above, then re-run.",
-              file=sys.stderr)
-        return 1
+    # Startup import sanity check.
+    if not cfg.skip_import_check:
+        _import_failures = validate_pipeline_imports()
+        if _import_failures:
+            print(f"[startup] {len(_import_failures)} pipeline "
+                  f"module(s) failed to import — pipeline "
+                  f"will not run:", file=sys.stderr)
+            for _f in _import_failures:
+                print(f"  {_f}", file=sys.stderr)
+            print("[startup] fix the modules above, then re-run.",
+                  file=sys.stderr)
+            return 1
+    else:
+        print("[startup] --skip-import-check: skipping pipeline "
+              "import validation", file=sys.stderr)
 
     t_start = time.monotonic()
+    timings: Optional[dict] = {} if cfg.profile else None
+
     run_errors: list = []
 
     print("[pass 1] extracting blocks (markdown AST)...")
@@ -571,7 +242,7 @@ def run(cfg: RecoverConfig) -> int:
           f"{len(deleted_files)} [DEL] markers")
 
     if cfg.apply_to is not None:
-        pre = _load_preexisting_blocks(cfg.apply_to)
+        pre = load_preexisting_blocks(cfg.apply_to)
         if pre:
             print(f"  + {len(pre)} pre-existing baseline file(s) "
                   f"from --apply-to", file=sys.stderr)
@@ -584,6 +255,7 @@ def run(cfg: RecoverConfig) -> int:
     _run_pass_no_return(
         "2 (classify)", pass2_classify, run_errors,
         blocks, llm, cfg.llm_mode, cfg.escalate_below, cfg.llm_verbose,
+        timings=timings,
     )
     n_full = sum(1 for b in blocks if b.kind == "full")
     n_partial = sum(1 for b in blocks if b.kind == "partial")
@@ -595,19 +267,14 @@ def run(cfg: RecoverConfig) -> int:
           f"other: {n_other}  recovered-meta: {n_meta}"
           + (f"  preexisting: {n_pre_full}" if n_pre_full else ""))
 
-    # NEW (2026-11-05): topic inference.  Computed once, before path
-    # resolution, so both `resolve_paths` and `pass4_attribute_orphans`
-    # see the same weights.  In standard (--out) mode there is no
-    # target tree to filter against, and `_existing_dirs_for` returns
-    # the empty set — `infer_topic_weights` then returns `{}` and the
-    # weighting is a no-op.
     topic_weights: dict = {}
     if cfg.apply_to is not None:
         print("[pass 2.1] inferring conversation topic weights...")
-        _existing_dirs = _existing_dirs_for(cfg.apply_to)
+        _existing_dirs = existing_dirs_for(cfg.apply_to)
         topic_weights = _run_pass(
             "2.1 (topic)", infer_topic_weights, {},
             run_errors, dump_text, blocks, _existing_dirs,
+            timings=timings,
         ) or {}
         if topic_weights:
             _top = sorted(topic_weights.items(),
@@ -622,6 +289,7 @@ def run(cfg: RecoverConfig) -> int:
         "2.5 (resolve)", resolve_paths, [],
         run_errors, blocks, cfg.apply_to, cfg.trace,
         topic_weights=topic_weights,
+        timings=timings,
     )
     n_resolved = sum(1 for r in resolutions
                      if not r["reason"].startswith("unresolved"))
@@ -646,50 +314,17 @@ def run(cfg: RecoverConfig) -> int:
             "4 (attribute)", pass4_attribute_orphans, run_errors,
             blocks, blocks_by_idx_all, records, cfg.trace,
             topic_weights=topic_weights,
+            timings=timings,
         )
         attributed = sum(1 for b in blocks if b.is_orphan and b.attributed_to)
         print(f"  {attributed}/{n_orphans} orphans attributed")
-
-    # Prune untouched pre-existing baselines now that orphan
-    # attribution has run and can contribute to `touched`.
-    if cfg.apply_to is not None:
-        touched = {b.output_path for b in blocks
-                   if b.classified_by != "preexisting" and b.output_path}
-        for b in blocks:
-            if b.is_orphan and b.attributed_to:
-                touched.add(b.attributed_to)
-        before = len(blocks)
-        kept_indices = {
-            b.idx for b in blocks
-            if b.classified_by != "preexisting"
-            or b.output_path in touched
-        }
-        blocks = [b for b in blocks if b.idx in kept_indices]
-        for path in list(records.keys()):
-            rec = records[path]
-            if rec.preexisting_base and path not in touched:
-                del records[path]
-                continue
-            rec.source_blocks = [i for i in rec.source_blocks
-                                 if i in kept_indices]
-            if (rec.last_full_idx is not None
-                    and rec.last_full_idx not in kept_indices):
-                rec.last_full_idx = None
-            if (rec.chosen_full_idx is not None
-                    and rec.chosen_full_idx not in kept_indices):
-                rec.chosen_full_idx = None
-            rec.all_full_idxs = [i for i in rec.all_full_idxs
-                                 if i in kept_indices]
-        n_pruned = before - len(blocks)
-        if n_pruned:
-            print(f"  pruned {n_pruned} untouched pre-existing "
-                  f"baseline(s)", file=sys.stderr)
 
     print("[pass 5] deduplicating multi-print files...")
     blocks_by_idx = {b.idx: b for b in blocks}
     _run_pass_no_return(
         "5 (deduplicate)", pass5_deduplicate, run_errors,
         records, blocks_by_idx, cfg.trace,
+        timings=timings,
     )
     state_counts = {}
     pre_base_count = 0
@@ -707,6 +342,7 @@ def run(cfg: RecoverConfig) -> int:
     _run_pass_no_return(
         "6 (apply)", pass6_apply_patches, run_errors,
         records, blocks_by_idx, llm,
+        timings=timings,
     )
     if len(run_errors) > _p6_errors_before:
         _fc_count = 0
@@ -727,7 +363,8 @@ def run(cfg: RecoverConfig) -> int:
     cross_validate = _run_pass(
         "7 (cross-validate)", pass7_cross_validate,
         {"exports": {}, "imports": {}, "problems": []},
-        run_errors, records,
+        run_errors, records, blocks_by_idx=blocks_by_idx,
+        timings=timings,
     )
     xv = cross_validate.get("problems", [])
     if xv:
@@ -748,6 +385,7 @@ def run(cfg: RecoverConfig) -> int:
     js_problems = _run_pass(
         "7.5 (js-validate)", pass7_5_js_validate, [],
         run_errors, records,
+        timings=timings,
     ) or []
     if js_problems:
         cross_validate["problems"] = (
@@ -770,6 +408,7 @@ def run(cfg: RecoverConfig) -> int:
             "7.7 (repair)", pass7_7_repair_js_imports,
             ([], js_problems),
             run_errors, records, js_problems, cfg.trace,
+            timings=timings,
         ) or ([], js_problems)
         if _repaired:
             _repaired_probs = {id(r["problem"]) for r in _repaired}
@@ -793,6 +432,7 @@ def run(cfg: RecoverConfig) -> int:
             "7.6 (missing-export)",
             pass7_6_demote_on_missing_export, 0,
             run_errors, records, js_problems, cfg.trace,
+            timings=timings,
         ) or 0
         if n_export_demoted:
             print(f"  {n_export_demoted} record(s) demoted to LOW "
@@ -803,6 +443,7 @@ def run(cfg: RecoverConfig) -> int:
             "7.6b (missing-python-export)",
             pass7_6b_demote_on_missing_python_export, 0,
             run_errors, records, cross_validate["problems"], cfg.trace,
+            timings=timings,
         ) or 0
         if n_py_export_demoted:
             print(f"  {n_py_export_demoted} record(s) demoted to LOW "
@@ -813,6 +454,7 @@ def run(cfg: RecoverConfig) -> int:
             "7.8 (universal-demote)",
             pass7_8_demote_on_any_finding, 0,
             run_errors, records, cross_validate["problems"], cfg.trace,
+            timings=timings,
         ) or 0
         if n_universal_demoted:
             print(f"  {n_universal_demoted} record-demotion(s) from "
@@ -822,12 +464,14 @@ def run(cfg: RecoverConfig) -> int:
     _run_pass_no_return(
         "8 (verify)", pass8_verify, run_errors,
         records, blocks_by_idx=blocks_by_idx,
+        timings=timings,
     )
 
     print("[pass 8.5] checking symbol resolution...")
     _run_pass_no_return(
         "8.5 (symbols)", pass8_5_check_symbols, run_errors,
         records, blocks_by_idx=blocks_by_idx,
+        timings=timings,
     )
 
     print("[pass 8.4] linting @command decorator args...")
@@ -835,6 +479,7 @@ def run(cfg: RecoverConfig) -> int:
     n_lint_warned = _run_pass(
         "8.4 (lint)", pass8_4_lint_command_args, 0,
         run_errors, records,
+        timings=timings,
     ) or 0
     if n_lint_warned:
         print(f"  {n_lint_warned} function(s) declared an unused "
@@ -847,6 +492,7 @@ def run(cfg: RecoverConfig) -> int:
     n_param_warned = _run_pass(
         "8.4b (added-param)", pass8_4b_check_added_unused_params, 0,
         run_errors, records, blocks_by_idx,
+        timings=timings,
     ) or 0
     if n_param_warned:
         print(f"  {n_param_warned} function(s) gained a parameter "
@@ -860,6 +506,7 @@ def run(cfg: RecoverConfig) -> int:
     n_promise_warned = _run_pass(
         "8.9 (prose-promise)", pass8_9_check_prose_promises, 0,
         run_errors, records,
+        timings=timings,
     ) or 0
     if n_promise_warned:
         print(f"  {n_promise_warned} record(s) had prose-promise gaps "
@@ -873,6 +520,7 @@ def run(cfg: RecoverConfig) -> int:
         "8.7d (verify-already-present)",
         pass8_7d_verify_already_present, 0,
         run_errors, records, blocks_by_idx,
+        timings=timings,
     ) or 0
     if n_already_unverified:
         print(f"  {n_already_unverified} already-present claim(s) "
@@ -885,6 +533,7 @@ def run(cfg: RecoverConfig) -> int:
     n_reconciled = _run_pass(
         "8.7 (reconcile)", pass8_7_reconcile, 0,
         run_errors, records, blocks_by_idx, cfg.trace,
+        timings=timings,
     ) or 0
     if n_reconciled:
         print(f"  {n_reconciled} record(s) reconciled "
@@ -895,6 +544,7 @@ def run(cfg: RecoverConfig) -> int:
     n_reverified = _run_pass(
         "8.7b (re-verify)", reverify_reconciled, 0,
         run_errors, records, blocks_by_idx,
+        timings=timings,
     ) or 0
     if n_reverified:
         print(f"  {n_reverified} reconciled record(s) re-demoted "
@@ -907,6 +557,7 @@ def run(cfg: RecoverConfig) -> int:
     n_verify_warned = _run_pass(
         "8.7c (verify-applied)", pass8_7c_verify_applied_patches, 0,
         run_errors, records, blocks_by_idx,
+        timings=timings,
     ) or 0
     if n_verify_warned:
         print(f"  {n_verify_warned} patch(es) with missing content "
@@ -914,20 +565,16 @@ def run(cfg: RecoverConfig) -> int:
     else:
         print("  all applied patches present in final content")
 
-    # NEW (2026-11-05): structural-equivalence pass.  Detects semantic
-    # divergence that every existing gate misses when the shapes
-    # balance (nested same-class HTML, added/removed declarations not
-    # declared by any patch body).  See the module docstring,
-    # STRUCTURAL-EQUIVALENCE PASS.
     print("[pass 8.10] structural-equivalence check...")
     _structural_changes = _run_pass(
-        "8.10 (structural-diff)", _check_structural_equivalence, {},
+        "8.10 (structural-diff)", check_structural_equivalence, {},
         run_errors, records, blocks_by_idx,
+        timings=timings,
     ) or {}
     _n_structural = sum(len(c) for c in _structural_changes.values())
     if _n_structural:
         print(f"  {_n_structural} structural divergence(s) introduced "
-              f"by patches \u2014 demoting affected records to LOW",
+              f"by patches — demoting affected records to LOW",
               file=sys.stderr)
         for _p, _changes in _structural_changes.items():
             for _c in _changes[:3]:
@@ -941,6 +588,7 @@ def run(cfg: RecoverConfig) -> int:
         n_shielded = _run_pass(
             "8.8 (shield)", pass8_8_shield_preexisting, 0,
             run_errors, records, cfg.apply_to, cfg.trace,
+            timings=timings,
         ) or 0
         if n_shielded:
             print(f"  [shield] {n_shielded} record(s) failed closed "
@@ -952,12 +600,14 @@ def run(cfg: RecoverConfig) -> int:
     cross_file_dups = _run_pass(
         "8.6 (cross-file)", find_cross_file_duplicates, [],
         run_errors, records, blocks_by_idx,
+        timings=timings,
     ) or []
     if cross_file_dups:
         print(f"  {len(cross_file_dups)} cross-file duplicate(s) "
               f"(see warnings.txt)")
 
     print("[pass 9] writing files...")
+    _t9 = time.monotonic() if timings is not None else 0.0
     try:
         rc = pass9_write(
             cross_file_duplicates=cross_file_dups,
@@ -978,6 +628,7 @@ def run(cfg: RecoverConfig) -> int:
             resolutions=resolutions,
             verbose=cfg.trace,
             run_errors=run_errors,
+            pass_timings=timings,
         )
     except Exception as e:
         print(f"  [!] pass 9 (write) raised: {type(e).__name__}: {e}",
@@ -991,6 +642,9 @@ def run(cfg: RecoverConfig) -> int:
             print(f"  [!] files may be partially written to "
                   f"{cfg.out_dir}/", file=sys.stderr)
         return 1
+    finally:
+        if timings is not None:
+            timings["9 (write)"] = time.monotonic() - _t9
 
     _residual_paths_for_stdout: Optional[list] = None
     try:
@@ -1017,7 +671,30 @@ def run(cfg: RecoverConfig) -> int:
         print(f"  [!] residual emission failed: "
               f"{type(e).__name__}: {e}", file=sys.stderr)
 
-    print(f"  total time: {time.monotonic() - t_start:.1f}s")
+    _total = time.monotonic() - t_start
+
+    if timings is not None:
+        print("[profile] top passes:", file=sys.stderr)
+        for _name, _secs in sorted(
+                timings.items(), key=lambda kv: -kv[1])[:8]:
+            print(f"  {_secs:6.2f}s  {_name}", file=sys.stderr)
+        _covered = sum(timings.values())
+        print(f"  {_covered:6.2f}s  (sum of timed passes; "
+              f"total wall {_total:.2f}s)", file=sys.stderr)
+
+        try:
+            from ._ast import parse_cache_stats
+            _cache = parse_cache_stats()
+            _calls = _cache["hits"] + _cache["misses"]
+            _ratio = (_cache["hits"] / _calls * 100) if _calls else 0.0
+            print(f"[profile] parse cache: {_cache['hits']} hits, "
+                  f"{_cache['misses']} misses ({_ratio:.0f}% hit), "
+                  f"{_cache['size']}/{_cache['maxsize']} entries",
+                  file=sys.stderr)
+        except Exception:
+            pass
+
+    print(f"  total time: {_total:.1f}s")
     if run_errors:
         print(f"  [!] {len(run_errors)} pass(es) crashed — see "
               f"warnings.txt for the traceback",

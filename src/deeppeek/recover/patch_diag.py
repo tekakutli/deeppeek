@@ -30,6 +30,22 @@ splice (nothing to add).
 
 The diagnostic now names that shape directly.  No behaviour
 change to the pipeline; the message the user sees improves.
+
+STRUCTURAL DIVERGENCE DIAGNOSTIC (2026-11-05)
+=============================================
+`_diagnose_structural_divergence` names what a *candidate* result
+changed structurally beyond what the patch's own body declares.
+It is used by `apply_patches._check_structural_sanity`'s caller
+when a candidate splice passed the structural-parser gate but the
+result is still semantically suspicious: e.g., a scoped replace
+that also dropped a sibling function.  `structural_diff` does the
+tree-level comparison; this module turns its findings into one
+readable line per difference.
+
+The diagnostic is attribution-shaped, not gate-shaped: it never
+raises, never blocks, and never mutates state.  It exists only to
+make the failure_reason on a skipped_structural_damage patch
+readable.
 """
 
 import re
@@ -399,3 +415,48 @@ def _diagnose_patch_failure_inner(patch, content, base):
 
     return (f"no heuristic matched (body is {len(body_lines)} lines, "
             f"first line: {body_lines[0][:60]!r})")
+
+
+def _diagnose_structural_divergence(base: str, attempted: str,
+                                     path: str, patch_body: str) -> str:
+    """Name what a *candidate* result changed structurally beyond
+    what the patch's own body declares.
+
+    Used by `apply_patches._check_structural_sanity`'s callers when a
+    candidate splice passed the structural-parser gate but the result
+    is still suspicious — the exact failure shape that motivated
+    `structural_diff`'s existence (a scoped replace that also dropped
+    a sibling function, or a region-replace that nested an element
+    inside itself).
+
+    Attribution-only: never raises, never blocks, never mutates
+    state.  An empty return means "no structural divergence found",
+    which is distinct from "the diagnostic itself failed" — a caller
+    that wants to distinguish should check for the `"structural
+    diagnostic raised"` prefix.
+
+    Motivating case (2026-10-29 `pg_panel_bindings.py`): a candidate
+    splice passed the whole-file balance check but had silently
+    swallowed the `_pickMaskAction` function.  `structural_diff` named
+    it; this wrapper turns that into the one line that ends up in the
+    manifest's `failure_reason`.
+    """
+    try:
+        from .structural_diff import structural_diff
+    except Exception as e:
+        return f"structural diagnostic raised {type(e).__name__}: {e}"
+
+    try:
+        changes = structural_diff(base, attempted, path, patch_body)
+    except Exception as e:
+        return f"structural diagnostic raised {type(e).__name__}: {e}"
+
+    if not changes:
+        return ""
+
+    parts = []
+    for c in changes[:5]:
+        parts.append(f"{c.kind} {c.signature!r}")
+    suffix = (f" (+{len(changes) - 5} more)"
+              if len(changes) > 5 else "")
+    return "structural divergence: " + ", ".join(parts) + suffix

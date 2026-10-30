@@ -9,11 +9,32 @@ it.  Diagnosing 634 against the bare base reports a misleading
 "introduces an unresolved symbol"; diagnosing against `base + 633`
 identifies whether the exclusion was legitimate or was a false
 positive of `_find_minimum_exclusions`.
+
+TEST-DATA NOTE
+==============
+The patch body for 634 is the *modified return statement only*, not
+a fragment that also reprints the `detail = ...` line above it.  The
+return statement is a single statement; `_try_statement_replace` can
+match it by dict-key identity.  If the body is a two-statement
+fragment (`detail = ...` followed by `return {...}`), the dispatcher
+routes through `_try_multi_statement_apply`, which splits the body and
+tries to place each statement independently.  The `detail = ...`
+line then has to be placed against a base that contains two similar
+`detail = ...` lines (`detail = 'no image'` from the base and
+`detail = captured.get('message') or ...` from patch 633) — the
+single-line-replace heuristic correctly declines on the ambiguity,
+the whole multi-statement apply fails, and the diagnostic reports
+"fails on cumulative state" instead of the "reconcile was wrong"
+message this test exists to exercise.
+
+Keeping the body to a single statement is the correct test data for
+the motivating case and matches how the real conversation emitted
+the block.
 """
 import sys
 from pathlib import Path
 
-_SRC = Path(__file__).resolve().parents[2] / "src"
+_SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
@@ -27,8 +48,13 @@ def _make_rec():
         {"idx": 633, "body": "...", "applied_by": "deterministic"},
         {
             "idx": 634,
+            # Body is the modified return statement only.  See the
+            # module docstring, TEST-DATA NOTE: adding the
+            # `detail = ...` prefix here turns the body into a
+            # two-statement fragment that the multi-statement
+            # splitter cannot place unambiguously against
+            # cumulative_base's two similar `detail = ...` lines.
             "body": (
-                "detail = captured.get(\"message\") or \"no image produced\"\n"
                 "return {\n"
                 "    \"success\": False,\n"
                 "    \"message\": detail,\n"
@@ -68,13 +94,24 @@ def test_diagnose_detects_valid_on_cumulative_state():
         cumulative_base=cumulative,
     )
     # The pre-fix message names a non-existent unresolved symbol.
-    # After the fix the message either (a) reports the specific
-    # validate_content error, (b) reports a specific unresolved
-    # symbol, or (c) reports that reconcile was wrong.  It must NOT
-    # be the bare "introduces an unresolved symbol or structural
-    # failure; content not found in any other file".
+    # After the fix the message names a *specific* cumulative-state
+    # outcome:
+    #   (a) the patch applies cleanly and reconcile was wrong, or
+    #   (b) the patch applies but the result fails validate_content
+    #       (specific reason reported), or
+    #   (c) the patch applies but introduces a specific unresolved
+    #       symbol (name reported), or
+    #   (d) the patch fails on cumulative state for a *specific*
+    #       reason (e.g. the anchor heuristic could not place it).
+    # It must NOT be the bare pre-fix "content not found in any
+    # other file" message, which carries no diagnostic information.
     assert "content not found in any other file" not in diag, (
         f"pre-fix diagnostic shape; got {diag!r}")
+    assert ("for the wrong reason" in diag
+            or "fails validate_content" in diag
+            or "unresolved symbol" in diag
+            or "fails on cumulative state" in diag), (
+        f"expected a specific-cumulative-state diagnosis; got {diag!r}")
 
 
 def test_diagnose_detects_fails_on_cumulative_state():

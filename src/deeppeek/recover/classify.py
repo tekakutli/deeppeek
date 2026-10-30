@@ -39,6 +39,7 @@ import json
 import sys
 from typing import Optional
 
+from ._ast import parse_source
 from .core import (
     Block,
     MAX_TOKENS_CLASSIFY,
@@ -341,7 +342,7 @@ def _looks_like_full_file(body: str, path: str) -> bool:
 
     if path.endswith(".py"):
         try:
-            tree = ast.parse(body)
+            tree = parse_source(body, filename=path or "<body>")
         except SyntaxError:
             return _looks_like_python_module_top_level(body)
 
@@ -368,9 +369,8 @@ def _looks_like_full_file(body: str, path: str) -> bool:
 
 def _looks_truncated(body: str, path: str) -> bool:
     if path.endswith(".py"):
-        import ast
         try:
-            ast.parse(body)
+            parse_source(body, filename=path or "<body>")
             return False
         except SyntaxError:
             if _looks_like_python_module_top_level(body):

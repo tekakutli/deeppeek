@@ -88,6 +88,41 @@ returns `comfy_generate`, which
 `patch_anchor_insert._anchor_within_callee` then resolves to
 `_comfy_generate_impl`.
 
+AST-BASED SCOPE RESOLUTION (2026-11-05)
+=======================================
+`_find_scope_body_range` and `_find_enclosing_scope_name` now
+resolve via `scope_ast.find_scope` and
+`scope_ast.find_enclosing_scope_name` instead of their own regex
+lists + line-walk.  The AST path handles decorated functions,
+`async def`, methods inside classes, generator functions, arrow
+functions assigned to `const`, and HTML `<details>` with exact
+boundaries — shapes the regex missed.
+
+`_try_insert_into_named_scope` threads `path` through to both
+helpers so the destination language's parser is chosen correctly.
+
+PARSE-CACHE ROUTING (2026-11-05)
+================================
+`_verify_scope_insertion` parses `base`, `result`, and the dedented
+`inserted_body` once per invocation.  Before this change, those
+were raw `ast.parse` calls — uncached, so a decorated-method patch
+that fell through to the normal chain parsed `base` and `result`
+twice, and each entry in a large conversation paid the full parse
+cost independently.
+
+The three calls now route through `_ast.parse_source` (memoized).
+`base` is a record's base content, almost always already parsed by
+`_analyze_python_with_sigs`, `_py_exports`, or `structural_diff`;
+`result` is a candidate that a subsequent pass will parse anyway.
+Both are cache hits after the first call.  The dedented
+`inserted_body` is unique per attempt, but the cache still helps
+when `_try_insert_into_named_scope` is called twice for the same
+patch (decorated path then normal path).
+
+`_find_enclosing_scope_name` and `_find_scope_body_range` already
+delegated into `scope_ast`, which internally parses via
+`parse_source` — no changes needed there.
+
 HIGH CHURN: this is the newest heuristic (FIX 8).
 """
 
@@ -96,6 +131,7 @@ import re
 import sys
 import textwrap
 
+from ._ast import parse_source
 from .patch_text import (
     _find_matching_brace,
     _reindent_body,
@@ -159,10 +195,18 @@ def _extract_after_anchor(prose):
     return None
 
 
-def _find_enclosing_scope_name(base: str, anchor: str) -> "str | None":
+def _find_enclosing_scope_name(base: str, anchor: str,
+                                path: str = "") -> "str | None":
+    """Find the innermost scope containing the *last* occurrence of
+    `anchor` in `base`.  AST-based since 2026-11-05.
+
+    Locates the last occurrence of `anchor` (with various suffixes
+    — `(`, `.`, `[`, or bare) and asks `scope_ast` for the innermost
+    function/class whose span contains it.  Returns None when
+    `anchor` doesn't appear or no enclosing scope exists.
+    """
     if not base or not anchor:
         return None
-
     positions = []
     for pat in (
         re.escape(anchor) + r'\s*\(',
@@ -176,130 +220,53 @@ def _find_enclosing_scope_name(base: str, anchor: str) -> "str | None":
             break
     if not positions:
         return None
-
     target_pos = max(positions)
-
-    decl_re = re.compile(
-        r'(?m)^([ \t]*)(?:async\s+)?(?:def|function|class)\s+(\w+)')
-
-    innermost = None
-    for m in decl_re.finditer(base):
-        if m.start() >= target_pos:
-            break
-        body_open = base.find("{", m.end())
-        if body_open == -1:
-            if _python_decl_contains(base, m.start(), m.group(1),
-                                     target_pos):
-                innermost = m.group(2)
-                continue
-        else:
-            body_close = _find_matching_brace(
-                base, body_open, is_python=False)
-            if body_close != -1 and m.start() <= target_pos < body_close:
-                innermost = m.group(2)
-                continue
-            if _python_decl_contains(base, m.start(), m.group(1),
-                                     target_pos):
-                innermost = m.group(2)
-    return innermost
+    from .scope_ast import find_enclosing_scope_name
+    return find_enclosing_scope_name(base, target_pos, path)
 
 
-def _python_decl_contains(base: str, decl_start: int, decl_indent: str,
-                          target_pos: int) -> bool:
-    if target_pos <= decl_start:
-        return False
-    end_of_line = base.find("\n", decl_start)
-    if end_of_line == -1:
-        return False
-    decl_indent_len = len(decl_indent)
-    scan = end_of_line + 1
-    while scan < len(base):
-        next_nl = base.find("\n", scan)
-        if next_nl == -1:
-            next_nl = len(base)
-        line = base[scan:next_nl]
-        if line.strip():
-            line_indent_len = len(line) - len(line.lstrip())
-            if line_indent_len <= decl_indent_len:
-                return target_pos < scan
-        if scan > target_pos:
-            return True
-        scan = next_nl + 1
-    return target_pos > decl_start
+def _find_scope_body_range(base, scope_name, path=""):
+    """Return `(scope_start_char, scope_end_char, body_indent)` for
+    the named scope, or None.
 
-
-def _find_scope_body_range(base, scope_name):
-    esc = re.escape(scope_name)
-
-    m = re.search(r'(?m)^([ \t]*)class\s+' + esc + r'\b', base)
-    if m:
-        return _python_scope_range(base, m, m.group(1))
-
-    m = re.search(
-        r'(?m)^([ \t]*)(?:async\s+)?def\s+' + esc + r'\s*\(',
-        base)
-    if m:
-        return _python_scope_range(base, m, m.group(1))
-
-    m = re.search(
-        r'(?m)^([ \t]*)(?:export\s+)?(?:async\s+)?class\s+'
-        + esc + r'\b', base)
-    if m:
-        return _js_scope_range(base, m)
-
-    m = re.search(
-        r'(?m)^([ \t]*)(?:export\s+)?(?:async\s+)?function\s+'
-        + esc + r'\s*\(', base)
-    if m:
-        return _js_scope_range(base, m)
-
-    return None
-
-
-def _python_scope_range(base, decl_match, decl_indent):
-    line_end = base.find('\n', decl_match.end())
-    if line_end == -1:
-        line_end = len(base)
-    scan = line_end + 1
-    body_indent = None
-    while scan < len(base):
-        nl = base.find('\n', scan)
-        if nl == -1:
-            nl = len(base)
-        line = base[scan:nl]
-        if not line.strip():
-            scan = nl + 1
-            continue
-        ln_indent = line[:len(line) - len(line.lstrip())]
-        if len(ln_indent) <= len(decl_indent):
-            return (decl_match.start(), scan,
-                    body_indent or (decl_indent + "    "))
-        if body_indent is None:
-            body_indent = ln_indent
-        scan = nl + 1
-    return (decl_match.start(), len(base),
-            body_indent or (decl_indent + "    "))
-
-
-def _js_scope_range(base, decl_match):
-    open_brace = base.find("{", decl_match.end())
-    if open_brace == -1:
+    AST-based since 2026-11-05: the span comes from
+    `scope_ast.find_scope`; the indent comes from the first
+    non-blank body line (falling back to `decl_indent + "    "` for
+    Python, `"  "` for JS).
+    """
+    from .scope_ast import find_scope
+    span = find_scope(base, scope_name, path)
+    if span is None:
         return None
-    close_brace = _find_matching_brace(base, open_brace, is_python=False)
-    if close_brace == -1:
-        return None
-    body_indent = "  "
-    scan = open_brace + 1
-    while scan < close_brace:
-        nl = base.find('\n', scan)
-        if nl == -1 or nl > close_brace:
-            break
+    start_char, end_char, kind = span
+    body_indent = _compute_body_indent(
+        base, start_char, end_char, kind)
+    return (start_char, end_char, body_indent)
+
+
+def _compute_body_indent(base, start_char, end_char, kind):
+    """First non-blank body line's indent, or `decl_indent + unit`."""
+    decl_line_start = base.rfind("\n", 0, start_char) + 1
+    decl_line_end = base.find("\n", decl_line_start)
+    if decl_line_end == -1:
+        decl_line_end = len(base)
+    decl_line = base[decl_line_start:decl_line_end]
+    decl_indent = decl_line[:len(decl_line) - len(decl_line.lstrip())]
+
+    scan = decl_line_end + 1
+    while scan < end_char:
+        nl = base.find("\n", scan)
+        if nl == -1 or nl > end_char:
+            nl = end_char
         line = base[scan:nl]
         if line.strip():
-            body_indent = line[:len(line) - len(line.lstrip())]
-            break
+            line_indent = line[:len(line) - len(line.lstrip())]
+            if len(line_indent) > len(decl_indent):
+                return line_indent
         scan = nl + 1
-    return (decl_match.start(), close_brace + 1, body_indent)
+
+    unit = "    " if kind == "python" else "  "
+    return decl_indent + unit
 
 
 def _find_after_anchor_end(base, anchor, scope_start, scope_end):
@@ -373,13 +340,22 @@ def _verify_scope_insertion(base: str, result: str,
     nested inside a sibling method.  Valid Python, dead code.  The
     direct-child check catches this: `def new_cmd` nested inside
     `def existing_cmd` is not a direct child of the class.
+
+    Parse-cache routing (2026-11-05): the three `ast.parse` calls
+    below go through `_ast.parse_source`.  `base` is a record's
+    base content, almost always already parsed by an earlier pass;
+    `result` will be parsed by a subsequent pass anyway.  See the
+    module docstring, PARSE-CACHE ROUTING.
     """
     if not path.endswith(".py"):
         return True
 
     try:
-        base_tree = ast.parse(base)
-        result_tree = ast.parse(result)
+        base_tree = parse_source(base, filename=path)
+    except SyntaxError:
+        return False
+    try:
+        result_tree = parse_source(result, filename=path)
     except SyntaxError:
         return False
 
@@ -397,7 +373,8 @@ def _verify_scope_insertion(base: str, result: str,
         return False
 
     try:
-        body_tree = ast.parse(textwrap.dedent(inserted_body))
+        body_tree = parse_source(
+            textwrap.dedent(inserted_body), filename=path)
     except SyntaxError:
         return False
 
@@ -472,11 +449,11 @@ def _try_insert_into_named_scope(base, body, context_before, path="",
     if not scope_name:
         anchor = _extract_after_anchor(context_before)
         if anchor:
-            scope_name = _find_enclosing_scope_name(base, anchor)
+            scope_name = _find_enclosing_scope_name(base, anchor, path)
     if not scope_name:
         return None
 
-    scope_range = _find_scope_body_range(base, scope_name)
+    scope_range = _find_scope_body_range(base, scope_name, path)
     if scope_range is None:
         return None
     scope_start, scope_end, body_indent = scope_range

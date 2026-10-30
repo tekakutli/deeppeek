@@ -125,6 +125,49 @@ into the new body.  Two failure shapes resulted:
 
   The fix is the `+ 1`.
 
+AST-BASED SCOPE RESOLUTION (2026-11-05)
+=======================================
+`_apply_scoped_single` now resolves the scope's span via
+`scope_ast.find_scope` instead of the pre-AST `_SCOPE_PATTERNS`
+regex list.  The AST path handles every declaration shape the
+language defines (decorated defs, `async def`, generator functions,
+arrow functions assigned to `const`, class methods, HTML
+`<details>`) with exact boundaries.
+
+`_SCOPE_PATTERNS`, `_find_scope_in_base`, and `_scope_in_base`
+remain in the file because the ellipsis and diagnostic paths still
+need the body-open / body-close char offsets that only those
+helpers extract.  Migrating those to AST is a separate concern; the
+mutation path is what matters for correctness.
+
+PARSE-CACHE ROUTING (2026-11-05)
+================================
+Three `ast.parse` calls in this module now route through
+`_ast.parse_source` (memoized):
+
+  · `_find_python_docstring_span` — parses the patch body looking
+    for a docstring placeholder marker.
+  · `_extract_python_docstring` — parses the base scope looking for
+    its docstring content.
+  · `_py_decls_isolated` — parses `base` and `result` once per
+    scope-isolation check.
+
+`base` is a record's base content, which is typically already
+parsed by `_analyze_python_with_sigs`, `_py_exports`, or
+`structural_diff` before `_verify_scope_isolation` runs, so the
+first call is a cache hit.  `result` is a candidate that later
+passes (structural diff, symbol check) will parse anyway.  The
+patch-body parse in `_find_python_docstring_span` is unique per
+patch, but the same patch's body is re-parsed if the same record
+is replayed during reconciliation.
+
+`_py_decls_isolated` now takes an optional `path` argument so the
+filename is threaded to `parse_source` for consistency with the
+other post-patch parse sites; the filename is not observed (the
+`SyntaxError` is caught locally and turned into a fail-open `True`),
+but preserving the parameter matches the convention of every other
+`parse_source` call in the post-apply stack.
+
 Prior docstring content (unchanged):
 - MULTI-SCOPE BODIES — REFINED
 - PLACEHOLDER MERGE (2026-10-28)
@@ -135,6 +178,7 @@ import re
 import ast
 from pathlib import Path
 
+from ._ast import parse_source
 from .prose import (
     _extract_scope_from_body,
     _SCOPE_FROM_BODY_PATTERNS,
@@ -285,25 +329,30 @@ def _scope_exists_any_kind(base, name):
 
 
 def _find_scope_in_base(base, scope_name):
-    for make_pattern in _SCOPE_PATTERNS:
-        try:
-            pattern = make_pattern(scope_name)
-        except re.error:
-            continue
-        m = pattern.search(base)
-        if not m:
-            continue
-        matched = base[m.start():m.end()]
-        if matched.lstrip().startswith("<details"):
-            return None
-        brace_open = base.find("{", m.start(), m.end())
-        if brace_open == -1:
-            continue
-        brace_close = _find_matching_brace(base, brace_open)
-        if brace_close == -1:
-            continue
-        return (m.start(), brace_open + 1, brace_close, brace_close + 1)
-    return None
+    """Return `(decl_start, body_open, body_close, scope_end)` for
+    the named scope, or None.
+
+    AST-based since 2026-11-05: `find_scope` gives the declaration
+    span; `find_scope_body_span` gives the body interior.
+
+    The pre-AST regex + brace-matcher version returned None for
+    Python `def foo():` scopes because Python bodies use `:` not `{`.
+    That was silently masked by `_try_deterministic_patch_inner`'s
+    `_strip_ellipsis_lines` fallback, which did a full replace
+    instead of a mid-body prefix-modification splice.  Fixtures
+    41 (`computeW`) exercised the correct path for `.js`; the
+    equivalent `.py` case fell through to the worse fallback.
+    """
+    from .scope_ast import find_scope, find_scope_body_span
+    span = find_scope(base, scope_name, "")
+    if span is None:
+        return None
+    body = find_scope_body_span(base, scope_name, "")
+    if body is None:
+        return None
+    decl_start, scope_end, _kind = span
+    body_open, body_close = body
+    return (decl_start, body_open, body_close, scope_end)
 
 
 def _matches_scope_declaration(line, scope_name):
@@ -349,9 +398,12 @@ def _find_python_docstring_span(body: str):
 
     Character offsets are into `body`.  `end_char` is exclusive —
     it points past the closing triple quote.
+
+    Routes through `parse_source` (memoized).  See the module
+    docstring, PARSE-CACHE ROUTING.
     """
     try:
-        tree = ast.parse(body)
+        tree = parse_source(body)
     except SyntaxError:
         return None
     if not tree.body:
@@ -387,9 +439,13 @@ def _find_python_docstring_span(body: str):
 
 
 def _extract_python_docstring(body: str):
-    """Return the first function/class's docstring *content*."""
+    """Return the first function/class's docstring *content*.
+
+    Routes through `parse_source` (memoized).  See the module
+    docstring, PARSE-CACHE ROUTING.
+    """
     try:
-        tree = ast.parse(body)
+        tree = parse_source(body)
     except SyntaxError:
         return None
     if not tree.body:
@@ -832,7 +888,7 @@ def _verify_scope_isolation(base, result, scope_name, path=""):
     ext = Path(path).suffix.lower() if path else ""
 
     if ext == ".py":
-        if not _py_decls_isolated(base, result, scope_name):
+        if not _py_decls_isolated(base, result, scope_name, path):
             return False
         return _embedded_html_isolated(base, result, scope_name)
     if ext in (".js", ".mjs", ".jsx", ".ts", ".tsx"):
@@ -842,10 +898,19 @@ def _verify_scope_isolation(base, result, scope_name, path=""):
     return True
 
 
-def _py_decls_isolated(base, result, scope_name):
+def _py_decls_isolated(base, result, scope_name, path=""):
+    """Python scope-isolation check.
+
+    Routes through `parse_source` (memoized).  See the module
+    docstring, PARSE-CACHE ROUTING.  The `path` argument is threaded
+    from `_verify_scope_isolation` for consistency with other
+    post-patch parse sites; the filename is not observed (the
+    `SyntaxError` is caught locally and turned into a fail-open
+    `True`).
+    """
     try:
-        base_tree = ast.parse(base)
-        result_tree = ast.parse(result)
+        base_tree = parse_source(base, filename=path or "<base>")
+        result_tree = parse_source(result, filename=path or "<result>")
     except SyntaxError:
         return True
     base_lines = base.splitlines()
@@ -1032,114 +1097,93 @@ def _embedded_html_isolated(base, result, scope_name):
 def _apply_scoped_single(base, scope_name, new_body, path=""):
     """Apply a single-scope replacement.
 
-    AST-snapped boundaries + structural validation + scope-isolation
-    verification, per the module docstring.  Returns None when no
-    candidate splice produced valid, isolated content.
+    AST-based since 2026-11-05: the scope's span comes from
+    `scope_ast.find_scope` instead of `_SCOPE_PATTERNS`.  Splicing
+    uses `patch_bounds.splice_region` with AST-snapped boundaries
+    and structural validation, followed by scope-isolation
+    verification (see the module docstring).
     """
     if not scope_name or not new_body.strip():
         return None
     if _has_ellipsis_marker(new_body):
         return _try_ellipsis_splice(base, new_body)
-    for make_pattern in _SCOPE_PATTERNS:
-        try:
-            pattern = make_pattern(scope_name)
-        except re.error:
-            continue
-        m = pattern.search(base)
-        if not m:
-            continue
-        m_start = m.start()
-        m_end = m.end()
-        base_scope_text = base[m_start:m_end]
 
-        if not _new_body_is_complete_for_scope(
-                base_scope_text, new_body):
-            spliced = _try_scoped_partial_splice(
-                base_scope_text, new_body)
-            if spliced is None:
-                return None
-            if m_start < len(base) and base[m_start] == "\n":
-                indent_pos = m_start + 1
-                base_indent = ""
-            else:
-                indent_pos = base.rfind("\n", 0, m_start) + 1
-                base_indent = base[indent_pos:m_start]
-            reindented = _reindent_body(base_indent, spliced)
-            if not _scope_signature_ok(reindented):
-                return None
-            partial_result = (
-                base[:indent_pos] + reindented + base[m_end:])
-            if not _verify_scope_isolation(
-                    base, partial_result, scope_name, path or ""):
-                return None
-            return partial_result
+    from .scope_ast import find_scope
+    span = find_scope(base, scope_name, path)
+    if span is None:
+        return None
+    m_start, m_end, _kind = span
 
-        if m_start < len(base) and base[m_start] == "\n":
-            indent_pos = m_start + 1
-            base_indent = ""
-        else:
-            indent_pos = base.rfind("\n", 0, m_start) + 1
-            base_indent = base[indent_pos:m_start]
-        if _body_starts_with_comment(new_body):
-            extended_start = _find_leading_comment_start(
-                base, indent_pos)
-            if extended_start < indent_pos:
-                indent_pos = extended_start
-        while m_end > m_start and base[m_end - 1] == "\n":
-            m_end -= 1
-        reindented = _reindent_body(base_indent, new_body)
+    # Extend backward over leading comments if the new body starts
+    # with a comment (mirrors the pre-AST behaviour).
+    if _body_starts_with_comment(new_body):
+        extended_start = _find_leading_comment_start(base, m_start)
+        if extended_start < m_start:
+            m_start = extended_start
 
-        # Already-present scoped-replace (2026-10-28f).
-        if _content_present_in_base(base_scope_text, reindented,
-                                     threshold=0.99):
-            return base
+    base_scope_text = base[m_start:m_end]
 
+    # Compute indentation for the scope's start line.
+    indent_pos = base.rfind("\n", 0, m_start) + 1
+    base_indent = base[indent_pos:m_start]
+
+    # Trim trailing newlines from the span for splice calculations.
+    trimmed_end = m_end
+    while trimmed_end > m_start and base[trimmed_end - 1] == "\n":
+        trimmed_end -= 1
+
+    if not _new_body_is_complete_for_scope(base_scope_text, new_body):
+        spliced = _try_scoped_partial_splice(
+            base_scope_text, new_body)
+        if spliced is None:
+            return None
+        reindented = _reindent_body(base_indent, spliced)
         if not _scope_signature_ok(reindented):
             return None
+        partial_result = (
+            base[:indent_pos] + reindented + base[m_end:])
+        if not _verify_scope_isolation(
+                base, partial_result, scope_name, path or ""):
+            return None
+        return partial_result
 
-        # AST-snapped splice with structural validation (2026-10-29)
-        # and scope-isolation verification (2026-10-29).
-        from .patch_bounds import (
-            try_boundary_pairs, try_ast_snapped_boundaries,
-            splice_region,
-        )
-        base_lines = base.splitlines()
-        start_line = base.count("\n", 0, indent_pos)
-        # EXCLUSIVE end-line.  `splice_region` replaces
-        # `base_lines[start:end]`, so `end` must be one past the
-        # scope's last line.  The pre-2026-10-30 computation —
-        # `base.count("\n", 0, m_end)` — returned the line index of
-        # `base[m_end - 1]` itself, i.e. the scope's last line.  That
-        # left the last line of every scope-replace intact in the new
-        # body.  When the new body re-stated the same last line, the
-        # damage was invisible; when it did not, the old last line
-        # survived as an unreachable statement (which `ast.parse`
-        # accepts).  See the module docstring, EXCLUSIVE END-LINE.
-        end_line = base.count("\n", 0, m_end) + 1
-        body_lines = reindented.split("\n")
+    reindented = _reindent_body(base_indent, new_body)
 
-        candidates = [(start_line, end_line)]
-        snapped = try_ast_snapped_boundaries(
-            base, path or "", start_line, end_line, reindented)
-        if snapped is not None and snapped != (start_line, end_line):
-            candidates.append(snapped)
-        candidates.extend(try_boundary_pairs(
-            start_line, end_line, len(base_lines)))
+    # Already-present scoped-replace: if the base's scope text
+    # (modulo reindent) is what the new body produces, no-op.
+    if _content_present_in_base(
+            base_scope_text, reindented, threshold=0.99):
+        return base
 
-        for trial_start, trial_end in candidates:
-            # Scope replaces legitimately shrink (function body
-            # replaced with something smaller); 30% floor rather
-            # than 50%.
-            result = splice_region(
-                base, trial_start, trial_end, body_lines,
-                path or "", min_fraction=0.3)
-            if result is None:
-                continue
-            if not _verify_scope_isolation(
-                    base, result, scope_name, path or ""):
-                continue
-            return result
+    if not _scope_signature_ok(reindented):
         return None
+
+    from .patch_bounds import (
+        try_boundary_pairs, try_ast_snapped_boundaries, splice_region,
+    )
+    base_lines = base.splitlines()
+    start_line = base.count("\n", 0, indent_pos)
+    end_line = base.count("\n", 0, trimmed_end) + 1
+    body_lines = reindented.split("\n")
+
+    candidates = [(start_line, end_line)]
+    snapped = try_ast_snapped_boundaries(
+        base, path or "", start_line, end_line, reindented)
+    if snapped is not None and snapped != (start_line, end_line):
+        candidates.append(snapped)
+    candidates.extend(try_boundary_pairs(
+        start_line, end_line, len(base_lines)))
+
+    for trial_start, trial_end in candidates:
+        result = splice_region(
+            base, trial_start, trial_end, body_lines,
+            path or "", min_fraction=0.3)
+        if result is None:
+            continue
+        if not _verify_scope_isolation(
+                base, result, scope_name, path or ""):
+            continue
+        return result
     return None
 
 

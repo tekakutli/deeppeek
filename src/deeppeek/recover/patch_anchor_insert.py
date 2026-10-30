@@ -93,6 +93,26 @@ class+decorated-body; if it declines for some reason, this branch
 declining lets the pipeline fall through to structural-append (which
 also declines class+decorated), and finally to fail-closed — a
 strictly better outcome than placing the method at module level.
+
+AST-BASED SCOPE RESOLUTION (2026-11-05)
+=======================================
+`_try_insert_after_def` now resolves the def/class/function's span
+via `scope_ast.find_scope` instead of its own two regexes + brace
+walker.  The AST path handles every declaration shape the language
+defines (decorated defs, `async def`, generator functions, arrow
+functions assigned to `const`, class methods, HTML `<details>`),
+with exact boundaries.
+
+The scope-aware anchor helpers (`_anchor_within_scope`,
+`_anchor_within_named_scope`, `_anchor_within_callee`) likewise
+delegate to `patch_scope_insert._find_scope_body_range`, which is
+now AST-backed, and take a `path` argument that they thread
+through so the destination language's parser is chosen correctly.
+
+Behaviour of every heuristic on the previously-supported shapes is
+unchanged; the only visible difference is that shapes the regex
+missed (arrow functions, generator functions, class methods) now
+resolve instead of failing closed.
 """
 
 import re
@@ -180,47 +200,32 @@ _BETWEEN_RE = re.compile(
 
 
 def _find_named_block_end(base, name):
+    """Return `(start_char, end_char)` for the named declaration,
+    or None.
+
+    AST-based since 2026-11-05.  **No `path` parameter on purpose:**
+    between-anchors prose names a *block* ("between the Image and
+    Masks `<details>` blocks") without naming its language, so the
+    lookup must try all three parsers.  Pre-fix, the old regex tried
+    `<details>` unconditionally before touching `def`/`function`; the
+    AST path reproduces that by passing the empty path, which
+    `find_scope` treats as Python → JS → HTML fallback.
+
+    For a `.py` file whose base contains `<details><summary>Image
+    </summary>...</details>` inside a raw string, `find_scope(base,
+    "Image", "")` tries `_find_python_scope` first (no `Image`
+    def/class), then `_find_js_scope` (no `Image` function/const),
+    then `_find_html_scope` (matches).  Threading the outer file's
+    `.py` path would stop at the Python attempt and return None,
+    breaking between-anchors for the playground pattern.
+    """
     if not name:
         return None
-
-    pat_details = re.compile(
-        r'<details\b[^>]*>\s*<summary>\s*'
-        + re.escape(name) + r'\s*</summary>.*?</details>',
-        re.DOTALL | re.IGNORECASE)
-    m = pat_details.search(base)
-    if m:
-        return (m.start(), m.end())
-
-    pat_obj = re.compile(
-        r'(?:^|\n)(?:export\s+)?(?:const|let|var)\s+'
-        + re.escape(name) + r'\s*=\s*\{',
-        re.MULTILINE)
-    m = pat_obj.search(base)
-    if m:
-        open_idx = base.find("{", m.end() - 1)
-        if open_idx != -1:
-            close_idx = _find_matching_brace(
-                base, open_idx, is_python=False)
-            if close_idx != -1:
-                end = close_idx + 1
-                if end < len(base) and base[end] == ";":
-                    end += 1
-                return (m.start(), end)
-
-    pat_fn = re.compile(
-        r'(?:^|\n)(?:export\s+)?(?:async\s+)?'
-        r'(?:function|def|class)\s+' + re.escape(name) + r'\b',
-        re.MULTILINE)
-    m = pat_fn.search(base)
-    if m:
-        open_idx = base.find("{", m.end())
-        if open_idx != -1:
-            close_idx = _find_matching_brace(
-                base, open_idx, is_python=False)
-            if close_idx != -1:
-                return (m.start(), close_idx + 1)
-
-    return None
+    from .scope_ast import find_scope
+    span = find_scope(base, name, "")
+    if span is None:
+        return None
+    return (span[0], span[1])
 
 
 def _try_insert_between_anchors(base, body, context_before, path=""):
@@ -270,6 +275,10 @@ def _try_insert_between_anchors(base, body, context_before, path=""):
 
 
 def _find_python_sig_end(base, start_pos):
+    """Kept for tests / external callers.  The 2026-11-05 AST-based
+    `_try_insert_after_def` no longer uses this helper directly, but
+    downstream code (and unit tests) may still import it.
+    """
     i = start_pos
     n = len(base)
     depth = 0
@@ -309,7 +318,7 @@ _DECL_START_PREFIXES = (
 )
 
 
-def _try_insert_after_def(base, ident, body):
+def _try_insert_after_def(base, ident, body, path=""):
     """If `ident` names a def/class/function in `base`, insert `body`
     AFTER the definition's whole body — at the def's own indent.
 
@@ -317,6 +326,9 @@ def _try_insert_after_def(base, ident, body):
     `class` in base: the intent is to add a method inside the class,
     not a module-level function after it.  See module docstring,
     CLASS-TARGET + DECORATED-BODY.
+
+    AST-based since 2026-11-05: the span comes from
+    `scope_ast.find_scope`.
     """
     if not ident or not body or not body.strip():
         return None
@@ -334,69 +346,73 @@ def _try_insert_after_def(base, ident, body):
         if _class_re.search(base):
             return None
 
-    py_re = re.compile(
-        r'(?m)^([ \t]*)(?:async\s+)?(?:def|class)\s+'
-        + re.escape(ident) + r'\b'
-    )
-    m = py_re.search(base)
-    if m:
-        def_indent = m.group(1)
-        sig_end = _find_python_sig_end(base, m.start())
-        if sig_end == -1:
-            return None
-        scan = base.find("\n", sig_end)
-        if scan == -1:
-            return None
-        scan += 1
-        insert_at = len(base)
-        while scan < len(base):
-            nl = base.find("\n", scan)
-            if nl == -1:
-                nl = len(base)
-            line = base[scan:nl]
-            if line.strip():
-                line_indent = len(line) - len(line.lstrip())
-                if line_indent <= len(def_indent):
-                    insert_at = scan
-                    break
-            scan = nl + 1
-        reindented = _reindent_body(def_indent, body.lstrip("\n").rstrip())
-        insertion = reindented.rstrip() + "\n\n"
-        result = base[:insert_at] + insertion + base[insert_at:]
-        return result if result != base else None
+    from .scope_ast import find_scope
+    span = find_scope(base, ident, path)
+    if span is None:
+        return None
+    start_char, end_char, kind = span
 
-    js_re = re.compile(
-        r'(?m)^([ \t]*)(?:export\s+)?(?:async\s+)?'
-        r'(?:function|class)\s+' + re.escape(ident) + r'\b'
-    )
-    m = js_re.search(base)
-    if m:
-        brace_open = base.find("{", m.end())
-        if brace_open == -1:
-            return None
-        brace_close = _find_matching_brace(base, brace_open)
-        if brace_close == -1:
-            return None
-        line_end = base.find("\n", brace_close)
-        if line_end == -1:
-            line_end = len(base)
-        else:
-            line_end += 1
-        sibling_indent = m.group(1)
-        reindented = _reindent_body(
-            sibling_indent, body.lstrip("\n").rstrip())
-        insertion = reindented.rstrip() + "\n"
-        result = base[:line_end] + insertion + base[line_end:]
-        return result if result != base else None
-
+    if kind == "python":
+        return _insert_after_python_scope(
+            base, start_char, end_char, body)
+    if kind == "js":
+        return _insert_after_js_scope(
+            base, start_char, end_char, body)
     return None
 
 
-def _anchor_within_scope(base, anchor_text, scope_name, spans=None):
+def _insert_after_python_scope(base, start_char, end_char, body):
+    """Insert `body` after a Python scope, skipping past trailing
+    blank lines to match the pre-AST behaviour.
+    """
+    decl_line_start = base.rfind("\n", 0, start_char) + 1
+    decl_line_end = base.find("\n", decl_line_start)
+    if decl_line_end == -1:
+        decl_line_end = len(base)
+    decl_line = base[decl_line_start:decl_line_end]
+    def_indent = decl_line[:len(decl_line) - len(decl_line.lstrip())]
+
+    scan = end_char
+    while scan < len(base):
+        nl = base.find("\n", scan)
+        if nl == -1:
+            break
+        if base[scan:nl].strip():
+            break
+        scan = nl + 1
+    insert_at = scan
+
+    reindented = _reindent_body(
+        def_indent, body.lstrip("\n").rstrip())
+    insertion = reindented.rstrip() + "\n\n"
+    result = base[:insert_at] + insertion + base[insert_at:]
+    return result if result != base else None
+
+
+def _insert_after_js_scope(base, start_char, end_char, body):
+    """Insert `body` after a JS scope (right after the `}` line)."""
+    line_start = base.rfind("\n", 0, start_char) + 1
+    line_end = base.find("\n", line_start)
+    if line_end == -1:
+        line_end = len(base)
+    decl_line = base[line_start:line_end]
+    sibling_indent = decl_line[:len(decl_line) - len(decl_line.lstrip())]
+
+    reindented = _reindent_body(
+        sibling_indent, body.lstrip("\n").rstrip())
+    insertion = reindented.rstrip() + "\n"
+    if end_char > 0 and base[end_char - 1] != "\n":
+        insertion = "\n" + insertion
+    result = base[:end_char] + insertion + base[end_char:]
+    return result if result != base else None
+
+
+def _anchor_within_scope(base, anchor_text, scope_name, spans=None,
+                          path=""):
     if not scope_name:
         return -1
     from .patch_scope_insert import _find_scope_body_range
-    scope_range = _find_scope_body_range(base, scope_name)
+    scope_range = _find_scope_body_range(base, scope_name, path)
     if scope_range is None:
         return -1
     scope_start, scope_end, _ = scope_range
@@ -416,21 +432,22 @@ def _anchor_within_scope(base, anchor_text, scope_name, spans=None):
 
 
 def _anchor_within_named_scope(base, anchor_text, context_before,
-                                spans=None):
+                                spans=None, path=""):
     from .patch_scope_insert import _extract_scope_name_from_prose
     named_scope = _extract_scope_name_from_prose(context_before or "")
     return _anchor_within_scope(
-        base, anchor_text, named_scope, spans=spans)
+        base, anchor_text, named_scope, spans=spans, path=path)
 
 
 _CALLEE_CALL_RE = re.compile(r'self\.([A-Za-z_]\w*)\s*\(')
 
 
-def _anchor_within_callee(base, anchor_text, scope_name, spans=None):
+def _anchor_within_callee(base, anchor_text, scope_name, spans=None,
+                           path=""):
     if not scope_name:
         return -1
     from .patch_scope_insert import _find_scope_body_range
-    scope_range = _find_scope_body_range(base, scope_name)
+    scope_range = _find_scope_body_range(base, scope_name, path)
     if scope_range is None:
         return -1
     scope_start, scope_end, _ = scope_range
@@ -442,7 +459,7 @@ def _anchor_within_callee(base, anchor_text, scope_name, spans=None):
 
     matches = []
     for name in sorted(callee_names):
-        callee_range = _find_scope_body_range(base, name)
+        callee_range = _find_scope_body_range(base, name, path)
         if callee_range is None:
             continue
         callee_start, callee_end, _ = callee_range
@@ -575,7 +592,8 @@ def _try_insert_after_anchor(base, body, context_before,
         ident_matches = _PROSE_BACKTICK_IDENT_RE.findall(
             context_before or "")
         for ident in reversed(ident_matches):
-            def_result = _try_insert_after_def(base, ident, body)
+            def_result = _try_insert_after_def(
+                base, ident, body, path=path)
             if def_result is not None:
                 return def_result
 
@@ -661,7 +679,8 @@ def _try_insert_after_anchor(base, body, context_before,
                 idx = positions[0]
             elif len(positions) > 1:
                 idx = _anchor_within_named_scope(
-                    base, stripped, context_before, spans=spans)
+                    base, stripped, context_before, spans=spans,
+                    path=path)
                 if idx == -1:
                     continue
             else:
@@ -705,10 +724,11 @@ def _try_insert_after_anchor(base, body, context_before,
 
         for stripped in sorted(scoped_priors):
             scope = prior_scopes[stripped]
-            idx = _anchor_within_scope(base, stripped, scope, spans=spans)
+            idx = _anchor_within_scope(
+                base, stripped, scope, spans=spans, path=path)
             if idx == -1:
                 idx = _anchor_within_callee(
-                    base, stripped, scope, spans=spans)
+                    base, stripped, scope, spans=spans, path=path)
             if idx == -1:
                 continue
             if is_inside_comment(idx, spans):

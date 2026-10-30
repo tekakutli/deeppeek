@@ -10,7 +10,7 @@ Four heuristics that transform existing content in place:
                                 literal (`const X = {`, `X = {`,
                                 `X.y = {`); preserves the base prefix
   _try_fuzzy_replace            replace-pair whose old_body is a
-                                token-subset of a base window
+                                structural match for a base window
   _try_signature_replace        body is a signature only (a `def`/
                                 `function`/`class` header ending with
                                 `:`); replace the matching signature
@@ -46,17 +46,85 @@ The pre-fix `_try_signature_replace` called `body.strip()`, which
 strips leading whitespace from the first line.  For an indented
 method (`    def _paste_result(...)`), the extracted `base_indent`
 was therefore `""`, and the signature search only matched
-top-level definitions.  The signature-only block for
-`_paste_result` in the comfyui.py conversation never matched; it
-fell through to the completeness gate and failed.
+top-level definitions.  The fix uses `body.strip("\n")` — strip only
+surrounding newlines, not spaces.
 
-The fix uses `body.strip("\n")` — strip only surrounding newlines,
-not spaces.  Indentation of the signature line determines which
-definition the heuristic targets.
+STRUCTURAL SINGLE-LINE MATCHING (2026-11-05)
+============================================
+`_try_single_line_replace` gains two structural upgrades:
+
+  · `_line_similarity_structurally` — parses both lines as statements
+    in the destination language and scores via `statement_sig` when
+    both parse.  Token Jaccard (order-insensitive, string-literal-
+    naive) remains the fallback for cases the AST cannot judge:
+    JS object properties (`value: false,` is a `labeled_statement`,
+    not in `_JS_STATEMENT_TYPES`), Python dict entries inside
+    braces, and short fragments that need context to parse.
+
+  · Result-parse validation — after building the swap, `parse_source`
+    on the full result.  If it fails, decline.  This moves the
+    failure-mode signal from `skipped_structural_damage` (pass 6
+    sanity gate fires, patch marked `deterministic → skipped`) to
+    `failed` (this heuristic declines, next heuristic tries, or
+    fail-closed with an honest "no heuristic matched" reason).
+
+STRUCTURAL FUZZY-REPLACE (2026-11-05)
+=====================================
+`_try_fuzzy_replace` is called by `patch_pairs._try_replace_pair` as
+the last resort after exact and whitespace-normalized matches fail:
+the base has drifted but is recognizably the same code.  The
+pre-fix implementation compared line-by-line with token Jaccard —
+any line-alignment shift (blank line inserted, statement split or
+joined, one line's tokens reordered) either rejected the whole match
+or picked a wrong window.
+
+The structural version:
+  1. Parses `old_body` as a statement list (Python AST via
+     `_parse_python_or_dedent`, or tree-sitter-javascript).
+  2. Parses `base` the same way.
+  3. Slides a window of len(old_stmts) over base_stmts, scoring each
+     window by `statement_sig` per aligned statement.
+  4. Fires when the best window beats `threshold` with a clear
+     gap (0.10 for close-index windows, 0.05 for distant) over the
+     runner-up.
+  5. Splices `new_body` over the matched base window via
+     `patch_bounds.splice_region`, which validates structurally.
+
+Falls back to `_try_fuzzy_replace_lines` (the pre-2026-11-05
+implementation, unchanged) when `old_body` cannot be parsed as
+statements: JS object properties, HTML fragments, prose-like YAML,
+etc.  The flat-line path is the only signal available for those.
+
+The same `path` parameter drives grammar selection here as in
+`_try_single_line_replace`; both callers pass it through so a `.py`
+fuzzy-replace gets Python AST scoring, a `.js` fuzzy-replace gets
+tree-sitter, and a `.html` fuzzy-replace gets the line-based
+fallback.
+
+STRUCTURAL OBJECT-LITERAL DISAMBIGUATION (2026-11-05)
+=====================================================
+When `_try_object_literal_splice` finds more than one `const name =
+{` in base, the pre-fix version scored each candidate by counting
+how many body *lines* appear verbatim in the block.  A base block
+with a comment interleaved (`key: /* x */ value,`), or extra
+internal whitespace (`key:    value,`), breaks the line-equality
+match even when the keys are identical.
+
+The structural version extracts the set of dict/object keys from the
+body's literal and from each candidate block's literal, and scores
+by Jaccard overlap.  Key extraction is brace-scan + regex — cheap,
+language-agnostic (Python dicts and JS objects use the same
+`key: value` shape for our purposes), and reformatting-invariant.
 """
+from __future__ import annotations
 
+import ast
 import re
+import textwrap
+from pathlib import Path
+from typing import Optional
 
+from ._ast import parse_source
 from .patch_text import (
     _first_identifier,
     _line_token_jaccard,
@@ -78,18 +146,93 @@ _OBJECT_LITERAL_ASSIGNMENT_RE = re.compile(
 
 
 # ===========================================================================
+#  Line-level structural similarity
+# ===========================================================================
+
+def _line_similarity_structurally(a: str, b: str, path: str) -> float:
+    """Structural similarity for two single lines.
+
+    When both lines parse as a single statement in the destination
+    language, score by `statement_sig`.  Otherwise fall back to
+    `_line_token_jaccard`.
+
+    The AST path gives order-sensitivity that token Jaccard lacks:
+    `foo(a, b)` and `foo(b, a)` have identical token sets but
+    different call semantics; `x = compute(a) + compute(b)` and
+    `x = compute(b) + compute(a)` likewise.  Neither ordering change
+    is visible to `_line_token_jaccard` but both are visible to
+    `statement_sig`.
+
+    The fallback covers the cases the AST cannot judge: JS object
+    properties (`value: false,` parses as a labeled statement in
+    JS, not a call/return/assign), Python dict entries inside
+    braces (`"key": value,` doesn't parse standalone), and short
+    fragments that need surrounding context.  Those are exactly the
+    common `_try_single_line_replace` use cases, so the fallback is
+    load-bearing, not vestigial.
+    """
+    if a == b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+
+    ext = Path(path).suffix.lower() if path else ""
+
+    if ext in (".py", ".pyi"):
+        try:
+            at = parse_source(a, filename="<line>")
+            bt = parse_source(b, filename="<line>")
+        except SyntaxError:
+            at = bt = None
+        if (at is not None and bt is not None
+                and len(at.body) == 1 and len(bt.body) == 1):
+            from .statement_sig import _python_sig, score
+            sa = _python_sig(at.body[0])
+            sb = _python_sig(bt.body[0])
+            if sa is not None and sb is not None:
+                return score(sa, sb)
+
+    if ext in (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"):
+        try:
+            from .ast_anchor import _get_parser
+            parser = _get_parser("javascript")
+        except Exception:
+            parser = None
+        if parser is not None:
+            try:
+                atree = parser.parse(a.encode("utf-8"))
+                btree = parser.parse(b.encode("utf-8"))
+                if (not atree.root_node.has_error
+                        and not btree.root_node.has_error
+                        and len(atree.root_node.children) == 1
+                        and len(btree.root_node.children) == 1):
+                    from .statement_sig import _tree_sitter_sig, score
+                    sa = _tree_sitter_sig(
+                        atree.root_node.children[0], "javascript")
+                    sb = _tree_sitter_sig(
+                        btree.root_node.children[0], "javascript")
+                    if sa is not None and sb is not None:
+                        return score(sa, sb)
+            except Exception:
+                pass
+
+    return _line_token_jaccard(a, b)
+
+
+# ===========================================================================
 #  Single-line replace
 # ===========================================================================
 #
 # A body that is exactly one non-blank line and matches a line already
-# in base by identifier + token-similarity, when the prose is not an
-# add-instruction, is a *substitution* of that line, not an insertion.
+# in base by identifier + structural similarity, when the prose is not
+# an add-instruction, is a *substitution* of that line, not an
+# insertion.
 
 _ONE_LINE_MIN_SIM = 0.35
 _ONE_LINE_MIN_GAP = 0.20
 
 
-def _try_single_line_replace(base, raw_body, context_before=""):
+def _try_single_line_replace(base, raw_body, context_before="", path=""):
     """Replace exactly one base line with a one-line body.
     """
     lines = [ln for ln in raw_body.split("\n") if ln.strip()]
@@ -118,7 +261,7 @@ def _try_single_line_replace(base, raw_body, context_before=""):
         cand_ident = _first_identifier(bl.strip())
         if cand_ident != new_ident:
             continue
-        sim = _line_token_jaccard(bl.strip(), stripped)
+        sim = _line_similarity_structurally(bl.strip(), stripped, path)
         if sim >= _ONE_LINE_MIN_SIM:
             candidates.append((sim, i))
 
@@ -137,14 +280,71 @@ def _try_single_line_replace(base, raw_body, context_before=""):
     result_lines = list(base_lines)
     result_lines[best_idx] = replacement
     result = "\n".join(result_lines)
-    return result if result != base else None
+    if result == base:
+        return None
+
+    # Refuse if the swap would make the file unparseable.  The pass-6
+    # sanity gate would catch this eventually, but declining here
+    # means the failure is a `failed` patch with an honest reason
+    # instead of a `deterministic → skipped_structural_damage`
+    # demotion that masks the real cause.
+    #
+    # `structural_valid` is language-aware (ast for .py, tree-sitter
+    # for .js/.ts, tree-sitter-html for .html), unlike `parse_source`
+    # which is Python-only.  Using `parse_source` here regressed
+    # every `.js` single-line replace — `ast.parse` on JS content
+    # always fails, so the swap was never applied (fixture 34,
+    # `attribute_sanity_failure finds culprit`).
+    if path:
+        from .patch_bounds import structural_valid
+        if not structural_valid(result, path):
+            return None
+
+    return result
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 #  Object-literal splice
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
-def _try_object_literal_splice(base, body_stripped, varname):
+_OBJECT_KEY_RE = re.compile(
+    r'["\']?([A-Za-z_$][\w$]*)["\']?\s*:')
+
+
+def _extract_object_keys(text: str) -> set:
+    """Extract the string/identifier keys of the first dict/object
+    literal in `text`, or empty set.
+
+    Brace-scan to find the first `{ ... }` span (respecting nested
+    braces), then regex the key:value shape inside.  Language-agnostic
+    for the two cases that matter here — Python dicts and JS objects
+    use the same `key: value` surface syntax even though the AST
+    underneath differs.
+
+    Returns empty set when no balanced brace pair is found or when
+    the body has no `key: value` pairs.
+    """
+    open_idx = text.find("{")
+    if open_idx < 0:
+        return set()
+    depth = 0
+    close_idx = -1
+    for i in range(open_idx, len(text)):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                close_idx = i
+                break
+    if close_idx < 0:
+        return set()
+    body = text[open_idx:close_idx + 1]
+    return set(_OBJECT_KEY_RE.findall(body))
+
+
+def _try_object_literal_splice(base, body_stripped, varname, path=""):
     if not varname:
         return None
     name = re.escape(varname)
@@ -158,10 +358,12 @@ def _try_object_literal_splice(base, body_stripped, varname):
         return None
 
     if len(matches) > 1:
-        body_lines = [
-            ln.strip() for ln in body_stripped.split("\n")
-            if ln.strip() and len(ln.strip()) >= 8
-        ]
+        # Structural disambiguation: score candidates by dict-key
+        # Jaccard against the body's dict keys.  Pre-fix version
+        # scored by verbatim line presence, which a comment
+        # interleaved in base (or extra whitespace inside a value)
+        # defeated even when the keys matched exactly.
+        body_keys = _extract_object_keys(body_stripped)
 
         def _block_at(m):
             open_idx = m.end() - 1
@@ -175,8 +377,21 @@ def _try_object_literal_splice(base, body_stripped, varname):
             block = _block_at(m)
             if block is None:
                 continue
-            score = sum(1 for ln in body_lines if ln in block)
-            scored.append((score, m))
+            block_keys = _extract_object_keys(block)
+            if not body_keys or not block_keys:
+                # No key signal — fall back to the verbatim line match
+                # so tiny objects (0-key, 1-key) don't fail-closed.
+                body_lines = [
+                    ln.strip() for ln in body_stripped.split("\n")
+                    if ln.strip() and len(ln.strip()) >= 8
+                ]
+                score = sum(1 for ln in body_lines if ln in block)
+                scored.append((score, m))
+                continue
+            jaccard = (
+                len(body_keys & block_keys) / len(body_keys | block_keys)
+            )
+            scored.append((jaccard, m))
 
         if not scored:
             return None
@@ -189,22 +404,6 @@ def _try_object_literal_splice(base, body_stripped, varname):
     else:
         base_m = matches[0]
 
-    # NEW (2026-10-28g): preserve the base's exact whitespace before
-    # `{` rather than forcing a single space.
-    #
-    # Motivating case (comfyui.py, in the wild): base has `args={`
-    # (no space); body has `args={...}`.  The old code produced
-    # `args= {...}` (spurious space).  Style-wise wrong; worse,
-    # `_max_contiguous_run` treats the modified `args= {` line as
-    # different from base's `args={` line, so a subsequent re-run
-    # sees the patch as still needed and re-applies it.
-    #
-    # Capturing `base[base_m.start():base_open]` gives exactly what
-    # the source had between line start and `{`:
-    #   · `        args=`          (source had no space)
-    #   · `        const board = ` (source had a space)
-    #   · `        args = `        (source had spaces on both sides)
-    # In every case the result preserves the source's original style.
     file_prefix = base[:base_m.start()]
 
     body_m = _OBJECT_LITERAL_ASSIGNMENT_RE.match(body_stripped)
@@ -251,8 +450,159 @@ def _try_object_literal_splice(base, body_stripped, varname):
 #  Fuzzy replace-pair matching
 # ===========================================================================
 
-def _try_fuzzy_replace(base, old_body, new_body, threshold=0.75):
-    """Similarity-based replace-pair fallback.
+_JS_STATEMENT_NODE_TYPES = frozenset({
+    "return_statement",
+    "expression_statement",
+    "lexical_declaration",
+    "variable_declaration",
+    "if_statement",
+    "for_statement",
+    "while_statement",
+    "try_statement",
+    "function_declaration",
+    "class_declaration",
+})
+
+
+def _parse_statement_list(text: str, path: str) -> list:
+    """Parse `text` as a statement list in the destination language.
+
+    Returns `[]` on unparseable input, on empty input, or when the
+    destination extension has no parser.  Dedent fallback for
+    fragment bodies (e.g. an indented `try:/except:` block).
+
+    Python statements carry `.lineno` / `.end_lineno` (1-based
+    inclusive).  Tree-sitter statements carry `.start_point` /
+    `.end_point` (0-based, half-open on the col).  Callers convert
+    to line ranges per language.
+    """
+    if not text or not text.strip():
+        return []
+    ext = Path(path).suffix.lower() if path else ""
+
+    if ext in (".py", ".pyi"):
+        candidates = [text]
+        dedented = textwrap.dedent(text)
+        if dedented != text:
+            candidates.append(dedented)
+        for cand in candidates:
+            try:
+                tree = parse_source(cand, filename=path or "<body>")
+            except SyntaxError:
+                continue
+            return [n for n in tree.body
+                    if hasattr(n, "lineno")
+                    and hasattr(n, "end_lineno")]
+        return []
+
+    if ext in (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"):
+        try:
+            from .ast_anchor import _get_parser
+            parser = _get_parser("javascript")
+        except Exception:
+            parser = None
+        if parser is None:
+            return []
+        try:
+            tree = parser.parse(text.encode("utf-8"))
+        except Exception:
+            return []
+        if tree is None or tree.root_node.has_error:
+            return []
+        return [c for c in tree.root_node.children
+                if c.type in _JS_STATEMENT_NODE_TYPES]
+
+    return []
+
+
+def _stmt_signature(stmt, path: str):
+    """`statement_sig`-style signature for a parsed statement, or None."""
+    ext = Path(path).suffix.lower() if path else ""
+    try:
+        if ext in (".py", ".pyi"):
+            from .statement_sig import _python_sig
+            return _python_sig(stmt)
+        if ext in (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"):
+            from .statement_sig import _tree_sitter_sig
+            return _tree_sitter_sig(stmt, "javascript")
+    except ImportError:
+        return None
+    return None
+
+
+def _stmt_line_range(stmt, path: str) -> tuple:
+    """Return `(start_line_0based, end_line_exclusive)` for `stmt`.
+
+    Python: `.lineno` is 1-based inclusive; `.end_lineno` is 1-based
+    inclusive; convert to 0-based [start, end_exclusive).
+
+    Tree-sitter: `.start_point[0]` is 0-based; `.end_point[0]` is
+    0-based and points to the last line the node touches; add 1 for
+    exclusivity.  A node whose `.end_point[1]` is 0 but occupies
+    nothing on the last line still ends on that line; adding 1 is
+    correct because `splice_region` replaces lines `[start, end)`.
+    """
+    ext = Path(path).suffix.lower() if path else ""
+    if ext in (".py", ".pyi"):
+        return stmt.lineno - 1, stmt.end_lineno
+    # tree-sitter
+    return stmt.start_point[0], stmt.end_point[0] + 1
+
+
+def _try_fuzzy_replace_structural(base, old_body, new_body, path,
+                                   threshold) -> Optional[str]:
+    """Structural statement-sig window match.  See module docstring,
+    STRUCTURAL FUZZY-REPLACE.
+    """
+    old_stmts = _parse_statement_list(old_body, path)
+    if not old_stmts:
+        return None
+    base_stmts = _parse_statement_list(base, path)
+    if len(base_stmts) < len(old_stmts):
+        return None
+
+    n = len(old_stmts)
+    old_sigs = [_stmt_signature(s, path) for s in old_stmts]
+    base_sigs = [_stmt_signature(s, path) for s in base_stmts]
+    if any(s is None for s in old_sigs):
+        return None
+
+    from .statement_sig import score as sig_score
+
+    scored = []
+    for i in range(len(base_stmts) - n + 1):
+        window = base_sigs[i:i + n]
+        if any(s is None for s in window):
+            continue
+        total = sum(sig_score(o, w) for o, w in zip(old_sigs, window))
+        scored.append((total / n, i))
+
+    if not scored:
+        return None
+    scored.sort(reverse=True)
+    best_score, best_idx = scored[0]
+    if best_score < threshold:
+        return None
+    if len(scored) > 1:
+        second_score, second_idx = scored[1]
+        if abs(second_idx - best_idx) <= n:
+            if best_score - second_score < 0.10:
+                return None
+        elif best_score - second_score < 0.05:
+            return None
+
+    start_line, _ = _stmt_line_range(base_stmts[best_idx], path)
+    _, end_line = _stmt_line_range(base_stmts[best_idx + n - 1], path)
+
+    from .patch_bounds import splice_region
+    return splice_region(
+        base, start_line, end_line,
+        new_body.split("\n"), path)
+
+
+def _try_fuzzy_replace_lines(base, old_body, new_body, threshold=0.75):
+    """Line-level fuzzy replace.  Pre-2026-11-05 implementation, kept
+    as the fallback for bodies the structural matcher cannot judge.
     """
     import re as _re
     from collections import Counter
@@ -264,8 +614,7 @@ def _try_fuzzy_replace(base, old_body, new_body, threshold=0.75):
 
     def _tokens(s):
         return Counter(_re.findall(
-            r"""[A-Za-z_$][\w$]*|[0-9]+|"[^"]*"|'[^']*'|[^\s\w]""",
-            s))
+            r"""[A-Za-z_$][\w$]*|[0-9]+|"[^"]*"|'[^']*'|[^\s\w]""", s))
 
     def _line_sim(a, b):
         if a == b:
@@ -321,6 +670,29 @@ def _try_fuzzy_replace(base, old_body, new_body, threshold=0.75):
     return "\n".join(result_lines) + trailing
 
 
+def _try_fuzzy_replace(base, old_body, new_body, path="", threshold=0.75):
+    """Match `old_body` against a window of `base` and replace it with
+    `new_body`.
+
+    Structural path first (`_try_fuzzy_replace_structural`); line-level
+    fallback (`_try_fuzzy_replace_lines`) when the structural matcher
+    cannot parse old_body or base.  See the module docstring,
+    STRUCTURAL FUZZY-REPLACE.
+    """
+    if not old_body or not old_body.strip():
+        return None
+    if not new_body or not new_body.strip():
+        return None
+
+    structural = _try_fuzzy_replace_structural(
+        base, old_body, new_body, path, threshold)
+    if structural is not None:
+        return structural
+
+    return _try_fuzzy_replace_lines(
+        base, old_body, new_body, threshold=threshold)
+
+
 # ===========================================================================
 #  Signature-only replace
 # ===========================================================================
@@ -348,6 +720,13 @@ def _try_signature_replace(base, body):
     matching-indent declaration in base.  `body.strip()` (the
     pre-fix call) discarded the indent and produced a spurious
     top-level match for indented methods.
+
+    Unchanged in the 2026-11-05 structural pass: the regex gate
+    ("does this look like a signature header?") is cheap and
+    accurate; `ast.parse` of a bare `def foo(...):` raises
+    SyntaxError, so AST is strictly worse for this predicate.  The
+    splice itself already uses `_find_matching_paren` which is
+    char-scan-based and correct for nested parens.
 
     Returns the patched base, or None.
     """

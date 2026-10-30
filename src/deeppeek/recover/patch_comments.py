@@ -172,19 +172,20 @@ def _find_python_comments(text: str) -> list:
     return spans
 
 
+_TRIPLE_QUOTED_RE = re.compile(
+    r'(?:[rbufRBUF]{0,2})("""|\'\'\')(.*?)\1', re.DOTALL)
+
+
 def _iter_triple_quoted(text: str):
     """Yield `(content_start, content)` for each triple-quoted string.
 
-    Handles Python string prefixes (`r`, `rb`, `f`, `u`, etc.).  Does
-    not handle escapes inside the triple quotes; a `\\\"\\\"\\\"` inside a
-    triple-quoted string is rare and, when it does appear, the
-    resulting over-detected comment span is safe (see module docstring).
+    Fast-path + precompiled regex.  Handles Python string prefixes
+    (`r`, `rb`, `f`, `u`, etc.).  Does not handle escapes inside
+    the triple quotes; a `\\\"\\\"\\\"` inside a triple-quoted string
+    is rare and, when it does appear, the resulting over-detected
+    comment span is safe (see module docstring).
     """
-    pat = re.compile(
-        r'(?:[rbufRBUF]{0,2})("""|\'\'\')(.*?)\1',
-        re.DOTALL,
-    )
-    for m in pat.finditer(text):
-        content_start = m.start(2)
-        content = m.group(2)
-        yield content_start, content
+    if '"""' not in text and "'''" not in text:
+        return
+    for m in _TRIPLE_QUOTED_RE.finditer(text):
+        yield m.start(2), m.group(2)

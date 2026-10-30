@@ -62,9 +62,32 @@ gate refused and which therefore never landed — is reported alongside
 `failed` and `skipped_unplaceable` instead of silently dropping out
 of both lists.  The FAIL-CLOSED summary loop uses the same set.
 
+PRE-EXISTING SKIP AGGREGATION (2026-11-05)
+==========================================
+The `preexisting_unmodified` branch no longer emits one
+`[PREEXISTING]` line per pre-existing file.  A single aggregate
+`[preexisting] N file(s) left unchanged (not part of this run)`
+line is written near the end of `warnings.txt`.
+
+Motivating run (2026-10-29): a mid-size `--apply-to` target tree
+had ~280 untouched pre-existing source files.  Before this change,
+`warnings.txt` was ~500 lines, of which ~280 were
+`[path] [PREEXISTING] pre-existing file with no conversation
+changes; left as-is` — pure noise, differing only in the file path.
+After: one aggregate line; per-file detail preserved in
+`manifest.decisions[path]` (which already has `state`,
+`preexisting_base`, `verification`, `warnings`).
+
+The `[PRESERVED]` summary line that follows it serves a different
+purpose: it counts files that were already in the *output directory*
+before this run, whether or not they were part of the conversation
+(this includes files whose records were never created).  The two
+lines together describe the complete "untouched" surface without
+per-file spam.
+
 MISSING-FILES SCOPE (2026-11-01b)
 =================================
-`_scan_mentioned_files` now scopes to source extensions
+`_scan_mentioned_files` scopes to source extensions
 (`_MENTION_EXTENSIONS`) rather than all recoverable extensions
 (`SOURCE_EXTENSIONS`).  Data files (`.json`, `.yaml`, `.toml`), docs
 (`.md`, `.rst`), and scripts (`.sh`, `.bash`) are excluded from the
@@ -79,6 +102,57 @@ files, but they are excluded from the MISSING report because they
 are almost always invoked rather than imported.  An imported-from
 shell script is not a thing; if you want to recover a specific one,
 name it explicitly in the conversation.
+
+PROSE-ONLY MENTION SCAN (2026-11-05)
+====================================
+`_scan_mentioned_files` now scans **prose** (`Block.context_before`)
+only.  The previous version accepted the raw dump text and matched
+filenames anywhere in it — every `from .foo import X` in a recovered
+source body, every mention in a `recovered_meta` project dump.  On
+the 2026-11-05 conversation that meant 21 deeppeek-source files (the
+embedded `deeppeek_dump.md` block) got reported as "referenced but
+never recovered", despite being present on disk in the target tree.
+
+The scan now:
+
+  · skips pre-existing baselines (their bodies are the target's
+    own code; a mention there is the target talking to itself);
+  · skips `recovered_meta` blocks (their bodies are entire project
+    dumps; a mention there is a nested recovery exercise, not this
+    conversation's target);
+  · reads only `context_before`, so the "human intent" signal — a
+    filename in the prose of a chat message — is the only signal;
+  · filters further to files that are *not* already on disk in the
+    target tree.
+
+Combined, that produces zero false-positive MISSING_FILES entries
+for a conversation whose `recovered_meta` block embeds a full repo
+dump, and preserves every genuinely-missing entry from a conversation
+that names a file by prose and never prints it.
+
+WARNINGS AGGREGATION (2026-11-05)
+=================================
+`warnings.txt` used to emit one line per record per warning class:
+200 untouched records with the same "structural-equivalence check
+raised: name '_python_signatures' is not defined" message produced
+200 lines, all identical apart from the path.
+
+`_aggregate_warnings` collapses identical-class warnings into:
+
+    [<first_path>] [WARN] <text> (+199 more file(s) with this
+    warning)
+
+One readable line.  Every distinct warning text is preserved in
+full, so the operator never has to search for a specific record's
+warning — they read one aggregate line and, if needed, open
+`manifest.decisions[path].warnings` for the full per-record text.
+
+The helper iterates its input exactly once, accumulating grouped
+entries into `warn_groups` and preserving non-warning lines verbatim
+into `result` — a prior version appended non-warning lines during
+classification *and* during reconstruction, doubling every
+non-`[WARN]` line in the output.  The variable rename from
+`preserved` to `result` makes the single-write pattern obvious.
 
 TOOL_BUG WARNINGS TAG (2026-10-29)
 ==================================
@@ -130,22 +204,34 @@ _MENTION_EXTENSIONS = frozenset({
 })
 
 
-def _scan_mentioned_files(dump_text: str) -> set:
-    """Return basenames of source files referenced anywhere in
-    `dump_text`.
+def _scan_mentioned_files(blocks) -> set:
+    """Return basenames of source files named in **prose**, not code.
 
-    Scoped to `_MENTION_EXTENSIONS` (source code only).  Data files,
-    docs, and shells are excluded — they are not code dependencies
-    and are the main source of MISSING_FILES.txt noise.
+    Filenames in a code body are imports; `_aggregate_missing_imports`
+    already accounts for those.  Filenames in *prose* are the
+    human intent: "this conversation is about `foo.py` and `bar.py`".
+
+    The previous version accepted the raw dump text and matched
+    filenames inside every recovered source file's body — every
+    `from .foo import X` in the recovered content produced a
+    spurious "missing" entry.  On the 2026-11-05 conversation, the
+    embedded `deeppeek_dump.md` alone produced 21 false positives.
     """
     mentioned: set = set()
-    for m in re.finditer(r'[A-Za-z0-9_./\-]+', dump_text):
-        tok = m.group(0)
-        if not any(tok.endswith(ext) for ext in _MENTION_EXTENSIONS):
+    for b in blocks:
+        if b.classified_by == "preexisting":
             continue
-        base = os.path.basename(tok)
-        if base and len(base) > 3:
-            mentioned.add(base)
+        if b.kind == "recovered_meta":
+            continue
+        prose = b.context_before or ""
+        for m in re.finditer(r'[A-Za-z0-9_./\-]+', prose):
+            tok = m.group(0)
+            if not any(tok.endswith(ext)
+                       for ext in _MENTION_EXTENSIONS):
+                continue
+            base = os.path.basename(tok)
+            if base and len(base) > 3:
+                mentioned.add(base)
     return mentioned
 
 
@@ -439,6 +525,93 @@ def _patch_context(patch: dict, limit: int = 800) -> str:
     return ctx[:limit - 3] + "..."
 
 
+# Warning-class key for aggregation.  Two warnings are considered the
+# same class if their whitespace-normalized text agrees up to the first
+# 60 characters, with variable fragments — file paths, backticked
+# names, line numbers, and numeric counts — replaced by a placeholder.
+# The 2026-11-05 run had 200 records emitting the *same* structural-
+# equivalence warning because a helper name was undefined; that is
+# one bug, and it should occupy one line in warnings.txt.
+_WARN_CLASS_VAR_RE = re.compile(
+    r'`[^`]+`'
+    r'|\bline \d+\b'
+    r'|\b\d+\b'
+    r'|\[[^\]\n]+\]'
+)
+
+
+def _warn_class_key(text: str) -> str:
+    """Stable class key for a warning text.
+
+    Strips the variable parts — backticked names, line numbers, bare
+    numbers, bracketed paths — and truncates to 60 characters.  Two
+    warnings with different variable fragments but the same shape
+    produce the same key, so they aggregate; two warnings with
+    genuinely different text produce different keys and stay
+    separate.
+    """
+    return _WARN_CLASS_VAR_RE.sub("_", text)[:60]
+
+
+def _aggregate_warnings(warnings_lines: list) -> list:
+    """Collapse runs of identical-class warnings into one line + count.
+
+    Preserves the per-record `[path] [WARN] <text>` lines for warnings
+    whose text differs, but a warning class that fires on N records
+    becomes:
+
+        [<path>] [WARN] <text> (+{N-1} more file(s) with this warning)
+
+    Non-`[WARN]` lines are preserved verbatim in their original order
+    — this function only touches the `[<path>] [WARN] <text>` shape.
+
+    The function iterates its input exactly **once**, accumulating
+    grouped entries into `warn_groups` and pushing every line —
+    aggregated or verbatim — into the single output list.  A prior
+    version appended non-warning lines during classification *and*
+    during reconstruction, doubling every non-`[WARN]` line in the
+    output; the 2026-11-05 test run reported one duplicate
+    `[preexisting]` line per untouched summary block.
+
+    Motivating case (2026-11-05): 200 records emitted the same
+    `structural-equivalence check raised: name '_python_signatures'
+    is not defined` warning because `structural_diff` was broken;
+    that is one bug and should occupy one line.
+    """
+    warn_pattern = re.compile(r'^\[([^\]]+)\] \[WARN\] (.+)$')
+    warn_groups: dict[str, list] = {}
+    order: list[tuple[str, str]] = []
+
+    for line in warnings_lines:
+        m = warn_pattern.match(line)
+        if not m:
+            order.append(("other", line))
+            continue
+        path, text = m.group(1), m.group(2)
+        key = _warn_class_key(text)
+        if key not in warn_groups:
+            warn_groups[key] = []
+            order.append(("warn", key))
+        warn_groups[key].append((path, text))
+
+    result: list = []
+    for kind, val in order:
+        if kind == "other":
+            result.append(val)
+            continue
+        entries = warn_groups[val]
+        if len(entries) == 1:
+            path, text = entries[0]
+            result.append(f"[{path}] [WARN] {text}")
+        else:
+            sample_path, sample_text = entries[0]
+            result.append(
+                f"[{sample_path}] [WARN] {sample_text} "
+                f"(+{len(entries) - 1} more file(s) with this warning)"
+            )
+    return result
+
+
 def pass9_write(records: dict,
                 blocks: list,
                 deleted_files: list,
@@ -456,7 +629,8 @@ def pass9_write(records: dict,
                 resolutions: Optional[list] = None,
                 cross_file_duplicates: Optional[list] = None,
                 verbose: bool = False,
-                run_errors: Optional[list] = None) -> int:
+                run_errors: Optional[list] = None,
+                pass_timings: Optional[dict] = None) -> int:
     if apply_to is not None:
         files_dir = apply_to
         aux_dir = apply_to / "deeppeek"
@@ -726,7 +900,6 @@ def pass9_write(records: dict,
         if preexisting_unmodified:
             reason = ("pre-existing file with no conversation "
                       "changes; left as-is")
-            warnings_lines.append(f"[{path}] [PREEXISTING] {reason}")
             skipped.append({
                 "path": path,
                 "state": rec.state,
@@ -739,6 +912,8 @@ def pass9_write(records: dict,
                 print(f"  SKIPPED {path} (preexisting): {reason}",
                       file=sys.stderr)
             preexisting_skipped_count += 1
+            # NOTE (2026-11-05): no per-file `[PREEXISTING]` warning
+            # line — aggregated below into a single summary line.
             continue
 
         if out_name in written_out_names:
@@ -918,7 +1093,9 @@ def pass9_write(records: dict,
             f"(lang={b.fence_lang}, {b.body_line_count} line(s), "
             f"first: {first_line!r})")
 
-    mentioned = _scan_mentioned_files(dump_text)
+    # NEW (2026-11-05): prose-only scan.  See module docstring,
+    # PROSE-ONLY MENTION SCAN section.
+    mentioned = _scan_mentioned_files(blocks)
 
     recovered_exts = _recovered_extensions(records)
     if recovered_exts:
@@ -941,9 +1118,18 @@ def pass9_write(records: dict,
     else:
         mentioned = set()
 
+    # NEW (2026-11-05): filter further to files that are not already
+    # present in the target tree.  A file that exists on disk was not
+    # "missed" by the recovery — it was just not touched by this run.
+    on_disk: set = set()
+    if apply_to is not None and apply_to.is_dir():
+        for p in apply_to.rglob("*"):
+            if p.is_file():
+                on_disk.add(p.name)
+
     missing = (
         (mentioned | imported_missing) - recovered - deleted_set
-        - SKIP_MISSING_FILES
+        - SKIP_MISSING_FILES - on_disk
     )
 
     if missing:
@@ -990,6 +1176,17 @@ def pass9_write(records: dict,
                 "  (per-file listing suppressed in --apply-to mode; "
                 "the target tree owns its own files)")
 
+    # NEW (2026-11-05): pre-existing-skip aggregation.  One line for
+    # the whole run instead of one `[PREEXISTING]` line per file.
+    # Per-file detail remains in `manifest.decisions[path]`, which has
+    # the record's state, preexisting_base flag, verification, and
+    # warnings.
+    if preexisting_skipped_count:
+        warnings_lines.append(
+            f"[preexisting] {preexisting_skipped_count} pre-existing "
+            f"file(s) left unchanged (not part of this run)"
+        )
+
     if cross_file_duplicates:
         for _d in cross_file_duplicates:
             _files = ", ".join(_d["files"])
@@ -1022,6 +1219,10 @@ def pass9_write(records: dict,
         }
     (reports_dir / "repairs.json").write_text(
         json.dumps(repairs_manifest, indent=2))
+
+    # NEW (2026-11-05): aggregate repeated warnings.  See module
+    # docstring, WARNINGS AGGREGATION section.
+    warnings_lines = _aggregate_warnings(warnings_lines)
 
     warnings_text = "\n".join(warnings_lines)
     if warnings_text:
@@ -1145,6 +1346,11 @@ def pass9_write(records: dict,
             },
             "ast": ast_info,
             "errors": _run_errors,
+            "pass_timings": (
+                {k: round(v, 3) for k, v in
+                 sorted(pass_timings.items(), key=lambda kv: -kv[1])}
+                if pass_timings else None
+            ),
             "block_classification": {
                 "total": len(blocks),
                 "escalated_to_llm": escalated,

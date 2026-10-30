@@ -118,7 +118,7 @@ DEFAULT_TREE_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modul
 
 # Directory names whitelist: if NON-EMPTY, only descend into subdirectories
 # whose basename is in this list.
-DEFAULT_INCLUDE_DIRS = []
+DEFAULT_INCLUDE_DIRS = ['recover']
 
 # Filename substrings whitelist: if NON-EMPTY, a file is only kept when its
 # filename contains AT LEAST ONE of these substrings.

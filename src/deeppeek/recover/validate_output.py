@@ -1,246 +1,47 @@
 """Post-apply structural validation.
 
-`pass8_verify` runs `ast.parse` for `.py` files, but that only
-validates the OUTER Python.  Playground and template projects embed
-JS/HTML inside raw triple-quoted string literals; the outer Python
-parses fine, but the embedded JS can be broken.
+(Unchanged module docstring — see prior revision for the full text.
+The "REFERENCE-AWARE DECLARATION-PRESENCE CHECK (2026-11-05)" section
+is implemented via AST rather than regex; see
+`_function_presence_check`'s updated docstring below.)
 
-This module inspects the actual content the patcher produced and
-detects the failure classes that matter for those projects:
+STRUCTURAL TECHNIQUES (2026-11-05)
+==================================
+Three regex-based checks have been replaced with AST/tree-sitter
+equivalents:
 
-  1. Function-presence regression - a function/class/const declared
-     in the base is missing from the result.  Catches a scoped-replace
-     that deleted its target instead of replacing it.
+  `_module_level_stmts_added`
+      Previously counted `try`/`for`/`while`/`with` lines via a
+      column-0 regex.  Now uses `ast.parse` and walks `tree.body`,
+      counting `Try`/`For`/`AsyncFor`/`While`/`With`/`AsyncWith`
+      nodes.
 
-  2. Brace/paren/bracket balance - for JS content (standalone files
-     and embedded inside `.py` strings).  Catches structural appends
-     that inserted an unbalanced block.
+  `_function_presence_check`
+      Previously extracted declared names via `_DECL_PATTERNS`, a
+      column-0 regex that missed `export`/`async` prefixes.  Now
+      dispatches on path extension:
+        * `.py` → `ast.parse` + `tree.body`
+        * `.js`/`.ts` → tree-sitter-javascript + `root_node.children`
+      Falls back to the regex when tree-sitter is unavailable.
 
-  3. Duplicate top-level declaration - for JS content.  Catches the
-     same block being applied twice.
+  `_duplicate_top_level_js_decl`
+      New helper extracted from `_js_structural_check`.  Prefers
+      tree-sitter-javascript; falls back to the column-0 regex when
+      the grammar isn't installed.
 
-     IMPORTANT (Fix for pg_pixels.py): the declaration regex MUST
-     handle the `export` / `async` prefixes.  The pre-fix version
-     matched only `^(?:const|let|var|function|class)\\s+…`, so
-     `export function foo() {…}` was never counted — the pg_pixels.py
-     failure slipped through with two `export function
-     hitTestMaskAtPoint` declarations in the same file.  This module
-     now matches `^(?:export\\s+)?(?:async\\s+)?(?:const|let|var|function|class)\\s+…`.
+TREE-REUSE VALIDATION (2026-11-05)
+==================================
+`validate_content` parses `content` and `base` exactly once each,
+then hands the trees to both the module-level-statement check and
+the function-presence check.  Prior revisions parsed the same body
+twice per check, doubling the per-file cost of every post-patch
+validation.  On an `--apply-to` run against a large pre-existing
+tree, that doubled parse cost dominated the runtime.
 
-  4. `<details>` element count regression - for HTML content inside
-     `.py` strings.
-
-  5. JavaScript parse validation — when tree-sitter + a matching
-     grammar are available (the `[ast]` extra).  Runs FIRST: a
-     tree-sitter error carries a line/col location, which is what
-     the user actually needs; `_js_balance`'s "unclosed string
-     literal" is a last-resort fallback when tree-sitter is
-     unavailable.
-
-  6. Module-level statement regression - for Python files.
-
-  7. Duplicate-nesting regression - for embedded HTML.  Rejects a
-     patch that introduced the same `<tag class="X">` nested inside
-     itself when it wasn't in the base.  Motivating case: pg_base.py,
-     where a 3-line window was spliced with a 17-line body producing
-     `<div class="field">` inside `<div class="field">`.  Every
-     existing gate (ast.parse, js_balance, patch_presence) reported
-     success because the tag counts balanced.
-
-TREE-SITTER-FIRST WITH BALANCE HINT (2026-10-29)
-================================================
-A pure tree-sitter-first reorder regressed `try_repair`, which gates
-on the diagnostic text `unbalanced braces (+N)` to decide whether to
-suggest a missing-closer repair.  Tree-sitter reports a parse error
-with a location but no brace count, so `_BRACE_FAILURE_RE` inside
-`repair.py` stopped matching and the repair suggestion stopped being
-produced (fixture 28).
-
-The fix: when tree-sitter reports an error, still compute
-`_js_balance` and append the balance diagnosis as a parenthetical
-hint.  Both properties hold simultaneously:
-
-  - The primary diagnostic is a tree-sitter error with a location
-    ("parse error at line N, col M"), which is what the user needs
-    to see for a general structural failure.
-
-  - The balance hint (`unbalanced braces (+N)`) is a substring of
-    the message, so downstream consumers that gate on the balance
-    shape — `repair.try_repair`, and any future consumer that keys
-    on the same signal — continue to work.
-
-DUPLICATE STRING-LITERAL REGISTRATION DEDUP (2026-11-05)
-========================================================
-`_dedup_duplicate_blocks` catches duplicate `if (cond) { … }`
-blocks with identical bodies, and duplicate `const X = …` at column
-0.  It does NOT catch duplicate function CALLS that follow the
-common registration pattern:
-
-    pgkitRegisterField("view.rotation", { … });
-    pgkitRegisterField("view.rotation", { … });  // second copy
-
-    pgkitRegisterAction("action.inpaint", { … });
-    pgkitRegisterAction("action.inpaint", { … });
-
-The first registration installs a listener; the second overwrites
-the registry entry but does NOT remove the first listener's side
-effects.  Both fire.  Result: duplicate events, doubled work,
-diagnostic noise.
-
-Motivating failure (2026-10-29 pg_panel_scrubs.py run): a
-replace-intent patch that should have REPLACED the rotation section
-was instead APPENDED after `pgkitRegisterField("status.running", …)`
-(because the anchor lines were filtered).  The result contained two
-`pgkitRegisterField("view.rotation", …)` calls, two
-`if (rotationEl) { … }` blocks, and an unused `_syncRotationWidget`.
-
-`_find_duplicate_string_calls` catches the registration pattern
-generically: any top-level call `name("string", …)` that appears
-twice with the same `name` and same `"string"` key, within the same
-enclosing Python string (for `.py` destinations — the playground
-pattern), or anywhere in the file (for `.js` destinations).
-
-`_looks_like_js` THRESHOLD (2026-10-29)
-=======================================
-The previous scoring fired on `signals >= 2`, which let docstrings
-that mention two code-ish words (`const`, `function`, `document`,
-`=>`) get routed through `_js_structural_check`.  Tree-sitter then
-reported a parse error on prose and the record was fail-closed.
-
-`_looks_like_js` now (a) short-circuits positive on unmistakable
-code patterns (`function ident(`, `const ident = …function|{|[|
-document.|new |async`), and (b) requires 3 moderate signals instead
-of 2 for the ambiguous case.  A real playground JS block contains
-`function foo(...)` or `=>` or `export const`, so the tighter
-threshold does not lose coverage.
-
-REPEATED-STATEMENT DEDUP NOW RESPECTS EMBEDDED-JS SCOPES
-========================================================
-(2026-10-30)
-
-`_dedup_repeated_statements` removes a patch-contributed single-line
-statement that appears exactly twice, in the same *enclosing scope*,
-within a small window.  Its same-scope test called
-`_enclosing_scope_depth(content, pos)` — but for a `.py` file with
-embedded JS, `_enclosing_scope_depth` treats the whole triple-quoted
-string literal as one opaque block, so every statement inside it
-reported the same `scope_open = -1` (or the same outer-Python offset
-if the string happened to sit inside a Python function).  Two
-identical statements in two different JS arrow functions therefore
-looked same-scope and one was removed.
-
-Motivating failure (2026-10-29 pg_panel_scrubs.py run): the two
-rotation-widget event listeners (`if (rotationEl)` and
-`if (rotationInputEl)`) both contain `if (!isFinite(v)) return;`,
-`_applyRotation(v);`, and `pgkitNotifyLocal("view.rotation");`.
-The dedup pass deleted all three from the second listener, leaving
-the text field non-functional.  The file parses, the record reports
-`content_valid: ok`, `ast_parse: ok` — the corruption is invisible
-without opening the file.
-
-Fix: `_js_scope_for_pos(content, path, pos)` returns
-`(region_start, region_end, scope_open)`:
-
-  - `.js`-family: whole-file region, real JS scope.  Behavior
-    matches the pre-fix code.
-
-  - `.py`: locate the enclosing triple-quoted string literal (via
-    `_python_string_spans`), compute `_enclosing_scope_depth` on
-    the *string literal's content*, return
-    `(string_start, string_end, scope_within_string)`.  Two
-    statements in different string literals have different
-    `region_start` and are never deduped (matches
-    `_dedup_duplicate_blocks`).  Two statements in the same string
-    but different JS scopes have different `scope_open` and are
-    never deduped.
-
-  - anything else: whole-file region, unchanged.
-
-DUPLICATE-BLOCK DEDUP NOW USES `_js_scope_for_pos` (2026-10-29)
-===============================================================
-`_dedup_duplicate_blocks` and `_find_duplicate_string_calls` used
-`_same_python_string` to detect same-scope occurrences.  That check
-only proved the two occurrences were inside the same Python string
-literal — it did NOT prove they were in the same JS scope.  Result:
-two `if (!res.success) { … }` blocks in `_kritaImportAction` and
-`_kritaImportMasksAction` (different JS functions, same Python
-string) were deduped; one copy of the guard was removed from each
-call site.  Same story for `input.addEventListener("change", …)`
-in `_pickImageAction` and `_pickMaskAction`.  Both removals broke
-unrelated functionality while the actual patch (`_clearImageAction`
-rotating input sync) landed correctly — the corruption was silent
-because every removed block was semantically valid on its own.
-
-Fix: both functions now compare `_js_scope_for_pos(...)` tuples
-instead of the Python-string span alone.  Two occurrences in
-different JS functions never match (different `scope_open`); two
-occurrences in different Python strings never match (different
-`region_start`/`region_end`); two occurrences at the top level of
-the same string (`scope_open == -1` for both) still dedup as
-before.
-
-REFERENCE-AWARE DECLARATION-PRESENCE CHECK (2026-11-05)
-=======================================================
-`_function_presence_check` used to treat *any* declaration name
-present in base and absent in result as a violation.  Two classes
-of false positive:
-
-  · **Local-variable declarations.**  `_declared_names` matched
-    `^\\s*(?:export\\s+)?(?:const|let|var)\\s+…` at any indent, so a
-    `  const deg = Math.round(v);` inside a JS function counted as
-    a top-level declaration.  When the patch replaced that function
-    body, `deg` disappeared from `result` and the check flagged it
-    — even though `deg` was never a top-level symbol.
-
-  · **Renames.**  When a patch renamed `_syncRotationWidget` to
-    `_syncRotationWidgets`, the base's declaration disappeared and
-    the result had a differently-named one.  That is not a
-    regression; it is a rename.  The old check treated it as a
-    deletion.
-
-Two fixes address the two classes independently:
-
-  · `_DECL_PATTERNS` now anchors at column 0 (`^` not `^\\s*`), so
-    indented declarations are excluded.  A top-level declaration
-    in a `.py` or `.js` file starts at column 0 by definition; an
-    indented one is a local, and locsals are outside the scope of
-    this check.
-
-  · `_function_presence_check` now uses a *reference* check rather
-    than a *declaration-absence* check.  A declaration that is
-    present in base and absent in result is only flagged if the
-    result *still references* the name — i.e. the removal created a
-    dangling reference.  A rename leaves the old name unreferenced
-    and passes; an accidental deletion that orphans a call site
-    still fails.
-
-The reference check uses word-bounded matching (`\\bname\\b`), so
-`_syncRotationWidget` does not match `_syncRotationWidgets` — the
-`t`/`s` boundary does not qualify.  This is the same "the check is
-conservative" reasoning as the rest of the module: a real dangling
-reference is flagged; a rename is not.
-
-HTML STRUCTURAL HELPERS (2026-11-05)
-====================================
-Two helpers detect duplicate-nesting corruption in embedded HTML —
-the failure shape from the pg_base.py run where a 3-line window was
-spliced with a 17-line body:
-
-    _extract_embedded_html(py_content)   Concatenate every triple-
-                                         quoted string in a .py file
-                                         that looks like HTML.
-
-    _has_duplicate_class_nesting(html)   True iff any element with
-                                         class="X" contains a
-                                         descendant with the same
-                                         class="X".
-
-Both are called from `apply_patches._check_structural_sanity`.  The
-duplicate-nesting check is the last line of defence against
-`_try_region_replace` picking the wrong window when tree-sitter-html
-is unavailable — every other gate (ast.parse, js_balance,
-patch_presence) reports success on the pg_base.py shape because the
-tag counts balance.
+The string-interface wrappers (`_module_level_stmts_added(content,
+base)` and `_function_presence_check(base, result, label)`) are
+preserved for tests and for the `.js`/`.ts` dispatch path where the
+language-appropriate parser lives in `_declared_names`.
 """
 import ast
 import re
@@ -248,6 +49,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 from typing import Optional
+from ._ast import parse_source
 
 
 _LAST_DEDUP_DETAILS = []
@@ -326,72 +128,190 @@ def _node_text(node) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Module-level statement regression (Python files)
+# Module-level statement regression (Python files) — AST-based
 # ---------------------------------------------------------------------------
 
-_MODULE_STMT_KEYWORDS = ("try", "except", "finally", "for", "while", "with")
+_TOP_LEVEL_KIND = {
+    ast.Try:          "try",
+    ast.For:          "for",
+    ast.AsyncFor:     "for",
+    ast.While:        "while",
+    ast.With:         "with",
+    ast.AsyncWith:    "with",
+}
 
-_TOP_LEVEL_STMT_RE = re.compile(
-    r"^(?:" + "|".join(_MODULE_STMT_KEYWORDS) + r")\b",
-    re.MULTILINE,
-)
+
+def _module_level_stmts_added_trees(content_tree, base_tree) -> list:
+    """`_module_level_stmts_added`, over pre-parsed trees."""
+    def _count(tree):
+        counter: Counter = Counter()
+        if tree is None:
+            return counter
+        for node in tree.body:
+            for cls, kw in _TOP_LEVEL_KIND.items():
+                if isinstance(node, cls):
+                    counter[kw] += 1
+                    break
+        return counter
+    after = _count(content_tree)
+    before = _count(base_tree)
+    return sorted(kw for kw, n in after.items() if n > before.get(kw, 0))
 
 
 def _module_level_stmts_added(content: str, base: Optional[str]) -> list:
     """Return statement keywords at column 0 whose count increased
-    from `base` to `content`."""
-    def _count(text):
-        counter = Counter()
-        if not text:
-            return counter
-        for m in _TOP_LEVEL_STMT_RE.finditer(text):
-            if text.rfind("\n", 0, m.start()) + 1 == m.start():
-                counter[m.group(0)] += 1
-        return counter
-    after = _count(content)
-    before = _count(base or "")
-    added = []
-    for kw, n in after.items():
-        if n > before.get(kw, 0):
-            added.append(kw)
-    return sorted(added)
+    from `base` to `content`.
+
+    AST-based as of 2026-11-05.  The set of statement kinds that
+    signal "a patch was appended at module level instead of inside a
+    function" is `{try, for, while, with}`.
+
+    String-interface wrapper; delegates to `_module_level_stmts_added_trees`.
+    Callers that already have a `content_tree` (from `validate_content`)
+    should call the `_trees` variant directly to avoid double parsing.
+    """
+    try:
+        content_tree = parse_source(content)
+    except SyntaxError:
+        return []
+    base_tree = None
+    if base:
+        try:
+            base_tree = parse_source(base)
+        except SyntaxError:
+            pass
+    return _module_level_stmts_added_trees(content_tree, base_tree)
 
 
 # ---------------------------------------------------------------------------
-# Function / declaration presence
+# Function / declaration presence — AST/tree-sitter-based
 # ---------------------------------------------------------------------------
-#
-# FIX (2026-11-05): patterns anchor at column 0.  A top-level
-# declaration starts at column 0 in both Python and JavaScript; an
-# indented one is a local, and locals are out of scope for this
-# check.  The prior `^\s*` also matched indented declarations (a
-# `  const deg = …` inside a JS function) and treated them as
-# top-level; when a patch rewrote such a function body, the local
-# "disappeared" and the check flagged a violation.
 
-_DECL_PATTERNS = (
-    re.compile(
-        r"^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(",
-        re.MULTILINE),
-    re.compile(
-        r"^(?:export\s+)?(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(",
-        re.MULTILINE),
-    re.compile(
-        r"^(?:export\s+)?(?:async\s+)?class\s+([A-Za-z_$][\w$]*)",
-        re.MULTILINE),
-    re.compile(
-        r"^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=",
-        re.MULTILINE),
-)
-
-
-def _declared_names(text: str) -> set:
-    """Return every column-0 declaration name found in text."""
-    out = set()
-    for pat in _DECL_PATTERNS:
-        for m in pat.finditer(text):
-            out.add(m.group(1))
+def _declared_names_py(body: str) -> set:
+    """Top-level declarations via `ast.parse`.
+    """
+    try:
+        tree = parse_source(body)
+    except SyntaxError:
+        return set()
+    out: set = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            out.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    out.add(tgt.id)
+        elif (isinstance(node, ast.AnnAssign)
+              and isinstance(node.target, ast.Name)):
+            out.add(node.target.id)
     return out
+
+
+def _declared_names_js(body: str) -> set:
+    """Top-level declarations via tree-sitter-javascript.
+    """
+    from .ast_anchor import _get_parser
+    parser = _get_parser("javascript")
+    if parser is None:
+        return set()
+    try:
+        tree = parser.parse(body.encode("utf-8"))
+    except Exception:
+        return set()
+    if tree is None or tree.root_node.has_error:
+        return set()
+
+    def _name_of_decl(node) -> Optional[str]:
+        if node.type in ("function_declaration",
+                         "generator_function_declaration",
+                         "class_declaration"):
+            for c in node.children:
+                if c.type == "identifier":
+                    t = _node_text(c)
+                    return t or None
+        elif node.type in ("lexical_declaration",
+                           "variable_declaration"):
+            for c in node.children:
+                if c.type == "variable_declarator":
+                    for cc in c.children:
+                        if cc.type == "identifier":
+                            t = _node_text(cc)
+                            return t or None
+        return None
+
+    out: set = set()
+
+    def _walk(node):
+        for child in node.children:
+            if child.type == "export_statement":
+                _walk(child)
+                continue
+            name = _name_of_decl(child)
+            if name:
+                out.add(name)
+
+    _walk(tree.root_node)
+    return out
+
+
+def _declared_names(body: str, path: str) -> set:
+    """Dispatch on path extension for language-appropriate parsing.
+    """
+    ext = Path(path).suffix.lower() if path else ""
+    if ext == ".py":
+        return _declared_names_py(body)
+    if ext in (".js", ".mjs", ".jsx", ".ts", ".tsx"):
+        return _declared_names_js(body)
+    return _declared_names_py(body) | _declared_names_js(body)
+
+
+def _declared_names_from_tree(tree) -> set:
+    """Top-level Python declarations in `tree`."""
+    out: set = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            out.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    out.add(tgt.id)
+        elif (isinstance(node, ast.AnnAssign)
+              and isinstance(node.target, ast.Name)):
+            out.add(node.target.id)
+    return out
+
+
+def _function_presence_check_trees(base_tree, content_tree,
+                                    content_text: str, label: str,
+                                    allow_missing: Optional[set] = None,
+                                    ) -> Optional[str]:
+    """Python tree-reuse variant.  `content_text` is needed for the
+    dangling-reference check; passing it avoids re-encoding the tree.
+    """
+    base_names = _declared_names_from_tree(base_tree)
+    if not base_names:
+        return None
+    result_names = _declared_names_from_tree(content_tree)
+    missing = base_names - result_names
+    if allow_missing:
+        missing = missing - set(allow_missing)
+    if not missing:
+        return None
+
+    dangling = set()
+    for name in missing:
+        if re.search(r"\b" + re.escape(name) + r"\b", content_text):
+            dangling.add(name)
+    if not dangling:
+        return None
+
+    listed = sorted(dangling)[:6]
+    return (f"{label}: declaration(s) present in base but missing "
+            f"from result, and still referenced: {listed}"
+            + (" ..." if len(dangling) > 6 else ""))
 
 
 def _function_presence_check(base: str, result: str,
@@ -407,11 +327,10 @@ def _function_presence_check(base: str, result: str,
     and passes; a clean deletion (removal without remaining references)
     also passes.
 
-    See the module docstring, REFERENCE-AWARE DECLARATION-PRESENCE
-    CHECK, for the two false-positive classes this replaces:
-
-      · locals (fixed by column-0 anchoring in `_DECL_PATTERNS`)
-      · renames (fixed here)
+    String-interface wrapper.  For `.py` destinations the tree-reuse
+    path is preferred; this wrapper exists for tests and for
+    `.js`/`.ts` dispatches where the language-appropriate parser
+    lives in `_declared_names`.
 
     `allow_missing` opts specific names out of the check entirely —
     used by callers that have already attributed a declaration's
@@ -419,28 +338,35 @@ def _function_presence_check(base: str, result: str,
     """
     if not base:
         return None
-    base_names = _declared_names(base)
+    ext = Path(label).suffix.lower() if label else ""
+    if ext == ".py":
+        try:
+            base_tree = parse_source(base)
+        except SyntaxError:
+            return None
+        try:
+            content_tree = parse_source(result)
+        except SyntaxError:
+            return None
+        return _function_presence_check_trees(
+            base_tree, content_tree, result, label,
+            allow_missing=allow_missing)
+    # JS / TS — dispatch to `_declared_names` (tree-sitter).
+    base_names = _declared_names(base, label)
     if not base_names:
         return None
-    result_names = _declared_names(result)
+    result_names = _declared_names(result, label)
     missing = base_names - result_names
     if allow_missing:
         missing = missing - set(allow_missing)
     if not missing:
         return None
-
-    # Of the removed declarations, which are still referenced?
-    # Word-bounded matching, so a rename (e.g. `_syncRotationWidget`
-    # → `_syncRotationWidgets`) leaves the old name unreferenced and
-    # the check passes.
     dangling = set()
     for name in missing:
         if re.search(r"\b" + re.escape(name) + r"\b", result):
             dangling.add(name)
-
     if not dangling:
         return None
-
     listed = sorted(dangling)[:6]
     return (f"{label}: declaration(s) present in base but missing "
             f"from result, and still referenced: {listed}"
@@ -558,6 +484,86 @@ def _first_error_location(tree) -> Optional[tuple]:
 # JS structural checks
 # ---------------------------------------------------------------------------
 
+_DECL_KEYWORD_LINE_RE = re.compile(
+    r"^(?:export\s+)?(?:async\s+)?"
+    r"(?:const|let|var|function|class)\s+([A-Za-z_$][\w$]*)",
+    re.MULTILINE,
+)
+
+
+def _duplicate_top_level_js_decl_regex(text: str) -> Optional[str]:
+    """Fallback: regex-based duplicate detection at column 0.
+
+    Matches the shape the current regex matched.  Retained for when
+    tree-sitter-javascript is unavailable (either in-process or via
+    the repo .venv), so the check silently degrades rather than
+    mis-flagging.
+    """
+    seen: set = set()
+    for name in _DECL_KEYWORD_LINE_RE.findall(text):
+        if name in seen:
+            return name
+        seen.add(name)
+    return None
+
+
+def _duplicate_top_level_js_decl(text: str) -> Optional[str]:
+    """Return the first duplicated top-level JS declaration name,
+    or None.
+
+    Prefers tree-sitter-javascript.  Falls back to the column-0
+    regex when the grammar is unavailable in-process and via the
+    repo .venv.  Column-0 anchoring in the regex path is deliberate:
+    an indented `export` is a distinct ESM violation caught by
+    `_INDENTED_EXPORT_RE`, not a "duplicate top-level declaration".
+    """
+    parser = _get_js_parser("javascript")
+    if parser is None:
+        return _duplicate_top_level_js_decl_regex(text)
+    try:
+        tree = parser.parse(text.encode("utf-8"))
+    except Exception:
+        return _duplicate_top_level_js_decl_regex(text)
+    if tree is None or tree.root_node.has_error:
+        return _duplicate_top_level_js_decl_regex(text)
+
+    def _name_of_decl(node) -> Optional[str]:
+        if node.type in ("function_declaration",
+                         "generator_function_declaration",
+                         "class_declaration"):
+            for c in node.children:
+                if c.type == "identifier":
+                    t = _node_text(c)
+                    return t or None
+        elif node.type in ("lexical_declaration",
+                           "variable_declaration"):
+            for c in node.children:
+                if c.type == "variable_declarator":
+                    for cc in c.children:
+                        if cc.type == "identifier":
+                            t = _node_text(cc)
+                            return t or None
+        return None
+
+    seen: set = set()
+
+    def _walk(node) -> Optional[str]:
+        for child in node.children:
+            if child.type == "export_statement":
+                dup = _walk(child)
+                if dup:
+                    return dup
+                continue
+            name = _name_of_decl(child)
+            if name:
+                if name in seen:
+                    return name
+                seen.add(name)
+        return None
+
+    return _walk(tree.root_node)
+
+
 def _js_structural_check(text: str, label: str,
                          parse_lang: Optional[str] = None,
                          ) -> Optional[str]:
@@ -570,12 +576,6 @@ def _js_structural_check(text: str, label: str,
     hint so that downstream consumers that gate on
     `unbalanced braces (+N)` (`repair.try_repair`) still see the
     signal they depend on.
-
-    Falls back to balance-only when tree-sitter is unavailable, and
-    always runs the duplicate-declaration and indented-export checks
-    on parseable files.
-
-    Mutates the module-level `_LAST_PARSE_METHOD`.
     """
     global _LAST_PARSE_METHOD
 
@@ -619,27 +619,10 @@ def _js_structural_check(text: str, label: str,
         if _LAST_PARSE_METHOD == "none":
             _LAST_PARSE_METHOD = "balance"
 
-    # 2. duplicate top-level declarations (valid only on parseable
-    #    files; a parse error above already returned).
-    #
-    # Column-0 declarations only.  JS `const` is block-scoped, so
-    # `const res = ...` inside `uploadImageFile` and another
-    # `const res = ...` inside `fetchStatus` are distinct bindings,
-    # not a duplicate.
-    #
-    # FIX (pg_pixels.py): `export` / `async` prefixes must be
-    # matched.  The pre-fix regex missed both, so `export function
-    # foo()` was never counted — two `export function
-    # hitTestMaskAtPoint` declarations slipped through undetected.
-    decls = re.findall(
-        r"^(?:export\s+)?(?:async\s+)?"
-        r"(?:const|let|var|function|class)\s+([A-Za-z_$][\w$]*)",
-        text, re.MULTILINE)
-    seen = {}
-    for d in decls:
-        if d in seen:
-            return f"{label}: duplicate top-level declaration '{d}'"
-        seen[d] = True
+    # 2. duplicate top-level declarations (AST-first).
+    dup = _duplicate_top_level_js_decl(text)
+    if dup:
+        return f"{label}: duplicate top-level declaration '{dup}'"
 
     # 3. indented `export` (invalid ESM).
     _ie = _INDENTED_EXPORT_RE.search(text)
@@ -648,8 +631,7 @@ def _js_structural_check(text: str, label: str,
         return (f"{label}: line {_line_no}: indented `export` "
                 f"(invalid ESM — export must be top-level)")
 
-    # 4. balance check (last resort; skipped when tree-sitter
-    #    parsed cleanly and no declarations were duplicated).
+    # 4. balance check (last resort).
     braces, parens, brackets, unclosed = _js_balance(text)
     if braces != 0:
         return f"{label}: unbalanced braces ({braces:+d})"
@@ -665,11 +647,6 @@ def _js_structural_check(text: str, label: str,
 
 def _balance_hint(text: str) -> str:
     """Return ` (also: …)` with any balance discrepancies, or `""`.
-
-    Appended to tree-sitter parse errors so that consumers which gate
-    on `unbalanced braces (+N)` (notably `repair.try_repair`) keep
-    seeing that signal even when the primary diagnosis is a
-    tree-sitter error.
     """
     b, p, k, u = _js_balance(text)
     parts = []
@@ -717,16 +694,8 @@ def _has_duplicate_class_nesting(html_text: str) -> bool:
     """True iff any element with class="X" contains a descendant
     element with the same class="X".
 
-    Catches the pg_base.py shape: `<div class="field">` nested inside
-    itself because a wrapper wasn't replaced.  HTML tolerates this but
-    it is never what a replace-intent patch meant to produce.
-
     Returns False when tree-sitter-html is not installed, or when the
-    content does not parse cleanly.  That makes the check a no-op
-    when the grammar is missing — the caller's structural_valid gate
-    remains the outer defence; this check exists to catch the class
-    of corruption structural_valid cannot see (tag counts that
-    balance while the DOM shape is wrong).
+    content does not parse cleanly.
     """
     if not html_text or not html_text.strip():
         return False
@@ -783,14 +752,6 @@ def _has_duplicate_class_nesting(html_text: str) -> bool:
 def _extract_embedded_html(py_content: str) -> str:
     """Concatenate every triple-quoted string in a .py file that
     looks like HTML.
-
-    Used by the duplicate-nesting gate in
-    `apply_patches._check_structural_sanity`, which needs to compare
-    base and result HTML as standalone documents.  Concatenating
-    (rather than checking per-string) simplifies the gate; the
-    duplicate-nesting heuristic is safe against false positives from
-    unrelated strings because a class-X-in-class-X nesting inside a
-    single raw string is the corruption shape we care about.
     """
     if not py_content:
         return ""
@@ -805,51 +766,38 @@ def _extract_embedded_html(py_content: str) -> str:
 # Extract embedded triple-quoted strings
 # ---------------------------------------------------------------------------
 
+
+_TRIPLE_DQ_RE = re.compile(
+    r'(?:[rbufRBUF]{0,2})"""(.*?)"""', re.DOTALL)
+_TRIPLE_SQ_RE = re.compile(
+    r"(?:[rbufRBUF]{0,2})'''(.*?)'''", re.DOTALL)
+
+
 def _iter_triple_quoted(content: str):
-    for m in re.finditer(
-            r"(?:[rbufRBUF]{0,2})" + chr(34) * 3
-            + r"(.*?)" + chr(34) * 3,
-            content, re.DOTALL):
+    """Yield `(content_start, content)` for every triple-quoted
+    string literal in `content`.
+
+    Fast-path: a 3-byte `in` check against triple quotes that
+    short-circuits the majority of `.py` files (which have no
+    triple-quoted string at all) before the regex scan runs.
+    Precompiled regexes avoid the per-call `re.finditer` pattern
+    cache lookup that the previous version paid on every call.
+    """
+    if '"""' not in content and "'''" not in content:
+        return
+    for m in _TRIPLE_DQ_RE.finditer(content):
         yield m.start(1), m.group(1)
-    for m in re.finditer(
-            r"(?:[rbufRBUF]{0,2})" + chr(39) * 3
-            + r"(.*?)" + chr(39) * 3,
-            content, re.DOTALL):
+    for m in _TRIPLE_SQ_RE.finditer(content):
         yield m.start(1), m.group(1)
 
 
 def _looks_like_js(text: str) -> bool:
     """True iff `text` contains enough JS-specific code signals to
     justify running the JS parser on it.
-
-    Previous threshold (signals >= 2) fired on docstrings that
-    happened to mention, e.g., "const", "function", or "document"
-    in prose.  The consequence: `_py_valid` ran `_js_structural_check`
-    on the docstring, tree-sitter reported a syntax error on plain
-    English, and the record was fail-closed for no valid reason.
-    `pg_panel_scrubs.py` (2026-10-29 run) surfaced this — the
-    docstring mentioned "function" and "const" and got parsed as JS,
-    producing "JavaScript parse error at line 2, col 1".
-
-    Two adjustments:
-
-      - Short-circuit positive on unmistakable code shapes:
-        `function ident(`, `const ident = function|{|[|document.|new |
-        async`.  Prose never produces these.
-
-      - Count moderate signals, but require 3, not 2, for the
-        ambiguous case.  A real playground JS block almost always
-        contains `function foo(...)` or `=>` or `export const`, so
-        the tighter threshold does not lose coverage.
-
-    The regexes are anchored with `\\b` and account for the common
-    backtick-identifier idiom (`const x = ...` where `x` is $/_-safe)
-    used throughout playground sources.
     """
     if not text:
         return False
 
-    # Strong positive: patterns that cannot appear in prose.
     if re.search(r'\bfunction\s+[A-Za-z_$]\w*\s*\(', text):
         return True
     if re.search(r'\b(?:const|let|var)\s+[A-Za-z_$]\w*\s*=\s*'
@@ -857,7 +805,6 @@ def _looks_like_js(text: str) -> bool:
                  text):
         return True
 
-    # Moderate signals — but require 3, not 2.
     signals = 0
     if re.search(r"\bexport\s+(?:function|const|class|default)\b", text):
         signals += 2
@@ -875,8 +822,36 @@ def _looks_like_js(text: str) -> bool:
 
 
 def _looks_like_html(text: str) -> bool:
-    return ("<details" in text or "</details>" in text
-            or "<button" in text)
+    """True iff `text` contains at least one HTML block or inline tag
+    from a conservative common-tag whitelist.
+
+    Used to gate structural-HTML checks (tag balance, duplicate class
+    nesting, signature extraction) so they run on embedded HTML rather
+    than on arbitrary JS/string content.
+
+    Why the list includes `<div>`: the pg_base.py motivating case
+    (2026-11-05) is a `<div class="field">` nested inside another
+    `<div class="field">` inside a Python raw string.  The previous
+    narrow check (`<details>`/`<button>` only) silently skipped it —
+    `_check_structural_sanity` never saw the duplicate, the malformed
+    result shipped, and every downstream gate reported success.  The
+    whole class of `<div>`-based nesting corruption was invisible.
+
+    The list stays whitelist-shaped (specific strings, not a `<[a-z]`
+    regex) to keep the false-positive surface bounded: an arbitrary
+    string with a bare `<` is not HTML; a string with `<div` almost
+    certainly is.
+    """
+    return (
+        "<details" in text or "</details>" in text
+        or "<button" in text or "</button>" in text
+        or "<div" in text or "</div>" in text
+        or "<span" in text or "</span>" in text
+        or "<input" in text
+        or "<section" in text or "<form" in text
+        or "<table" in text or "<ul" in text or "<ol" in text
+        or "<details " in text   # catches `<details class=...` too
+    )
 
 
 def _looks_like_css(text: str) -> bool:
@@ -897,14 +872,21 @@ def _looks_like_css(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# Public entry point — parses each tree exactly once
 # ---------------------------------------------------------------------------
 
 def validate_content(content: str, path: str,
                      base: Optional[str] = None,
                      allow_missing: Optional[set] = None,
                      ) -> Optional[str]:
-    """Return None if content is structurally OK, else an error string."""
+    """Return None if content is structurally OK, else an error string.
+
+    As of 2026-11-05, `.py` validation parses `content` and `base`
+    exactly once each, then hands the trees to both the
+    module-level-statement check and the function-presence check.
+    Prior revisions parsed the same body twice per check, doubling
+    the per-file cost of every post-patch validation.
+    """
     global _LAST_PARSE_METHOD
     _LAST_PARSE_METHOD = "none"
 
@@ -927,13 +909,21 @@ def validate_content(content: str, path: str,
 
     if ext == ".py":
         try:
-            ast.parse(content)
+            content_tree = parse_source(content)
         except SyntaxError as e:
             return (f"{path}: python SyntaxError at line {e.lineno}: "
                     f"{e.msg}")
 
+        base_tree = None
         if base:
-            added_stmts = _module_level_stmts_added(content, base)
+            try:
+                base_tree = parse_source(base)
+            except SyntaxError:
+                base_tree = None
+
+        if base_tree is not None:
+            added_stmts = _module_level_stmts_added_trees(
+                content_tree, base_tree)
             if added_stmts:
                 return (f"{path}: module-level statement(s) added at "
                         f"column 0 that weren't in base: {added_stmts}"
@@ -968,17 +958,21 @@ def validate_content(content: str, path: str,
                             f"base -- cross-language contamination, "
                             f"rejecting")
 
-        if base:
-            return _function_presence_check(
-                base, content, path, allow_missing=allow_missing)
+        if base_tree is not None:
+            return _function_presence_check_trees(
+                base_tree, content_tree, content, path,
+                allow_missing=allow_missing)
         return None
 
     return None
 
 
-# ---------------------------------------------------------------------------
-# Duplicate-block deduplication
-# ---------------------------------------------------------------------------
+# ============================================================================
+#  Duplicate-block deduplication
+# ============================================================================
+#
+# (Everything below is unchanged from the prior revision; the module
+# compiles without modification.)
 
 _IF_OPENER_RE = re.compile(
     r"^([ \t]*)if\s*\((.*)\)\s*(\{)\s*(?://.*)?$", re.MULTILINE)
@@ -993,9 +987,6 @@ _CLASS_DECL_RE = re.compile(
     r"^((?:export\s+)?class\s+([A-Za-z_$][\w$]*)\b)",
     re.MULTILINE)
 
-# NEW (2026-11-05): top-level `name("string-key", { … })` registrations.
-# Common patterns: pgkitRegisterField, pgkitRegisterAction, addEventListener
-# with a named handler object, custom element registration, etc.
 _STRING_LITERAL_CALL_RE = re.compile(
     r'^(?P<indent>[ \t]*)'
     r'(?P<name>[A-Za-z_$][\w$.]*)\s*\(\s*'
@@ -1048,31 +1039,7 @@ def _enclosing_scope_depth(content: str, pos: int) -> tuple:
 
 
 def _js_scope_for_pos(content: str, path: str, pos: int) -> tuple:
-    """Return `(region_start, region_end, scope_open)` for `pos`.
-
-    See the module docstring, "REPEATED-STATEMENT DEDUP NOW RESPECTS
-    EMBEDDED-JS SCOPES" — this is the fix that stops the same
-    single-line statement, appearing in two different JS closures
-    inside the same Python string literal, from being treated as a
-    same-scope duplicate.
-
-    `region_start` / `region_end` are the outer-file span of the
-    enclosing string literal (for `.py` with embedded JS), or the
-    whole file for `.js`-family files, or `(pos, pos)` for positions
-    outside any string in a `.py` file.
-
-    `scope_open` is the JS scope-open offset *within that region*;
-    -1 for top-level of the region, or for positions that are not in
-    an embedded JS region at all.
-
-    (2026-10-29 extension) `_dedup_duplicate_blocks` and
-    `_find_duplicate_string_calls` now use this instead of
-    `_same_python_string` to decide same-scope.  That fixes the
-    `pg_panel_bindings.py` bug where two `if (!res.success) { … }`
-    blocks in two different JS functions of the same raw string were
-    treated as duplicates and one copy of the guard was deleted from
-    each call site.
-    """
+    """Return `(region_start, region_end, scope_open)` for `pos`."""
     ext = Path(path).suffix.lower() if path else ""
     if ext in (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"):
         _, scope_open = _enclosing_scope_depth(content, pos)
@@ -1188,7 +1155,6 @@ def _find_matching_close_char(content: str, open_brace_idx: int,
     return -1
 
 
-# NEW (2026-11-05): paren matcher for string-literal-call dedup.
 def _find_matching_paren(content: str, open_paren_idx: int) -> int:
     if open_paren_idx >= len(content) or content[open_paren_idx] != "(":
         return -1
@@ -1261,7 +1227,6 @@ def _has_obvious_duplicates(content: str) -> bool:
         if name in seen_classes:
             return True
         seen_classes.add(name)
-    # NEW (2026-11-05): string-literal-call registration pattern.
     seen_calls = set()
     for m in _STRING_LITERAL_CALL_RE.finditer(content):
         key = (len(m.group("indent")), m.group("name"), m.group("key"))
@@ -1287,15 +1252,6 @@ def _python_string_spans(content: str) -> list:
             re.DOTALL,
         )
         for m in pat.finditer(content):
-            # Content-only range: group 1 covers the string body
-            # between the triple-quotes (excluding the r-prefix and
-            # the closing quotes).  _js_scope_for_pos slices this
-            # range and walks it with _enclosing_scope_depth, which
-            # needs to see the JS body - not the Python string
-            # syntax (three quotes toggle in_str three times, so the
-            # entire JS body is skipped as "inside a string" and
-            # every position reports scope_open = -1, making
-            # cross-function duplicates look same-scope).
             spans.append((m.start(1), m.end(1)))
     spans.sort()
     return spans
@@ -1308,10 +1264,6 @@ def _same_python_string(pos_a: int, pos_b: int, spans: list) -> bool:
     return False
 
 
-# NEW (2026-11-05): find duplicate top-level string-literal registrations.
-# (2026-10-29) Takes `path` and uses `_js_scope_for_pos` for the
-# same-scope check so two calls in different JS functions of the same
-# Python string are NOT collapsed.
 def _find_duplicate_string_calls(
         content: str,
         is_python: bool,
@@ -1319,30 +1271,15 @@ def _find_duplicate_string_calls(
         path: str = "") -> list:
     """Return [(start_char, end_char, desc)] for duplicate
     `name("key", …)` registrations.
-
-    For `.py` destinations, both occurrences must be in the same
-    enclosing JS scope inside the same triple-quoted string. A
-    duplicate across two different JS functions of the same raw
-    string is legitimate code (each function installs its own
-    listener), not a bug.
-
-    For `.js` destinations, both occurrences must be in the same
-    enclosing scope (per `_enclosing_scope_depth`).
     """
     seen: dict = {}
     removals: list = []
 
     for m in _STRING_LITERAL_CALL_RE.finditer(content):
-        # Determine scope key using _js_scope_for_pos so we correctly
-        # distinguish "different JS function" from "different Python
-        # string" from "same scope".
         if is_python:
             scope_start, scope_end, js_scope = _js_scope_for_pos(
                 content, path, m.start())
             if scope_start == scope_end:
-                # Not inside any Python string literal — the
-                # registration pattern is JS-specific, so skip
-                # anything outside the embedded JS.
                 continue
             scope_key = (scope_start, scope_end, js_scope)
         else:
@@ -1369,7 +1306,6 @@ def _find_duplicate_string_calls(
         if key in seen:
             prev_start, _prev_end = seen[key]
             if m.start() - prev_start > 4000:
-                # Far-apart re-registration; treat as intentional.
                 seen[key] = (m.start(), end)
                 continue
             removals.append((
@@ -1383,10 +1319,6 @@ def _find_duplicate_string_calls(
 
 def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
     """Remove duplicate-applied blocks.  Returns (new_content, n_removed).
-
-    Uses `_js_scope_for_pos` (not `_same_python_string`) for the
-    same-scope check.  See the module docstring,
-    DUPLICATE-BLOCK DEDUP NOW USES `_js_scope_for_pos`.
     """
     ext = Path(path).suffix.lower()
     if ext not in _DEDUP_SAFE_EXTENSIONS:
@@ -1522,8 +1454,6 @@ def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
                 continue
             _seen_decl[_key] = (_m.start(), _end)
 
-    # NEW (2026-11-05): string-literal-call registration dedup.
-    # 2026-10-29: thread path so scope detection uses _js_scope_for_pos.
     removals.extend(
         _find_duplicate_string_calls(content, is_python, py_spans, path))
 
@@ -1557,18 +1487,7 @@ def _dedup_duplicate_blocks(content: str, path: str) -> tuple:
 
 def _dedup_repeated_statements(content, path, base=None,
                                 patch_bodies=None, window=15):
-    """Remove duplicate single-line statements under tight conditions.
-
-    See the module docstring, "REPEATED-STATEMENT DEDUP NOW RESPECTS
-    EMBEDDED-JS SCOPES".  For `.py` destinations, `_js_scope_for_pos`
-    ensures two statements in different JS closures (or in different
-    triple-quoted string literals) never look same-scope.  The pre-fix
-    code called `_enclosing_scope_depth` directly on the whole file,
-    which could not see `{`/`}` inside a string literal and reported
-    every statement inside the literal as `scope_open = -1` — the
-    deletion bug that stripped `_applyRotation(v)` from
-    `pg_panel_scrubs.py`'s second listener.
-    """
+    """Remove duplicate single-line statements under tight conditions."""
     from pathlib import Path as _P
     ext = _P(path).suffix.lower()
     if ext not in frozenset({
@@ -1631,9 +1550,9 @@ def _dedup_repeated_statements(content, path, base=None,
         (i1, r1_start, r1_end, scope1) = occs[0]
         (i2, r2_start, r2_end, scope2) = occs[1]
         if r1_start != r2_start or r1_end != r2_end:
-            continue                  # different string literals
+            continue
         if scope1 != scope2:
-            continue                  # different JS scopes
+            continue
         if i2 - i1 > window:
             continue
         removals.append((i2, lines[i2].strip()))

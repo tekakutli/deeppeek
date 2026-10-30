@@ -1,4 +1,4 @@
-"""
+r"""
 patch_misc_insert — context insert, object-entry insert, and
                      named-dict insert.
 

@@ -45,6 +45,7 @@ from typing import Optional
 
 from .statement_sig import extract as extract_sig, score as sig_score
 from .ast_anchor import _get_parser, _LANG_BY_EXT
+from ._ast import parse_source
 
 
 _MIN_SCORE = 0.55
@@ -117,7 +118,7 @@ def _splice(base_lines: list, start: int, end: int,
 
 def _valid_python(content: str) -> bool:
     try:
-        ast.parse(content)
+        parse_source(content)
     except SyntaxError:
         return False
     return True
@@ -153,7 +154,7 @@ def try_statement_replace(base: str, body: str,
 
 def _try_python(base, body, path):
     try:
-        body_tree = ast.parse(textwrap.dedent(body))
+        body_tree = parse_source(textwrap.dedent(body))
     except SyntaxError:
         return None
     if len(body_tree.body) != 1:
@@ -164,7 +165,7 @@ def _try_python(base, body, path):
         return None
 
     try:
-        base_tree = ast.parse(base)
+        base_tree = parse_source(base)
     except SyntaxError:
         return None
 

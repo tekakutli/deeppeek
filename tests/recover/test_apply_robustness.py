@@ -248,6 +248,68 @@ def test_fuzzy_line_match_token_equivalent():
 
 
 # ---------------------------------------------------------------------------
+# 6. Ellipsis-splice — Python prefix-modification (2026-11-05)
+# ---------------------------------------------------------------------------
+#
+# Motivating shape (fixture 41, `computeW`): a body that replaces
+# ONE line with TWO lines in the middle of a function, marked with
+# `...` meaning "rest unchanged".  For `.js` the `_find_scope_in_base`
+# regex found the `{` body and `_try_prefix_modification` did the
+# right splice.  For `.py` the same call returned None (Python uses
+# `:` not `{`), so the ellipsis-splice fell through to the
+# strip-and-retry fallback — which strips `...` and retries as a
+# FULL scope replace, dropping the mid-body.
+
+def test_ellipsis_splice_python_prefix_modification():
+    """Reproduces the pg_pixels.py shape for Python.
+
+    Pre-fix (`_find_scope_in_base` returning None for Python defs),
+    the ellipsis path fell through to `_strip_ellipsis_lines` +
+    full scope replace, dropping `return x + y`.  Post-fix,
+    `_try_prefix_modification` fires and the tail is preserved.
+    """
+    from deeppeek.recover.patch_scope import _try_ellipsis_splice
+    base = (
+        "def foo():\n"
+        "    x, y = compute_old()\n"
+        "    return x + y\n"
+    )
+    body = (
+        "def foo():\n"
+        "    x = compute_a()\n"
+        "    y = compute_b()\n"
+        "    ...\n"
+    )
+    result = _try_ellipsis_splice(base, body)
+    assert result is not None, (
+        "ellipsis-splice did not fire for Python — the pre-fix bug "
+        "where `_find_scope_in_base` failed on `def foo():` bodies "
+        "is back; without it, the dispatcher falls through to "
+        "strip-and-retry and does a full scope replace"
+    )
+    assert "x = compute_a()" in result
+    assert "y = compute_b()" in result
+    assert "return x + y" in result, (
+        "mid-body preservation failed — the tail was dropped:\n"
+        + result)
+    assert "compute_old()" not in result, (
+        "the old line was not replaced:\n" + result)
+    assert result.count("x, y =") == 0
+
+
+def test_ellipsis_splice_python_no_scope_returns_none():
+    """A body with `...` but no scoped declaration returns None so
+    the strip-and-retry fallback in the dispatcher takes over (the
+    Python analogue of fixture 36).  Regression guard against the
+    fix over-triggering."""
+    from deeppeek.recover.patch_scope import _try_ellipsis_splice
+    base = "x = 1\n"
+    body = "x = 1\ny = 2\n...\n"
+    result = _try_ellipsis_splice(base, body)
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -271,6 +333,10 @@ def main():
          test_scoped_partial_splice_rejects_pure_deletion),
         ("fuzzy line match token equivalent",
          test_fuzzy_line_match_token_equivalent),
+        ("ellipsis splice python prefix modification",
+         test_ellipsis_splice_python_prefix_modification),
+        ("ellipsis splice python no scope returns none",
+         test_ellipsis_splice_python_no_scope_returns_none),
     ]
     failed = 0
     for name, fn in tests:

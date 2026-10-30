@@ -123,7 +123,7 @@ from .apply_patches import (
     _apply_pairs, _broader_context_for, _try_deterministic_patch,
 )
 from .patch_text import _collect_inserted_lines
-
+from ._ast import parse_source
 
 _NO_OP_STATUSES = frozenset({
     "already-present",
@@ -828,9 +828,8 @@ def pass8_7_reconcile(records, blocks_by_idx, verbose=False):
         rec.verification["content_valid"] = "ok"
 
         if path.endswith(".py"):
-            import ast
             try:
-                ast.parse(new_content)
+                parse_source(new_content, filename=path)
                 rec.verification["ast_parse"] = "ok"
             except SyntaxError:
                 continue

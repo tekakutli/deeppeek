@@ -79,14 +79,62 @@ correctly defines `foo(a)` but is called as `foo(a, b)` does not
 produce an unresolved call — the call resolves, the invocation
 fails.  That is a separate class (call-arity / keyword-arg
 checking) and would be a distinct pass.
+
+MEMOIZATION (2026-11-05)
+========================
+Every helper below that is a pure function of its string argument
+is decorated with `@lru_cache(maxsize=None)`.  Motivation:
+
+  · `find_unresolved_references` iterates every OTHER record in the
+    run, calling `_extract_exported(other.content, other_path)` for
+    each.  Before this cache, that loop was O(N) full AST walks +
+    regex scans per call, and `pass8_5_check_symbols` calls it once
+    per record — O(T × N) walks per pass.
+
+  · `reconcile._count_failures` calls `find_unresolved_references`
+    once per exclusion-search step (O(P²) per record), re-analyzing
+    the same content many times per run.
+
+With the cache, `_extract_exported` on a repeated `(content, path)`
+is a dict lookup.  `_analyze_python_with_sigs(content)` and
+`_analyze_js(content)` are likewise one lookup after the first call.
+
+Cache bounds: `maxsize=None` (unbounded), safe because:
+  · The number of distinct `content` strings in a run is bounded by
+    the number of records, typically <1000.
+  · Each cache lives for the duration of the pipeline run; nothing
+    persists across `deeppeek recover` invocations.
+  · Memory cost: ~1 KB per content per helper, ~few MB total.
+
+RETURN TYPE SAFETY
+==================
+Cached values must not be mutated by callers, or the cache is
+corrupted for subsequent hits.  Two patterns are used:
+
+  · `_extract_exported`, `_extract_python_exports`, and
+    `_extract_js_exports` return `frozenset` — callers cannot
+    mutate them.  (The internal `_extract_exported` union is
+    written as `frozenset | frozenset`, producing a new frozenset
+    each time; the cached value is never in-place mutated.)
+
+  · `_analyze_python_with_sigs` and `_analyze_js` return
+    `(frozenset, frozenset, dict, dict)` and
+    `(frozenset, frozenset, frozenset)`.  The frozensets are
+    immutable; the two dicts in `_analyze_python_with_sigs` carry
+    `list` values that the current callers
+    (`find_unresolved_references`, `_check_signature_mismatches`)
+    treat as read-only.  A future caller that mutates them must
+    copy first, or refactor the function to return immutable types.
 """
 from __future__ import annotations
 
 import ast
 import re
+from functools import lru_cache
 from typing import Optional
 
 from .core import FileRecord
+from ._ast import parse_source
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +203,16 @@ def find_unresolved_references(record: FileRecord,
         return [], []
 
     new_calls = call_p - call_b - imp_p - decl_p
-    resolvable = imp_p | decl_p | imp_b | decl_b
+
+    # `_analyze_python_with_sigs` and `_analyze_js` return frozensets
+    # (cached; immutable).  `resolvable` below is mutated via `|=`,
+    # so it must be a plain `set`.  See the module docstring's
+    # RETURN TYPE SAFETY section.
+    resolvable = set()
+    resolvable.update(imp_p)
+    resolvable.update(decl_p)
+    resolvable.update(imp_b)
+    resolvable.update(decl_b)
 
     for other_path, other_rec in all_records.items():
         if other_path == record.path:
@@ -210,6 +267,7 @@ def find_unresolved_calls(record, base_content, all_records):
 # Module-vs-container discrimination
 # ---------------------------------------------------------------------------
 
+@lru_cache(maxsize=None)
 def _looks_like_python_module(py_content: str) -> bool:
     """True iff the file has substantial top-level Python structure.
 
@@ -230,11 +288,15 @@ def _looks_like_python_module(py_content: str) -> bool:
 
     Files that fail to parse as Python (should not happen post-
     verify) return False so the old behaviour is preserved.
+
+    Cached.  The `parse_source` call inside is itself memoized, so
+    the cost on a cache hit here is 1 walk avoided; on a miss it's
+    one parse-cache lookup + one tree walk.
     """
     if not py_content:
         return False
     try:
-        tree = ast.parse(py_content)
+        tree = parse_source(py_content)
     except SyntaxError:
         return False
     return sum(
@@ -278,6 +340,7 @@ _JS_STRONG_SIGNALS = (
 _MIN_LONG_JS_BODY = 200
 
 
+@lru_cache(maxsize=None)
 def _extract_dominant_js_string(py_content: str,
                                 force: bool = False) -> Optional[str]:
     """Return the largest triple-quoted string that looks like JS, or
@@ -310,6 +373,10 @@ def _extract_dominant_js_string(py_content: str,
     rules must apply to both sides so `call_p - call_b` is a
     meaningful set difference rather than an accidental comparison
     between a JS patch and a Python base.
+
+    Cached on `(py_content, force)`.  The `force` kwarg is part of
+    the cache key, so callers that pass `force=True` and callers
+    that use the default `False` do not collide.
     """
     best = None
     pat = re.compile(
@@ -376,7 +443,14 @@ _JS_IMPORT_RE = re.compile(
 )
 
 
-def _extract_js_imports(content: str) -> set:
+def _extract_js_imports(content: str) -> frozenset:
+    """Return the imported names in `content` as a frozenset.
+
+    Called only from `_analyze_js`, which is itself cached; caching
+    this independently would be redundant.  Return type is frozen
+    so the outer `_analyze_js` can safely return the result as part
+    of its cached tuple.
+    """
     names = set()
     for m in _JS_IMPORT_RE.finditer(content):
         if m.group(1):
@@ -392,7 +466,7 @@ def _extract_js_imports(content: str) -> set:
                     names.add(part.split(" as ", 1)[1].strip())
                 else:
                     names.add(part)
-    return names
+    return frozenset(names)
 
 _JS_IMPORT_WITH_SRC_RE = re.compile(
     r'import\s+'
@@ -431,15 +505,25 @@ _JS_DECL_RE = re.compile(
 )
 
 
-def _extract_js_decls(content: str) -> set:
-    return {m.group(1) for m in _JS_DECL_RE.finditer(content)}
+def _extract_js_decls(content: str) -> frozenset:
+    """Return the top-level JS declaration names as a frozenset.
+
+    Called only from `_analyze_js`; frozen so the outer cached
+    tuple is immutable.
+    """
+    return frozenset(m.group(1) for m in _JS_DECL_RE.finditer(content))
 
 
 _JS_CALL_RE = re.compile(r'\b([A-Za-z_$][\w$]*)\s*\(')
 _METHOD_PREFIX_RE = re.compile(r'(?:\.|\?\.|!\.)\s*$')
 
 
-def _extract_js_calls(content: str) -> set:
+def _extract_js_calls(content: str) -> frozenset:
+    """Return the bare-call names in `content` as a frozenset.
+
+    Called only from `_analyze_js`; frozen so the outer cached
+    tuple is immutable.
+    """
     names = set()
     for m in _JS_CALL_RE.finditer(content):
         pre = content[max(0, m.start() - 3):m.start()]
@@ -449,7 +533,7 @@ def _extract_js_calls(content: str) -> set:
         if name in _JS_KEYWORDS:
             continue
         names.add(name)
-    return names
+    return frozenset(names)
 
 
 def _blank_js_comments(text: str) -> str:
@@ -569,8 +653,10 @@ def _blank_js_comments_and_strings(text: str) -> str:
     return "".join(out)
 
 
+@lru_cache(maxsize=None)
 def _analyze_js(content: str):
-    """Extract imports, declarations, and calls from JS content.
+    """Extract imports, declarations, and calls from JS content as
+    `(frozenset, frozenset, frozenset)`.
 
     Imports and declarations are extracted from a copy with only
     comments blanked (module paths must survive intact).
@@ -578,6 +664,10 @@ def _analyze_js(content: str):
     blanked (neither can contain a real call).  All three passes see
     the same underlying code; the split only affects what each regex
     is allowed to match.
+
+    Cached; frozen return so callers cannot mutate the shared value.
+    The three regex passes over the two blanked copies are the cost
+    being amortized.
     """
     no_comments = _blank_js_comments(content)
     no_strings  = _blank_js_comments_and_strings(content)
@@ -608,20 +698,28 @@ _PY_BUILTINS = frozenset({
     "SystemExit", "None", "True", "False", "self", "cls",
 })
 
+@lru_cache(maxsize=None)
 def _analyze_python_with_sigs(content: str):
-    """Return (imports, decls, calls_by_name, sigs_by_name).
+    """Return `(imports, decls, calls_by_name, sigs_by_name)`.
 
-    `calls_by_name[name]` = list of (pos_arg_count, frozenset(kw_names)).
-    `sigs_by_name[name]` = (pos_arity, frozenset(kwonly_names),
-                            has_vararg, has_kwarg).
+    `imports` and `decls` are frozensets — cached, so callers cannot
+    mutate them.  `calls_by_name[name]` is a list of
+    `(pos_arg_count, frozenset(kw_names))`; `sigs_by_name[name]` is
+    `(pos_arity, pos_names, kwonly, has_vararg, has_kwarg)`.
 
     Enables signature-level checking: a call `foo(1, k=2)` is
     compatible with `def foo(x, k):` but not with `def foo(x):`.
+
+    Cached.  Callers (`find_unresolved_references`,
+    `_check_signature_mismatches`) read the returned dicts but do
+    not mutate them.  A future caller that mutates must copy
+    first — otherwise the cached value is corrupted for every
+    subsequent record.
     """
     try:
-        tree = ast.parse(content)
+        tree = parse_source(content)
     except SyntaxError:
-        return set(), set(), {}, {}
+        return frozenset(), frozenset(), {}, {}
 
     imports, decls = set(), set()
     calls: dict = {}
@@ -665,7 +763,7 @@ def _analyze_python_with_sigs(content: str):
             calls.setdefault(node.func.id, []).append(
                 (len(node.args), kw))
 
-    return imports, decls, calls, sigs
+    return frozenset(imports), frozenset(decls), calls, sigs
 
 
 def _check_signature_mismatches(calls: dict, sigs: dict) -> list:
@@ -707,7 +805,7 @@ def _check_signature_mismatches(calls: dict, sigs: dict) -> list:
 
 def _analyze_python(content: str):
     try:
-        tree = ast.parse(content)
+        tree = parse_source(content)
     except SyntaxError:
         return set(), set(), set()
 
@@ -750,7 +848,12 @@ _JS_EXPORT_DEFAULT_RE = re.compile(
 )
 
 
-def _extract_js_exports(content: str) -> set:
+@lru_cache(maxsize=None)
+def _extract_js_exports(content: str) -> frozenset:
+    """Return the set of names exported by JS content as a frozenset.
+
+    Cached; frozen so callers cannot mutate the shared value.
+    """
     names = set()
     for m in _JS_EXPORT_DECL_RE.finditer(content):
         names.add(m.group(1))
@@ -765,15 +868,19 @@ def _extract_js_exports(content: str) -> set:
                 names.add(part)
     for m in _JS_EXPORT_DEFAULT_RE.finditer(content):
         names.add(m.group(1))
-    return names
+    return frozenset(names)
 
 
-def _extract_python_exports(content: str) -> set:
-    """Python has no explicit export: every top-level name is importable."""
+@lru_cache(maxsize=None)
+def _extract_python_exports(content: str) -> frozenset:
+    """Python has no explicit export: every top-level name is importable.
+
+    Returns a `frozenset` — callers cannot mutate the cached value.
+    """
     try:
-        tree = ast.parse(content)
+        tree = parse_source(content)
     except SyntaxError:
-        return set()
+        return frozenset()
     names = set()
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
@@ -786,10 +893,11 @@ def _extract_python_exports(content: str) -> set:
         elif isinstance(node, ast.AnnAssign):
             if isinstance(node.target, ast.Name):
                 names.add(node.target.id)
-    return names
+    return frozenset(names)
 
 
-def _extract_exported(content: str, path: str) -> set:
+@lru_cache(maxsize=None)
+def _extract_exported(content: str, path: str) -> frozenset:
     """Return the names exported by `content` interpreted as `path`'s
     language.
 
@@ -799,17 +907,23 @@ def _extract_exported(content: str, path: str) -> set:
     the docstring-derived "embedded JS" is not trusted.
 
     Guarded by `_looks_like_python_module` for the same reason
-    `find_unresolved_calls` is: a Python docstring mentioning
+    `find_unresolved_references` is: a Python docstring mentioning
     "import" or "function" must not be treated as a JS export
     surface.
+
+    Cached.  Returns frozenset: the union is written as
+    `frozenset | frozenset` (which produces a new value, never
+    mutating the cached input), and callers do
+    `resolvable |= _extract_exported(...)` (which mutates
+    `resolvable`, not the returned value).
     """
     if _is_js_lang(path):
-        return _extract_js_exports(content)
+        return _extract_js_exports(content)  # already frozenset
     if path.endswith(".py"):
-        exports = _extract_python_exports(content)
+        exports = _extract_python_exports(content)  # frozenset
         if not _looks_like_python_module(content):
             embedded = _extract_dominant_js_string(content)
             if embedded is not None:
-                exports |= _extract_js_exports(embedded)
+                exports = exports | _extract_js_exports(embedded)
         return exports
-    return set()
+    return frozenset()

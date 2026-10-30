@@ -127,12 +127,30 @@ orphans into the `orphan_patches` collection, this is what makes
 `pg_base.py`, `pg_panel_scrubs.py`, and `pg_panel_bindings.py` fixes
 actually apply after attribution.  Before this, the `full` label
 caused them to be silently dropped from the patch pipeline.
+
+PARSE-CACHE ROUTING (2026-11-05)
+================================
+`_dedup_pick` parses candidate full bodies to filter out syntactically
+invalid ones before the modifier-score and prose-fix heuristics run.
+Two `ast.parse` loops exist: one before the modifier-score check, one
+as a final fallback.  When the first loop filters `fulls` down (e.g.
+3 candidates → 2 valid), the second loop re-parses the survivors.
+
+Both loops now route through `_ast.parse_source` (memoized).  The
+first loop populates the cache; the second loop hits it.  Net effect:
+a record with N candidate fulls does N parses on the first loop and
+0 on the second, instead of up to 2N.  On a `--apply-to` run against
+a pre-existing tree with repeated reprints, the cache also catches the
+same body across records — `pass6` parses each selected full body
+again, and `pass8` parses it a third time for validation.  All three
+share one cache entry.
 """
 
 import re
 import sys
 from typing import Optional
 
+from ._ast import parse_source
 from .core import (
     Block, FileRecord, FIX_PROSE_PHRASES, MODIFIER_RANK,
     _is_deletion_instruction,
@@ -961,6 +979,14 @@ def pass5_deduplicate(records: dict,
 def _dedup_pick(path: str,
                 fulls: list,
                 blocks_by_idx: dict) -> tuple:
+    """Pick one winner from multiple full-print candidates.
+
+    Body-parsing check (subset-demote, modifier score, prose-fix,
+    syntax fallback) routes through `_ast.parse_source` (memoized),
+    so a candidate body that passes the first syntax filter is not
+    re-parsed by the second.  See the module docstring,
+    PARSE-CACHE ROUTING.
+    """
     if len(fulls) == 1:
         return fulls[0], "single"
 
@@ -1013,11 +1039,10 @@ def _dedup_pick(path: str,
         return newest, f"revision (sim {qualifies[newest]:.2f})"
 
     if path.endswith(".py"):
-        import ast
         valid = []
         for i in fulls:
             try:
-                ast.parse(blocks_by_idx[i].body)
+                parse_source(blocks_by_idx[i].body)
                 valid.append(i)
             except SyntaxError:
                 pass
@@ -1046,11 +1071,10 @@ def _dedup_pick(path: str,
         return flagged[0], "prose_fix"
 
     if path.endswith(".py"):
-        import ast
         valid = []
         for i in fulls:
             try:
-                ast.parse(blocks_by_idx[i].body)
+                parse_source(blocks_by_idx[i].body)
                 valid.append(i)
             except SyntaxError:
                 pass

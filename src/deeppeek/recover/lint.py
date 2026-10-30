@@ -24,58 +24,32 @@ DELEGATION AWARENESS (2026-10-28f)
 ==================================
 The lint above is a *shallow* check: it only looks at
 `params.get(...)` reads inside the method's own body.  But `@command`
-methods frequently delegate:
-
-    @command(args={"--output_rotation": {...}})
-    def comfy_generate(self, params):
-        return self._comfy_generate_impl(params)
-
-    def _comfy_generate_impl(self, params):
-        output_rotation = float(params.get("output_rotation") or 0.0)
-        ...
-
-Shallow lint flags `comfy_generate` because the method's body has no
-`params.get("output_rotation")`.  In the wild, this produced a false
-positive on `comfy_generate` and would have shipped a correct
-implementation as LOW trust.
-
-Fix: for each `@command` method, also collect `params.get(...)` reads
-from any direct delegate `self.X(params)`.  One level deep — deep
-recursion would follow mutual delegations indefinitely; one level
-matches the common "command method delegates to a helper" pattern.
-A delegate that itself delegates is not scanned: the caller's intent
-is clear from the first hop.
+methods frequently delegate.  For each `@command` method, also
+collect `params.get(...)` reads from any direct delegate
+`self.X(params)`.  One level deep.
 
 WARN-ONLY (2026-10-28 revision)
 ===============================
 A prior version of `pass8_4_lint_command_args` demoted the record to
 LOW when a patch introduced an `@command` arg that the body never
 read.  That demotion — together with `verify-applied`'s — was
-producing exactly the failure mode it was meant to prevent:
-`comfyui.py` was routed into `low_trust/` for `--output_rotation`
-even though every patch had landed cleanly.
-
-The contract is: `deeppeek` applies patches.  If the conversation
-added an arg and did not wire it, the file ships with the dead arg,
-and a warning surfaces the gap.  Gating the write on the conversation
-having been complete is a category error — it converts a reportable
-fact into a pipeline failure.
-
-`pass8_4` now emits a warning (and `verification.unused_command_args`
-for auditability) and never touches `rec.trust`.
+producing exactly the failure mode it was meant to prevent.  The
+contract is: `deeppeek` applies patches; if the conversation added
+an arg and did not wire it, the file ships with the dead arg and a
+warning surfaces the gap.
 
 PASS 8.4b — ADDED PARAMETERS NEVER REFERENCED IN THE BODY
 =========================================================
-Companion check at the function-signature level.  A function that
-gained a parameter (via a patch) whose body never references the
-parameter is suspect — the parameter is accepted and discarded.
-Warn-only, same reasoning as `pass8_4`: an interface-compatibility
-signature legitimately gains unused parameters.
+Companion check at the function-signature level.  Warn-only.
 
-Idempotency: warnings keyed on `f"{function}.{param}"` are tracked in
-`rec.verification["added_param_warnings"]`.  Re-running the pass on
-the same content (via `reverify_reconciled` after reconcile) does not
-duplicate warnings.
+PRE-EXISTING SHORT-CIRCUIT (2026-11-05)
+=======================================
+`pass8_4b_check_added_unused_params` skips pre-existing records
+that pass 6 marked `preexisting_unchanged`.  Their body has not
+changed — no parameter could have been "added".  Without this
+guard, every untouched pre-existing `.py` file in a large
+`--apply-to` tree got two `ast.parse` calls (base + content)
+for a check that could never fire.
 """
 
 from __future__ import annotations
@@ -85,6 +59,7 @@ import re
 from typing import Optional
 
 from .core import FileRecord
+from ._ast import parse_source
 
 
 # ============================================================================
@@ -121,9 +96,6 @@ _PARAM_USAGE_RE = re.compile(
 
 # `self.X(params)` / `self.X(params, ...)` — a direct delegate call
 # that receives the command method's `params` object unmodified.
-# Excludes `self.X(params.get(...))` (that's an *extraction* call, not
-# a delegation of the whole params dict — the callee sees the read
-# result, not `params` itself).
 _DELEGATE_CALL_RE = re.compile(
     r'self\.([A-Za-z_]\w*)\s*\(\s*params\s*[,)]'
 )
@@ -145,8 +117,6 @@ def _extract_method_body(content: str, start: int) -> str:
 def _find_method_body(content: str, method_name: str) -> Optional[str]:
     """Locate `def <method_name>(self, ...)` in `content` and return
     its body text, or None if the method isn't found.
-
-    Matches methods at indent 0–8 (i.e. inside a class, one level).
     """
     pat = re.compile(
         r'(?m)^[ \t]{0,8}(?:async\s+)?def\s+' + re.escape(method_name) +
@@ -161,12 +131,6 @@ def _find_method_body(content: str, method_name: str) -> Optional[str]:
 def _collect_direct_delegates(content: str, method_body: str) -> list:
     """Return the bodies of every `self.X(params)` callee reachable
     from `method_body`, one level deep.
-
-    The motivating case is `def comfy_generate(self, params):
-    return self._comfy_generate_impl(params)` — the arg reads happen
-    in `_comfy_generate_impl`, not in the method body.  Without this,
-    the lint would falsely flag every arg on `comfy_generate` as
-    unused.
     """
     bodies = []
     for m in _DELEGATE_CALL_RE.finditer(method_body):
@@ -179,11 +143,6 @@ def _collect_direct_delegates(content: str, method_body: str) -> list:
 def _find_command_violations(content: str) -> list[dict]:
     """Return one dict per `@command` whose declared args are
     unused by its method body (or by one level of direct delegates).
-
-    Each dict has:
-        name           — method name
-        declared       — set of arg keys the decorator declares
-        unused         — set of arg keys the body never reads
     """
     violations: list[dict] = []
 
@@ -204,9 +163,6 @@ def _find_command_violations(content: str) -> list[dict]:
             _PARAM_USAGE_RE.finditer(method_body)
         }
 
-        # DELEGATION AWARENESS (2026-10-28f): follow direct
-        # `self.X(params)` callees to find reads that happen in a
-        # helper.
         for delegate_body in _collect_direct_delegates(
                 content, method_body):
             used.update(
@@ -229,10 +185,6 @@ def _arg_introduced_by_patch(rec: FileRecord, arg: str) -> bool:
     """True iff any patch body in `rec` DECLARES `arg` — i.e. contains
     `"--arg":` (dict-key form), not merely a mention of
     `params.get("arg")` or `"--arg"` inside a help string.
-
-    A patch that adds `"--foo": {...}` to the decorator introduced the
-    arg.  A patch that adds `params.get("foo")` provided the *wiring*,
-    not the declaration — that is the fix, not the defect.
     """
     pattern = re.compile(
         r'["\'](?:-{1,2})?' + re.escape(arg) + r'["\']\s*:'
@@ -250,17 +202,6 @@ def pass8_4_lint_command_args(records: dict[str, FileRecord]) -> int:
     reads.
 
     Returns the number of warnings emitted (not demotions).
-
-    The demotion branch that used to live here (patch added a
-    declaration but the wiring didn't apply → demote to LOW) was
-    removed alongside `verify-applied`'s demotion.  Both were
-    attempting to gate the write on the conversation having been
-    complete; the record should ship with the incomplete feature and
-    the warning should surface the gap for human review.
-
-    Records already marked LOW for other reasons are also processed:
-    a LOW record whose `@command` has an unused arg deserves the
-    warning too, for the manifest's accuracy.
     """
     n_warned = 0
     for path, rec in records.items():
@@ -269,6 +210,16 @@ def pass8_4_lint_command_args(records: dict[str, FileRecord]) -> int:
         if not path.endswith(".py"):
             continue
         if rec.is_deleted:
+            continue
+        # NEW (2026-11-05): skip untouched pre-existing records.
+        # `pass6` marks them; the body has not changed, so no
+        # `@command` decorator was added by this run — a violation
+        # that only fires on *introduced* args cannot fire.  This
+        # is the same guard `pass8_4b_check_added_unused_params`
+        # already had; 8.4 was missed in the 2026-11-05 sweep.
+        # On a 300-file untouched tree this removes ~300 file-level
+        # regex passes that could only discover zero violations.
+        if rec.verification.get("preexisting_unchanged"):
             continue
 
         try:
@@ -317,20 +268,6 @@ def pass8_4_lint_command_args(records: dict[str, FileRecord]) -> int:
 def _collect_functions(tree: ast.AST) -> dict:
     """Return `{qualified_name: {params, body_refs, lineno}}` for
     every function in `tree`.
-
-    `qualified_name` is `'Class.method'` for methods,
-    `'outer.inner'` for nested functions, `'func'` for module-level
-    functions.  Disambiguation by qualified name means two classes
-    with same-named methods don't collide.
-
-    `params` is the set of parameter names (positional-only,
-    positional-or-keyword, keyword-only, plus `*args`/`**kwargs`
-    captured by their actual names).  `body_refs` is the set of all
-    `ast.Name` identifiers appearing anywhere in the function body,
-    including nested lambdas and comprehensions.  Over-inclusive by
-    design: false negatives (identifiers that look like parameter
-    references but aren't) are preferable to false positives in a
-    warn-only pass.
     """
     out: dict = {}
 
@@ -372,21 +309,15 @@ def _find_added_unused_params(base: str, content: str) -> list[dict]:
     """Return `[{function, param, line}]` for each parameter that
     exists in `content`'s function signature but not in `base`'s, and
     that the body never references.
-
-    Only functions present in both trees are compared — a function
-    that only exists in `content` has every parameter "new", which
-    is not a signal.
-
-    Fail-open: a syntax error in either side returns `[]`.
     """
     if not base or not content:
         return []
     try:
-        base_tree = ast.parse(base)
+        base_tree = parse_source(base)
     except SyntaxError:
         return []
     try:
-        content_tree = ast.parse(content)
+        content_tree = parse_source(content)
     except SyntaxError:
         return []
 
@@ -426,10 +357,8 @@ def pass8_4b_check_added_unused_params(
       · non-`.py` records
       · records with no content or no recoverable base
       · deleted records
-
-    The base is `blocks_by_idx[rec.last_full_idx].body` — the
-    pre-application content.  `pass6_apply_patches` and every demoting
-    pass compare against the same base; consistency matters here.
+      · pre-existing records that pass 6 marked `preexisting_unchanged`
+        (2026-11-05): nothing was added, nothing to check
     """
     n_warned = 0
 
@@ -443,13 +372,23 @@ def pass8_4b_check_added_unused_params(
 
         # Get base content.  Prefer last_full_idx block.  `None`
         # means we cannot compare — skip rather than warn on a
-        # synthetic diff (e.g. record with no full-print baseline).
+        # synthetic diff.
         base: Optional[str] = None
         if blocks_by_idx is not None and rec.last_full_idx is not None:
             base_block = blocks_by_idx.get(rec.last_full_idx)
             if base_block is not None:
                 base = base_block.body
         if base is None:
+            continue
+
+        # NEW (2026-11-05): skip untouched pre-existing records.
+        # `pass6` marks them; their body hasn't changed, so no
+        # parameter could have been "added".  Without this guard,
+        # every untouched pre-existing `.py` file in a large
+        # `--apply-to` tree paid two `ast.parse` calls
+        # (`_find_added_unused_params(base, content)`) for a check
+        # that could never fire.
+        if rec.verification.get("preexisting_unchanged"):
             continue
 
         try:

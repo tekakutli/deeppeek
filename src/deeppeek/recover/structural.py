@@ -39,6 +39,7 @@ import textwrap
 from typing import Optional
 
 from .validate_output import _js_balance
+from ._ast import parse_source
 
 
 _ASSIGNMENT_RE = re.compile(
@@ -78,7 +79,7 @@ def check_balance(body: str, path: str = "") -> Optional[str]:
 
     if path.endswith(".py") or _looks_like_python(body):
         try:
-            ast.parse(textwrap.dedent(body))
+            parse_source(textwrap.dedent(body))
         except SyntaxError:
             pass
         else:

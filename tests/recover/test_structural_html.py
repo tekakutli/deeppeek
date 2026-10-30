@@ -446,8 +446,22 @@ def test_pg_base_shape_region_replace_expands_to_enclosing_div():
     assert "viewRotationInput" in result, (
         f"new input widget missing from result:\n{result}"
     )
-    assert "viewRotationValue" in result, (
-        f"existing value span must survive:\n{result}"
+    # The body replaces the old `<span id="viewRotationValue">0</span>`
+    # with `<span style="...">°</span>`.  Since region-replace targets
+    # the *outer* `<div class="field">` (the wrapper the body reopens),
+    # the inner span is *supposed* to be gone.  Asserting it survives
+    # would pin the wrong behaviour — and would fail even when the
+    # outer-snap path runs correctly.
+    assert "viewRotationValue" not in result, (
+        f"old value span should be replaced by the body's new "
+        f"`<span>`; it survived, meaning the body's full replacement "
+        f"did not happen (likely an under-snapped splice):\n{result}"
+    )
+    # Sanity: the body's new span (with its distinguishing style) IS
+    # present.  If the body were only partially spliced, this would
+    # be missing too.
+    assert 'color:#7b8794' in result, (
+        f"body's new styled span missing from result:\n{result}"
     )
 
 def test_manual_html_snap_falls_back_to_innermost_without_signature():
@@ -605,3 +619,7 @@ def main():
         return 1
     print(f"\nAll {len(tests)} structural-html tests passed")
     return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

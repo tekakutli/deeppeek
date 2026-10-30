@@ -107,6 +107,7 @@ import ast
 import re
 
 from .core import FileRecord
+from ._ast import parse_source
 
 
 # Update-family verbs.  Presence anywhere in the prose is required
@@ -201,40 +202,48 @@ def _body_includes_call_updates(body, fn_names):
     return False
 
 
-def _find_calls_missing_kwarg(content, fn_name, kwarg_name):
-    """Return line numbers of every call to `fn_name` in `content`
-    that does not include `kwarg_name=` as a keyword argument.
+def _find_calls_missing_kwargs(content, fn_names, kwarg_name):
+    """Return `{fn_name: [lineno, ...]}` for every call to a name in
+    `fn_names` that does not include `kwarg_name=` as a keyword
+    argument.
+
+    Batched: one `parse_source` + one `ast.walk` per `content`,
+    regardless of `len(fn_names)`.  The previous per-fn version
+    walked `content` once per promised fn; on a record that promised
+    call-site updates to three functions, that was three walks where
+    one suffices.
 
     AST-based: parses `content` and walks every `ast.Call` whose
-    `func` is a bare `ast.Name` matching `fn_name`.  Attribute calls
-    (`.fn(...)`, `obj.fn(...)`) are not checked: the promised call
-    sites are module-level free functions, and a method call that
-    happens to share a name is a different function entirely.
+    `func` is a bare `ast.Name` matching one of `fn_names`.
+    Attribute calls (`.fn(...)`, `obj.fn(...)`) are not checked:
+    the promised call sites are module-level free functions, and a
+    method call that happens to share a name is a different function
+    entirely.
 
-    Fail-open: a `SyntaxError` in `content` returns `[]`.  By this
-    point in the pipeline `content` has been through `ast.parse`
-    checks; a syntax error here is unexpected but should not block
-    the pipeline.
+    Fail-open: a `SyntaxError` in `content` returns empty lists for
+    every name.  By this point in the pipeline `content` has been
+    through `ast.parse` checks; a syntax error here is unexpected
+    but should not block the pipeline.
     """
     if not content:
-        return []
+        return {fn: [] for fn in fn_names}
     try:
-        tree = ast.parse(content)
+        tree = parse_source(content)
     except SyntaxError:
-        return []
+        return {fn: [] for fn in fn_names}
 
-    out = []
+    missing = {fn: [] for fn in fn_names}
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         if not isinstance(node.func, ast.Name):
             continue
-        if node.func.id != fn_name:
+        if node.func.id not in missing:
             continue
         kw_names = {kw.arg for kw in node.keywords if kw.arg}
         if kwarg_name not in kw_names:
-            out.append(node.lineno)
-    return out
+            missing[node.func.id].append(node.lineno)
+    return missing
 
 
 def pass8_9_check_prose_promises(records):
@@ -286,11 +295,14 @@ def pass8_9_check_prose_promises(records):
 
         # Second-order: bodies include the promised updates.  Verify
         # they actually landed in final content, with line numbers.
+        # Batched: one parse + one walk per record regardless of how
+        # many functions the prose promised call-site updates for.
         if not path.endswith(".py"):
             continue
+        missing_by_fn = _find_calls_missing_kwargs(
+            rec.content, promised_fns, "rotation")
         for fn in sorted(promised_fns):
-            line_nos = _find_calls_missing_kwarg(
-                rec.content, fn, "rotation")
+            line_nos = missing_by_fn.get(fn, [])
             if not line_nos:
                 continue
             preview = ", ".join(str(n) for n in line_nos[:5])
