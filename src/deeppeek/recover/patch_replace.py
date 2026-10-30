@@ -115,12 +115,32 @@ body's literal and from each candidate block's literal, and scores
 by Jaccard overlap.  Key extraction is brace-scan + regex — cheap,
 language-agnostic (Python dicts and JS objects use the same
 `key: value` shape for our purposes), and reformatting-invariant.
+
+LINE-SIG CACHING (2026-11-05)
+=============================
+`_line_similarity_structurally` calls `parse_source(a, "<line>")`
+and `parse_source(b, "<line>")` for every candidate line compared
+against a new-line body.  Each call parses a one-line string —
+unique per call, so `parse_source`'s memoization never hits.
+
+Two `lru_cache`-decorated helpers (`_python_line_sig`,
+`_js_line_sig`) cache the *full result* — parse + `statement_sig`
+extraction — keyed on the line string.  Identical lines (boilerplate
+`return;`, `}` closers, repeated error handlers) hit the cache; the
+per-line cost drops to a dict lookup.
+
+`_try_single_line_replace` also caps AST-sim at
+`_AST_SIM_CANDIDATE_MAX = 8`.  Above that, it falls back to
+`_line_token_jaccard` (cheap, no parsing) — a file with dozens of
+lines sharing the body's first identifier no longer pays N× parse
+costs to discriminate.
 """
 from __future__ import annotations
 
 import ast
 import re
 import textwrap
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -146,8 +166,55 @@ _OBJECT_LITERAL_ASSIGNMENT_RE = re.compile(
 
 
 # ===========================================================================
-#  Line-level structural similarity
+#  Line-level structural similarity — cached sigs  (2026-11-05)
 # ===========================================================================
+
+@lru_cache(maxsize=2048)
+def _python_line_sig(line: str):
+    """Parse one line as Python and return its `statement_sig`, or
+    None.
+
+    Cached on the raw line string.  See module docstring,
+    LINE-SIG CACHING.
+    """
+    try:
+        tree = parse_source(line, filename="<line>")
+    except SyntaxError:
+        return None
+    if len(tree.body) != 1:
+        return None
+    from .statement_sig import _python_sig
+    return _python_sig(tree.body[0])
+
+
+@lru_cache(maxsize=2048)
+def _js_line_sig(line: str):
+    """Parse one line as JS via tree-sitter and return its
+    `statement_sig`, or None.
+
+    Returns None when tree-sitter-javascript is not installed, when
+    the line doesn't parse as exactly one child node, or when
+    `_tree_sitter_sig` declines.
+
+    Cached on the raw line string.  See module docstring,
+    LINE-SIG CACHING.
+    """
+    try:
+        from .ast_anchor import _get_parser
+        parser = _get_parser("javascript")
+    except Exception:
+        return None
+    if parser is None:
+        return None
+    try:
+        tree = parser.parse(line.encode("utf-8"))
+    except Exception:
+        return None
+    if tree.root_node.has_error or len(tree.root_node.children) != 1:
+        return None
+    from .statement_sig import _tree_sitter_sig
+    return _tree_sitter_sig(tree.root_node.children[0], "javascript")
+
 
 def _line_similarity_structurally(a: str, b: str, path: str) -> float:
     """Structural similarity for two single lines.
@@ -177,44 +244,19 @@ def _line_similarity_structurally(a: str, b: str, path: str) -> float:
         return 0.0
 
     ext = Path(path).suffix.lower() if path else ""
+    from .statement_sig import score
 
     if ext in (".py", ".pyi"):
-        try:
-            at = parse_source(a, filename="<line>")
-            bt = parse_source(b, filename="<line>")
-        except SyntaxError:
-            at = bt = None
-        if (at is not None and bt is not None
-                and len(at.body) == 1 and len(bt.body) == 1):
-            from .statement_sig import _python_sig, score
-            sa = _python_sig(at.body[0])
-            sb = _python_sig(bt.body[0])
-            if sa is not None and sb is not None:
-                return score(sa, sb)
+        sa = _python_line_sig(a)
+        sb = _python_line_sig(b)
+        if sa is not None and sb is not None:
+            return score(sa, sb)
 
     if ext in (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"):
-        try:
-            from .ast_anchor import _get_parser
-            parser = _get_parser("javascript")
-        except Exception:
-            parser = None
-        if parser is not None:
-            try:
-                atree = parser.parse(a.encode("utf-8"))
-                btree = parser.parse(b.encode("utf-8"))
-                if (not atree.root_node.has_error
-                        and not btree.root_node.has_error
-                        and len(atree.root_node.children) == 1
-                        and len(btree.root_node.children) == 1):
-                    from .statement_sig import _tree_sitter_sig, score
-                    sa = _tree_sitter_sig(
-                        atree.root_node.children[0], "javascript")
-                    sb = _tree_sitter_sig(
-                        btree.root_node.children[0], "javascript")
-                    if sa is not None and sb is not None:
-                        return score(sa, sb)
-            except Exception:
-                pass
+        sa = _js_line_sig(a)
+        sb = _js_line_sig(b)
+        if sa is not None and sb is not None:
+            return score(sa, sb)
 
     return _line_token_jaccard(a, b)
 
@@ -230,6 +272,10 @@ def _line_similarity_structurally(a: str, b: str, path: str) -> float:
 
 _ONE_LINE_MIN_SIM = 0.35
 _ONE_LINE_MIN_GAP = 0.20
+
+# Above this many candidate lines, skip the AST-similarity path and
+# use token Jaccard only.  See module docstring, LINE-SIG CACHING.
+_AST_SIM_CANDIDATE_MAX = 8
 
 
 def _try_single_line_replace(base, raw_body, context_before="", path=""):
@@ -254,14 +300,29 @@ def _try_single_line_replace(base, raw_body, context_before="", path=""):
         return None
 
     base_lines = base.split("\n")
-    candidates = []
+
+    # Collect candidate indices first (cheap identifier match).
+    # Above `_AST_SIM_CANDIDATE_MAX`, skip the per-line AST parse
+    # and use token Jaccard only — a file with dozens of lines
+    # sharing the body's first identifier would otherwise pay N×
+    # parse costs.  See module docstring, LINE-SIG CACHING.
+    candidate_idxs = []
     for i, bl in enumerate(base_lines):
         if not bl.strip():
             continue
         cand_ident = _first_identifier(bl.strip())
         if cand_ident != new_ident:
             continue
-        sim = _line_similarity_structurally(bl.strip(), stripped, path)
+        candidate_idxs.append(i)
+
+    use_ast = len(candidate_idxs) <= _AST_SIM_CANDIDATE_MAX
+    candidates = []
+    for i in candidate_idxs:
+        bl = base_lines[i].strip()
+        if use_ast:
+            sim = _line_similarity_structurally(bl, stripped, path)
+        else:
+            sim = _line_token_jaccard(bl, stripped)
         if sim >= _ONE_LINE_MIN_SIM:
             candidates.append((sim, i))
 

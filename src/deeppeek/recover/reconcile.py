@@ -5,6 +5,31 @@ excluding the minimum set of patches/pairs that caused the failure.
 See the pre-fix module docstring for the motivating cases and the
 "reconciled to base is not a rescue" invariant.
 
+SEARCH CAP (2026-11-05)
+=======================
+`_find_minimum_exclusions` used to search the full candidate set
+combinatorially: for a record with N applied items it replayed the
+patch chain O(N²) times, each replay applying O(N) patches — O(N³)
+patch applications in the worst case.  On the 2026-11-05
+`inpaint_server.py` run that was the single largest per-record cost.
+
+The search is now capped at `_MAX_FULL_SEARCH = 10` candidates.
+Above that, only `failed` and `skipped_structural_damage` patches
+are considered — the two statuses pass 6 assigns when it *knows*
+something broke.  The cap preserves the common case (small records
+get full search) and fail-closes the pathological one (large record
+with many suspect patches — the target is preserved, which is
+what would happen anyway if the search found nothing).
+
+REPLAY MEMOIZATION (2026-11-05)
+===============================
+`_replay_excluding` is deterministic: same `(base, excluded_set)`
+returns the same content.  The algorithm re-requests
+`replay({best})` in iteration K+1 after computing it as
+`replay({best})` in iteration K.  A per-call
+`frozenset(excluded) -> content` cache eliminates that redundant
+replay — one per iteration after the first.
+
 CUMULATIVE-CONTEXT DIAGNOSTICS (2026-10-29; refined 2026-11-05)
 ================================================================
 `_diagnose_exclusion` used to compare the excluded patch's body
@@ -46,20 +71,9 @@ against slightly different prior-insertion contexts and produce
 different results — the diagnostic would describe a state the
 pipeline never reached.
 
-The 2026-10-29 version threaded `prior_insertions` through
-`_replay_excluding` but still called `_try_deterministic_patch`
-directly from `_diagnose_exclusion` with only `cumulative_base` —
-losing the prior-insertion context.  The inpaint_server.py run of
-2026-11-05 surfaced that: `_diagnose_exclusion` produced "applies
-structurally, but the result fails validate_content: declaration(s)
-present in base but missing from result, and still referenced:
-['handle_krita_import_masks']", which described neither the state
-`_replay_excluding` had built nor the state `_try_deterministic_patch`
-actually consumed.
-
 PRIOR-INSERTIONS REPLAY (2026-10-29)
 ====================================
-`_replay_excluding` now threads `prior_insertions` and `prior_scopes`
+`_replay_excluding` threads `prior_insertions` and `prior_scopes`
 through `_try_deterministic_patch`, the same way
 `pass6_apply_patches` does. The two code paths now see the same
 content; without this, reconcile could exclude a patch that
@@ -78,30 +92,11 @@ then saw `key` as already-applied and returned unchanged — so the
 diagnostic always said "applies cleanly" for every single-exclusion
 record, regardless of the actual applicability. Fixed to `{key}`.
 
-POST-EXCLUDE STATEMENT AUDIT (2026-10-29, this revision)
-=======================================================
+POST-EXCLUDE STATEMENT AUDIT (2026-10-29)
+=========================================
 `pass8_7_reconcile` now runs `structural_diff(base, new_content,
 path, "")` after successful promotion and reports any statement-level
 divergence to `rec.warnings`.  Advisory only — does not change trust.
-
-Motivating shape (inpaint_server.py): the excluded patch 634 was a
-*modified version of one statement* — the failure return — but
-reconcile's only check (`validate_content` + `find_unresolved_
-references`) confirms the resulting file parses and resolves.  It
-does not notice that a body shaped like a modified return landed as
-a duplicate (the excluded patch's contributions arriving through
-some other heuristic as dead code).  The statement-level diff names
-the divergence: "return {...errors...}" is a signature present in
-base? no — present only in the pre-exclusion state; absent from
-result.  Combined with the pass-8.10 check on the *unreconciled*
-content, this closes the loop: divergence is caught either before
-reconcile (reject the patch) or after (warn the user).
-
-The invariant this audit surfaces, without enforcing:
-"reconcile promoted, but the promoted content does not carry the
-statement shape the excluded patch was trying to introduce, and may
-carry a look-alike that parses."  That sentence, as a warning, is
-what a user reading `warnings.txt` actually needs.
 
 Prior docstring content (unchanged):
 - STALE-WARNING CLEANUP
@@ -131,6 +126,11 @@ _NO_OP_STATUSES = frozenset({
     "skipped_unplaceable",
     "skipped_structural_damage",
 })
+
+# Search-cap threshold.  Above this many candidates in
+# `_find_minimum_exclusions`, restrict to failed / skipped_structural
+# patches.  See module docstring, SEARCH CAP.
+_MAX_FULL_SEARCH = 10
 
 
 def _pair_key(pair):
@@ -303,7 +303,8 @@ def _replay_state_up_to(rec, base, excluded_keys, stop_key, path,
     return (content, record_inserted, prior_scopes)
 
 
-def _count_failures(content, path, rec, base, records, excluded_keys):
+def _count_failures(content, path, rec, base, records, excluded_keys,
+                    global_exports=None):
     """Return (n_failures, [failure_descriptors]).
 
     Runs every *demoting* check pass 8.x performs. Lint and
@@ -321,7 +322,7 @@ def _count_failures(content, path, rec, base, records, excluded_keys):
 
     trial = replace(rec, content=content)
     unresolved, mismatched = find_unresolved_references(
-        trial, base, records)
+        trial, base, records, global_exports=global_exports)
     if unresolved or mismatched:
         failures.append(("unresolved_calls", {
             "unresolved": unresolved,
@@ -347,18 +348,69 @@ def _count_failures(content, path, rec, base, records, excluded_keys):
 
 
 def _find_minimum_exclusions(rec, base, records, path, blocks_by_idx):
+    """Return the smallest set of exclusion keys that resolves every
+    failure, or None.
+
+    Capped and memoized.  See module docstring, SEARCH CAP and
+    REPLAY MEMOIZATION for the 2026-11-05 changes and the motivating
+    numbers.
+    """
     candidates = _applied_keys(rec)
     if not candidates:
         return None
 
-    excluded = set()
+    # Precompute the cross-record export union once.  Both
+    # `_count_failures` calls below would otherwise rebuild it from
+    # scratch — O(N) `_extract_exported` unions per exclusion trial,
+    # which dominates the exclusion search's wall time on large
+    # `--apply-to` runs.  `_extract_exported` is `@lru_cache`d, so
+    # the union itself is a few-hundred dict lookups, paid once per
+    # record rather than once per trial.
+    from .symbols import _extract_exported
+    global_exports: set = set()
+    for p, r in records.items():
+        if r.content is not None:
+            global_exports |= _extract_exported(r.content, p)
+
+    # Cap above `_MAX_FULL_SEARCH`: restrict to patches pass 6
+    # explicitly marked as bad.  Full combinatorial search on a
+    # 20-patch record is O(20³) = 8000 patch applications, each of
+    # which re-parses content.  The failed set is where the culprit
+    # almost always lives (pass 6 downgrades structural failures to
+    # "failed"), and fail-closing on the pathological case is the
+    # correct outcome — the target is preserved.
+    if len(candidates) > _MAX_FULL_SEARCH:
+        failed_idxs = {
+            p["idx"] for p in rec.patches
+            if p.get("applied_by") in (
+                "failed", "skipped_structural_damage")
+        }
+        candidates = [k for k in candidates
+                      if k[0] == "patch" and k[1] in failed_idxs]
+        if not candidates:
+            return None
+
+    # Memoize replay by exclusion set.  Each iteration K+1
+    # re-requests `replay(current_excluded)`, which was already
+    # computed as the trial set of iteration K.  The cache
+    # eliminates one full replay per iteration after the first.
+    cache: dict = {}
+
+    def _replay(excl):
+        key = frozenset(excl)
+        if key not in cache:
+            cache[key] = _replay_excluding(
+                rec, base, excl, path, blocks_by_idx, records)
+        return cache[key]
+
+    excluded: set = set()
     for _ in range(len(candidates) + 1):
-        content = _replay_excluding(
-            rec, base, excluded, path, blocks_by_idx, records)
+        content = _replay(excluded)
         if content is None:
             return None
         failures, _ = _count_failures(
-            content, path, rec, base, records, excluded)
+            content, path, rec, base, records, excluded,
+            global_exports=global_exports)
         if failures == 0:
             return sorted(excluded)
 
@@ -367,12 +419,12 @@ def _find_minimum_exclusions(rec, base, records, path, blocks_by_idx):
             if key in excluded:
                 continue
             trial_set = excluded | {key}
-            trial_content = _replay_excluding(
-                rec, base, trial_set, path, blocks_by_idx, records)
+            trial_content = _replay(trial_set)
             if trial_content is None:
                 continue
             trial_failures, _ = _count_failures(
-                trial_content, path, rec, base, records, trial_set)
+                trial_content, path, rec, base, records, trial_set,
+                global_exports=global_exports)
             gain = failures - trial_failures
             if gain <= 0:
                 continue

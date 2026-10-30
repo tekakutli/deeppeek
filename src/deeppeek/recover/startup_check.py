@@ -14,6 +14,22 @@ months.
 
 `RecoverConfig.skip_import_check` (see orchestration.py) lets a run
 skip this pass for latency; every test invocation should set it.
+
+MODULE-LEVEL CACHE (2026-11-05)
+===============================
+`_find_unresolved_module_names` walks the module's AST — potentially
+thousands of nodes — every time it is called.  In the current
+pipeline it is called exactly once per module per run, so the walk
+cost is bounded by `n_modules × n_nodes`.  The `@lru_cache(maxsize=
+None)` decorator does not make the *first* call any cheaper, but it
+makes a re-call (from a test, from a second `validate_pipeline_imports`
+invocation in the same process, from a diagnostic command that wants
+to re-check one module) a dict lookup.
+
+The module's source cannot change during a process, so the cache is
+safe for the process lifetime.  The public wrapper converts the
+cached tuple back to a list so existing callers see the pre-fix
+return type.
 """
 
 import ast
@@ -21,13 +37,32 @@ import builtins
 import importlib
 import pkgutil
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 from ._ast import parse_source
 
 
+@lru_cache(maxsize=None)
+def _find_unresolved_module_names_cached(
+        module_name: str) -> tuple:
+    """Cached worker.  Returns a tuple so callers cannot mutate the
+    cached value; the public wrapper converts to list."""
+    return tuple(_find_unresolved_module_names_uncached(module_name))
+
+
 def _find_unresolved_module_names(
-        module_name: str) -> list[tuple[int, str]]:
+        module_name: str) -> list:
+    """Public wrapper over the cached worker.
+
+    Returns a fresh list per call — the cached value is a tuple, so
+    callers who do `result.append(...)` do not corrupt the cache.
+    """
+    return list(_find_unresolved_module_names_cached(module_name))
+
+
+def _find_unresolved_module_names_uncached(
+        module_name: str) -> list:
     """Walk `module_name`'s AST and return `[(lineno, name)]` for every
     name load that is not bound ANYWHERE in the module.
 

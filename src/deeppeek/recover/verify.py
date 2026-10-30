@@ -44,6 +44,19 @@ Pass 8.5 — symbol resolution
 against each file's imports and declarations.  Demote the record to
 LOW trust on an unresolved call introduced by a patch.
 
+GLOBAL EXPORT INDEX (2026-11-05)
+================================
+`pass8_5_check_symbols` used to call `find_unresolved_references`
+per record, and that function re-derived the cross-file export set
+inside every call — O(N) `_extract_exported` unions per record, so
+O(N²) unions per pass.  The cached `_extract_exported` made each
+individual union cheap, but the loop dominated on large trees.
+
+The pass now precomputes the export union once and threads it
+through `global_exports` — pass 8.5's per-record work drops to a
+single set-union against the precomputed set, turning the pass from
+O(N²) into O(N + K) where K is the export-set size.
+
 SANITY ATTRIBUTION CROSS-RECORD GATE
 ====================================
 `attribute_sanity_failure` (from `apply_patches.py`) can
@@ -512,7 +525,26 @@ def pass8_verify(records: dict[str, FileRecord],
 
 def pass8_5_check_symbols(records: dict[str, FileRecord],
                           blocks_by_idx: Optional[dict] = None) -> None:
-    from .symbols import find_unresolved_references
+    """Cross-check patch-introduced bare calls against each file's
+    imports and declarations.  Demote to LOW on an unresolved call
+    introduced by a patch.
+
+    Precomputes `global_exports` once (see module docstring, GLOBAL
+    EXPORT INDEX) and threads it through every `find_unresolved_
+    references` call.  Turns the pass from O(N²) export-set unions
+    into O(N + K).
+    """
+    from .symbols import find_unresolved_references, _extract_exported
+
+    # Build the cross-record export union once.  Each
+    # `_extract_exported` is `@lru_cache`d; repeat calls within a run
+    # are dict lookups.  The union is what makes the per-record loop
+    # cheap — without it, every per-record call rebuilds the union
+    # from scratch, which is O(N) per record.
+    global_exports: set = set()
+    for p, r in records.items():
+        if r.content is not None:
+            global_exports |= _extract_exported(r.content, p)
 
     for path, rec in records.items():
         if rec.content is None:
@@ -529,7 +561,7 @@ def pass8_5_check_symbols(records: dict[str, FileRecord],
                 base = base_block.body
 
         unresolved, mismatched = find_unresolved_references(
-            rec, base, records)
+            rec, base, records, global_exports=global_exports)
         if not unresolved and not mismatched:
             continue
 

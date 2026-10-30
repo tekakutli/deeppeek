@@ -80,6 +80,24 @@ produce an unresolved call — the call resolves, the invocation
 fails.  That is a separate class (call-arity / keyword-arg
 checking) and would be a distinct pass.
 
+CROSS-FILE EXPORT INDEX (2026-11-05)
+====================================
+`find_unresolved_references` used to re-derive the cross-file export
+set on every call — O(N) `_extract_exported` unions per caller
+record, hence O(N²) unions per pass.  The cached `_extract_exported`
+made each individual union cheap, but the loop itself dominated on
+large `--apply-to` runs.
+
+The caller can now precompute the union once and pass it as
+`global_exports`.  `pass8_5_check_symbols` and
+`reconcile._find_minimum_exclusions` both do this — the former
+turns pass 8.5 from O(N²) into O(N + K); the latter removes the
+export-set derivation from every exclusion-search trial.
+
+When `global_exports` is None (the default), the function falls back
+to the pre-fix O(N) loop.  That path is preserved for ad-hoc callers
+(tests, scripts) that only have a small `all_records`.
+
 MEMOIZATION (2026-11-05)
 ========================
 Every helper below that is a pure function of its string argument
@@ -143,7 +161,9 @@ from ._ast import parse_source
 
 def find_unresolved_references(record: FileRecord,
                                base_content: Optional[str],
-                               all_records: dict) -> tuple[list, list]:
+                               all_records: dict,
+                               global_exports: Optional[set] = None,
+                               ) -> tuple[list, list]:
     """Return (unresolved_bare_calls, signature_mismatches).
 
     `unresolved_bare_calls` is the sorted list of new call names that
@@ -153,6 +173,11 @@ def find_unresolved_references(record: FileRecord,
     for calls whose args are incompatible with the resolved
     definition's signature.  Populated only for Python files whose
     callee is declared in the same content (not imported).
+
+    `global_exports` — optional precomputed union of `_extract_exported`
+    over every record in `all_records`.  When supplied, the O(N) loop
+    over `all_records` is replaced by a single set-union.  See the
+    module docstring, CROSS-FILE EXPORT INDEX.
 
     Empty lists mean the record is clean.
     """
@@ -214,12 +239,19 @@ def find_unresolved_references(record: FileRecord,
     resolvable.update(imp_b)
     resolvable.update(decl_b)
 
-    for other_path, other_rec in all_records.items():
-        if other_path == record.path:
-            continue
-        if other_rec.content is None:
-            continue
-        resolvable |= _extract_exported(other_rec.content, other_path)
+    # Cross-file resolution.  With a precomputed `global_exports`, one
+    # set-union replaces the O(N) loop over `all_records`.  Without,
+    # fall back to the pre-fix loop (ad-hoc callers only).
+    if global_exports is not None:
+        resolvable |= global_exports
+    else:
+        for other_path, other_rec in all_records.items():
+            if other_path == record.path:
+                continue
+            if other_rec.content is None:
+                continue
+            resolvable |= _extract_exported(
+                other_rec.content, other_path)
 
     if is_js_content:
         resolvable |= _JS_BUILTINS

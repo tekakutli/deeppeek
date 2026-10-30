@@ -15,6 +15,23 @@ attributes, etc.
 The AST-based finder handles every shape the language defines, in
 one place, with exact boundaries.
 
+CACHE FIX (2026-11-05)
+======================
+The pre-fix caches used `key = (hash(base), len(base), name, path)`.
+Two different bases with the same 64-bit hash *and* the same length
+would return the wrong cached result.  Vanishingly unlikely per pair,
+permanent if it happens, and it wasn't even faster — CPython hashes
+`str` once per object and dict lookup is O(1) either way.
+
+The caches are now `@functools.lru_cache(maxsize=1024)` keyed on the
+actual `base` string.  `lru_cache` evicts LRU instead of `.clear()`
+on overflow, so busy runs don't thrash.
+
+`_python_decl_index(content)` caches the per-content declaration
+index: one `ast.walk(tree)` per unique content, reused by every scope
+lookup on that file.  A file with 3 scope lookups pays 1 walk
+instead of 3; a file with 6 pays 1 instead of 6.
+
 BOUNDARIES
 ==========
 `find_scope` returns `(start_char, end_char, kind)` where:
@@ -117,15 +134,16 @@ from __future__ import annotations
 
 import ast
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
 from ._ast import parse_source
 
-_SCOPE_CACHE: dict[tuple, object] = {}
-_SCOPE_BODY_CACHE: dict[tuple, object] = {}
-_SCOPE_ENCLOSING_CACHE: dict[tuple, object] = {}
-_SCOPE_CACHE_MAX = 512
+# Cache size for the three finder caches.  A mid-sized --apply-to
+# run touches ~500 files; 1024 entries hold every (base, name, path)
+# triple plus headroom for reconciliation replay.
+_SCOPE_CACHE_MAX = 1024
 
 # Minimum length of a triple-quoted string for it to count as a
 # candidate for embedded-JS scanning.  Matches the threshold used
@@ -135,28 +153,89 @@ _SCOPE_CACHE_MAX = 512
 _MIN_EMBEDDED_JS_LEN = 100
 
 
+# ---------------------------------------------------------------------------
+#  Python declaration index  (NEW 2026-11-05)
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=512)
+def _python_decl_index(content: str) -> dict:
+    """`{name: [nodes]}` for every named declaration in `content`.
+
+    One `ast.walk(tree)` per unique content, cached.  Every scope
+    lookup for this file reuses the index instead of re-walking.
+
+    "Named declaration" here means FunctionDef, AsyncFunctionDef,
+    ClassDef, `X = ...` (Assign), and `X: T = ...` (AnnAssign).  The
+    node type distinguishes scope-with-body (functions/classes) from
+    scope-with-value (assignments); callers that need the former
+    filter with `isinstance`.
+
+    Returned dict is cached — callers MUST NOT mutate it or the
+    lists it contains.  Every existing caller iterates or uses
+    `.get(...)` only.
+    """
+    try:
+        tree = parse_source(content)
+    except SyntaxError:
+        return {}
+
+    idx: dict = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            idx.setdefault(node.name, []).append(node)
+        elif isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    idx.setdefault(tgt.id, []).append(node)
+                    break
+        elif (isinstance(node, ast.AnnAssign)
+              and isinstance(node.target, ast.Name)):
+            idx.setdefault(node.target.id, []).append(node)
+    return idx
+
+
+def _iter_python_nodes(tree):
+    """Yield (name, node) for every named declaration in `tree`.
+
+    Backward-compat shim.  New code should use `_python_decl_index`
+    instead — this walks the tree fresh on every call.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            yield node.name, node
+        elif isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    yield tgt.id, node
+                    break
+        elif (isinstance(node, ast.AnnAssign)
+              and isinstance(node.target, ast.Name)):
+            yield node.target.id, node
+
+
+# ---------------------------------------------------------------------------
+#  Public dispatch — thin lru_cache wrappers
+# ---------------------------------------------------------------------------
+
 def find_scope(base: str, name: str, path: str = "",
                scope_hint: str = "") -> Optional[tuple[int, int, str]]:
     """Return `(start_char, end_char, kind)` for the named scope,
     or None.
 
-    Memoized: subsequent calls with the same `(base, name, path)`
-    return the cached tuple.  See the module docstring's
-    CACHING section for the key design and the reason `base` is not
-    kept in the key.
-
-    (rest of original docstring unchanged)
+    Memoized by `(base, name, path, scope_hint)` — the actual base
+    string, not its hash.  See module docstring, CACHE FIX.
     """
     if not base or not name:
         return None
-    key = (hash(base), len(base), name, path)
-    if key in _SCOPE_CACHE:
-        return _SCOPE_CACHE[key]
-    result = _find_scope_uncached(base, name, path, scope_hint)
-    if len(_SCOPE_CACHE) >= _SCOPE_CACHE_MAX:
-        _SCOPE_CACHE.clear()
-    _SCOPE_CACHE[key] = result
-    return result
+    return _find_scope_cached(base, name, path, scope_hint)
+
+
+@lru_cache(maxsize=_SCOPE_CACHE_MAX)
+def _find_scope_cached(base: str, name: str, path: str,
+                       scope_hint: str):
+    return _find_scope_uncached(base, name, path, scope_hint)
 
 
 def _find_scope_uncached(base, name, path, scope_hint):
@@ -203,38 +282,33 @@ def _find_scope_uncached(base, name, path, scope_hint):
 
 
 def find_enclosing_scope_name(base: str, anchor_pos: int,
-                                path: str = "") -> Optional[str]:
-    """...original docstring...
+                               path: str = "") -> Optional[str]:
+    """Return the name of the innermost function/class whose span
+    contains `anchor_pos`, or None.
 
-    Memoized on `(base, anchor_pos, path)`.
+    Memoized by `(base, anchor_pos, path)`.  See module docstring,
+    CACHE FIX.
     """
     if not base or anchor_pos < 0:
         return None
-    key = (hash(base), len(base), anchor_pos, path)
-    if key in _SCOPE_ENCLOSING_CACHE:
-        return _SCOPE_ENCLOSING_CACHE[key]
-    result = _find_enclosing_scope_name_uncached(base, anchor_pos, path)
-    if len(_SCOPE_ENCLOSING_CACHE) >= _SCOPE_CACHE_MAX:
-        _SCOPE_ENCLOSING_CACHE.clear()
-    _SCOPE_ENCLOSING_CACHE[key] = result
-    return result
+    return _find_enclosing_scope_name_cached(base, anchor_pos, path)
+
+
+@lru_cache(maxsize=_SCOPE_CACHE_MAX)
+def _find_enclosing_scope_name_cached(base: str, anchor_pos: int,
+                                       path: str):
+    return _find_enclosing_scope_name_uncached(base, anchor_pos, path)
 
 
 def _find_enclosing_scope_name_uncached(base, anchor_pos, path):
-    # Body identical to the pre-change `find_enclosing_scope_name`
-    # implementation, with no changes — the guard at
-    # `_iter_embedded_js_decls` (below) short-circuits the embedded
-    # tier for `.py` files without triple-quotes.
     ext = Path(path).suffix.lower() if path else ""
-    candidates: list[tuple[str, int]] = []
+    candidates: list = []
 
     if ext in (".py", ".pyi") or not ext:
-        try:
-            tree = parse_source(base)
-        except SyntaxError:
-            tree = None
-        if tree is not None:
-            for node in ast.walk(tree):
+        # Index-driven lookup.  Iterates declarations, not tree
+        # nodes, and reuses the cached index across calls.
+        for _name, nodes in _python_decl_index(base).items():
+            for node in nodes:
                 if not isinstance(node, (ast.FunctionDef,
                                           ast.AsyncFunctionDef,
                                           ast.ClassDef)):
@@ -263,20 +337,20 @@ def _find_enclosing_scope_name_uncached(base, anchor_pos, path):
 
 def find_scope_body_span(base: str, name: str,
                           path: str = "") -> Optional[tuple[int, int]]:
-    """...original docstring...
+    """Return `(body_open_char, body_close_char)` for the named
+    scope, or None.
 
-    Memoized on `(base, name, path)`.
+    Memoized by `(base, name, path)`.  See module docstring,
+    CACHE FIX.
     """
     if not base or not name:
         return None
-    key = (hash(base), len(base), name, path)
-    if key in _SCOPE_BODY_CACHE:
-        return _SCOPE_BODY_CACHE[key]
-    result = _find_scope_body_span_uncached(base, name, path)
-    if len(_SCOPE_BODY_CACHE) >= _SCOPE_CACHE_MAX:
-        _SCOPE_BODY_CACHE.clear()
-    _SCOPE_BODY_CACHE[key] = result
-    return result
+    return _find_scope_body_span_cached(base, name, path)
+
+
+@lru_cache(maxsize=_SCOPE_CACHE_MAX)
+def _find_scope_body_span_cached(base: str, name: str, path: str):
+    return _find_scope_body_span_uncached(base, name, path)
 
 
 def _find_scope_body_span_uncached(base, name, path):
@@ -311,13 +385,29 @@ def _find_scope_body_span_uncached(base, name, path):
     return _find_embedded_js_body_span(base, name)
 
 
-def _find_python_body_span(base, name):
-    try:
-        tree = parse_source(base)
-    except SyntaxError:
+# ---------------------------------------------------------------------------
+#  Python scope resolution — index-driven  (NEW 2026-11-05)
+# ---------------------------------------------------------------------------
+
+def _find_python_scope(base: str,
+                        name: str) -> Optional[tuple[int, int, str]]:
+    # Matches original behavior: assignments are valid "scopes" here
+    # (used by the object-literal-replace path), so no type filter.
+    candidates = _python_decl_index(base).get(name, [])
+    if not candidates:
         return None
-    candidates = [node for n, node in _iter_python_nodes(tree)
-                  if n == name]
+    node = min(candidates, key=lambda n: n.lineno)
+    return (_python_start_char(base, node),
+            _python_end_char(base, node),
+            "python")
+
+
+def _find_python_body_span(base, name):
+    candidates = [
+        n for n in _python_decl_index(base).get(name, [])
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                          ast.ClassDef))
+    ]
     if not candidates:
         return None
     node = min(candidates, key=lambda n: n.lineno)
@@ -338,6 +428,146 @@ def _find_python_body_span(base, name):
     if last_line_idx < len(lines):
         body_close += len(lines[last_line_idx])
     return (body_open, body_close)
+
+
+def _python_start_char(base: str, node) -> int:
+    """Char offset of the node's first line, extended up through
+    decorators if present."""
+    lineno = node.lineno  # 1-based
+    for dec in getattr(node, "decorator_list", []) or []:
+        if dec.lineno < lineno:
+            lineno = dec.lineno
+    lines = base.split("\n")
+    start = 0
+    for i in range(lineno - 1):
+        start += len(lines[i]) + 1
+    return start
+
+
+def _python_end_char(base: str, node) -> int:
+    """Char offset one past the node's last line (includes trailing
+    newline when the file has one)."""
+    end_lineno = node.end_lineno  # 1-based inclusive
+    lines = base.split("\n")
+    end = 0
+    for i in range(min(end_lineno, len(lines))):
+        end += len(lines[i]) + 1
+    return min(end, len(base))
+
+
+# ---------------------------------------------------------------------------
+#  JavaScript / TypeScript
+# ---------------------------------------------------------------------------
+
+def _line_starts(base: str) -> list:
+    """0-based char offset of each line's start."""
+    starts = [0]
+    for i, ch in enumerate(base):
+        if ch == "\n":
+            starts.append(i + 1)
+    return starts
+
+
+def _char_of(base: str, line_starts: list, point: tuple) -> int:
+    """Convert tree-sitter `(row, col)` to char offset."""
+    row, col = point
+    if row >= len(line_starts):
+        return len(base)
+    return line_starts[row] + col
+
+
+def _walk(node):
+    yield node
+    for c in node.children:
+        yield from _walk(c)
+
+
+def _node_text(node) -> str:
+    t = node.text
+    if isinstance(t, bytes):
+        return t.decode("utf-8", "replace")
+    return t or ""
+
+
+def _js_decl_name(node) -> Optional[str]:
+    """Extract the name from a JS declaration node."""
+    if node.type == "export_statement":
+        for child in node.children:
+            n = _js_decl_name(child)
+            if n:
+                return n
+        return None
+    if node.type in ("function_declaration",
+                     "generator_function_declaration",
+                     "class_declaration"):
+        for c in node.children:
+            if c.type == "identifier":
+                return _node_text(c)
+        return None
+    if node.type in ("lexical_declaration", "variable_declaration"):
+        for c in node.children:
+            if c.type == "variable_declarator":
+                for cc in c.children:
+                    if cc.type == "identifier":
+                        return _node_text(cc)
+        return None
+    return None
+
+
+def _find_js_scope(base: str, name: str) -> Optional[tuple[int, int, str]]:
+    from .ast_anchor import _get_parser
+    parser = _get_parser("javascript")
+    if parser is None:
+        return None
+    try:
+        tree = parser.parse(base.encode("utf-8"))
+    except Exception:
+        return None
+    if tree is None or tree.root_node.has_error:
+        return None
+
+    line_starts = _line_starts(base)
+    for node in _walk(tree.root_node):
+        if _js_decl_name(node) != name:
+            continue
+        start = _char_of(base, line_starts, node.start_point)
+        end = _char_of(base, line_starts, node.end_point)
+        if end < len(base):
+            if base[end] == "\n":
+                end += 1
+            else:
+                nl = base.find("\n", end)
+                end = len(base) if nl == -1 else nl + 1
+        return (start, end, "js")
+    return None
+
+
+def _iter_js_scope_spans(base: str):
+    """Yield (name, start_char, end_char) for every named JS scope."""
+    from .ast_anchor import _get_parser
+    parser = _get_parser("javascript")
+    if parser is None:
+        return
+    try:
+        tree = parser.parse(base.encode("utf-8"))
+    except Exception:
+        return
+    if tree is None or tree.root_node.has_error:
+        return
+    line_starts = _line_starts(base)
+    for node in _walk(tree.root_node):
+        n = _js_decl_name(node)
+        if not n:
+            continue
+        start = _char_of(base, line_starts, node.start_point)
+        end = _char_of(base, line_starts, node.end_point)
+        if end < len(base):
+            if base[end] == "\n":
+                end += 1
+            else:
+                nl = base.find("\n", end)
+                end = len(base) if nl == -1 else nl + 1
+        yield n, start, end
 
 
 def _find_js_body_span(base, name):
@@ -415,6 +645,69 @@ def _find_js_body_node(node):
     # Object / array literal: the node itself is the "body".
     if node.type in ("object", "array"):
         return node
+    return None
+
+
+# ---------------------------------------------------------------------------
+#  HTML
+# ---------------------------------------------------------------------------
+
+def _html_tag_name(node) -> Optional[str]:
+    for child in node.children:
+        if child.type in ("start_tag", "self_closing_tag"):
+            for c in child.children:
+                if c.type == "tag_name":
+                    return _node_text(c).lower()
+    return None
+
+
+def _html_summary_of(node, base: str) -> str:
+    """Return the text of the first `<summary>` descendant, or ""."""
+    line_starts = _line_starts(base)
+    for child in node.children:
+        if child.type == "element" and _html_tag_name(child) == "summary":
+            start = _char_of(base, line_starts, child.start_point)
+            end = _char_of(base, line_starts, child.end_point)
+            text = base[start:end]
+            m = re.search(r"<summary[^>]*>(.*?)</summary>",
+                          text, re.DOTALL | re.IGNORECASE)
+            if m:
+                return re.sub(r"\s+", " ", m.group(1)).strip()
+    return ""
+
+
+def _find_html_scope(base: str, name: str) -> Optional[tuple[int, int, str]]:
+    try:
+        import tree_sitter_html  # type: ignore
+        from tree_sitter import Language, Parser
+    except ImportError:
+        return None
+    try:
+        parser = Parser(Language(tree_sitter_html.language()))
+        tree = parser.parse(base.encode("utf-8"))
+    except Exception:
+        return None
+    if tree is None:
+        return None
+
+    line_starts = _line_starts(base)
+    for node in _walk(tree.root_node):
+        if node.type != "element":
+            continue
+        if _html_tag_name(node) != "details":
+            continue
+        summary = _html_summary_of(node, base)
+        if summary != name:
+            continue
+        start = _char_of(base, line_starts, node.start_point)
+        end = _char_of(base, line_starts, node.end_point)
+        if end < len(base):
+            if base[end] == "\n":
+                end += 1
+            else:
+                nl = base.find("\n", end)
+                end = len(base) if nl == -1 else nl + 1
+        return (start, end, "html")
     return None
 
 
@@ -584,252 +877,3 @@ def _iter_embedded_js_scope_spans(base: str):
         yield (js_name,
                content_start + inner_start,
                content_start + inner_end)
-
-
-# ===========================================================================
-#  Python
-# ===========================================================================
-
-def _iter_python_nodes(tree):
-    """Yield (name, node) for every named declaration in `tree`.
-
-    Handles:
-      · FunctionDef / AsyncFunctionDef / ClassDef at any nesting level
-      · module-level `NAME = ...` Assign and `NAME: type = ...` AnnAssign
-
-    Note: this generator is used by `find_scope` (where assignments
-    ARE useful — `X = {...}` is a legitimate scope for object-literal
-    replacement) and by `find_scope_body_span`. It is NOT used by
-    `find_enclosing_scope_name`, which filters to function/class
-    nodes only.
-    """
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
-                              ast.ClassDef)):
-            yield node.name, node
-        elif isinstance(node, ast.Assign):
-            for tgt in node.targets:
-                if isinstance(tgt, ast.Name):
-                    yield tgt.id, node
-                    break
-        elif (isinstance(node, ast.AnnAssign)
-              and isinstance(node.target, ast.Name)):
-            yield node.target.id, node
-
-
-def _find_python_scope(base: str, name: str) -> Optional[tuple[int, int, str]]:
-    try:
-        tree = parse_source(base)
-    except SyntaxError:
-        return None
-    candidates = [node for n, node in _iter_python_nodes(tree)
-                  if n == name]
-    if not candidates:
-        return None
-    node = min(candidates, key=lambda n: n.lineno)
-    return (_python_start_char(base, node),
-            _python_end_char(base, node),
-            "python")
-
-
-def _python_start_char(base: str, node) -> int:
-    """Char offset of the node's first line, extended up through
-    decorators if present."""
-    lineno = node.lineno  # 1-based
-    for dec in getattr(node, "decorator_list", []) or []:
-        if dec.lineno < lineno:
-            lineno = dec.lineno
-    lines = base.split("\n")
-    start = 0
-    for i in range(lineno - 1):
-        start += len(lines[i]) + 1
-    return start
-
-
-def _python_end_char(base: str, node) -> int:
-    """Char offset one past the node's last line (includes trailing
-    newline when the file has one)."""
-    end_lineno = node.end_lineno  # 1-based inclusive
-    lines = base.split("\n")
-    end = 0
-    for i in range(min(end_lineno, len(lines))):
-        end += len(lines[i]) + 1
-    return min(end, len(base))
-
-
-# ===========================================================================
-#  JavaScript / TypeScript
-# ===========================================================================
-
-def _line_starts(base: str) -> list:
-    """0-based char offset of each line's start."""
-    starts = [0]
-    for i, ch in enumerate(base):
-        if ch == "\n":
-            starts.append(i + 1)
-    return starts
-
-
-def _char_of(base: str, line_starts: list, point: tuple) -> int:
-    """Convert tree-sitter `(row, col)` to char offset."""
-    row, col = point
-    if row >= len(line_starts):
-        return len(base)
-    return line_starts[row] + col
-
-
-def _walk(node):
-    yield node
-    for c in node.children:
-        yield from _walk(c)
-
-
-def _node_text(node) -> str:
-    t = node.text
-    if isinstance(t, bytes):
-        return t.decode("utf-8", "replace")
-    return t or ""
-
-
-def _js_decl_name(node) -> Optional[str]:
-    """Extract the name from a JS declaration node."""
-    if node.type == "export_statement":
-        for child in node.children:
-            n = _js_decl_name(child)
-            if n:
-                return n
-        return None
-    if node.type in ("function_declaration",
-                     "generator_function_declaration",
-                     "class_declaration"):
-        for c in node.children:
-            if c.type == "identifier":
-                return _node_text(c)
-        return None
-    if node.type in ("lexical_declaration", "variable_declaration"):
-        for c in node.children:
-            if c.type == "variable_declarator":
-                for cc in c.children:
-                    if cc.type == "identifier":
-                        return _node_text(cc)
-        return None
-    return None
-
-
-def _find_js_scope(base: str, name: str) -> Optional[tuple[int, int, str]]:
-    from .ast_anchor import _get_parser
-    parser = _get_parser("javascript")
-    if parser is None:
-        return None
-    try:
-        tree = parser.parse(base.encode("utf-8"))
-    except Exception:
-        return None
-    if tree is None or tree.root_node.has_error:
-        return None
-
-    line_starts = _line_starts(base)
-    for node in _walk(tree.root_node):
-        if _js_decl_name(node) != name:
-            continue
-        start = _char_of(base, line_starts, node.start_point)
-        end = _char_of(base, line_starts, node.end_point)
-        if end < len(base):
-            if base[end] == "\n":
-                end += 1
-            else:
-                nl = base.find("\n", end)
-                end = len(base) if nl == -1 else nl + 1
-        return (start, end, "js")
-    return None
-
-
-def _iter_js_scope_spans(base: str):
-    """Yield (name, start_char, end_char) for every named JS scope."""
-    from .ast_anchor import _get_parser
-    parser = _get_parser("javascript")
-    if parser is None:
-        return
-    try:
-        tree = parser.parse(base.encode("utf-8"))
-    except Exception:
-        return
-    if tree is None or tree.root_node.has_error:
-        return
-    line_starts = _line_starts(base)
-    for node in _walk(tree.root_node):
-        n = _js_decl_name(node)
-        if not n:
-            continue
-        start = _char_of(base, line_starts, node.start_point)
-        end = _char_of(base, line_starts, node.end_point)
-        if end < len(base):
-            if base[end] == "\n":
-                end += 1
-            else:
-                nl = base.find("\n", end)
-                end = len(base) if nl == -1 else nl + 1
-        yield n, start, end
-
-
-# ===========================================================================
-#  HTML
-# ===========================================================================
-
-def _html_tag_name(node) -> Optional[str]:
-    for child in node.children:
-        if child.type in ("start_tag", "self_closing_tag"):
-            for c in child.children:
-                if c.type == "tag_name":
-                    return _node_text(c).lower()
-    return None
-
-
-def _html_summary_of(node, base: str) -> str:
-    """Return the text of the first `<summary>` descendant, or ""."""
-    line_starts = _line_starts(base)
-    for child in node.children:
-        if child.type == "element" and _html_tag_name(child) == "summary":
-            start = _char_of(base, line_starts, child.start_point)
-            end = _char_of(base, line_starts, child.end_point)
-            text = base[start:end]
-            m = re.search(r"<summary[^>]*>(.*?)</summary>",
-                          text, re.DOTALL | re.IGNORECASE)
-            if m:
-                return re.sub(r"\s+", " ", m.group(1)).strip()
-    return ""
-
-
-def _find_html_scope(base: str, name: str) -> Optional[tuple[int, int, str]]:
-    try:
-        import tree_sitter_html  # type: ignore
-        from tree_sitter import Language, Parser
-    except ImportError:
-        return None
-    try:
-        parser = Parser(Language(tree_sitter_html.language()))
-        tree = parser.parse(base.encode("utf-8"))
-    except Exception:
-        return None
-    if tree is None:
-        return None
-
-    line_starts = _line_starts(base)
-    for node in _walk(tree.root_node):
-        if node.type != "element":
-            continue
-        if _html_tag_name(node) != "details":
-            continue
-        summary = _html_summary_of(node, base)
-        if summary != name:
-            continue
-        start = _char_of(base, line_starts, node.start_point)
-        end = _char_of(base, line_starts, node.end_point)
-        if end < len(base):
-            if base[end] == "\n":
-                end += 1
-            else:
-                nl = base.find("\n", end)
-                end = len(base) if nl == -1 else nl + 1
-        return (start, end, "html")
-    return None

@@ -91,12 +91,30 @@ Both helpers have safer homes:
 at module level is safe — same pattern as `patch_dispatch`.  The
 heavier dependencies (`validate_output`, `ast_anchor`, `patch_text`)
 are lazy, imported only by the code path that actually needs them.
+
+PYTHON SIG CACHE (2026-11-05)
+=============================
+`_python_top_level_signatures` calls `ast.unparse` for every
+top-level FunctionDef / AsyncFunctionDef / ClassDef in `content`,
+then SHA-256s the result.  `find_cross_file_duplicates` calls it
+twice per record — once against `base_block.body` (to compute the
+"preexisting signatures" set), once against `rec.content` (the
+candidate "new signatures").  When a function exists unchanged in
+both, its `ast.unparse` output (and therefore its SHA) is
+identical; the unparse and hash are done twice for nothing.
+
+`@lru_cache(maxsize=256)` on `_python_sig_cache(content, path)` —
+the tuple-returning worker — makes the second call a dict lookup.
+256 entries covers a 500-file `--apply-to` run's working set
+comfortably; anything beyond that evicts LRU, which is fine (the
+second call comes milliseconds after the first).
 """
 from __future__ import annotations
 
 import ast
 import hashlib
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -187,22 +205,33 @@ def _python_top_level_signatures(
         content: str, path: str) -> Iterator[tuple]:
     """Yield signatures for every top-level def/async def/class.
 
-    `ast.unparse` on the parsed node gives a reformatting-invariant
-    canonical body: comments stripped, whitespace normalised, quote
-    style canonicalised.  Two functions with different ASTs (different
-    identifiers, different expressions, different structure) hash
-    differently; the same function after reformatting hashes
-    identically.
+    Delegates to `_python_sig_cache`, which caches the tuple of
+    `(kind, name, canonical, sha, line_count)` entries on
+    `(content, path)`.  See module docstring, PYTHON SIG CACHE.
 
     Skips when `ast.parse` fails (unparseable file), when the node is
     not one of the three accepted types, or when `ast.unparse` raises
     on a pathological AST.
     """
+    yield from _python_sig_cache(content, path)
+
+
+@lru_cache(maxsize=256)
+def _python_sig_cache(content: str, path: str) -> tuple:
+    """Cached worker behind `_python_top_level_signatures`.
+
+    `ast.unparse` on every top-level def/class, then SHA-256 of the
+    canonical form.  Cached on `(content, path)` — the same
+    `(base_block.body, path)` and `(rec.content, path)` pair that
+    `find_cross_file_duplicates` computes back-to-back for every
+    record hits the cache on the second call.
+    """
     try:
         tree = parse_source(content, filename=path or "<cross_file>")
     except SyntaxError:
-        return
+        return ()
 
+    out = []
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             kind = "function"
@@ -218,7 +247,8 @@ def _python_top_level_signatures(
 
         line_count = node.end_lineno - node.lineno + 1
         sha = _structural_hash("python", canonical)
-        yield kind, node.name, canonical, sha, line_count
+        out.append((kind, node.name, canonical, sha, line_count))
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------

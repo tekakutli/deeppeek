@@ -85,12 +85,26 @@ across every touched record; on a large `--apply-to` run the same
 content is re-parsed across passes 6, 8, 8.4b, 8.5, 8.7d, and 8.10.
 Routing through the cache means the parse is one lookup after the
 first.
+
+RESULT CACHE (2026-11-05)
+=========================
+The `parse_source` cache only memoizes the parse; the subsequent
+`ast.walk` / `tree.body` iteration was re-done on every call.  Pass
+7 is called from `pass7_cross_validate` (once per touched record)
+*and* from `write/_scan._aggregate_missing_imports` (once per
+record with content) — same `_py_imports(body)` re-walking the tree
+twice per record.  `@lru_cache(maxsize=1024)` on both helpers makes
+the second and subsequent calls a dict lookup on `body` itself.
+
+Return types are frozen (`frozenset`, `tuple`) so callers cannot
+mutate a cached value.  Every existing caller iterates; none mutate.
 """
 
 import ast
 import os
 import re
 import sys
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -123,7 +137,7 @@ def pass7_cross_validate(records: dict[str, FileRecord],
     blocks_by_idx = blocks_by_idx or {}
 
     # ---- Phase 1: imports from touched records only ----
-    imports: dict[str, list[tuple[str, str]]] = {}
+    imports: dict[str, tuple] = {}
     for path, rec in records.items():
         if rec.preexisting_base and not rec.patches and not rec.pairs:
             continue
@@ -150,7 +164,7 @@ def pass7_cross_validate(records: dict[str, FileRecord],
     }
 
     # ---- Phase 3: extract exports only for targets ----
-    exports: dict[str, set[str]] = {}
+    exports: dict[str, frozenset] = {}
     for path in needed_targets:
         rec = records.get(path)
         if rec is None:
@@ -195,7 +209,7 @@ def pass7_cross_validate(records: dict[str, FileRecord],
                         "module": display,
                     })
                 continue
-            if name not in exports.get(target, set()):
+            if name not in exports.get(target, frozenset()):
                 key = (path, target, name)
                 if key in seen_missing_exports:
                     continue
@@ -670,16 +684,20 @@ def _resolve_js_module(module: str, from_path: str,
     return None
 
 
-def _py_exports(body: str) -> set[str]:
+@lru_cache(maxsize=1024)
+def _py_exports(body: str) -> frozenset:
     """Return top-level names declared in `body`.
 
-    Routes through `parse_source` (memoized) instead of `ast.parse`.
-    See the module docstring, PARSE-CACHE ROUTING.
+    Routes through `parse_source` (memoized) instead of `ast.parse`,
+    then caches the *result* on the body string.  See the module
+    docstring, PARSE-CACHE ROUTING and RESULT CACHE.
+
+    Returns a `frozenset` so callers cannot mutate the cached value.
     """
     try:
         tree = parse_source(body)
     except SyntaxError:
-        return set()
+        return frozenset()
     out: set[str] = set()
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
@@ -692,19 +710,24 @@ def _py_exports(body: str) -> set[str]:
         elif (isinstance(node, ast.AnnAssign)
               and isinstance(node.target, ast.Name)):
             out.add(node.target.id)
-    return out
+    return frozenset(out)
 
 
-def _py_imports(body: str) -> list[tuple[str, str]]:
+@lru_cache(maxsize=1024)
+def _py_imports(body: str) -> tuple:
     """Return `(module, name)` pairs from `body`'s `from` imports.
 
-    Routes through `parse_source` (memoized) instead of `ast.parse`.
-    See the module docstring, PARSE-CACHE ROUTING.
+    Routes through `parse_source` (memoized) instead of `ast.parse`,
+    then caches the *result* on the body string.  See the module
+    docstring, PARSE-CACHE ROUTING and RESULT CACHE.
+
+    Returns a `tuple[tuple[str, str], ...]` so callers cannot mutate
+    the cached value.  All existing callers iterate; none mutate.
     """
     try:
         tree = parse_source(body)
     except SyntaxError:
-        return []
+        return ()
     out: list[tuple[str, str]] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
@@ -716,7 +739,7 @@ def _py_imports(body: str) -> list[tuple[str, str]]:
                 if alias.name == "*":
                     continue
                 out.append((mod, alias.name))
-    return out
+    return tuple(out)
 
 
 def _rec_will_be_on_disk(rec: FileRecord) -> bool:

@@ -110,9 +110,7 @@ from .orchestration import (
     _run_pass, _run_pass_no_return,
     _resolve_dump, _validate_apply_to, _wipe_deeppeek_dir,
 )
-from .preexisting import (
-    load_preexisting_blocks, existing_dirs_for,
-)
+from .preexisting import scan_apply_to
 from .startup_check import validate_pipeline_imports
 from .equivalence import check_structural_equivalence
 # Re-export the moved startup helpers under their pre-refactor names.
@@ -241,8 +239,10 @@ def run(cfg: RecoverConfig) -> int:
     print(f"  {len(blocks)} fenced blocks ({n_orphans} orphans), "
           f"{len(deleted_files)} [DEL] markers")
 
+    existing_dirs: set = set()
+    on_disk_names: set = set()
     if cfg.apply_to is not None:
-        pre = load_preexisting_blocks(cfg.apply_to)
+        pre, existing_dirs, on_disk_names = scan_apply_to(cfg.apply_to)
         if pre:
             print(f"  + {len(pre)} pre-existing baseline file(s) "
                   f"from --apply-to", file=sys.stderr)
@@ -270,10 +270,9 @@ def run(cfg: RecoverConfig) -> int:
     topic_weights: dict = {}
     if cfg.apply_to is not None:
         print("[pass 2.1] inferring conversation topic weights...")
-        _existing_dirs = existing_dirs_for(cfg.apply_to)
         topic_weights = _run_pass(
             "2.1 (topic)", infer_topic_weights, {},
-            run_errors, dump_text, blocks, _existing_dirs,
+            run_errors, dump_text, blocks, existing_dirs,
             timings=timings,
         ) or {}
         if topic_weights:
@@ -629,6 +628,7 @@ def run(cfg: RecoverConfig) -> int:
             verbose=cfg.trace,
             run_errors=run_errors,
             pass_timings=timings,
+            on_disk_names=on_disk_names,
         )
     except Exception as e:
         print(f"  [!] pass 9 (write) raised: {type(e).__name__}: {e}",

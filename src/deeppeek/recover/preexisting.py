@@ -5,15 +5,30 @@ with `classified_by="preexisting"` and `kind="full"`.  These baselines
 are prepended to the conversation's blocks and act as the base content
 for matching records.
 
-The exclusion lists (which directories, extensions, and file sizes are
-ignored) encode domain knowledge about what counts as "source" in a
-project tree — they change rarely.
+SINGLE-WALK (2026-11-05)
+========================
+Prior revisions walked the target tree three times per run:
 
-See `pipeline.py`'s module docstring, PRE-EXISTING BASELINES, for the
-historical context on why untouched pre-existing files flow through
-passes 5-9 normally and are skipped by the writer.
+  · `load_preexisting_blocks` — load every source file as a baseline
+  · `existing_dirs_for` — collect directories for topic inference
+  · `pass9_write`'s `on_disk` — build a name set for MISSING_FILES
+
+Each walk used `rglob("*")` with post-filter exclusion, so
+`node_modules` and friends were traversed and then discarded.  The new
+`scan_apply_to` collapses all three into one `os.walk` whose
+`dirnames[:]` assignment prunes excluded directories *before* the walk
+descends.  `node_modules` is now never visited.
+
+The pipeline calls `scan_apply_to` once (after pass 1) and threads all
+three products forward: baselines to the block list, directories to
+`infer_topic_weights`, on-disk names to `pass9_write`.
+
+The legacy entry points (`load_preexisting_blocks`, `existing_dirs_for`)
+remain as thin wrappers for out-of-tree callers.  They re-scan, but the
+pipeline no longer calls them.
 """
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -38,93 +53,113 @@ _PREEXISTING_EXCLUDE_EXTENSIONS = frozenset({
 })
 
 
-def load_preexisting_blocks(apply_to: Path) -> list[Block]:
-    """Scan `apply_to` and return one synthetic 'full print' block per
-    source-like file, ready to be prepended to the conversation's
-    blocks.
+def scan_apply_to(apply_to: Path) -> tuple[list[Block], set, set]:
+    """Single-pass scan of `apply_to`.
 
-    Filters out:
-      * dot-directories and well-known build/cache directories
-      * extensions not in `SOURCE_EXTENSIONS`
-      * extensions in `_PREEXISTING_EXCLUDE_EXTENSIONS` (docs, data,
-        config — never imported by source code)
-      * files larger than `_PREEXISTING_MAX_FILE_SIZE`
+    Returns `(blocks, existing_dirs, on_disk_names)`:
+
+      · `blocks` — one synthetic full-print Block per source file,
+        ready to be prepended to the conversation's block list.
+
+      · `existing_dirs` — relative directory paths under `apply_to`
+        (e.g. `{"playgrounds/inpaint", "playgrounds/board"}`), used
+        by `topic.infer_topic_weights` to filter its output.
+
+      · `on_disk_names` — basenames of every file the walk visited
+        (any extension, including excluded dirs are NOT in this set
+        because they're pruned).  Consumed by `pass9_write` for the
+        MISSING_FILES scan so it doesn't walk the tree again.
+
+    Directory exclusion uses `dirnames[:] = [...]` in-place, which
+    `os.walk` respects for all subsequent recursion — the excluded
+    subtree is never visited.  The previous `rglob("*")` version
+    descended into `node_modules` and filtered afterwards, paying the
+    I/O for files that were then discarded.
     """
     blocks: list[Block] = []
+    existing_dirs: set = set()
+    on_disk_names: set = set()
+
     if not apply_to.is_dir():
-        return blocks
+        return blocks, existing_dirs, on_disk_names
 
-    for p in sorted(apply_to.rglob("*")):
-        if not p.is_file():
-            continue
-        rel = p.relative_to(apply_to)
-        rel_parts = rel.parts
+    for dirpath, dirnames, filenames in os.walk(apply_to):
+        # Prune in place — os.walk will not recurse into the removed
+        # entries.  This is the whole performance win: excluded dirs
+        # are never entered, not traversed-and-discarded.
+        dirnames[:] = [
+            d for d in dirnames
+            if not d.startswith(".")
+            and d not in _PREEXISTING_EXCLUDE_DIRS
+        ]
 
-        if any(part.startswith(".") for part in rel_parts):
-            continue
-        if any(part in _PREEXISTING_EXCLUDE_DIRS for part in rel_parts):
-            continue
-        if p.suffix.lower() not in SOURCE_EXTENSIONS:
-            continue
-        if p.suffix.lower() in _PREEXISTING_EXCLUDE_EXTENSIONS:
-            continue
+        base = Path(dirpath)
         try:
-            if p.stat().st_size > _PREEXISTING_MAX_FILE_SIZE:
+            rel_base = base.relative_to(apply_to)
+        except ValueError:
+            continue
+
+        if rel_base.parts:
+            existing_dirs.add("/".join(rel_base.parts))
+
+        for fn in filenames:
+            on_disk_names.add(fn)
+            if fn.startswith("."):
                 continue
-        except OSError:
-            continue
-        try:
-            raw = p.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
-            continue
-        body = raw.replace("\r\n", "\n")
-        if body.endswith("\n"):
-            body = body[:-1]
+            ext = os.path.splitext(fn)[1].lower()
+            if ext not in SOURCE_EXTENSIONS:
+                continue
+            if ext in _PREEXISTING_EXCLUDE_EXTENSIONS:
+                continue
+            p = base / fn
+            try:
+                if p.stat().st_size > _PREEXISTING_MAX_FILE_SIZE:
+                    continue
+            except OSError:
+                continue
+            try:
+                raw = p.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            body = raw.replace("\r\n", "\n")
+            if body.endswith("\n"):
+                body = body[:-1]
 
-        rel_str = rel.as_posix()
-        blocks.append(Block(
-            idx=0,
-            header_path=rel_str,
-            modifier=None,
-            fence_lang="",
-            body=body,
-            body_line_count=body.count("\n") + 1,
-            context_before="",
-            line_start=-1,
-            line_end=-1,
-            is_orphan=False,
-            is_code_file=True,
-            kind="full",
-            canonical_path=rel_str,
-            output_path=rel_str,
-            confidence=1.0,
-            classified_by="preexisting",
-            heuristic_kind="full",
-        ))
+            rel_str = (rel_base / fn).as_posix()
+            blocks.append(Block(
+                idx=0,
+                header_path=rel_str,
+                modifier=None,
+                fence_lang="",
+                body=body,
+                body_line_count=body.count("\n") + 1,
+                context_before="",
+                line_start=-1,
+                line_end=-1,
+                is_orphan=False,
+                is_code_file=True,
+                kind="full",
+                canonical_path=rel_str,
+                output_path=rel_str,
+                confidence=1.0,
+                classified_by="preexisting",
+                heuristic_kind="full",
+            ))
+
+    return blocks, existing_dirs, on_disk_names
+
+
+def load_preexisting_blocks(apply_to: Path) -> list[Block]:
+    """Backward-compat wrapper.  New code should call `scan_apply_to`
+    and use the returned `(blocks, dirs, names)` triple, avoiding a
+    second tree walk."""
+    blocks, _, _ = scan_apply_to(apply_to)
     return blocks
 
 
 def existing_dirs_for(apply_to: Optional[Path]) -> set:
-    """Return the set of relative directory paths under `apply_to`.
-
-    Used by `topic.infer_topic_weights` to filter its output to
-    directories that actually exist in the target tree.  Returns
-    the empty set when `apply_to` is None or missing.
-    """
-    if apply_to is None or not apply_to.is_dir():
+    """Backward-compat wrapper.  New code should call `scan_apply_to`."""
+    if apply_to is None:
         return set()
-    out: set = set()
-    for p in apply_to.rglob("*"):
-        if not p.is_dir():
-            continue
-        try:
-            rel = p.relative_to(apply_to)
-        except ValueError:
-            continue
-        parts = rel.parts
-        if any(part.startswith(".") for part in parts):
-            continue
-        if any(part in _PREEXISTING_EXCLUDE_DIRS for part in parts):
-            continue
-        out.add("/".join(parts))
-    return out
+    _, dirs, _ = scan_apply_to(apply_to)
+    return dirs
