@@ -1,0 +1,14 @@
+{
+  "deepseek-web": {
+    "max_input_tokens": 128000,
+    "max_output_tokens": 8192,
+    "litellm_provider": "openai",
+    "mode": "chat"
+  },
+  "deepseek-reasoner-web": {
+    "max_input_tokens": 128000,
+    "max_output_tokens": 8192,
+    "litellm_provider": "openai",
+    "mode": "chat"
+  }
+}

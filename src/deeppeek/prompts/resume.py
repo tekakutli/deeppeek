@@ -57,6 +57,44 @@ prompt.  The regex is deliberately narrow — it matches
 `<[A-Z][A-Z0-9 _-]{2,}>`, so real code like `<input>` or `<div>`
 (lowercase) is untouched.
 
+MULTI-GENERATION RESUME
+=======================
+A second or later resume finds the previous resume file as one of
+the seed attachments (the previous run attached `resume_A.md` plus
+A's seed files; the current conversation's first prompt carries
+them, and `--first` fetches them).  `resume` now detects these:
+
+  · merge content      — `MERGED FILE 1/N:` in the first 2KB
+  · plain capture      — filename starts with `resume_` or
+                         `merged_resume_`
+
+and merges them with the current plain capture into a single file:
+
+  /tmp/merged_<conv_path.stem>_<ts>.md
+
+which is attached in place of the individual prior resumes.  If a
+prior attachment is itself a merged file (third-or-later resume),
+its conversations are extracted first, recursively, so the merged
+output is always flat (A + B + C, not (A + B) + C).  Seed files
+that are not resumes stay in the attachment list unchanged — they
+are the seed context, not history, and the AI still needs them.
+
+The merge falls back to the pre-merge behaviour (attach everything
+separately) if `scripts/merge_md.py` is missing, times out, or
+exits non-zero; the failure reason is printed to stderr.
+
+`--no-merge` disables the merge step entirely, for the rare case
+where a seed attachment happens to share the resume naming
+convention and you don't want it treated as history.
+
+Note on `--name`: content-detection handles merged files
+regardless of filename, so a `--name custom.md` output that later
+gets merged is picked up correctly.  But a *plain* capture named
+`custom.md` (never merged) is only detected by the filename rule —
+so if you use `--name`, prefer a `resume_*` prefix to keep the
+chain detectable.  The default (title-derived) naming already
+does this.
+
 The whole emit stage (open-tab, attach, type) runs in ONE
 composer_session so port 8765 is bound once.  attach is retried
 up to three times, because the new tab's content script has to
@@ -83,6 +121,9 @@ from ..commands._composer import (
 )
 
 
+_PROJECT_ROOT    = Path(__file__).resolve().parents[3]
+_MERGE_MD_SCRIPT = _PROJECT_ROOT / "scripts" / "merge_md.py"
+
 # The exact wording the user asked for, with a `{guidance}` slot
 # where the extracted tail goes.  No str.format on the whole
 # thing — we substitute one piece explicitly so user-supplied
@@ -100,6 +141,17 @@ _GUIDANCE_MAX_CHARS = 500  # safety net for pathological single tokens
 # Matches `<NOTE>`, `<THE ACTUAL TAIL>`, `<FILL_ME_IN>`, etc., but
 # not `<input>`, `<div>`, or `<last 40 words>` (lowercase).
 _PLACEHOLDER_RE = re.compile(r"<[A-Z][A-Z0-9 _-]{2,}>")
+
+# merge_md.py's per-file boundary is a run of `+` whose width is
+# `max(70, max_plus_run_in_content + 1)`.  The `\1` backreference
+# ensures opener and closer use the same width — no false positives
+# from `+` runs inside the fenced content.
+_MERGE_HEADER_RE = re.compile(
+    r"^(\+{70,})\n"
+    r"MERGED FILE (\d+)/(\d+): (.+?)\n"
+    r"\1\n",
+    re.MULTILINE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +367,100 @@ def _extract_last_relevant_string(
 
 
 # ---------------------------------------------------------------------------
+# Merge helpers
+# ---------------------------------------------------------------------------
+
+def _is_merge_content(text: str) -> bool:
+    """True iff `text` looks like merge_md.py output.
+
+    The `MERGED FILE 1/` marker is unique to merge_md.py; it never
+    appears inside a plain conversation.md (whose headers are `## User`
+    / `## Assistant`).  Checking only the head is enough and cheap.
+    """
+    return "MERGED FILE 1/" in text[:2048]
+
+
+def _extract_from_merge(
+    text: str, depth: int = 0,
+) -> list[tuple[str, str]]:
+    """Return [(filename, content), ...] flattened from a merge_md.py file.
+
+    Recurses when a chunk's inner content is itself a merge, so a
+    merge-of-merges yields the original leaf conversations in order,
+    not a nested structure.  `depth` guards against a self-referential
+    file.
+    """
+    if depth > 20:
+        print("warning: merge nesting too deep; stopping recursion",
+              file=sys.stderr)
+        return [("unknown.md", text)]
+
+    headers = list(_MERGE_HEADER_RE.finditer(text))
+    if not headers:
+        return [("unknown.md", text)]
+
+    result: list[tuple[str, str]] = []
+    for i, m in enumerate(headers):
+        name = m.group(4)
+        content_start = m.end()
+        content_end = (
+            headers[i + 1].start()
+            if i + 1 < len(headers)
+            else len(text)
+        )
+        chunk = text[content_start:content_end]
+
+        # Chunk shape (from merge_md._emit_block):
+        #   ```<lang?>\n<content>\n```\n\n[optional group header]
+        opener = re.match(r"(`{3,})[^\n]*\n", chunk)
+        if not opener:
+            inner = chunk.rstrip("\n")
+        else:
+            n = len(opener.group(1))
+            closer_pat = "\n" + "`" * n + "\n"
+            last = chunk.rfind(closer_pat)
+            if last < 0:
+                # Defensive: closer without trailing newline.
+                fallback = "\n" + "`" * n
+                last = chunk.rfind(fallback)
+                inner = (
+                    chunk[opener.end():].rstrip("\n")
+                    if last < 0
+                    else chunk[opener.end():last]
+                )
+            else:
+                inner = chunk[opener.end():last]
+
+        if _is_merge_content(inner):
+            result.extend(_extract_from_merge(inner, depth + 1))
+        else:
+            result.append((name, inner))
+
+    return result
+
+
+def _is_resume_or_merge_attachment(path: Path) -> bool:
+    """True iff `path` should be treated as a prior resume.
+
+    Merge-marker detection runs first (exact, cannot false-positive
+    on a normal conversation).  Filename fallback catches plain
+    captures — `resume_*.md` from `_stage_capture`, `merged_resume_*`
+    from this function's output on a later resume.
+    """
+    if not path.is_file():
+        return False
+    try:
+        head = path.read_text(encoding="utf-8")[:2048]
+    except (OSError, UnicodeDecodeError):
+        return False
+    if _is_merge_content(head):
+        return True
+    name = path.name
+    return (name.startswith("resume_")
+            or name.startswith("merged_resume_"))
+
+
+# ---------------------------------------------------------------------------
 # Stages
 # ---------------------------------------------------------------------------
 
@@ -393,6 +539,118 @@ def _stage_get_attachments(attach_dir: Path,
         print(f"  {f.name}  ({f.stat().st_size:,} bytes)",
               file=sys.stderr)
     return files
+
+
+def _stage_merge_history(
+    resume_files: list[Path],
+    current_conversation: Path,
+    args: argparse.Namespace,
+) -> Path | None:
+    """Merge prior resumes with the current conversation into one file.
+
+    Returns the merged path, or None when merge is not possible
+    (merge_md.py missing / subprocess fails / times out / produces
+    nothing).  None means: fall back to attaching everything
+    separately — the caller keeps the pre-merge behaviour, and the
+    user sees a warning naming the reason.
+
+    Chronological order: each prior resume contributes the
+    conversation(s) it carries (in file order), and the current
+    capture comes last, so a reader of the merged file sees
+    A → B → C.
+    """
+    if not _MERGE_MD_SCRIPT.is_file():
+        print(f"warning: merge_md.py not found at {_MERGE_MD_SCRIPT}; "
+              f"attaching resumes separately (not flat)",
+              file=sys.stderr)
+        return None
+
+    conversation_parts: list[tuple[str, str]] = []
+    for r in resume_files:
+        try:
+            text = r.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            print(f"warning: cannot read {r}: {e}; skipping",
+                  file=sys.stderr)
+            continue
+        if _is_merge_content(text):
+            parts = _extract_from_merge(text)
+            if not parts:
+                print(f"warning: no conversations extracted from "
+                      f"{r}; treating content as a single file",
+                      file=sys.stderr)
+                parts = [(r.name, text)]
+            conversation_parts.extend(parts)
+        else:
+            conversation_parts.append((r.name, text))
+
+    if not conversation_parts:
+        print("warning: no prior conversations to merge; "
+              "attaching current only", file=sys.stderr)
+        return None
+
+    try:
+        current_text = current_conversation.read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"warning: cannot read current conversation "
+              f"{current_conversation}: {e}; skipping merge",
+              file=sys.stderr)
+        return None
+    conversation_parts.append(
+        (current_conversation.name, current_text))
+
+    ts   = _timestamp()
+    stem = current_conversation.stem or "conversation"
+    merged_path = current_conversation.parent / f"merged_{stem}_{ts}.md"
+
+    parts_dir = Path(tempfile.mkdtemp(prefix="deeppeek_resume_parts_"))
+    try:
+        part_paths: list[Path] = []
+        for i, (name, body) in enumerate(conversation_parts):
+            safe = Path(name).name or "conversation.md"
+            p = parts_dir / f"{i:03d}_{safe}"
+            p.write_text(body, encoding="utf-8")
+            part_paths.append(p)
+
+        cmd = [
+            sys.executable, str(_MERGE_MD_SCRIPT),
+            "-o", str(merged_path),
+            "-t", "Resume history (all conversations)",
+            *[str(p) for p in part_paths],
+        ]
+        print(f"[merge] {len(part_paths)} conversation(s) → "
+              f"{merged_path}", file=sys.stderr)
+        for p, (name, _body) in zip(part_paths, conversation_parts):
+            print(f"  {name}", file=sys.stderr)
+
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=args.merge_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"warning: merge_md.py timed out after "
+                  f"{args.merge_timeout}s; attaching resumes separately",
+                  file=sys.stderr)
+            return None
+
+        if proc.returncode != 0:
+            print(f"warning: merge_md.py exited {proc.returncode}; "
+                  f"attaching resumes separately", file=sys.stderr)
+            for line in (proc.stderr or "").splitlines()[:5]:
+                print(f"  {line}", file=sys.stderr)
+            return None
+    finally:
+        shutil.rmtree(parts_dir, ignore_errors=True)
+
+    if not merged_path.is_file():
+        print(f"warning: merge_md.py did not produce {merged_path}; "
+              f"attaching resumes separately", file=sys.stderr)
+        return None
+
+    print(f"[merge] wrote {merged_path} "
+          f"({merged_path.stat().st_size:,} bytes)", file=sys.stderr)
+    return merged_path
 
 
 def _stage_emit(files: list[Path], text: str,
@@ -568,7 +826,32 @@ def run(args: argparse.Namespace) -> int:
 
         # 2. First prompt's files (base64 → attach_dir).
         attached = _stage_get_attachments(attach_dir, args)
-        all_files = [conv_path] + attached
+
+        # 2b. Collapse prior resumes.
+        #     A second-or-later resume finds the previous resume file
+        #     (or a merge file from an even earlier resume) as one of
+        #     the seed attachments.  Left alone, the AI would see the
+        #     same history twice — once as `resume_A.md`, once as
+        #     `resume_B.md` — with no signal that A precedes B.
+        #     Instead we merge them into one file and attach only
+        #     that.  Non-resume attachments (images, docs, code) are
+        #     unaffected: they were the seed of A, re-attached by the
+        #     first resume, and they stay in the attachment list.
+        if attached and not args.no_merge:
+            resume_atts = [f for f in attached
+                           if _is_resume_or_merge_attachment(f)]
+            other_atts  = [f for f in attached
+                           if not _is_resume_or_merge_attachment(f)]
+            if resume_atts:
+                merged = _stage_merge_history(resume_atts, conv_path, args)
+                if merged is not None:
+                    all_files = [merged] + other_atts
+                else:
+                    all_files = [conv_path] + attached
+            else:
+                all_files = [conv_path] + attached
+        else:
+            all_files = [conv_path] + attached
 
         # 3. Composer text.
         text, source_tag = _build_text(args, conv_path)
@@ -677,6 +960,18 @@ def register(sub: argparse._SubParsersAction) -> None:
                    help="timeout per attach attempt (default: 180)")
     p.add_argument("--type-timeout", type=float, default=300.0,
                    help="timeout for the type ack (default: 300)")
+    p.add_argument(
+        "--no-merge", action="store_true",
+        help="do not merge prior resume attachments with the current "
+             "conversation; attach them all separately (pre-merge "
+             "behaviour).  Useful if a seed attachment happens to "
+             "share the resume naming convention and you don't want "
+             "it treated as history.",
+    )
+    p.add_argument(
+        "--merge-timeout", type=float, default=120.0,
+        help="timeout for scripts/merge_md.py (default: 120)",
+    )
     p.add_argument(
         "--dry-run", action="store_true",
         help="run capture + attachments, print what would be "

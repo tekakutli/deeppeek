@@ -19,6 +19,7 @@ from .commands import (
     test as test_cmd,
     scripts as scripts_cmd,
     hijack as hijack_cmd,
+    daemon as daemon_cmd,
 )
 
 
@@ -108,6 +109,7 @@ def _build_root_parser() -> argparse.ArgumentParser:
     diagnose_cmd.register(sub)
     test_cmd.register(sub)
     scripts_cmd.register(sub)
+    daemon_cmd.register(sub)
     return p
 
 
@@ -126,6 +128,7 @@ _DISPATCH = {
     "test": test_cmd.run,
     "scripts": scripts_cmd.run,
     "hijack": hijack_cmd.run,
+    "daemon": daemon_cmd.run,
 }
 
 

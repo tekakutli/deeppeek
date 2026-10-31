@@ -431,6 +431,246 @@ function attachHandlers(es) {
     } catch (_) {}
   });
 
+  // ==================================================================
+  // deeppeek daemon handlers — extract / submit / watch
+  // ==================================================================
+
+  // ---- extract (deeppeek daemon) ----
+  //
+  // Request-response extraction: unlike `arm`, this fires exactly
+  // once per event and acks with the payload.  Used by the daemon's
+  // fallback poller; the primary path is `watch` below.
+  es.addEventListener("extract", async (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+    const batchId = data.batch_id;
+    const includeForked = !!data.include_forked;
+
+    let result = { success: false, reason: "no active deepseek tab" };
+    try {
+      const [tab] = await browser.tabs.query({
+        active: true, currentWindow: true,
+      });
+      if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+        const resp = await browser.tabs.sendMessage(tab.id, {
+          type: "DSX_EXTRACT",
+          include_forked: includeForked,
+        });
+        if (resp) {
+          result = { success: true, payload: resp };
+        } else {
+          result = { success: false, reason: "no response from content script" };
+        }
+      }
+    } catch (err) {
+      result = { success: false, reason: `sendMessage threw: ${err.message}` };
+    }
+
+    try {
+      await fetch(`${DSX_URL}/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          __ack: "extract",
+          batch_id: batchId,
+          result,
+        }),
+      });
+    } catch (_) {}
+  });
+
+  // ---- submit (deeppeek daemon, atomic clear+type+enter) ----
+  //
+  // Combines three existing events into one round-trip.  The three
+  // sub-results are returned in the ack so the bridge can see which
+  // step failed if the overall success is false.
+  es.addEventListener("submit", async (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+    const batchId = data.batch_id;
+    const text = data.text || "";
+
+    let result = { success: false, reason: "no active deepseek tab" };
+    try {
+      const [tab] = await browser.tabs.query({
+        active: true, currentWindow: true,
+      });
+      if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+        const clear = await browser.tabs.sendMessage(tab.id, {
+          type: "DSX_CLEAR", opts: {},
+        });
+        const type = await browser.tabs.sendMessage(tab.id, {
+          type: "DSX_TYPE", text, opts: { skip_verify: true },
+        });
+        const enter = await browser.tabs.sendMessage(tab.id, {
+          type: "DSX_ENTER", opts: { verify_ms: 300 },
+        });
+        result = {
+          success: !!(clear && clear.success
+                      && type && type.success
+                      && enter && enter.success),
+          clear, type, enter,
+        };
+      }
+    } catch (err) {
+      result = { success: false, reason: `submit threw: ${err.message}` };
+    }
+
+    try {
+      await fetch(`${DSX_URL}/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          __ack: "submit",
+          batch_id: batchId,
+          result,
+        }),
+      });
+    } catch (_) {}
+  });
+
+  // ---- watch (deeppeek daemon, streaming) ----
+  //
+  // Keeps a poll loop inside the extension (direct IDB access, no
+  // per-poll HTTP round-trip to the daemon).  Emits one `watch-delta`
+  // per content growth, a `watch-rewrite` when the message is
+  // replaced wholesale (rare), and `watch-done` on stability or
+  // timeout.
+  //
+  // The `polling` guard prevents overlapping polls when a poll takes
+  // longer than `pollInterval` (extract is fast, but let's be safe).
+  // `maxDuration` is a safety net: a watch that never sees content
+  // never settles, so it needs an absolute ceiling.
+  es.addEventListener("watch", async (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+    const batchId = data.batch_id;
+    const includeForked = !!data.include_forked;
+    const pollInterval = Math.max(100, data.poll_interval_ms || 300);
+    const settleTicks = Math.max(1, data.settle_ticks || 5);
+    const maxDuration = Math.max(5000, data.max_duration_ms || 180000);
+
+    let lastContent = "";
+    let stableTicks = 0;
+    let stopped = false;
+    let polling = false;
+    let timer = null;
+    const startedAt = Date.now();
+
+    const stop = async () => {
+      if (stopped) return;
+      stopped = true;
+      if (timer) { clearInterval(timer); timer = null; }
+      try {
+        await fetch(`${DSX_URL}/export`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ __ack: "watch-done", batch_id: batchId }),
+        });
+      } catch (_) {}
+    };
+
+    const poll = async () => {
+      if (stopped || polling) return;
+      polling = true;
+      try {
+        if (Date.now() - startedAt > maxDuration) {
+          await stop();
+          return;
+        }
+        const [tab] = await browser.tabs.query({
+          active: true, currentWindow: true,
+        });
+        if (!tab || !tab.url || !tab.url.startsWith("https://chat.deepseek.com/")) {
+          await stop();
+          return;
+        }
+        let resp;
+        try {
+          resp = await browser.tabs.sendMessage(tab.id, {
+            type: "DSX_EXTRACT",
+            include_forked: includeForked,
+          });
+        } catch (_) {
+          // Tab may still be loading (or no session ID yet on a
+          // fresh tab).  Not fatal; keep polling until maxDuration.
+          stableTicks = 0;
+          return;
+        }
+        if (!resp) { stableTicks = 0; return; }
+
+        let content = "";
+        const msgs = resp.messages || [];
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          if (msgs[i].role === "assistant") {
+            content = msgs[i].content || "";
+            break;
+          }
+        }
+
+        if (content === lastContent) {
+          if (lastContent) stableTicks++;
+        } else if (content.startsWith(lastContent)) {
+          const delta = content.slice(lastContent.length);
+          lastContent = content;
+          stableTicks = 0;
+          if (delta) {
+            await fetch(`${DSX_URL}/export`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                __ack: "watch-delta",
+                batch_id: batchId,
+                delta,
+              }),
+            });
+          }
+        } else {
+          // Rewrite — message changed non-extending.  Emit the
+          // full content as a rewrite marker; the Python side logs
+          // it and passes it through.
+          lastContent = content;
+          stableTicks = 0;
+          await fetch(`${DSX_URL}/export`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              __ack: "watch-rewrite",
+              batch_id: batchId,
+              content,
+            }),
+          });
+        }
+
+        if (lastContent && stableTicks >= settleTicks) {
+          await stop();
+        }
+      } catch (err) {
+        console.error("DSX: watch poll error:", err);
+        await stop();
+      } finally {
+        polling = false;
+      }
+    };
+
+    try {
+      await fetch(`${DSX_URL}/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          __ack: "watch",
+          batch_id: batchId,
+          result: { success: true },
+        }),
+      });
+    } catch (_) {
+      return;
+    }
+
+    timer = setInterval(poll, pollInterval);
+    poll();
+  });
+
   es.onopen = () => {
     console.log("DSX: SSE connected");
     wasConnected = true;
