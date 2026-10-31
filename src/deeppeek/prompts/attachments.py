@@ -24,6 +24,11 @@ Two primary workflows, plus supporting modes:
 
 Supporting modes for completeness:
 
+  --first              attachments from the literal first user
+                       message of the conversation.  Returns empty
+                       when the seed prompt had no files; that is
+                       not an error.  Used by `deeppeek prompt
+                       resume`.
   --message-id ID      attachments from one sent message
   --last N             attachments from the last N sent messages
                        that had files
@@ -74,17 +79,31 @@ to save files" is enabled in Firefox settings, you will get one
 that is a lot of dialogs.  Use `--list-only` to preview the
 count before committing.
 
+--fetch-to DIR (base64 mode)
+============================
+Instead of triggering browser downloads, fetch each attachment's
+bytes as base64 inside the extension and write them to DIR on
+the local filesystem.  This is what `deeppeek prompt resume`
+uses: it needs the seed prompt's files on disk so it can pipe
+them into a fresh tab along with the conversation markdown.
+The extension's `_fetchAndEncode` code path (already exercised
+by `prompt retry`) is reused, so there is exactly one base64
+fetch implementation in the page world.
+
+Mutually exclusive with --list-only — listing does not fetch,
+fetching needs somewhere to write.
+
 Exit codes:
-    0  all requested downloads were triggered
+    0  all requested downloads (or base64 writes) succeeded
     1  extension connection failure
     2  at least one file failed (fetch error, size mismatch, or
-       download trigger failure)
+       download/write failure)
     3  no attachments matched the selection
 """
-
 from __future__ import annotations
 
 import argparse
+import base64
 import sys
 from pathlib import Path
 from typing import Optional
@@ -114,6 +133,8 @@ def _human_size(n: Optional[int]) -> str:
 # ---------------------------------------------------------------------------
 
 def _resolve_mode(args: argparse.Namespace) -> str:
+    if args.first:
+        return "first"
     if args.prompt_regex is not None:
         return "prompt-regex"
     if args.filename is not None:
@@ -132,6 +153,7 @@ def _build_opts(args: argparse.Namespace, mode: str) -> dict:
         "mode": mode,
         "list_only": bool(args.list_only),
         "include_forked": bool(args.include_forked),
+        "return_base64": bool(args.fetch_to),
     }
     if mode == "prompt-regex":
         opts["pattern"] = args.prompt_regex
@@ -162,6 +184,11 @@ def run(args: argparse.Namespace) -> int:
         print("error: --case-sensitive is only meaningful with "
               "--prompt-regex or --filename", file=sys.stderr)
         return 3
+    if args.fetch_to and args.list_only:
+        print("error: --fetch-to and --list-only are mutually "
+              "exclusive (list does not fetch, fetch needs "
+              "somewhere to write)", file=sys.stderr)
+        return 3
 
     opts = _build_opts(args, mode)
 
@@ -177,7 +204,8 @@ def run(args: argparse.Namespace) -> int:
               + (f"  filename={args.filename!r}" if mode == "filename" else "")
               + (f"  message_id={args.message_id}" if mode == "message-id" else "")
               + (f"  last={args.last}" if mode == "last-N" else "")
-              + ("  (list only)" if args.list_only else ""),
+              + ("  (list only)" if args.list_only else "")
+              + (f"  (fetch-to {args.fetch_to})" if args.fetch_to else ""),
               file=sys.stderr)
 
         rc, result = broadcast_and_wait(
@@ -213,11 +241,75 @@ def run(args: argparse.Namespace) -> int:
     if not files:
         reason = result.get("reason") or "no attachments matched the selection"
         print(f"\n{reason}", file=sys.stderr)
+        # --first returning empty is a valid, non-error outcome:
+        # the seed prompt simply had no attachments.  Return 0 so
+        # callers (resume) can distinguish "no files" from "error".
+        if mode == "first":
+            print(f"[first] seed prompt had no attachments — "
+                  f"nothing to fetch", file=sys.stderr)
+            return 0
         return 3
 
     print(f"\n[found] {len(files)} attachment(s) in {title!r}",
           file=sys.stderr)
 
+    # ---- fetch-to: write base64 payloads to disk ---------------------
+    if args.fetch_to is not None:
+        out_dir = Path(args.fetch_to).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        written = 0
+        failed = 0
+        for f in files:
+            name = f.get("file_name") or "attachment.bin"
+            # Flatten: strip any path components the extension or
+            # the model may have embedded in the name.  Basename
+            # cannot escape out_dir.
+            name = Path(name).name or "attachment.bin"
+            if f.get("error"):
+                print(f"  [fail] {name}: {f['error']}",
+                      file=sys.stderr)
+                failed += 1
+                continue
+            b64 = f.get("base64")
+            if not b64:
+                print(f"  [fail] {name}: no base64 in ack",
+                      file=sys.stderr)
+                failed += 1
+                continue
+            # Collision-safe naming: name, name (1), name (2), ...
+            # Mirrors how `deeppeek hijack --preserve-path` off-mode
+            # would behave if the same file were downloaded twice.
+            target = out_dir / name
+            n = 1
+            while target.exists():
+                target = out_dir / (
+                    f"{Path(name).stem} ({n}){Path(name).suffix}")
+                n += 1
+            try:
+                data = base64.b64decode(b64)
+            except Exception as e:
+                print(f"  [fail] {name}: b64decode threw ({e})",
+                      file=sys.stderr)
+                failed += 1
+                continue
+            try:
+                target.write_bytes(data)
+            except OSError as e:
+                print(f"  [fail] {name}: write failed ({e})",
+                      file=sys.stderr)
+                failed += 1
+                continue
+            written += 1
+            print(f"  [ok]   {target.name}  ({len(data):,} bytes)",
+                  file=sys.stderr)
+
+        print(f"\n[fetch-to] {written}/{len(files)} file(s) → "
+              f"{out_dir}", file=sys.stderr)
+        if failed:
+            return 2
+        return 0
+
+    # ---- default: browser download / list-only reporting -------------
     ok_count = 0
     err_count = 0
     total_bytes = 0
@@ -277,8 +369,8 @@ def register(sub: argparse._SubParsersAction) -> None:
         "attachments",
         help="Download files attached to the current conversation "
              "to your browser's download directory "
-             "(composer draft/edit, prompt regex, message id, "
-             "last N, filename, or all)",
+             "(composer draft/edit, first prompt, prompt regex, "
+             "message id, last N, filename, or all)",
     )
 
     g = p.add_mutually_exclusive_group(required=False)
@@ -289,6 +381,14 @@ def register(sub: argparse._SubParsersAction) -> None:
              "editing a previous message.  Detects edit-mode via "
              "textarea messageId: -2 = new draft, +N = editing "
              "message N.",
+    )
+    g.add_argument(
+        "--first", action="store_true",
+        help="attachments from the literal first user message of "
+             "the conversation.  Returns empty when the seed prompt "
+             "had no files — that is not an error.  Used by "
+             "`deeppeek prompt resume` to rehydrate the seed "
+             "context.",
     )
     g.add_argument(
         "--prompt-regex", metavar="PATTERN",
@@ -340,13 +440,22 @@ def register(sub: argparse._SubParsersAction) -> None:
         help="include attachments from forked-away branches "
              "(edited or regenerated messages hidden from the UI).  "
              "Only meaningful with --prompt-regex, --filename, "
-             "--message-id, --last, or --all.",
+             "--first, --message-id, --last, or --all.",
     )
     p.add_argument(
         "--list-only", action="store_true",
         help="enumerate matching files without triggering any "
              "downloads.  Fast, useful for checking counts before "
-             "committing.",
+             "committing.  Mutually exclusive with --fetch-to.",
+    )
+    p.add_argument(
+        "--fetch-to", metavar="DIR", default=None,
+        help="fetch files as base64 and write them to DIR instead "
+             "of triggering browser downloads.  Implies "
+             "return_base64 in the extension, which reuses the "
+             "same _fetchAndEncode code path as `prompt retry`.  "
+             "Mutually exclusive with --list-only.  Used by "
+             "`deeppeek prompt resume`.",
     )
     p.add_argument(
         "--port", type=int, default=8765,

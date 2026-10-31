@@ -2,15 +2,44 @@
 // extractor and bridges messages between it and the background
 // script. Also holds an open port to the background, which keeps the
 // MV3 event page alive.
-
+//
+// The page-world surface is split across 11 sibling scripts, loaded
+// in dependency order with `async = false` so execution order is
+// preserved.  Each script is an IIFE that attaches to
+// `window.__dsx__`; the `__dsx_*_json` bridge entry points live on
+// `window` directly (Xray-safe: content.js accesses them via
+// `window.wrappedJSObject`).
+//
+// Load order matters only in that the bootstrap (`injected.js`) must
+// define `window.__dsx__` before the others run.  Everything else
+// guards `window.__dsx__` at the top of its IIFE, so any individual
+// file could theoretically be reordered — but keeping the current
+// order stable keeps future debugging sane.
 (async function () {
+  const PAGE_WORLD_SCRIPTS = [
+    "injected.js",          // bootstrap: __dsx__, config, helpers
+    "injected-idb.js",      // T1: IndexedDB schema
+    "injected-fiber.js",    // T2: React fiber walk (fallback)
+    "injected-extract.js",  // T2: extraction orchestrator
+    "injected-fetch.js",    // T1: signed-URL → bytes
+    "injected-attach.js",   // T2: drop / file-input attach
+    "injected-composer.js", // T2: typing + Enter
+    "injected-clear.js",    // T3: composer clearing
+    "injected-attachments.js", // T3: attachment extraction modes
+    "injected-retry.js",    // T3: retry-last
+    "injected-hijack.js",   // T3: download-button interception
+  ];
+
   function injectPageWorldScript() {
-    const url = browser.runtime.getURL("injected.js");
-    const s = document.createElement("script");
-    s.src = url;
-    s.async = false;
-    s.onload = () => s.remove();
-    (document.head || document.documentElement).appendChild(s);
+    const head = document.head || document.documentElement;
+    for (const name of PAGE_WORLD_SCRIPTS) {
+      const url = browser.runtime.getURL(name);
+      const s = document.createElement("script");
+      s.src = url;
+      s.async = false;
+      s.onload = () => s.remove();
+      head.appendChild(s);
+    }
   }
 
   if (!window.__dsx_content_installed__) {

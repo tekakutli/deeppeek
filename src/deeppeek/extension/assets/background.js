@@ -193,6 +193,41 @@ function attachHandlers(es) {
     } catch (_) {}
   });
 
+  // ---- open-tab (deeppeek prompt new) ----
+  es.addEventListener("open-tab", async (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+    const batchId = data.batch_id;
+    const url = data.url || "https://chat.deepseek.com/";
+
+    console.log(`DSX: open-tab received (batch=${batchId}, url=${url})`);
+
+    let result = { success: false, reason: "tabs.create threw" };
+    try {
+      const tab = await browser.tabs.create({ url, active: true });
+      result = { success: true, tab_id: tab.id, url: tab.url || url };
+    } catch (err) {
+      result = {
+        success: false,
+        reason: `tabs.create threw: ${err.message}`,
+      };
+    }
+
+    console.log(`DSX: open-tab result (batch=${batchId}):`, result);
+
+    try {
+      await fetch(`${DSX_URL}/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          __ack: "open-tab",
+          batch_id: batchId,
+          result,
+        }),
+      });
+    } catch (_) {}
+  });
+
   // ---- hijack-install (deeppeek hijack) ----
   es.addEventListener("hijack-install", async (e) => {
     let data = {};

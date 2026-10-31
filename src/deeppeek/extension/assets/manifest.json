@@ -29,7 +29,19 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["injected.js"],
+      "resources": [
+        "injected.js",
+        "injected-idb.js",
+        "injected-fiber.js",
+        "injected-extract.js",
+        "injected-fetch.js",
+        "injected-attach.js",
+        "injected-composer.js",
+        "injected-clear.js",
+        "injected-attachments.js",
+        "injected-retry.js",
+        "injected-hijack.js"
+      ],
       "matches": ["https://chat.deepseek.com/*"]
     }
   ]
