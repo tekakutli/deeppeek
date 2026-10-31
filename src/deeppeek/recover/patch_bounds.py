@@ -27,8 +27,28 @@ Both are addressable at the splice site without case-specific rules:
   · `try_boundary_pairs(...)` — expand/contract by ±1..N lines; cheap
     fallback when the AST snap can't help.
 
-  · `splice_region(...)` — do the splice, validate, return `None` on
-    parse error or extreme size loss.
+  · `splice_region(...)` — do the splice, validate, return a
+    `SpliceResult` distinguishing "changed", "noop", and "invalid".
+
+SPLICE RESULT (2026-11-06)
+==========================
+`splice_region` previously returned `str | None`, conflating two
+distinct outcomes:
+
+  · "the splice is a no-op — the base already contains this content"
+  · "the splice is invalid — the resulting content does not parse"
+
+Both returned `None`. Callers (`_apply_scoped_single`,
+`_try_region_replace_lines`, `_try_replace_intent`, ...) treated
+`None` as "try the next candidate". When all candidates are no-ops,
+they fell through to `_diagnose_scoped_failure` and recorded the
+patch `failed`. That is a false failure: the content was already
+applied.
+
+The fix is a `SpliceResult` with an explicit `status` field. Callers
+now distinguish "already applied" (return `base`) from "genuinely
+failed" (return `None`). This is the single largest source of the
+2026-10-30 run's false failures.
 
 EMBEDDED-HTML SNAPPING (2026-10-29)
 ===================================
@@ -54,14 +74,6 @@ The fix: `try_ast_snapped_boundaries` first tries
     signature;
   · otherwise falls back to the innermost enclosing element.
 
-When the body's opening signature doesn't match any enclosing element
-(the fallback path), the innermost element is used.  That is still
-wrong for the classic nested-`<div>` case, but it is *bounded* wrong —
-the outer element survives — rather than catastrophically wrong.  The
-`min_fraction` gate in `splice_region` catches the "over-replace"
-direction when a stray small fragment is spliced into a large
-container.
-
 MANUAL HTML SNAP FALLBACK (2026-11-05, revised)
 ===============================================
 Tree-sitter-html is optional.  When it is not installed, the
@@ -70,65 +82,64 @@ and `_try_embedded_html_snap` needs a text-only path.  Two failure
 modes motivated the revision:
 
   · First version of `_try_manual_html_snap` required `body` to have
-    an HTML opening signature (`<div class="..."`).  A body with no
-    signature (e.g. prose, or an empty body) returned `None` even
-    when the window was clearly inside an HTML block element.
-    Motivating case: `test_patch_bounds_html.py::embedded html snap
-    falls back to innermost`.
+    an HTML opening signature. A body with no signature (e.g. prose,
+    or an empty body) returned `None` even when the window was
+    clearly inside an HTML block element.
 
   · When `_try_embedded_html_snap` returned `None` for that case,
     `try_ast_snapped_boundaries` fell through to
     `_python_top_level_stmt_ranges`, which expanded `[start, end)` to
-    the *whole* `BODY = r\"\"\"...\"\"\"` assignment.  That is the worst
-    possible snap — larger than either the outer or inner element —
-    and produces a silent over-replacement.  Motivating case: the
-    same test's `expected (2, 6) — inner div range; got (0, 9)`.
+    the *whole* `BODY = r\"\"\"...\"\"\"` assignment.
 
 Revised behaviour, three tiers:
 
-  1. **Signature present, matches one or more enclosing elements.**
-     Return the innermost match.  Preserves `pg_base.py` semantics
-     where `<div class="field" style="...">` matches only the outer
-     wrapper, and identifies it unambiguously.
-
-  2. **Signature present, matches no enclosing element.**  Return
-     `None` (fail-closed).  Preserves
-     `test_manual_html_snap_none_when_class_mismatch`.
-
-  3. **No signature.**  Scan for *every* block-tag open (not just one
-     tag), compute each open's matching close by depth, and return the
-     innermost enclosing range.  This matches what `_try_html_snap`
-     does via tree-sitter (min over enclosing), so behaviour is
-     identical whether tree-sitter-html is installed or not.
-
-Additionally, `try_ast_snapped_boundaries` now consults
-`_window_inside_html_string(content, start)` — a cheap string scan —
-and if the window is inside a triple-quoted string containing an HTML
-block tag, it returns `None` instead of falling through to the Python
-statement ranges.  This closes the `(0, 9)` case at its source rather
-than relying on the manual fallback to be perfectly correct.
+  1. Signature present, matches one or more enclosing elements.
+     Return the innermost match.
+  2. Signature present, matches no enclosing element. Return `None`
+     (fail-closed).
+  3. No signature. Return the innermost enclosing range.
 
 REINDENTING SPLICED BODIES (2026-11-05)
 =======================================
 `splice_region` reindents a dedented body to match the base region's
-first line.  Without this, a body written at column 0 spliced into an
-8-space-indented context either fails `ast.parse` (Python) or lands
-at column 0 inside an HTML string.  The `inpaint_server.py` run showed
-the first case; the pg_base.py run showed the second.  A body that
-reopens a wrapper at the wrong column is structurally valid Python
-(string contents are opaque) but semantically wrong HTML.
-
-The reindent is guarded: only fires when the body's first line has
-zero indentation and the base's first line does not.  A body that
-already carries the base's indentation is spliced verbatim.
-
-Each heuristic wires them in identically: build a candidate list from
-the AST snap + the pair sweep, try each, return the first valid one.
+first line.
 """
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 from ._ast import parse_source
+
+
+# ===========================================================================
+#  SpliceResult — the distinct-outcome type
+# ===========================================================================
+
+@dataclass
+class SpliceResult:
+    """Outcome of a `splice_region` call.
+
+    `content` is the new file content when `status == "changed"` or
+    `"noop"`, and `None` when `status == "invalid"`.
+
+    `status` is one of:
+      · "changed" — new bytes, validated
+      · "noop"    — splice produced the same content as base; the
+                    base already contains what the patch declared
+      · "invalid" — the candidate splice did not parse / was
+                    structurally rejected
+    """
+    content: Optional[str]
+    status: Literal["changed", "noop", "invalid"]
+
+    def is_changed(self) -> bool:
+        return self.status == "changed"
+
+    def is_noop(self) -> bool:
+        return self.status == "noop"
+
+    def is_invalid(self) -> bool:
+        return self.status == "invalid"
 
 
 # ── structural validation ──────────────────────────────────────────
@@ -138,10 +149,7 @@ def structural_valid(content: str, path: str) -> bool:
 
     Empty or unrecognised `path` — which happens when callers invoke
     heuristics directly without a record path, as the test suite does
-    — falls back to a generic parse-then-balance check.  Without this,
-    the structural gate silently accepts broken content for empty-path
-    calls, defeating the AST-snap that's supposed to reject off-by-one
-    splices.
+    — falls back to a generic parse-then-balance check.
     """
     ext = Path(path).suffix.lower() if path else ""
     if ext == ".py":
@@ -150,11 +158,6 @@ def structural_valid(content: str, path: str) -> bool:
         return _js_valid(content, path, ext)
     if ext == ".html":
         return _html_valid(content, path)
-    # Unknown / empty extension: try Python parse first (most content
-    # is Python or Python-containing), then JS balance.  A `.py` snippet
-    # with apostrophes in `#` comments would pass `ast.parse` but fail
-    # `_js_balance`; the reverse is true for a JS snippet containing
-    # `#`, but that's rare.
     import ast
     import textwrap
     try:
@@ -206,50 +209,14 @@ def _html_valid(content: str, path: str) -> bool:
 def try_ast_snapped_boundaries(content, path, start, end, body=""):
     """Snap `[start, end)` outward to enclosing statement boundaries.
 
-    Returns `(new_start, new_end)` or `None`. For `.py` also considers
-    the top-level statements of any dominant embedded JS string and
-    any embedded HTML element, so a `.py`-with-playground-JS case snaps
-    to the correct JS nodes rather than the (irrelevant) Python wrapper,
-    and a `.py`-with-playground-HTML case snaps to the enclosing HTML
-    element that matches the patch body's opening tag.
-
-    `body` is optional. When omitted (as in older call sites or tests
-    that just exercise the range extraction), only the "min/max of
-    every overlapping statement" expansion happens. When provided, the
-    embedded-HTML path additionally prefers the innermost matching
-    signature.
-
-    THE HTML-FALLTHROUGH GUARD (2026-11-05)
-    =======================================
-    When `_try_embedded_html_snap` returns `None` but the window is
-    still inside a triple-quoted HTML string, we DO NOT fall through
-    to `_python_top_level_stmt_ranges`.  Those ranges expand to the
-    *whole* `BODY = r\"\"\"...\"\"\"` assignment — the wrong
-    granularity — and silently over-replacing it produces a nested
-    wrapper.  Fail closed instead; the caller then falls through to
-    the insert heuristics rather than over-replacing.
-
-    Motivating case: `test_patch_bounds_html.py::embedded html snap
-    falls back to innermost` reported `expected (2, 6) — inner div
-    range; got (0, 9)` — the (0, 9) came from
-    `_python_top_level_stmt_ranges` on the `BODY = r\"\"\"...\"\"\"`
-    statement after `_try_embedded_html_snap` failed to produce a
-    snap.
+    Returns `(new_start, new_end)` or `None`.
     """
     ext = Path(path).suffix.lower() if path else ""
 
-    # HTML-aware snap: embedded HTML in `.py`, or standalone `.html`.
-    # Both use the innermost enclosing element (preferring a signature
-    # match when the body opens with an HTML block element).
     if ext == ".py":
         html_result = _try_embedded_html_snap(content, start, end, body)
         if html_result is not None:
             return html_result
-        # Guard: if the window is inside an embedded HTML string but
-        # no enclosing element was found, return None.  Falling
-        # through to Python ranges would over-expand to the whole
-        # `BODY = r\"\"\"...\"\"\"` assignment.  See module docstring,
-        # THE HTML-FALLTHROUGH GUARD.
         if _window_inside_html_string(content, start):
             return None
     elif ext == ".html":
@@ -278,7 +245,7 @@ def try_ast_snapped_boundaries(content, path, start, end, body=""):
     return new_start, new_end
 
 
-# ── Embedded-HTML range extraction and snap (2026-10-29) ──────────
+# ── Embedded-HTML range extraction and snap ────────────────────────
 
 _HTML_TRIPLE_RE = re.compile(
     r'(?:[rbufRBUF]{0,2})("""|\'\'\')(.*?)\1',
@@ -293,17 +260,6 @@ _HTML_BLOCK_TAGS = frozenset({
 
 
 def _try_html_snap(content, start, end, body, ranges):
-    """Snap `[start, end)` to the innermost enclosing HTML element in
-    `ranges`.
-
-    Selection:
-      1. Restrict to ranges that fully enclose `[start, end)`.
-      2. If `body` has an HTML opening tag signature, prefer the
-         innermost range whose opening line matches that signature.
-      3. Otherwise, pick the innermost enclosing range.
-
-    Returns `(new_start, new_end)` or `None`.
-    """
     if not ranges:
         return None
 
@@ -326,63 +282,20 @@ def _try_html_snap(content, start, end, body, ranges):
 
 
 def _try_embedded_html_snap(content, start, end, body):
-    """Snap `[start, end)` to the enclosing HTML element inside one of
-    the file's triple-quoted strings.  Only fires when the window is
-    entirely inside one of those strings and that string parses as
-    HTML.  See `_try_html_snap` for the selection logic.
-
-    Falls back to `_try_manual_html_snap` when tree-sitter-html is
-    not installed (`_embedded_html_top_level_stmt_ranges` returns
-    `[]`).  See the module docstring, MANUAL HTML SNAP FALLBACK.
-    """
     ranges = _embedded_html_top_level_stmt_ranges(content)
     if ranges:
         return _try_html_snap(content, start, end, body, ranges)
-    # tree-sitter-html missing or all strings failed to parse.
     return _try_manual_html_snap(content, start, end, body)
 
 
 def _try_manual_html_snap(content: str, start: int, end: int,
                           body: str) -> Optional[tuple]:
-    """Fallback for when tree-sitter-html is not installed.
-
-    Scans content line-by-line for HTML block-element openings and,
-    for each opening, computes its matching close by depth counting.
-    Filters candidates to those whose close is on or after `end`.
-
-    Selection (see module docstring, MANUAL HTML SNAP FALLBACK):
-
-      · body_sig present and matches one or more enclosing elements →
-        innermost match.
-      · body_sig present and matches none → None (fail-closed).
-      · body_sig absent → innermost enclosing element.
-
-    Depth starts at 1 (the caller's window is presumed to be inside
-    the element being opened) so single-line `<div></div>` resolves
-    and nested opens of the same tag close at the correct level.
-
-    Motivating cases:
-
-      · `test_manual_html_snap_none_when_class_mismatch`: signature
-        mismatches must NOT snap (fail-closed).
-      · `test_patch_bounds_html.py::embedded html snap falls back to
-        innermost`: an empty body must still snap to the innermost
-        enclosing block element.
-      · pg_base.py: `<div class="field" style="...">` matches only
-        the outer wrapper, unambiguously.
-    """
     lines = content.split("\n")
     if start < 0 or end > len(lines) or start >= end:
         return None
 
     body_sig = _extract_html_opening_signature(body) if body else None
 
-    # Find every block-element open on or before `start`, compute its
-    # matching close by depth, keep those whose close is on or after
-    # `end`.  One open per line is enough: HTML block tags do not
-    # legitimately repeat on one line in the playground pattern, and
-    # if they do (a compact one-liner), the innermost one on that
-    # line is the correct target anyway.
     all_open_re = re.compile(
         r'<(' + '|'.join(
             sorted(re.escape(t) for t in _HTML_BLOCK_TAGS)
@@ -390,7 +303,7 @@ def _try_manual_html_snap(content: str, start: int, end: int,
         re.IGNORECASE,
     )
 
-    candidates: list = []  # (open_idx, close_idx_exclusive, opening_line)
+    candidates: list = []
     for i in range(start, -1, -1):
         for m in all_open_re.finditer(lines[i]):
             tag = m.group(1).lower()
@@ -398,8 +311,6 @@ def _try_manual_html_snap(content: str, start: int, end: int,
                 r'<' + re.escape(tag) + r'\b', re.IGNORECASE)
             close_re = re.compile(
                 r'</' + re.escape(tag) + r'\s*>', re.IGNORECASE)
-            # Depth 1 = we are inside the element that just opened.
-            # Count opens and closes to the right of the open.
             depth = 1
             close_idx = -1
             for j in range(i, len(lines)):
@@ -414,8 +325,6 @@ def _try_manual_html_snap(content: str, start: int, end: int,
             if close_idx < end:
                 continue
             candidates.append((i, close_idx + 1, lines[i]))
-            # One candidate per line: the innermost match on this line
-            # is the correct target.
             break
 
     if not candidates:
@@ -428,16 +337,8 @@ def _try_manual_html_snap(content: str, start: int, end: int,
         ]
         if matching:
             return min(matching, key=lambda r: r[1] - r[0])
-        # Signature mismatch: fail closed.  Do NOT fall back to
-        # innermost — a body whose sig doesn't match any enclosing
-        # element is not a safe replacement, and the caller must
-        # decide to fail-closed or try another heuristic.  See
-        # `test_manual_html_snap_none_when_class_mismatch`.
         return None
 
-    # No signature: fall back to innermost enclosing element.  This
-    # is the "falls back to innermost" case from the module
-    # docstring.
     return min(
         ((s, e) for s, e, _ in candidates),
         key=lambda r: r[1] - r[0],
@@ -445,18 +346,6 @@ def _try_manual_html_snap(content: str, start: int, end: int,
 
 
 def _window_inside_html_string(content: str, line: int) -> bool:
-    """True iff `line` falls inside a triple-quoted string whose
-    content contains at least one HTML block tag.
-
-    Used by `try_ast_snapped_boundaries` to refuse the Python-statement
-    fallback when the window is inside embedded HTML but no enclosing
-    HTML element was found.  The Python statement that wraps the
-    string (`BODY = r\"\"\"...\"\"\"`) spans the whole string —
-    expanding to it is a silent over-replacement that produces a
-    nested wrapper.
-
-    Cheap: one regex scan per triple-quoted string, no tree-sitter.
-    """
     if not content or line < 0:
         return False
     lines = content.split("\n")
@@ -481,16 +370,6 @@ def _window_inside_html_string(content: str, line: int) -> bool:
 
 
 def _embedded_html_top_level_stmt_ranges(content):
-    """Return [(start_line, end_line)] for every HTML block element
-    (nested or not) inside every triple-quoted string literal.
-
-    Skips very short strings (<60 chars) — those are almost always
-    docstrings that happen to mention a tag, not real embedded markup.
-    A five-element HTML fragment is ~100 chars; the threshold sits
-    just below that so genuine small playground bodies (a `<div>` with
-    one `<input>` and one `<span>`, for instance) still parse while a
-    one-line `# example: <div>` in a comment does not.
-    """
     ranges = []
     for m in _HTML_TRIPLE_RE.finditer(content):
         body = m.group(2)
@@ -506,18 +385,6 @@ def _embedded_html_top_level_stmt_ranges(content):
 
 
 def _html_top_level_stmt_ranges(content, include_nested=False):
-    """Return [(start_line, end_line)] for HTML block elements.
-
-    `include_nested=True` returns every block element at any depth
-    (outermost and inner alike); `include_nested=False` returns only
-    the outermost block elements. The embedded-HTML snap uses nested
-    so it can pick a signature match at the correct depth.
-
-    "Block element" is a fixed tag whitelist (`_HTML_BLOCK_TAGS`).
-    Inline-only tags (`<span>`, `<a>`, `<input>`, ...) are not ranges;
-    the enclosing block is the boundary for a patch that references
-    them. Tree-sitter-html missing → empty list.
-    """
     try:
         import tree_sitter_html  # type: ignore
         from tree_sitter import Language, Parser
@@ -562,16 +429,6 @@ def _html_tag_name(node):
 
 
 def _extract_html_opening_signature(body):
-    """Extract `{tag, class?, style?}` from the first non-blank line of
-    `body`, or None if it isn't an HTML block-element opening tag.
-
-    The signature captures the tag name plus the exact `class="..."`
-    and `style="..."` attribute values, so a body whose opening is
-    `<div class="field" style="align-items:center;">` only matches an
-    enclosing `<div>` with those same attributes. That's how the
-    `pg_base.py` outer-field replacement is distinguished from the
-    inner flex `<div>`.
-    """
     if not body:
         return None
     first_line = next(
@@ -602,9 +459,6 @@ def _extract_html_opening_signature(body):
 
 
 def _html_signature_matches(opening_line, sig):
-    """True iff `opening_line`'s tag (and captured attributes) match
-    `sig`. Extra attributes on `opening_line` are permitted; only the
-    ones captured in `sig` are compared."""
     if not opening_line or not sig:
         return False
     m = re.match(r'^\s*<([a-zA-Z][\w-]*)\b', opening_line)
@@ -638,8 +492,6 @@ def _python_top_level_stmt_ranges(content):
             continue
         if getattr(node, "end_lineno", None) is None:
             continue
-        # ast lineno/end_lineno are 1-based inclusive; convert to
-        # 0-based [start, end_exclusive).
         out.append((node.lineno - 1, node.end_lineno))
     return out
 
@@ -684,10 +536,6 @@ def _embedded_js_top_level_stmt_ranges(content):
             continue
         if tree.root_node.has_error:
             continue
-        # The JS content begins on the same file line as the opening
-        # `r\"\"\"`; `content_start_line` is the 0-based file line index
-        # of that opening quote. JS line 0 is the empty line right
-        # after it, which is still file line `content_start_line`.
         content_start_line = content.count("\n", 0, content_start)
         out.extend(_tree_top_level_ranges(
             tree.root_node, offset=content_start_line))
@@ -700,8 +548,6 @@ def _tree_top_level_ranges(root_node, offset):
         sp = child.start_point
         ep = child.end_point
         file_start = offset + sp[0]
-        # tree-sitter end_point is (line, col) exclusive.  The node's
-        # last touched line is ep[0] if ep[1] > 0, else ep[0] - 1.
         file_end = offset + ep[0] + (1 if ep[1] > 0 else 0)
         if file_end > file_start:
             out.append((file_start, file_end))
@@ -711,13 +557,6 @@ def _tree_top_level_ranges(root_node, offset):
 # ── expansion / contraction candidates ─────────────────────────────
 
 def try_boundary_pairs(start, end, total, max_delta=3):
-    """Yield `(start, end)` candidates: original, then ±delta.
-
-    Expansions yielded before contractions — cutting a statement
-    short is more likely to leave an orphan than including a
-    neighbouring one, so the pipeline prefers expansion when both
-    would produce valid content.
-    """
     seen = set()
 
     def _emit(s, e):
@@ -741,23 +580,20 @@ def try_boundary_pairs(start, end, total, max_delta=3):
 # ── splice + validate ──────────────────────────────────────────────
 
 def splice_region(base, start, end, body_lines, path,
-                  min_fraction=0.5) -> Optional[str]:
-    """Splice base[start:end] with body_lines, validate, return or None.
+                  min_fraction=0.5) -> SpliceResult:
+    """Splice base[start:end] with body_lines, validate, and return
+    a `SpliceResult` distinguishing the three outcomes.
 
-    Reindents a dedented body to match the base region's first line —
-    see the module docstring, REINDENTING SPLICED BODIES.  Without
-    this, a body written at column 0 spliced into an 8-space-indented
-    context either fails `ast.parse` (Python) or lands at column 0
-    inside an HTML string (both observed in the 2026-11-05 run).
+    The caller decides what to do with each:
+      · "changed"  — return content
+      · "noop"     — return base (already present)
+      · "invalid"  — try next candidate or fail
     """
     base_lines = base.splitlines()
     if start < 0 or end > len(base_lines) or start >= end:
-        return None
+        return SpliceResult(None, "invalid")
 
-    # Reindent the body to match the base region's first line.  Fires
-    # only when the body's first line has zero indent and the base's
-    # does not — a body that already carries an indent is spliced
-    # verbatim.
+    # Reindent the body to match the base region's first line.
     if body_lines and start < len(base_lines):
         first_body = body_lines[0]
         first_base = base_lines[start]
@@ -775,12 +611,12 @@ def splice_region(base, start, end, body_lines, path,
 
     new_lines = base_lines[:start] + list(body_lines) + base_lines[end:]
     if len(new_lines) < len(base_lines) * min_fraction:
-        return None
+        return SpliceResult(None, "invalid")
     result = "\n".join(new_lines)
     if base.endswith("\n") and not result.endswith("\n"):
         result += "\n"
     if result == base:
-        return None
+        return SpliceResult(base, "noop")
     if not structural_valid(result, path):
-        return None
-    return result
+        return SpliceResult(None, "invalid")
+    return SpliceResult(result, "changed")

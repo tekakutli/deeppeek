@@ -22,8 +22,56 @@ A single block becomes a scoped-replace (`paired_with = -1`) when:
     2. Its prose says "replace … with:" AND its body carries a scope
        marker (name extracted from body via
        `_extract_scope_from_body`), OR
-    3. Its body carries a scope marker AND its prose has a
-       replace/add verb.
+    3. Its body carries a scope marker AND the extracted scope name
+       appears in the prose (see SCOPE NAME MUST APPEAR IN PROSE
+       below), AND the block would not be handled by the patch
+       machinery as-is.
+
+SCOPE NAME MUST APPEAR IN PROSE (2026-11-07)
+============================================
+Case 3 used to fire whenever the body carried a scope marker AND
+the prose had a verb from either the replace family or the add
+family.  Two shapes came through that gate, one correct and one
+wrong:
+
+  · "Add the full-canvas early-out to `drawInpaintContext`:"
+    Body: `export function drawInpaintContext(r) { … }`
+    → CORRECT scoped-replace.  The prose names the target scope
+      explicitly ("to `drawInpaintContext`").  Fixture 13 exercises
+      this; the pair path (`pairs_applied == 1`) must fire.
+
+  · "Insert between the Image and Masks `<details>` blocks:"
+    Body: `<details><summary>View</summary> … </details>`
+    → WRONG scoped-replace.  The prose is *positional* — it names
+      two anchor scopes (Image, Masks) and asks for insertion
+      between them.  It does *not* name "View" at all.  The body's
+      scope marker is incidental; the extracted name "View" comes
+      from the body, not the prose.  `_try_insert_between_anchors`
+      has the right prose regex for this shape and should fire
+      instead of `_apply_scoped`.
+
+The distinguishing factor is whether the extracted scope name
+appears in the prose.  If it does, the prose is telling us *what*
+to replace (scoped-replace).  If it doesn't, the prose is telling
+us *where* to insert (positional insert), and other heuristics own
+the case.
+
+Prior fix (2026-11-06) dropped `_ADD_VERBS` from the `has_verb`
+union entirely.  That closed the pg_base.py misclassification, but
+it also broke fixture 13's add-verb-scoped-replace path (the block
+went through the deterministic dispatcher instead of the pair
+path, and `pairs_applied` stayed at 0).  The current fix restores
+the add-verb union and adds the prose-mention gate — both
+motivating shapes now land on their correct handlers.
+
+Note that fixture 42 (`42_between_anchors_embedded_html`) was never
+actually broken by the old Case 3, because its body is
+`<div class="divider"></div>` — `_extract_scope_from_body` returns
+`("", "")` and the `if not name: continue` guard fires before any
+verb check runs.  The "View"-body variant is what the gate exists
+for.  See `tests/recover/fixtures/42_between_anchors_embedded_html.md`
+for the shape and `tests/recover/fixtures/13_scoped_add_verb.md`
+for the counter-example.
 
 SCOPED BLOCKS MUST BE `partial`
 ===============================
@@ -240,6 +288,32 @@ def _detect_scoped(blocks: list) -> None:
         # Case 3: prose has a replace/add verb AND body carries a
         # scope marker AND the block would not be handled by the
         # patch machinery as-is.
+        #
+        # FIX (2026-11-07): the extracted scope name must appear in
+        # the prose.  Otherwise the prose is naming *other* scopes —
+        # an "insert between X and Y" instruction — and this block
+        # is an insertion, not a scope replacement.  The pre-fix
+        # rule fired on any add/replace verb plus any scope-marker
+        # body; "Insert between the Image and Masks `<details>`
+        # blocks" (with body `<details><summary>View</summary>`)
+        # was classified as a scoped-replace of "View", because
+        # "insert" is an add-verb and the body's scope marker says
+        # "View".  But "View" isn't in the prose — the prose is
+        # pointing at two *other* scopes.  The block should route
+        # to `_try_insert_between_anchors`, not to `_apply_scoped`.
+        #
+        # The reverse case — "Add the full-canvas early-out to
+        # `drawInpaintContext`:" with body `export function
+        # drawInpaintContext(…)` — has the scope name in the
+        # prose.  That IS a scoped-replace (fixture 13 asserts the
+        # pair path fires, not the deterministic dispatcher).
+        #
+        # The 2026-11-06 fix dropped `_ADD_VERBS` from the union
+        # entirely.  That closed the pg_base.py misclassification
+        # but broke fixture 13 (the block went through the
+        # deterministic dispatcher instead of the pair path, and
+        # `pairs_applied` stayed at 0).  The current fix restores
+        # the add-verb union and adds the prose-mention gate.
         ctx_lower = b.context_before.lower()
         has_verb = (
             intent.action == REPLACE_PAIR
@@ -252,6 +326,9 @@ def _detect_scoped(blocks: list) -> None:
             continue
         name, kind = _extract_scope_from_body(b.body)
         if not name:
+            continue
+        # NEW: the extracted scope name must appear in the prose.
+        if name.lower() not in ctx_lower:
             continue
         b.scope_hint = kind
         b.scope_name = name

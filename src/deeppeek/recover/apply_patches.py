@@ -246,12 +246,13 @@ def _try_replace_intent(content: str, patch, path: str,
         start_line, end_line, len(base_lines)))
 
     for trial_start, trial_end in candidates:
-        result = splice_region(
+        out = splice_region(
             content, trial_start, trial_end, body_lines, path)
-        if result is None:
-            continue
-        if result == content:
+        if out.status == "noop":
             return content
+        if out.status == "invalid":
+            continue
+        result = out.content
         if not _verify_no_duplicate_insertion(
                 content, result, patch, path):
             continue

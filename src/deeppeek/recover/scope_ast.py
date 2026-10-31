@@ -32,6 +32,40 @@ index: one `ast.walk(tree)` per unique content, reused by every scope
 lookup on that file.  A file with 3 scope lookups pays 1 walk
 instead of 3; a file with 6 pays 1 instead of 6.
 
+SUBPROCESS FALLBACK (2026-11-06)
+================================
+When in-process tree-sitter is unavailable but the repo .venv has
+it (`ast_status() == {"in_process": False, "via_venv": True}`), the
+three public finders fall back to a subprocess running the venv's
+Python.  The subprocess imports `deeppeek.recover.scope_ast` from
+`<repo>/src/` via `sys.path.insert`, calls the corresponding
+`_find_*_cached` function, and returns its result via JSON.
+
+The motivating failure: the 2026-10-31 inpaint conversation.  Every
+patch that targeted a JS or HTML scope inside a Python raw string
+failed with "scope X could not be located structurally (AST scope
+finder returned None)" — but every one of those scopes *existed* in
+the base.  The running interpreter simply could not import
+`tree_sitter_html` or `tree_sitter_javascript`, so
+`_find_embedded_js_scope` and `_find_html_scope` both returned None
+and `find_scope` returned None and `_apply_scoped_single` refused
+the splice and the patch was recorded as `failed`.
+
+Per-query cost: ~200 ms.  Cache: `@lru_cache(maxsize=128)` on the
+subprocess helper, keyed on `(kind, base, name, path, anchor_pos)`.
+For the 8 lookups the motivating run needed, ~1.6 s added.  During
+reconciliation replay, the same `(kind, base, name, path)` hits the
+cache, so it's a dict lookup.
+
+The subprocess only fires when `_find_scope_cached` returned None.
+The common case — running from the venv, `in_process: True` — never
+spawns a subprocess.  When the subprocess *does* run and also
+returns None, the lookup genuinely has no scope; the diagnostic
+that `_diagnose_scoped_failure` emits then names the true cause
+("scope X could not be located structurally") rather than lying
+("scope matched but replacement produced no change") — see
+`patch_diag.py`'s HONEST SCOPED-FAILURE DIAGNOSTIC section.
+
 BOUNDARIES
 ==========
 `find_scope` returns `(start_char, end_char, kind)` where:
@@ -133,7 +167,9 @@ to nothing.
 from __future__ import annotations
 
 import ast
+import json
 import re
+import subprocess
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
@@ -215,8 +251,127 @@ def _iter_python_nodes(tree):
             yield node.target.id, node
 
 
+# ===========================================================================
+#  Runtime AST availability + subprocess fallback  (NEW 2026-11-06)
+# ===========================================================================
+#
+# See the module docstring, SUBPROCESS FALLBACK.
+
+def _has_inprocess_ast() -> bool:
+    """True iff at least one tree-sitter grammar is importable in the
+    current interpreter."""
+    try:
+        from .ast_anchor import _has_inprocess_ast as _h
+        return _h()
+    except Exception:
+        return False
+
+
+def _has_venv_ast() -> bool:
+    """True iff the repo .venv has tree-sitter + at least one grammar.
+
+    The underlying probe in `ast_anchor._has_venv_ast` is itself
+    `@lru_cache`d via `_VENV_AST_AVAILABLE`, so this wrapper pays the
+    import-of-ast_anchor cost once per process.
+    """
+    try:
+        from .ast_anchor import _has_venv_ast as _h
+        return _h()
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=128)
+def _scope_query_subprocess(
+        kind: str, base: str, name: str, path: str,
+        anchor_pos: int = 0):
+    """Run a scope query in the repo .venv's Python interpreter.
+
+    `kind` is one of:
+      · "scope"           — `_find_scope_cached(base, name, path, '')`
+      · "body_span"       — `_find_scope_body_span_cached(base, name, path)`
+      · "enclosing"       — `_find_enclosing_scope_name_cached(base, anchor_pos, path)`
+
+    Returns the same value the corresponding in-process function
+    would return, or None on any failure (subprocess crash,
+    unparseable JSON, etc.).  Memoized on the full argument tuple so
+    reconciliation replay hits the cache.  See module docstring,
+    SUBPROCESS FALLBACK.
+    """
+    try:
+        from .ast_anchor import _find_venv_python, _src_dir
+    except ImportError:
+        return None
+    py = _find_venv_python()
+    if py is None:
+        return None
+
+    payload = json.dumps({
+        "kind": kind,
+        "base": base,
+        "name": name,
+        "path": path,
+        "anchor_pos": anchor_pos,
+    })
+    helper = (
+        "import json, sys\n"
+        f"sys.path.insert(0, {str(_src_dir())!r})\n"
+        "from deeppeek.recover.scope_ast import (\n"
+        "    _find_scope_cached, _find_scope_body_span_cached,\n"
+        "    _find_enclosing_scope_name_cached,\n"
+        ")\n"
+        "d = json.load(sys.stdin)\n"
+        "kind = d['kind']\n"
+        "if kind == 'scope':\n"
+        "    r = _find_scope_cached(d['base'], d['name'],\n"
+        "                           d['path'], '')\n"
+        "    out = None if r is None else list(r)\n"
+        "elif kind == 'body_span':\n"
+        "    r = _find_scope_body_span_cached(\n"
+        "        d['base'], d['name'], d['path'])\n"
+        "    out = None if r is None else list(r)\n"
+        "elif kind == 'enclosing':\n"
+        "    r = _find_enclosing_scope_name_cached(\n"
+        "        d['base'], d['anchor_pos'], d['path'])\n"
+        "    out = r\n"
+        "else:\n"
+        "    out = None\n"
+        "sys.stdout.write(json.dumps(out))\n"
+    )
+    try:
+        proc = subprocess.run(
+            [str(py), "-c", helper],
+            input=payload, capture_output=True, text=True, timeout=30.0,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    out = proc.stdout.strip()
+    if not out or out == "null":
+        return None
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+
+    if kind == "enclosing":
+        return str(data) if data else None
+    if isinstance(data, list) and len(data) == 2:
+        try:
+            return (int(data[0]), int(data[1]))
+        except (TypeError, ValueError):
+            return None
+    if isinstance(data, list) and len(data) == 3:
+        try:
+            return (int(data[0]), int(data[1]), str(data[2]))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 # ---------------------------------------------------------------------------
-#  Public dispatch — thin lru_cache wrappers
+#  Public dispatch — thin lru_cache wrappers with subprocess fallback
 # ---------------------------------------------------------------------------
 
 def find_scope(base: str, name: str, path: str = "",
@@ -226,10 +381,25 @@ def find_scope(base: str, name: str, path: str = "",
 
     Memoized by `(base, name, path, scope_hint)` — the actual base
     string, not its hash.  See module docstring, CACHE FIX.
+
+    Subprocess fallback (2026-11-06): if `_find_scope_cached`
+    returns None AND in-process tree-sitter is unavailable AND the
+    repo .venv has it, retry via `_scope_query_subprocess`.  This is
+    the fix that closes the 2026-10-30 run's "scope X could not be
+    located structurally" residuals for embedded-JS/HTML scopes that
+    the running interpreter couldn't parse.  See module docstring,
+    SUBPROCESS FALLBACK.
     """
     if not base or not name:
         return None
-    return _find_scope_cached(base, name, path, scope_hint)
+    result = _find_scope_cached(base, name, path, scope_hint)
+    if result is not None:
+        return result
+    if not _has_inprocess_ast() and _has_venv_ast():
+        r = _scope_query_subprocess("scope", base, name, path)
+        if isinstance(r, tuple) and len(r) == 3:
+            return r
+    return None
 
 
 @lru_cache(maxsize=_SCOPE_CACHE_MAX)
@@ -288,10 +458,20 @@ def find_enclosing_scope_name(base: str, anchor_pos: int,
 
     Memoized by `(base, anchor_pos, path)`.  See module docstring,
     CACHE FIX.
+
+    Subprocess fallback (2026-11-06): same tier as `find_scope`.
     """
     if not base or anchor_pos < 0:
         return None
-    return _find_enclosing_scope_name_cached(base, anchor_pos, path)
+    result = _find_enclosing_scope_name_cached(base, anchor_pos, path)
+    if result is not None:
+        return result
+    if not _has_inprocess_ast() and _has_venv_ast():
+        r = _scope_query_subprocess(
+            "enclosing", base, "", path, anchor_pos)
+        if isinstance(r, str):
+            return r
+    return None
 
 
 @lru_cache(maxsize=_SCOPE_CACHE_MAX)
@@ -342,10 +522,19 @@ def find_scope_body_span(base: str, name: str,
 
     Memoized by `(base, name, path)`.  See module docstring,
     CACHE FIX.
+
+    Subprocess fallback (2026-11-06): same tier as `find_scope`.
     """
     if not base or not name:
         return None
-    return _find_scope_body_span_cached(base, name, path)
+    result = _find_scope_body_span_cached(base, name, path)
+    if result is not None:
+        return result
+    if not _has_inprocess_ast() and _has_venv_ast():
+        r = _scope_query_subprocess("body_span", base, name, path)
+        if isinstance(r, tuple) and len(r) == 2:
+            return r
+    return None
 
 
 @lru_cache(maxsize=_SCOPE_CACHE_MAX)

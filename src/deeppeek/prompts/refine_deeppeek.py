@@ -17,19 +17,54 @@ Pipeline (extends `review`):
     cwd-dump   (optional, --with-dump) dump_filtered.py in cwd,
                filtered to files whose basenames appear as `## File:`
                headers in the conversation
-    merge      diff.txt + meta files + conversation.md + deeppeek_dump.md
-               [+ project_dump_<cwd>_filtered.md with --with-dump]
-               → a single refine_deeppeek_merged.md via
-               scripts/merge_md.py
+    merge      → a single refine_deeppeek_merged.md via
+               scripts/merge_md.py, WITH NAMED GROUPS:
+                 [Target project]      diff.txt
+                                       [+ project_dump_<cwd>_filtered.md]
+                 [Metadata]            the reports under deeppeek/
+                 [Conversation]        the original conversation.md
+                 [deeppeek source]     deeppeek_dump.md
     pipe       the single merged.md as one file chip
     type       short templated prompt
 
-The four (or five) inputs are merged into one markdown file before
-they hit the pipe stage.  `merge_md.py` uses `+` separators and
-`MERGED FILE i/N:` headers, so the merged file remains unambiguous
-even when its inputs are themselves dump files.  The AI gets one
-file chip containing the conversation, the diff, the reports, and
-the deeppeek source dump, all in one.
+The inputs are merged into one markdown file before they hit the
+pipe stage.  `merge_md.py` uses `+` separators and `MERGED FILE i/N:`
+headers, so the merged file remains unambiguous even when its
+inputs are themselves dump files.
+
+NAMED GROUPS (2026-11-05)
+=========================
+`_stage_merge` drives `merge_md.py` in group mode rather than
+positional mode.  Each input class gets its own `#`-bounded heading
+and appears as a directory in the preamble's tree view:
+
+    Target project (post-apply diff + current state)/  (1–2 file(s))
+    Metadata (reports under deeppeek/)/               (N file(s))
+    Original conversation (patches that were applied)/  (1 file(s))
+    deeppeek source (the codebase to refine)/         (M file(s))
+
+This gives the AI (and the human) a navigable structure.  Without
+groups, the merged file for a `--with-dump` run is a flat sequence
+of ~90 file blocks with no section boundaries, and the AI spends
+attention distinguishing "is this the source of the tool I'm
+refining, or a file the conversation tried to edit?".  With groups,
+the answer is a heading.
+
+Pairing the diff with the filtered project dump (rather than
+splitting them into two groups) matches how a reader actually
+consumes them: the diff is *what changed* on the target, the
+filtered dump is *the full content of the files that were touched*.
+They describe the same artefact from two angles, and grouping them
+keeps the "target project" story in one place.  When `--with-dump`
+is off, the group carries just the diff and is named "Target
+project (post-apply diff)" so the heading stays truthful — the
+group is still about the target project, just without the
+full-content view.
+
+Group mode is `merge_md.py --group NAME FILE [FILE ...]` (repeatable),
+not a new script or a rewrite of `merge_md.py` — the same command
+already used by `deeppeek prompt send_tests`, so the two prompts
+produce merges with the same visual contract.
 
 Differences from `review`:
 
@@ -135,11 +170,12 @@ This is the outcome of my deeppeek utility trying to apply the patches
 you just printed through: "deeppeek recover {conversation_name} --apply-here".
 
 I've attached a single merged markdown file ({merged_name}) that
-bundles, in order: the original conversation markdown,
-diff.txt (what actually changed on disk), the reports under
-deeppeek/, and a dump of deeppeek's own source
-({deeppeek_dump_name}).  The merge uses per-file headers so you can
-locate each piece.
+bundles four inputs in named groups: the target project's
+post-apply diff (and, when --with-dump is on, the current content
+of the files that were touched), the reports under deeppeek/, the
+original conversation markdown, and a dump of deeppeek's own
+source ({deeppeek_dump_name}).  The merge uses per-group headings
+and per-file headers so you can locate each piece.
 
 Help me evaluate the results.  If you detect bugs, propose robust
 fixes.  Better still, build infrastructure, further abstractions, or
@@ -511,14 +547,26 @@ def _stage_dump_cwd_filtered(cwd: Path, ws: Path,
 # Merge — bundle every input into one file via scripts/merge_md.py
 # ---------------------------------------------------------------------------
 
-def _stage_merge(ws: Path, files: list[Path],
+def _stage_merge(ws: Path,
+                 groups: list[tuple[str, list[Path]]],
                  args: argparse.Namespace) -> Path:
-    """Merge `files` into a single markdown file using merge_md.py.
+    """Merge named groups of files into a single markdown file
+    using `merge_md.py --group`.
 
-    The merge_md.py script uses `+` separators and `MERGED FILE i/N:`
-    headers, which stay unambiguous even when the inputs are
-    themselves dump files (which use `===` and `FILE i/N:`).  The
-    output lands in the workspace as `refine_deeppeek_merged.md`
+    Each group becomes one `#`-bounded section (see `merge_md.py`'s
+    grouped-output docstring); the preamble contains a tree view
+    of every file bucketed under its group.  This is the same
+    contract `deeppeek prompt send_tests` uses, so the two merged
+    artefacts the AI receives have the same navigable structure —
+    the AI can say "in the deeppeek-source group, file X, function
+    Y" rather than "in the third file-chip block, around line 400".
+
+    `groups` is a list of `(name, [files])` pairs.  Empty groups
+    (all files filtered out by `.is_file()`) are skipped; if every
+    group ends up empty, we abort with a specific message — no
+    merged file is produced.
+
+    The output lands in the workspace as `refine_deeppeek_merged.md`
     and is what the pipe stage attaches to the chat.
     """
     script = args.merge_md or _MERGE_MD_SCRIPT
@@ -532,27 +580,41 @@ def _stage_merge(ws: Path, files: list[Path],
         )
 
     out = ws / "refine_deeppeek_merged.md"
-    existing = [f for f in files if f.is_file()]
-    if not existing:
-        raise SystemExit(
-            "error: no input files to merge — this should not happen; "
-            "check that the earlier stages produced their outputs"
-        )
 
     cmd = [
         sys.executable, str(script),
         "-o", str(out),
         "-t", "refine_deeppeek — merged inputs",
-    ] + [str(f) for f in existing]
+    ]
 
-    print(f"[merge] merging {len(existing)} file(s) -> {out}",
+    kept_groups: list[tuple[str, list[Path]]] = []
+    for gname, gfiles in groups:
+        existing = [f for f in gfiles if f.is_file()]
+        if not existing:
+            continue
+        cmd.append("--group")
+        cmd.append(gname)
+        cmd.extend(str(f) for f in existing)
+        kept_groups.append((gname, existing))
+
+    if not kept_groups:
+        raise SystemExit(
+            "error: no input files to merge — this should not happen; "
+            "check that the earlier stages produced their outputs"
+        )
+
+    print(f"[merge] merging {sum(len(fs) for _, fs in kept_groups)} "
+          f"file(s) in {len(kept_groups)} group(s) -> {out}",
           file=sys.stderr)
-    for f in existing:
-        try:
-            print(f"  {f}  ({f.stat().st_size:,} bytes)",
-                  file=sys.stderr)
-        except OSError:
-            print(f"  {f}", file=sys.stderr)
+    for gname, gfiles in kept_groups:
+        print(f"  [{gname}]  ({len(gfiles)} file(s))",
+              file=sys.stderr)
+        for f in gfiles:
+            try:
+                print(f"    {f}  ({f.stat().st_size:,} bytes)",
+                      file=sys.stderr)
+            except OSError:
+                print(f"    {f}", file=sys.stderr)
 
     rc, _, stderr = _run_cmd(
         cmd, timeout=args.merge_timeout, allow_failure=False,
@@ -756,29 +818,66 @@ def run(args: argparse.Namespace) -> int:
         cwd_dump_path = _stage_dump_cwd_filtered(
             cwd, ws, args.conversation)
 
-    # 7. Assemble the inputs that will be merged (and then piped as
-    #    one file chip).
-    to_merge: list[Path] = [
-        status_path,
-        *meta_files,
-        args.conversation,
-        dump_path,
-    ]
+    # 7. Assemble the inputs that will be merged, bucketed into
+    #    named groups.  `merge_md.py --group` writes a `#`-bounded
+    #    heading per group and a tree view in the preamble, so the
+    #    AI (and the human) can navigate the merged file by section
+    #    rather than scanning a flat list of file blocks.  Same
+    #    shape `deeppeek prompt send_tests` uses.
+    #
+    #    Group names are chosen to answer the question the AI will
+    #    ask while reading: "is this the source of the tool I'm
+    #    refining, or a file the conversation tried to edit?".
+    #
+    #    The diff and the filtered project dump (when --with-dump)
+    #    live in the SAME group.  Both describe the target project's
+    #    post-apply state — the diff is the delta, the filtered
+    #    dump is the full content of the files that were touched —
+    #    and a reader consumes them together ("what changed" +
+    #    "what it changed to").  Splitting them into two groups
+    #    forces the AI to reconstruct that relationship from
+    #    filenames.
     if cwd_dump_path is not None:
-        to_merge.append(cwd_dump_path)
+        target_group_label = (
+            "Target project (post-apply diff + current state)")
+        target_group_files = [status_path, cwd_dump_path]
+    else:
+        target_group_label = "Target project (post-apply diff)"
+        target_group_files = [status_path]
 
-    # 8. Dry-run: show what would be merged and the composer text.
+    merge_groups: list[tuple[str, list[Path]]] = [
+        (target_group_label, target_group_files),
+        ("Metadata (reports under deeppeek/)",
+         list(meta_files)),
+        ("Original conversation (patches that were applied)",
+         [args.conversation]),
+        ("deeppeek source (the codebase to refine)",
+         [dump_path]),
+    ]
+
+    # 8. Dry-run: show grouped inputs and the composer text.
     if args.dry_run:
-        existing = [f for f in to_merge if f.is_file()]
         merged_name = "refine_deeppeek_merged.md"
         composer_text, source_tag = _resolve_composer_text(
             args, args.conversation, dump_path, Path(merged_name),
         )
-        print("\n[dry-run] would merge:", file=sys.stderr)
-        for f in existing:
-            print(f"  {f}", file=sys.stderr)
+        print("\n[dry-run] would merge (grouped):", file=sys.stderr)
+        total_files = 0
+        kept_group_count = 0
+        for gname, gfiles in merge_groups:
+            existing = [f for f in gfiles if f.is_file()]
+            if not existing:
+                continue
+            kept_group_count += 1
+            print(f"  [{gname}]  ({len(existing)} file(s))",
+                  file=sys.stderr)
+            for f in existing:
+                print(f"    {f}", file=sys.stderr)
+            total_files += len(existing)
         print(f"[dry-run] then pipe the single merged file "
-              f"({merged_name}) as one chip", file=sys.stderr)
+              f"({merged_name}, {total_files} file(s) in "
+              f"{kept_group_count} group(s)) as one chip",
+              file=sys.stderr)
         print(f"\n[dry-run] recover exited {recover_rc}", file=sys.stderr)
         print(f"[dry-run] composer text ({source_tag}) below; not typed.",
               file=sys.stderr)
@@ -790,7 +889,7 @@ def run(args: argparse.Namespace) -> int:
         merged_path: Optional[Path] = None
         files: list[Path] = []
     else:
-        merged_path = _stage_merge(ws, to_merge, args)
+        merged_path = _stage_merge(ws, merge_groups, args)
         files = [merged_path]
 
     # 10. Build composer text and pipe.
@@ -812,7 +911,8 @@ def register(sub: argparse._SubParsersAction) -> None:
         "refine_deeppeek",
         help="Reset, re-apply the conversation, capture the aftermath, "
              "merge the conversation + diff + reports + a dump of "
-             "deeppeek itself into one file, and pipe that merged file",
+             "deeppeek itself into one grouped file, and pipe that "
+             "merged file",
     )
 
     p.add_argument(
@@ -848,7 +948,8 @@ def register(sub: argparse._SubParsersAction) -> None:
         "--merge-md", type=Path, default=None,
         help=f"override the merge_md.py path "
              f"(default: {_MERGE_MD_SCRIPT}).  Must accept "
-             f"`-o PATH FILE [FILE ...]`.",
+             f"`-o PATH` plus one or more `--group NAME FILE [FILE ...]` "
+             f"invocations (group mode).",
     )
     p.add_argument(
         "--merge-timeout", type=float, default=120.0,
@@ -866,8 +967,10 @@ def register(sub: argparse._SubParsersAction) -> None:
              "matches (e.g. `utils.py` in several directories) "
              "include every match; the conversation may not "
              "specify a path, so any potential target is kept.  "
-             "Runs regardless of --no-pipe (the filtered dump is "
-             "a useful workspace artifact even when not piped).",
+             "The dump and the diff land together in the "
+             "`Target project` group of the merged file.  Runs "
+             "regardless of --no-pipe (the filtered dump is a "
+             "useful workspace artifact even when not piped).",
     )
     p.add_argument(
         "--no-pipe", action="store_true",
@@ -878,8 +981,9 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--dry-run", action="store_true",
         help="run the reset + apply, capture the status, dump "
-             "deeppeek, list what would be merged, print the "
-             "composer text, then stop — no merge, no pipe, no type",
+             "deeppeek, list the grouped files that would be merged, "
+             "print the composer text, then stop — no merge, no "
+             "pipe, no type",
     )
     p.add_argument(
         "--recover-timeout", type=float, default=1800.0,

@@ -15,6 +15,7 @@ loop calls for each patch.  It dispatches, in order:
    6. single-line replaces
    6a. indented def/class replaces
    6b. decorated-def scope insert (2026-11-02)
+   6c. decorator kwarg dict splice (2026-11-06)  ← NEW
    7. scoped replaces
    8. ellipsis splices, with fallback
    9. object-literal splices (with trailing-content refusal)
@@ -166,7 +167,7 @@ PROSE-NAMED-SCOPE: INSERT vs REPLACE (2026-11-05)
 
 Two bugs in the prior version:
 
-  1. The regex `\\b(?:in|inside|within|to|for)\\s+`[A-Za-z_][\\w$]*``
+  1. The regex `\b(?:in|inside|within|to|for)\s+`[A-Za-z_][\w$]*``
      did NOT match dotted identifiers or filenames (`pg_base.py`,
      `comfyui_krita.py`).  When the prose said "In `pg_base.py`,
      replace the rotation field:", the regex missed it and
@@ -215,6 +216,63 @@ stripping).  Without this, `<div class="field" style="align-items:center;">`
 matched a window opening `<input type="range" id="viewRotation"` —
 both start with `<`.  The looser "first word" check is retained for
 JS/Python.
+
+DECORATOR KWARG DICT SPLICE (2026-11-06)
+========================================
+Motivating case: patch 461 in the 2026-10-30 run had body
+
+    args={
+        "--timeout": {...},
+        "--output_name": {...},
+        "--count": {...},
+        "--seed": {...},
+        "--output_rotation": {...},
+    },
+
+targeting the `@command(args={...})` decorator on `comfy_generate`.
+The pre-fix dispatcher reached `_try_object_literal_splice`, which
+sees `args={...}` at column 0 in the body, finds the base's
+`args={...}` inside the decorator, and refuses because the body has
+"trailing content after the object literal" (the closing `),` line,
+the `def comfy_generate(self, params):` line, etc.).  The patch
+landed as `skipped_unplaceable`.
+
+The companion failure was patch 428: body
+
+    "--output_rotation": {"type": "float", "default": 0.0,
+                          "help": "..."},
+
+targeting the same `args={...}` dict, inserting a single entry.
+`_try_named_dict_insert` routed it to the wrong decorator
+(`comfy_connect`'s args) because the prose only said "find the
+`comfy_generate` command decorator" and the first `args={...}` in
+file order won.
+
+`_try_decorator_kwarg_splice` is the general fix:
+
+  · Parse the body as either `name = {...}` (full-dict replacement)
+    or a bare `"key": val,` entry (merge into an existing dict).
+
+  · For the replace case, walk `base`'s AST for a decorated function
+    or class whose `@<decorator>` call has a `name={...}` keyword,
+    and replace the value's source span with the body's dict text.
+
+  · For the merge case, walk the decorators looking for a kwarg
+    dict whose keys do not include the new key, and insert the entry
+    before the closing `}`.  If the key is already present in a
+    matching decorator, return `base` (already-present no-op).
+
+  · Target selection:
+      1. The function named by `_extract_scope_name_from_prose()`.
+      2. If that fails, the decorator kwarg dict whose key set has
+         the largest overlap with the body's dict keys — must beat
+         the runner-up by at least 3 keys, else fail-closed.
+      3. If neither applies, decline.
+
+The generalization is that any `@decorator(name={...})` on a
+function or class becomes a structural patch target — not just
+`@command`.  A future `@route(kwargs={...})` or `@cache(headers={...})`
+shape is handled by the same helper.
 
 TOOL-BUG DETECTION (2026-10-29)
 ===============================
@@ -814,9 +872,14 @@ def _try_region_replace_structural(base: str, body_stripped: str,
     if snapped is not None:
         start_line, end_line = snapped
 
-    return splice_region(
+    out = splice_region(
         base, start_line, end_line,
         body_stripped.split("\n"), path)
+    if out.status == "noop":
+        return base
+    if out.status == "changed":
+        return out.content
+    return None
 
 
 def _parse_python_body(body: str, path: str) -> Optional[ast.AST]:
@@ -1022,12 +1085,377 @@ def _try_region_replace_lines(base: str, body_stripped: str,
     candidates.append((start, end))
     candidates.extend(try_boundary_pairs(start, end, total))
 
+    saw_noop = False
     for trial_start, trial_end in candidates:
-        result = splice_region(
+        out = splice_region(
             base, trial_start, trial_end, body_lines, path)
-        if result is not None:
-            return result
+        if out.status == "noop":
+            saw_noop = True
+            continue
+        if out.status == "invalid":
+            continue
+        return out.content
+    if saw_noop:
+        return base
     return None
+
+
+# ============================================================================
+#  Decorator-kwarg splice (2026-11-06)
+# ============================================================================
+#
+# See module docstring, DECORATOR KWARG DICT SPLICE (2026-11-06).
+#
+# The generic target is any `@<decorator>(<kwarg>= {...})` on a
+# function or class.  In practice the motivating shapes are all
+# `@command(args={...})`, but there is no reason to hardcode `command`
+# or `args` at the caller.
+
+_DECORATOR_KWARG_KWARG_DEFAULT = "args"
+
+
+def _char_offset(text: str, line0: int, col: int) -> Optional[int]:
+    """Convert a 0-based `(line, col)` to a character offset in
+    `text`, or None if out of range.
+
+    Uses `split("\\n")` and a prefix sum — O(lines).  Callers are
+    inside an AST walk over a handful of decorators, so this is
+    fine.
+    """
+    lines = text.split("\n")
+    if line0 < 0 or line0 >= len(lines):
+        return None
+    return sum(len(ln) + 1 for ln in lines[:line0]) + col
+
+
+def _extract_decorator_kwarg_hint(context_before: str) -> Optional[str]:
+    """Try to pull a decorator kwarg name out of prose.
+
+    Recognised shapes:
+      "the `args` dict" / "the args dict"
+      "the args={...}" / "the `args={...}`"
+      "kwargs={...}" / "the kwargs dict"
+
+    Returns None when nothing recognisable is present.  The caller
+    treats None as "use the default kwarg name" (`args`).
+    """
+    if not context_before:
+        return None
+    m = re.search(
+        r'\b([A-Za-z_][\w]*)\s*=\s*\{',
+        context_before,
+    )
+    if m:
+        return m.group(1)
+    m = re.search(
+        r'\bthe\s+`?([A-Za-z_][\w]*)`?\s+'
+        r'(?:dict|kwarg|keyword|argument)',
+        context_before, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+    return None
+
+
+def _find_decorator_kwarg_dicts(base: str, kwarg_name: str) -> list:
+    """Return `[(func_name, dict_node, open_char, close_char)]` for
+    every decorated function/class whose `@<decorator>(<kwarg>={...})`
+    kwarg value is a dict literal.
+
+    Walks the AST, filters by kwarg name, and translates each
+    matching `ast.Dict` node to char offsets so callers can splice
+    directly.
+    """
+    try:
+        base_tree = parse_source(base)
+    except SyntaxError:
+        return []
+
+    out = []
+    for node in ast.walk(base_tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef)):
+            continue
+        for dec in getattr(node, "decorator_list", []) or []:
+            if not isinstance(dec, ast.Call):
+                continue
+            for kw in dec.keywords:
+                if kw.arg != kwarg_name:
+                    continue
+                if not isinstance(kw.value, ast.Dict):
+                    continue
+                start = _char_offset(
+                    base, kw.value.lineno - 1, kw.value.col_offset)
+                end = _char_offset(
+                    base, kw.value.end_lineno - 1,
+                    kw.value.end_col_offset)
+                if start is None or end is None:
+                    continue
+                out.append((node.name, kw.value, start, end))
+    return out
+
+
+def _dict_keys_of(dict_node) -> set:
+    """String keys of an `ast.Dict` node."""
+    out: set = set()
+    for k in dict_node.keys:
+        if isinstance(k, ast.Constant) and isinstance(k.value, str):
+            out.add(k.value)
+    return out
+
+
+def _pick_decorator_target(candidates: list, body_keys: set,
+                            scope_name: Optional[str]) -> Optional[tuple]:
+    """Choose among `_find_decorator_kwarg_dicts` results.
+
+    Selection order:
+      1. If `scope_name` matches a candidate's function name, use it.
+      2. Otherwise, score each candidate by key overlap with the
+         body's keys.  The winner must beat the runner-up by at
+         least 3 keys; ties and near-ties fail-closed (return None).
+      3. If there is only one candidate, use it.
+    """
+    if not candidates:
+        return None
+
+    if scope_name:
+        for c in candidates:
+            if c[0] == scope_name:
+                return c
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    scored = []
+    for c in candidates:
+        func_name, dict_node, _start, _end = c
+        existing = _dict_keys_of(dict_node)
+        overlap = len(body_keys & existing)
+        scored.append((overlap, func_name, c))
+    scored.sort(key=lambda x: -x[0])
+
+    if not scored:
+        return None
+    best_overlap = scored[0][0]
+    second_overlap = scored[1][0] if len(scored) > 1 else -1
+
+    if best_overlap == 0:
+        # No key overlap anywhere — ambiguous.
+        return None
+    if second_overlap == best_overlap:
+        # Tie — fail-closed.
+        return None
+    if best_overlap - second_overlap < 3:
+        # Too close — fail-closed.
+        return None
+    return scored[0][2]
+
+
+def _splice_decorator_kwarg(base: str, path: str,
+                             kwarg_name: str, dict_text: str,
+                             context_before: str) -> Optional[str]:
+    """Replace the value of a decorator kwarg dict with `dict_text`.
+
+    Returns new content on success, `base` on no-op (all body keys
+    already present), or None when no candidate is unambiguous.
+
+    The `intent_satisfied_in` check is skipped here: the body may
+    legitimately change the *values* of existing keys, which
+    `intent_satisfied_in` cannot detect (it only checks key presence).
+    The already-present fast path lives upstream in
+    `_is_already_applied` — if that returned True, we never reach
+    this helper.
+    """
+    try:
+        body_tree = parse_source(dict_text)
+    except SyntaxError:
+        return None
+    if (len(body_tree.body) != 1
+            or not isinstance(body_tree.body[0], ast.Expr)
+            or not isinstance(body_tree.body[0].value, ast.Dict)):
+        # Wrap `{...}` in an expression so ast.parse accepts it.
+        try:
+            body_tree = parse_source("_ = " + dict_text)
+        except SyntaxError:
+            return None
+        if (len(body_tree.body) != 1
+                or not isinstance(body_tree.body[0], ast.Assign)
+                or not isinstance(body_tree.body[0].value, ast.Dict)):
+            return None
+        body_keys = _dict_keys_of(body_tree.body[0].value)
+    else:
+        body_keys = _dict_keys_of(body_tree.body[0].value)
+
+    from .patch_scope_insert import _extract_scope_name_from_prose
+    scope_name = _extract_scope_name_from_prose(context_before or "")
+
+    candidates = _find_decorator_kwarg_dicts(base, kwarg_name)
+    target = _pick_decorator_target(candidates, body_keys, scope_name)
+    if target is None:
+        return None
+
+    _func_name, _dict_node, start, end = target
+    result = base[:start] + dict_text + base[end:]
+
+    from .patch_bounds import structural_valid
+    if not structural_valid(result, path):
+        return None
+    return result if result != base else base
+
+
+def _merge_decorator_kwarg_entry(base: str, path: str,
+                                  kwarg_name: str, new_key: str,
+                                  entry_text: str,
+                                  context_before: str) -> Optional[str]:
+    """Insert a dict entry into an existing decorator kwarg dict.
+
+    Returns new content on success, `base` on no-op (key already
+    present), or None when no candidate is unambiguous.
+
+    Reuses `patch_misc_insert._splice_dict_entry` for the actual
+    indentation-aware insertion.
+    """
+    from .patch_scope_insert import _extract_scope_name_from_prose
+    scope_name = _extract_scope_name_from_prose(context_before or "")
+
+    candidates = _find_decorator_kwarg_dicts(base, kwarg_name)
+    if not candidates:
+        return None
+
+    # Filter out candidates that already contain the key.
+    without_key = [c for c in candidates
+                   if new_key not in _dict_keys_of(c[1])]
+    with_key = [c for c in candidates
+                if new_key in _dict_keys_of(c[1])]
+
+    # If the scope-named function's dict already has the key, that is
+    # the no-op signal.
+    if scope_name:
+        for c in with_key:
+            if c[0] == scope_name:
+                return base
+        for c in without_key:
+            if c[0] == scope_name:
+                return _do_merge_into(base, path, c[2], c[3], entry_text)
+
+    if not without_key:
+        # Every candidate already has the key.
+        if len(with_key) == len(candidates):
+            return base
+        return None
+
+    if len(without_key) == 1:
+        c = without_key[0]
+        return _do_merge_into(base, path, c[2], c[3], entry_text)
+
+    # Multiple candidates without the key.  Use key overlap on the
+    # EXISTING keys (the dict we're merging into).  Not great but
+    # bounded by fail-closed.
+    scored = []
+    for c in without_key:
+        existing = _dict_keys_of(c[1])
+        # We don't know the body's full key set for a merge, so
+        # use a heuristic: candidate's key count as a proxy for
+        # "which decorator is this".  In practice the smallest dict
+        # without the key tends to be the intended target for a
+        # single-entry insert.  See patch_misc_insert._try_named_dict_insert
+        # for the same fallback pattern.
+        scored.append((len(existing), c))
+
+    if not scored:
+        return None
+    scored.sort(key=lambda x: x[0])
+
+    if len(scored) >= 2 and scored[0][0] == scored[1][0]:
+        # Tie on size — fail-closed.
+        return None
+
+    c = scored[0][1]
+    return _do_merge_into(base, path, c[2], c[3], entry_text)
+
+
+def _do_merge_into(base: str, path: str,
+                    open_char: int, close_char: int,
+                    entry_text: str) -> Optional[str]:
+    """Splice `entry_text` before the closing `}` of the dict whose
+    `{` is at `open_char` and `}` is at `close_char`.
+    """
+    from .patch_misc_insert import _splice_dict_entry
+    from .patch_bounds import structural_valid
+    result = _splice_dict_entry(base, entry_text, open_char, close_char)
+    if result is None:
+        return None
+    if not structural_valid(result, path):
+        return None
+    return result
+
+
+def _try_decorator_kwarg_splice(base: str, body: str, path: str,
+                                 context_before: str = "") -> Optional[str]:
+    """Structural decorator-kwarg dict splice.
+
+    See module docstring, DECORATOR KWARG DICT SPLICE (2026-11-06).
+
+    Body shapes recognised:
+      1. `name = {...}` (possibly with trailing content) — replace
+         the corresponding decorator kwarg dict `name`.
+      2. Bare dict entry `"key": val,` — merge into a decorator
+         kwarg dict that lacks this key.
+
+    The target is identified via `_pick_decorator_target`: the
+    scope named in `context_before` if any, else the candidate with
+    the largest unique key overlap.
+
+    Returns new content on success, `base` on no-op, or None.
+    """
+    if not path.endswith(".py"):
+        return None
+    body_stripped = body.strip()
+    if not body_stripped:
+        return None
+
+    # ---- Case 1: `name = {...}` ----
+    m = re.search(
+        r'^\s*([A-Za-z_][\w]*)\s*=\s*\{',
+        body_stripped, re.MULTILINE)
+    if m:
+        kwarg_name = m.group(1)
+        brace_start = body_stripped.find("{", m.start())
+        if brace_start >= 0:
+            brace_end = _find_matching_brace(
+                body_stripped, brace_start, is_python=True)
+            if brace_end > brace_start:
+                dict_text = body_stripped[brace_start:brace_end + 1]
+                return _splice_decorator_kwarg(
+                    base, path, kwarg_name, dict_text, context_before)
+
+    # ---- Case 2: bare entry `"key": val,` ----
+    try:
+        wrapped = parse_source(
+            "_ = {" + body_stripped.rstrip(",") + "}")
+    except SyntaxError:
+        return None
+    if not (len(wrapped.body) == 1
+            and isinstance(wrapped.body[0], ast.Assign)
+            and isinstance(wrapped.body[0].value, ast.Dict)):
+        return None
+    dict_node = wrapped.body[0].value
+    if len(dict_node.keys) != 1:
+        return None
+    k = dict_node.keys[0]
+    if not (isinstance(k, ast.Constant) and isinstance(k.value, str)):
+        return None
+    new_key = k.value
+
+    entry_text = body_stripped.rstrip()
+    if not entry_text.endswith(","):
+        entry_text += ","
+
+    # Determine the target kwarg name: prose hint or default `args`.
+    kwarg_name = (_extract_decorator_kwarg_hint(context_before)
+                  or _DECORATOR_KWARG_KWARG_DEFAULT)
+    return _merge_decorator_kwarg_entry(
+        base, path, kwarg_name, new_key, entry_text, context_before)
 
 
 # ============================================================================
@@ -1180,6 +1608,16 @@ def _try_deterministic_patch_inner(base, patch, path="",
         )
         if _decorated_scope_result is not None:
             return _decorated_scope_result
+
+    # NEW (2026-11-06): decorator kwarg splice.  Runs before the
+    # object-literal branch so `args={...}` bodies targeting a
+    # decorator kwarg are handled structurally, not routed through
+    # `_try_object_literal_splice` (which refuses trailing content
+    # and picks the wrong decorator when multiple `args={...}` exist).
+    _decor_result = _try_decorator_kwarg_splice(
+        base, body_stripped, path, context_before)
+    if _decor_result is not None:
+        return _decor_result
 
     _body_is_obj_lit = bool(
         _OBJECT_LITERAL_ASSIGNMENT_RE.match(body_stripped))

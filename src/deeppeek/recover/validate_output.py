@@ -42,11 +42,53 @@ The string-interface wrappers (`_module_level_stmts_added(content,
 base)` and `_function_presence_check(base, result, label)`) are
 preserved for tests and for the `.js`/`.ts` dispatch path where the
 language-appropriate parser lives in `_declared_names`.
+
+DUPLICATE-NESTING FAIL-CLOSED (2026-11-06)
+==========================================
+`_has_duplicate_class_nesting` is called from two gate sites:
+
+  · `pass6_sanity._check_structural_sanity` — the exact check the
+    2026-10-29 pg_base.py run was designed to catch (`<div
+    class="field">` nested inside itself).
+
+  · `structural_diff` — reports duplicate nesting as a structural
+    divergence.
+
+The pre-fix implementation returned `False` whenever
+tree-sitter-html was unavailable, which silently defeated both
+gates whenever the running interpreter couldn't import the
+grammar.  The 2026-10-30 run's manifest recorded
+`in_process: false` for the whole run; every HTML patch in that
+run went through the gate with it returning `False` unconditionally.
+
+The check is now three-tiered:
+
+  1. In-process tree-sitter-html.  Precise; returns `None` when
+     the grammar is unavailable or the tree doesn't parse.
+  2. Repo .venv subprocess.  Same precision, ~200 ms overhead.
+     Reached only when tier 1 declines AND the venv has the
+     grammar.  Cached on `(html_text)` so repeat calls with the
+     same input hit a dict lookup.
+  3. Line-based fail-closed fallback.  Less precise; catches the
+     exact "element with class=X nested inside another element
+     with class=X" shape via a regex + tag-stack sweep.  Chosen
+     when both tree-sitter tiers decline, so the gate fails
+     closed rather than silently passing the exact corruption it
+     was built to reject.
+
+The line-based fallback's regexes (`_DUP_TAG_TOKEN_RE`,
+`_DUP_CLASS_ATTR_RE`, `_DUP_VOID_TAGS`) are the only regexes in
+this module that participate in a *safety* gate; all other
+structural checks are AST/tree-sitter based.  The fallback exists
+so a machine without tree-sitter-html (in-process AND in the
+repo .venv) still gets a fail-closed gate rather than a silent
+bypass.
 """
 import ast
 import re
 import sys
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 from ._ast import parse_source
@@ -687,31 +729,17 @@ def _html_structural_check(text: str, label: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Duplicate-nesting detection (2026-11-05)
+# Duplicate-nesting detection (2026-11-05, fail-closed 2026-11-06)
 # ---------------------------------------------------------------------------
 
-def _has_duplicate_class_nesting(html_text: str) -> bool:
-    """True iff any element with class="X" contains a descendant
-    element with the same class="X".
+def _has_duplicate_class_nesting_from_tree(root_node) -> bool:
+    """Tree-walking core: True iff any element with `class="X"` has a
+    descendant element with the same class.
 
-    Returns False when tree-sitter-html is not installed, or when the
-    content does not parse cleanly.
+    Extracted from `_has_duplicate_class_nesting` (2026-11-06) so the
+    same logic is reusable from the subprocess helper and stays
+    testable without spinning up tree-sitter.
     """
-    if not html_text or not html_text.strip():
-        return False
-    try:
-        import tree_sitter_html  # type: ignore
-        from tree_sitter import Language, Parser
-    except ImportError:
-        return False
-    try:
-        parser = Parser(Language(tree_sitter_html.language()))
-        tree = parser.parse(html_text.encode("utf-8"))
-    except Exception:
-        return False
-    if tree is None or tree.root_node.has_error:
-        return False
-
     def _class_of(node):
         for child in node.children:
             if child.type == "start_tag":
@@ -746,7 +774,168 @@ def _has_duplicate_class_nesting(html_text: str) -> bool:
                 return True
         return False
 
-    return _walk(tree.root_node, frozenset())
+    return _walk(root_node, frozenset())
+
+
+def _has_duplicate_class_nesting_ast_only(
+        html_text: str) -> Optional[bool]:
+    """Return True/False via in-process tree-sitter-html, or None
+    when the grammar is unavailable or the tree doesn't parse.
+
+    The `None` return distinguishes "grammar declined" from
+    "grammar ran and found no nesting" — the caller uses that
+    distinction to decide whether to try the subprocess or the
+    line-based fallback.
+    """
+    if not html_text or not html_text.strip():
+        return False
+    try:
+        import tree_sitter_html  # type: ignore
+        from tree_sitter import Language, Parser
+    except ImportError:
+        return None
+    try:
+        parser = Parser(Language(tree_sitter_html.language()))
+        tree = parser.parse(html_text.encode("utf-8"))
+    except Exception:
+        return None
+    if tree is None or tree.root_node.has_error:
+        return None
+    return _has_duplicate_class_nesting_from_tree(tree.root_node)
+
+
+@lru_cache(maxsize=128)
+def _has_duplicate_class_nesting_subprocess(
+        html_text: str) -> Optional[bool]:
+    """Run `_has_duplicate_class_nesting_ast_only` in the repo .venv.
+
+    Returns None when the venv has no tree-sitter-html either; the
+    caller falls through to the line-based fallback.
+    """
+    try:
+        from .ast_anchor import (
+            _find_venv_python, _src_dir, _has_venv_ast,
+        )
+    except ImportError:
+        return None
+    if not _has_venv_ast():
+        return None
+    py = _find_venv_python()
+    if py is None:
+        return None
+    import json as _json
+    import subprocess as _subprocess
+    payload = _json.dumps({"html": html_text})
+    helper = (
+        "import json, sys\n"
+        f"sys.path.insert(0, {str(_src_dir())!r})\n"
+        "from deeppeek.recover.validate_output import (\n"
+        "    _has_duplicate_class_nesting_ast_only,\n"
+        ")\n"
+        "d = json.load(sys.stdin)\n"
+        "r = _has_duplicate_class_nesting_ast_only(d['html'])\n"
+        "sys.stdout.write(\n"
+        "    'null' if r is None else ('true' if r else 'false')\n"
+        ")\n"
+    )
+    try:
+        proc = _subprocess.run(
+            [str(py), "-c", helper],
+            input=payload, capture_output=True, text=True, timeout=15.0,
+        )
+    except (_subprocess.SubprocessError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    out = proc.stdout.strip()
+    if out == "true":
+        return True
+    if out == "false":
+        return False
+    return None
+
+
+_TAG_TOKEN_RE = re.compile(
+    r"<(/?)([A-Za-z][\w-]*)"
+    r"((?:\s+[^\s>/=]+"
+    r"(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+))?)*)"
+    r"\s*(/?)>"
+)
+_CLASS_ATTR_RE = re.compile(r"\bclass\s*=\s*[\"']([^\"']*)[\"']")
+_VOID_TAGS = frozenset({
+    "area", "base", "br", "col", "embed", "hr", "img", "input",
+    "link", "meta", "param", "source", "track", "wbr",
+})
+
+
+def _has_duplicate_class_nesting_linebased(html_text: str) -> bool:
+    """Line-based fallback: detect the specific failure shape.
+
+    Detects the pattern the motivating failure produced: an element
+    with `class="X"` nested inside another element that also has
+    `class="X"`.
+
+    Errs on the side of detection — false positives trigger a
+    structural rejection; false negatives would let corruption
+    through.  The fallback exists so a machine without
+    tree-sitter-html (in-process AND in the repo .venv) still gets a
+    fail-closed gate rather than a silent bypass.
+
+    Not a full HTML parser.  Mismatched nesting is not detected,
+    CDATA sections are not handled, script/style content is treated
+    as text.  That is the contract: fail-closed on the exact shape
+    the gate exists for, permissive about everything else.
+    """
+    if not html_text:
+        return False
+    stack: list = []
+    for m in _TAG_TOKEN_RE.finditer(html_text):
+        is_close = m.group(1) == "/"
+        tag = m.group(2).lower()
+        attrs = m.group(3) or ""
+        self_close = bool(m.group(4))
+        if is_close:
+            if stack:
+                stack.pop()
+            continue
+        if tag in _VOID_TAGS or self_close:
+            continue
+        cm = _CLASS_ATTR_RE.search(attrs)
+        cls = cm.group(1) if cm else None
+        if cls is not None and cls in stack:
+            return True
+        stack.append(cls)
+    return False
+
+
+def _has_duplicate_class_nesting(html_text: str) -> bool:
+    """True iff any element with class="X" contains a descendant
+    element with the same class="X".
+
+    Three tiers, tried in order (2026-11-06):
+
+      1. In-process tree-sitter-html.  Precise; returns None when
+         the grammar is unavailable or the tree doesn't parse.
+      2. Repo .venv subprocess.  Same precision, ~200 ms overhead.
+         Reached only when (1) declines AND the venv has the
+         grammar.  Cached on `(html_text)`.
+      3. Line-based fail-closed fallback.  Less precise, catches
+         the exact shape the gate exists for.
+
+    Pre-fix, tier 1 returned False when unavailable, so the gate
+    silently passed the exact corruption it was built to reject.
+    The 2026-10-30 run's manifest recorded `in_process: false` for
+    every HTML patch — the gate was a no-op for the entire run.
+    """
+    if not html_text or not html_text.strip():
+        return False
+    tier1 = _has_duplicate_class_nesting_ast_only(html_text)
+    if tier1 is not None:
+        return tier1
+    tier2 = _has_duplicate_class_nesting_subprocess(html_text)
+    if tier2 is not None:
+        return tier2
+    return _has_duplicate_class_nesting_linebased(html_text)
 
 
 def _extract_embedded_html(py_content: str) -> str:

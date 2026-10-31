@@ -656,9 +656,14 @@ def _try_fuzzy_replace_structural(base, old_body, new_body, path,
     _, end_line = _stmt_line_range(base_stmts[best_idx + n - 1], path)
 
     from .patch_bounds import splice_region
-    return splice_region(
+    out = splice_region(
         base, start_line, end_line,
         new_body.split("\n"), path)
+    if out.status == "noop":
+        return base
+    if out.status == "changed":
+        return out.content
+    return None
 
 
 def _try_fuzzy_replace_lines(base, old_body, new_body, threshold=0.75):

@@ -3,6 +3,7 @@
 
 Usage:
     merge_md.py [-o OUT] FILE [FILE ...]
+    merge_md.py [-o OUT] --group NAME FILE [FILE ...] [--group NAME2 …]
 
 Each file is rendered as one block:
 
@@ -36,6 +37,35 @@ so a reader can tell at a glance: anything starting with `+` and
 `MERGED FILE` is a real boundary; anything with `FILE i/N:` or `===`
 is dump-file *content* inside a fenced block.
 
+Grouped output
+==============
+
+Pass `--group NAME FILE [FILE ...]` (repeatable) to bundle files into
+named groups.  Each group gets a `#`-bounded heading; files inside a
+group still have their own `+`/`MERGED FILE` header.  `#` is visually
+distinct from both `+` (file separator) and `=` (dump separator), so
+the three levels — dump content, file boundary, group boundary — are
+each unambiguous.  Without `--group`, files render flat as before.
+
+The preamble of a grouped merge contains a tree view:
+
+    send_tests_merged.md
+    ├── test log/  (1 file(s))
+    │   └── tests.log
+    ├── Test files/  (1 file(s))
+    │   └── test_recover.py
+    ├── 13_scoped_add_verb (from test_recover.py)/  (3 file(s))
+    │   ├── fixtures/13_scoped_add_verb.md
+    │   ├── expected/13_scoped_add_verb/view.js
+    │   └── preexisting/13_scoped_add_verb/view.js
+    └── …
+
+Each group's files are stripped to their longest common parent
+prefix so the tree stays readable — three files under
+`<root>/tests/recover/{fixtures,expected,preexisting}/13_…/`
+show as `fixtures/13_…md`, `expected/13_…/view.js`,
+`preexisting/13_…/view.js`, not three full absolute paths.
+
 The fence-width guarantee
 =========================
 
@@ -59,6 +89,11 @@ Options:
     --no-preamble        omit the format-explanation preamble and file
                          list at the top.
     --no-language-tag    omit the language tag from the fence opener.
+    --group NAME FILE... open a named group; repeatable.  Files
+                         inside the group have their own `MERGED FILE`
+                         header; the group itself gets a `#`-bounded
+                         heading.  Mutually exclusive with positional
+                         FILE args.
 """
 import argparse
 import sys
@@ -101,6 +136,7 @@ _LANG_BY_EXT = {
 # to `FILE i/N:` / `===` at the content level, and using the same
 # characters for the merge boundary would be ambiguous.
 _SEP_CHAR = "+"
+_GROUP_CHAR = "#"
 _MIN_SEPARATOR_WIDTH = 70
 _MIN_FENCE_WIDTH = 3
 
@@ -151,6 +187,89 @@ def _read_file(path: Path) -> str:
         return path.read_text(encoding="latin-1")
 
 
+def _group_header(name: str, n_files: int) -> str:
+    """`#`-bounded group heading.  `#` is distinct from the `+` file
+    separator and the `=` dump separator, so all three levels are
+    unambiguous."""
+    bar = _GROUP_CHAR * _MIN_SEPARATOR_WIDTH
+    return (
+        f"{bar}\n"
+        f"# GROUP: {name}\n"
+        f"# {n_files} file(s)\n"
+        f"{bar}\n"
+        f"\n"
+    )
+
+
+def _common_prefix_dir(paths: list[Path]) -> Path:
+    """Longest common *parent-directory* prefix across `paths`.
+
+    Used by the tree renderer so a group of three files under
+    `<root>/tests/recover/{fixtures,expected,preexisting}/13_…/`
+    shows as `fixtures/13_…md`, `expected/13_…/view.js`,
+    `preexisting/13_…/view.js` — not three full absolute paths.
+
+    Returns `Path("")` when the input is empty or has no shared
+    prefix (e.g. files on different drives, or a single file whose
+    parent is relative).  Callers fall back to the raw path in that
+    case.
+    """
+    if not paths:
+        return Path("")
+    parents = [p.parent.parts for p in paths]
+    if not parents:
+        return Path("")
+    common: list[str] = []
+    for parts in zip(*parents):
+        if len(set(parts)) != 1:
+            break
+        common.append(parts[0])
+    if not common:
+        return Path("")
+    return Path(*common)
+
+
+def _render_group_tree(
+    groups: list[tuple[str | None, list[Path]]],
+    root_label: str = "merged",
+) -> str:
+    """Render groups + their files as a unix `tree`-style block.
+
+    Groups become directories; files become leaf nodes; each group's
+    file paths are stripped to their longest common parent prefix so
+    the tree stays readable.  Ungrouped (flat-mode) entries render
+    under a single `(flat)/` directory.
+
+    Preserves input order — `send_tests` deliberately emits
+    fixtures-first, then expected, then preexisting, and re-sorting
+    would lose that grouping hint.
+    """
+    lines = [root_label + "/"]
+    if not groups:
+        return lines[0]
+
+    for gi, (name, files) in enumerate(groups):
+        last_group = gi == len(groups) - 1
+        group_connector = "└── " if last_group else "├── "
+        group_ext = "    " if last_group else "│   "
+        header = name if name is not None else "(flat)"
+        lines.append(
+            f"{group_connector}{header}/  ({len(files)} file(s))"
+        )
+
+        common = _common_prefix_dir(files)
+        for fi, f in enumerate(files):
+            last_file = fi == len(files) - 1
+            file_connector = "└── " if last_file else "├── "
+            try:
+                rel = (f.relative_to(common)
+                       if common != Path("") else f)
+            except ValueError:
+                rel = f
+            lines.append(f"{group_ext}{file_connector}{rel}")
+    return "\n".join(lines)
+
+
 def _emit_block(fh, index: int, total: int, path: Path,
                 content: str, language: str, *,
                 emit_lang_tag: bool) -> None:
@@ -168,17 +287,31 @@ def _emit_block(fh, index: int, total: int, path: Path,
     fh.write(fence + "\n\n")
 
 
-def _preamble(total: int, files: list[Path]) -> str:
-    lines = [
-        "# Merged file",
-        "",
-        f"{total} file(s) merged:",
-        "",
-    ]
-    for i, p in enumerate(files, 1):
-        lines.append(f"{i}. {p}")
+def _preamble(total: int, files: list[Path],
+              groups: list[tuple[str | None, list[Path]]] | None = None,
+              has_groups: bool = False,
+              root_label: str = "merged") -> str:
+    lines: list[str] = ["# Merged file", ""]
+    if has_groups and groups:
+        named_count = sum(1 for n, _ in groups if n is not None)
+        lines.append(
+            f"{total} file(s) across {named_count} group(s):"
+        )
+        lines.append("")
+        tree = _render_group_tree(groups, root_label)
+        tree_fence = _fence_for(tree)
+        lines.append(tree_fence)
+        lines.append(tree)
+        lines.append(tree_fence)
+        lines.append("")
+    else:
+        lines.append(f"{total} file(s) merged:")
+        lines.append("")
+        for i, p in enumerate(files, 1):
+            lines.append(f"{i}. {p}")
+        lines.append("")
+
     lines += [
-        "",
         "Each file block has this structure:",
         "",
         "    " + _SEP_CHAR * _MIN_SEPARATOR_WIDTH,
@@ -195,6 +328,23 @@ def _preamble(total: int, files: list[Path]) -> str:
         "lines, another `FILE i/N:` header — its own copy of a marker is",
         "strictly narrower than the outer boundary that wraps it.",
         "",
+    ]
+    if has_groups:
+        lines += [
+            "Files may be organized into groups. Each group is preceded",
+            "by a `#`-bounded heading:",
+            "",
+            "    " + _GROUP_CHAR * _MIN_SEPARATOR_WIDTH,
+            "    # GROUP: <group name>",
+            "    # <n> file(s)",
+            "    " + _GROUP_CHAR * _MIN_SEPARATOR_WIDTH,
+            "",
+            "`#` is distinct from both `+` (file separators) and `=`",
+            "(dump separators used by `dump.py`), so group boundaries,",
+            "file boundaries, and dump boundaries are each unambiguous.",
+            "",
+        ]
+    lines += [
         "**Input files that are themselves dump files.** A common case",
         "for `merge_md.py` is merging `project_dump_*.md` files, which",
         "internally use `FILE i/N:` headers and `===` separators. Those",
@@ -219,8 +369,9 @@ def main() -> int:
         ),
     )
     parser.add_argument(
-        "files", nargs="+", type=Path, metavar="FILE",
-        help="files to merge, in input order",
+        "files", nargs="*", type=Path, metavar="FILE",
+        help="files to merge, in input order (positional mode; "
+             "mutually exclusive with --group)",
     )
     parser.add_argument(
         "-o", "--output", type=Path, default=None, metavar="PATH",
@@ -247,10 +398,47 @@ def main() -> int:
         action="store_false", default=True,
         help="omit the language tag from the fence opener.",
     )
+    parser.add_argument(
+        "--group", action="append", nargs="+", default=[],
+        metavar="ARGS",
+        help="Open a named group. The first ARGS value is the group "
+             "name; the rest are files that belong to the group.  "
+             "Repeatable.  Grouped and positional modes are mutually "
+             "exclusive; inside a group every file still has its own "
+             "`MERGED FILE` header, so file and group boundaries are "
+             "both unambiguous.",
+    )
     args = parser.parse_args()
 
+    # ---- resolve inputs ----
+    if args.files and args.group:
+        print("error: --group and positional FILE args are mutually "
+              "exclusive", file=sys.stderr)
+        return 1
+    if not args.files and not args.group:
+        print("error: no input files (pass FILE args or --group)",
+              file=sys.stderr)
+        return 1
+
+    file_entries: list[tuple[str | None, Path]] = []
+    if args.files:
+        for f in args.files:
+            file_entries.append((None, f))
+    else:
+        for grp in args.group:
+            if len(grp) < 2:
+                print(
+                    f"error: --group requires a name and at least "
+                    f"one file; got {list(grp)!r}",
+                    file=sys.stderr,
+                )
+                return 1
+            group_name = grp[0]
+            for f in grp[1:]:
+                file_entries.append((group_name, Path(f)))
+
     # ---- validate inputs ----
-    for p in args.files:
+    for _name, p in file_entries:
         if not p.is_file():
             print(f"error: not a regular file: {p}", file=sys.stderr)
             return 1
@@ -270,7 +458,7 @@ def main() -> int:
 
         # Refuse to overwrite one of the inputs.
         out_resolved = out_path.resolve()
-        for p in args.files:
+        for _name, p in file_entries:
             if p.resolve() == out_resolved:
                 print(f"error: output path equals input: {p}",
                       file=sys.stderr)
@@ -284,15 +472,54 @@ def main() -> int:
             return 1
         out_display = str(out_path)
 
-    total = len(args.files)
+    total = len(file_entries)
+    has_groups = any(n is not None for n, _ in file_entries)
+
+    # Pre-count files per group so the group header can say "N file(s)".
+    group_counts: dict[str | None, int] = {}
+    for name, _p in file_entries:
+        group_counts[name] = group_counts.get(name, 0) + 1
+
     try:
         if args.title:
             fh.write(f"# {args.title}\n\n")
         if args.include_preamble:
-            fh.write(_preamble(total, args.files))
+            # Build contiguous runs of (name, files) for the tree
+            # renderer.  In grouped mode every run corresponds to one
+            # `--group`; in flat mode there's a single run with
+            # `name=None` (the renderer labels it `(flat)`), but we
+            # take the numbered-list branch instead.
+            ordered_groups: list[tuple[str | None, list[Path]]] = []
+            cur_name: str | None = None
+            cur_files: list[Path] = []
+            for name, path in file_entries:
+                if name != cur_name:
+                    if cur_files:
+                        ordered_groups.append((cur_name, cur_files))
+                    cur_name, cur_files = name, [path]
+                else:
+                    cur_files.append(path)
+            if cur_files:
+                ordered_groups.append((cur_name, cur_files))
+
+            root_label = (out_path.name if out_path is not None
+                          else "merged")
+            fh.write(_preamble(
+                total,
+                [p for _, p in file_entries],
+                groups=ordered_groups,
+                has_groups=has_groups,
+                root_label=root_label,
+            ))
             fh.write("\n")
 
-        for i, path in enumerate(args.files, 1):
+        current_group: str | None = None
+        for i, (name, path) in enumerate(file_entries, 1):
+            if name != current_group:
+                if name is not None:
+                    fh.write(_group_header(name,
+                                           group_counts[name]))
+                current_group = name
             content = _read_file(path)
             language = _language_for(path, args.lang)
             _emit_block(fh, i, total, path, content, language,

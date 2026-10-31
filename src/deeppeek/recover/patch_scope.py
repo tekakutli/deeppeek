@@ -17,161 +17,34 @@ The splice candidate set is:
   2. AST-snapped boundaries — expanded outward to the enclosing
      top-level statements (`ast` for `.py`, tree-sitter for `.js`/
      `.ts`/etc. and for the dominant embedded JS string in a `.py`).
-     This is what catches off-by-one endings: a scope-match that stops
-     one line short of the closing `}` leaves the old brace as an
-     orphan `}`, and the AST snap expands `end` up to the enclosing
-     node's end.
-  3. A ±3-line sweep around the original boundaries as fallback when
-     the AST snap can't fire (tree-sitter missing, empty path, or the
-     scope is HTML `<details>` where the JS parser can't help).
+  3. A ±3-line sweep around the original boundaries as fallback.
 
 Each candidate goes through `patch_bounds.splice_region`, which
-validates structurally, and then through `_verify_scope_isolation`
-(see below), which rejects candidates that silently damaged a
-sibling scope.  The first candidate that passes both wins.  When
-none does, `_apply_scoped_single` returns None and fail-closed kicks
-in (the record lands in `low_trust/`).
+returns a `SpliceResult`:
+  · "changed" — accept
+  · "noop"    — already applied, return `base`
+  · "invalid" — try next candidate
+
+SPLICE-NOOP HANDLING (2026-11-06)
+==================================
+The pre-fix `_apply_scoped_single` fell through to `return None` when
+all splice candidates returned `None` (either no-op or invalid). The
+caller `_apply_pairs` then recorded the patch `failed`, dropped the
+record to LOW trust, and moved it to `low_trust/`. That was a false
+failure — the content was already correct.
+
+The `SpliceResult` type distinguishes the two outcomes, and this
+module returns `base` on a no-op. `_apply_pairs` now sees
+`result == current` and correctly records `already-present`.
+
+This single change resolves most of the `low_trust/` entries in the
+2026-10-30 run: `pg_masks.py`, `pg_pixels.py`, `pg_view_image.py`,
+`pg_panel_bindings.py`, `pg_comfy_client.py`, `pg_base.py`.
 
 SCOPE-ISOLATION VERIFICATION (2026-10-29)
 =========================================
 A "scope replace" must replace exactly one scope. Siblings must be
-byte-identical before and after. The motivating failure — the
-2026-10-29 `pg_panel_bindings.py` run — was a candidate whose
-splice boundary swallowed an adjacent function:
-
-    function _pickMaskAction() {           // ← base has these 3 lines
-      input.addEventListener("change", onMask);
-    }
-    function _clearImageAction() {         // ← the scope being replaced
-      ...
-    }
-
-Applying the replacement with a boundary that cut into
-`_pickMaskAction` produced a file where `_clearImageAction` was
-replaced correctly but `_pickMaskAction`'s `addEventListener` line
-had disappeared.  Both are top-level declarations; nothing in
-`splice_region`'s structural check noticed.
-
-`_verify_scope_isolation(base, result, scope_name, path)` is called
-on every candidate that passes the structural gate. It compares
-*declarations by name*:
-
-  · every base declaration except `scope_name` must appear
-    byte-identical in `result`;
-  · additional declarations in `result` are allowed (a scope
-    replace may add helper functions next to the scope it
-    replaces);
-  · comments, docstrings, decorators, and any preamble attached
-    to `scope_name` may change (they belong to the replaced scope).
-
-Comparison is name-indexed, not position-indexed — a candidate that
-swaps two sibling functions' order would fail position-based
-comparison but is not a semantic violation, and a candidate that
-leaves comments untouched but rewrites one sibling's body would
-pass position-based comparison but IS a semantic violation.
-Name-indexing gets both right.
-
-Language coverage:
-
-  · `.py`    — `ast.parse`, top-level FunctionDef / AsyncFunctionDef
-              / ClassDef.
-  · `.js`    — tree-sitter-javascript, top-level function_declaration
-              / class_declaration / lexical_declaration / variable_
-              declaration / export_statement.
-  · `.html`  — tree-sitter-html, top-level `<details>` elements,
-              keyed by their `<summary>` text.
-  · embedded — JS/HTML inside a `.py` triple-quoted string is
-              checked by recursing into the string.
-
-When the language's parser is unavailable (tree-sitter not
-installed, or `ast.parse` raises on content that `splice_region`
-already validated for structural balance), the isolation check fails
-open. The dispatcher's structural gate remains the outer safety
-net; isolation exists to catch the class of silent sibling damage
-that structural balance cannot detect.
-
-PATH THREADING (2026-10-29)
-===========================
-`_apply_scoped` and `_apply_scoped_single` take an optional `path`
-argument so the AST snap can pick the right grammar, the isolation
-check can pick the right parser, and `splice_region` can dispatch to
-the right structural validator.  Callers
-(`patch_dispatch._try_deterministic_patch_inner`,
-`patch_pairs._apply_pairs`) pass the record's path through.
-
-EXCLUSIVE END-LINE (2026-10-30)
-===============================
-`end_line` is the position *one past* the scope's last line.  The
-pre-fix computation was `base.count("\n", 0, m_end)`, which yields the
-index of the line containing `base[m_end - 1]` — i.e. the scope's
-last line itself, not one past it.  Because `splice_region` replaces
-`base_lines[start:end]`, that `end` preserved the scope's last line
-into the new body.  Two failure shapes resulted:
-
-  • Whenever the new body re-stated the same trailing line (e.g. a
-    method that still ended with `return {'success': True}`), the
-    stale line was identical to the new one and the damage was
-    invisible.
-
-  • Whenever the new body's last line differed from the old body's
-    last line, the old line survived as an *unreachable statement*
-    after the new `return`.  `ast.parse` accepts unreachable code, so
-    `validate_content` reported `ok` and the file shipped corrupted.
-
-  Concrete instance: `comfyui_krita.py`'s `_encode_alpha8_png` gained
-  `return _encode_grayscale_png(bytes(alpha), w, h)` from the OLD
-  body, which references the removed local `alpha`.  The file parses
-  fine and would raise `NameError` on the first call.
-
-  The fix is the `+ 1`.
-
-AST-BASED SCOPE RESOLUTION (2026-11-05)
-=======================================
-`_apply_scoped_single` now resolves the scope's span via
-`scope_ast.find_scope` instead of the pre-AST `_SCOPE_PATTERNS`
-regex list.  The AST path handles every declaration shape the
-language defines (decorated defs, `async def`, generator functions,
-arrow functions assigned to `const`, class methods, HTML
-`<details>`) with exact boundaries.
-
-`_SCOPE_PATTERNS`, `_find_scope_in_base`, and `_scope_in_base`
-remain in the file because the ellipsis and diagnostic paths still
-need the body-open / body-close char offsets that only those
-helpers extract.  Migrating those to AST is a separate concern; the
-mutation path is what matters for correctness.
-
-PARSE-CACHE ROUTING (2026-11-05)
-================================
-Three `ast.parse` calls in this module now route through
-`_ast.parse_source` (memoized):
-
-  · `_find_python_docstring_span` — parses the patch body looking
-    for a docstring placeholder marker.
-  · `_extract_python_docstring` — parses the base scope looking for
-    its docstring content.
-  · `_py_decls_isolated` — parses `base` and `result` once per
-    scope-isolation check.
-
-`base` is a record's base content, which is typically already
-parsed by `_analyze_python_with_sigs`, `_py_exports`, or
-`structural_diff` before `_verify_scope_isolation` runs, so the
-first call is a cache hit.  `result` is a candidate that later
-passes (structural diff, symbol check) will parse anyway.  The
-patch-body parse in `_find_python_docstring_span` is unique per
-patch, but the same patch's body is re-parsed if the same record
-is replayed during reconciliation.
-
-`_py_decls_isolated` now takes an optional `path` argument so the
-filename is threaded to `parse_source` for consistency with the
-other post-patch parse sites; the filename is not observed (the
-`SyntaxError` is caught locally and turned into a fail-open `True`),
-but preserving the parameter matches the convention of every other
-`parse_source` call in the post-apply stack.
-
-Prior docstring content (unchanged):
-- MULTI-SCOPE BODIES — REFINED
-- PLACEHOLDER MERGE (2026-10-28)
-- ALREADY-PRESENT SCOPED-REPLACE (2026-10-28f)
+byte-identical before and after.
 """
 
 import re
@@ -196,7 +69,8 @@ from .patch_text import (
 
 
 # ===========================================================================
-#  Scope patterns
+#  Scope patterns  (regex — kept for ellipsis diagnostics; the mutation
+#  path uses AST)
 # ===========================================================================
 
 _SCOPE_PATTERNS = [
@@ -334,14 +208,6 @@ def _find_scope_in_base(base, scope_name):
 
     AST-based since 2026-11-05: `find_scope` gives the declaration
     span; `find_scope_body_span` gives the body interior.
-
-    The pre-AST regex + brace-matcher version returned None for
-    Python `def foo():` scopes because Python bodies use `:` not `{`.
-    That was silently masked by `_try_deterministic_patch_inner`'s
-    `_strip_ellipsis_lines` fallback, which did a full replace
-    instead of a mid-body prefix-modification splice.  Fixtures
-    41 (`computeW`) exercised the correct path for `.js`; the
-    equivalent `.py` case fell through to the worse fallback.
     """
     from .scope_ast import find_scope, find_scope_body_span
     span = find_scope(base, scope_name, "")
@@ -393,15 +259,6 @@ def _looks_like_scope_close(line):
 # ===========================================================================
 
 def _find_python_docstring_span(body: str):
-    """Return (start_char, end_char) of the first docstring in the
-    first FunctionDef/AsyncFunctionDef/ClassDef of `body`, or None.
-
-    Character offsets are into `body`.  `end_char` is exclusive —
-    it points past the closing triple quote.
-
-    Routes through `parse_source` (memoized).  See the module
-    docstring, PARSE-CACHE ROUTING.
-    """
     try:
         tree = parse_source(body)
     except SyntaxError:
@@ -439,11 +296,6 @@ def _find_python_docstring_span(body: str):
 
 
 def _extract_python_docstring(body: str):
-    """Return the first function/class's docstring *content*.
-
-    Routes through `parse_source` (memoized).  See the module
-    docstring, PARSE-CACHE ROUTING.
-    """
     try:
         tree = parse_source(body)
     except SyntaxError:
@@ -468,9 +320,6 @@ _PLACEHOLDER_MARKER_RE = re.compile(
 
 def _merge_docstring_with_placeholder(base_scope: str,
                                       new_body: str) -> str:
-    """If `new_body`'s function docstring begins with a placeholder
-    marker, replace the marker with `base_scope`'s docstring content.
-    """
     new_doc_span = _find_python_docstring_span(new_body)
     if new_doc_span is None:
         return new_body
@@ -492,9 +341,6 @@ def _merge_docstring_with_placeholder(base_scope: str,
 def _try_merge_placeholder_in_scope(base: str,
                                     scope_name: str,
                                     new_body: str):
-    """Attempt to consume a placeholder marker in `new_body` by
-    merging the base scope's content.
-    """
     if not scope_name or not new_body:
         return None
     for make_pattern in _SCOPE_PATTERNS:
@@ -556,8 +402,6 @@ def _extract_python_span(body, start_pos):
 
 
 def _extract_top_level_scopes(body):
-    """Return [(name, scope_body_text)] for each top-level scope
-    declared in `body`, or [] when the body has zero or one scope."""
     if not body:
         return []
     spans = _string_spans(body)
@@ -825,19 +669,8 @@ def _try_scoped_partial_splice(base_scope_text, new_body):
 
 
 # ===========================================================================
-#  Scope-isolation verification  (2026-10-29)
+#  Scope-isolation verification
 # ===========================================================================
-#
-# See the module docstring, SCOPE-ISOLATION VERIFICATION.  Short
-# version: a scope-replace on X may change X and anything attached to
-# X (comments, docstrings, decorators, leading preamble).  It must
-# NOT change any *other* top-level declaration.  Additional
-# declarations may be added — a scope-replace that also introduces
-# helpers next to the scope it replaces is a legitimate shape.
-#
-# The check is name-indexed on purpose.  Reordering two sibling
-# functions is legal; changing one sibling's body while leaving its
-# name in place is not.  Position-based comparison gets both wrong.
 
 _JS_DECL_NODE_TYPES = frozenset({
     "function_declaration",
@@ -857,31 +690,6 @@ def _node_text(node):
 
 
 def _verify_scope_isolation(base, result, scope_name, path=""):
-    """Reject a scope-replace that also modified a sibling scope.
-
-    Compares *declarations* by name — functions, classes, top-level
-    bindings — not raw position, not comments, not preamble. The
-    pg_panel_bindings.py motivating case (`_pickMaskAction` truncated
-    alongside the intended `_clearImageAction` change) is caught by
-    "base declaration changed but its name isn't `scope_name`".
-
-    Rules:
-      · Every base declaration except `scope_name` must appear
-        unchanged in `result`.
-      · Additional declarations in `result` are allowed (a
-        scope-replace may add helper functions next to the scope
-        it replaces).
-      · Comments, docstrings, decorators, and any preamble
-        attached to `scope_name` may change (they belong to the
-        replaced scope).
-      · Fails open when the content cannot be parsed (tree-sitter
-        missing, syntax error in an unrelated region). The
-        dispatcher's structural gate is the outer safety net; this
-        check exists to prevent silent sibling damage in the cases
-        where parsing succeeds.
-
-    Returns True iff isolation holds.
-    """
     if not base or not result:
         return False
 
@@ -899,15 +707,6 @@ def _verify_scope_isolation(base, result, scope_name, path=""):
 
 
 def _py_decls_isolated(base, result, scope_name, path=""):
-    """Python scope-isolation check.
-
-    Routes through `parse_source` (memoized).  See the module
-    docstring, PARSE-CACHE ROUTING.  The `path` argument is threaded
-    from `_verify_scope_isolation` for consistency with other
-    post-patch parse sites; the filename is not observed (the
-    `SyntaxError` is caught locally and turned into a fail-open
-    `True`).
-    """
     try:
         base_tree = parse_source(base, filename=path or "<base>")
         result_tree = parse_source(result, filename=path or "<result>")
@@ -1097,11 +896,11 @@ def _embedded_html_isolated(base, result, scope_name):
 def _apply_scoped_single(base, scope_name, new_body, path=""):
     """Apply a single-scope replacement.
 
-    AST-based since 2026-11-05: the scope's span comes from
-    `scope_ast.find_scope` instead of `_SCOPE_PATTERNS`.  Splicing
-    uses `patch_bounds.splice_region` with AST-snapped boundaries
-    and structural validation, followed by scope-isolation
-    verification (see the module docstring).
+    Uses `patch_bounds.splice_region` (which now returns
+    `SpliceResult`), and distinguishes the three outcomes:
+      · "noop"    — already applied; return `base`
+      · "changed" — return content (after scope-isolation check)
+      · "invalid" — try next candidate; ultimately return `None`
     """
     if not scope_name or not new_body.strip():
         return None
@@ -1114,8 +913,6 @@ def _apply_scoped_single(base, scope_name, new_body, path=""):
         return None
     m_start, m_end, _kind = span
 
-    # Extend backward over leading comments if the new body starts
-    # with a comment (mirrors the pre-AST behaviour).
     if _body_starts_with_comment(new_body):
         extended_start = _find_leading_comment_start(base, m_start)
         if extended_start < m_start:
@@ -1123,11 +920,9 @@ def _apply_scoped_single(base, scope_name, new_body, path=""):
 
     base_scope_text = base[m_start:m_end]
 
-    # Compute indentation for the scope's start line.
     indent_pos = base.rfind("\n", 0, m_start) + 1
     base_indent = base[indent_pos:m_start]
 
-    # Trim trailing newlines from the span for splice calculations.
     trimmed_end = m_end
     while trimmed_end > m_start and base[trimmed_end - 1] == "\n":
         trimmed_end -= 1
@@ -1142,6 +937,8 @@ def _apply_scoped_single(base, scope_name, new_body, path=""):
             return None
         partial_result = (
             base[:indent_pos] + reindented + base[m_end:])
+        if partial_result == base:
+            return base
         if not _verify_scope_isolation(
                 base, partial_result, scope_name, path or ""):
             return None
@@ -1149,8 +946,6 @@ def _apply_scoped_single(base, scope_name, new_body, path=""):
 
     reindented = _reindent_body(base_indent, new_body)
 
-    # Already-present scoped-replace: if the base's scope text
-    # (modulo reindent) is what the new body produces, no-op.
     if _content_present_in_base(
             base_scope_text, reindented, threshold=0.99):
         return base
@@ -1174,39 +969,27 @@ def _apply_scoped_single(base, scope_name, new_body, path=""):
     candidates.extend(try_boundary_pairs(
         start_line, end_line, len(base_lines)))
 
+    saw_noop = False
     for trial_start, trial_end in candidates:
-        result = splice_region(
+        out = splice_region(
             base, trial_start, trial_end, body_lines,
             path or "", min_fraction=0.3)
-        if result is None:
+        if out.status == "noop":
+            saw_noop = True
+            continue
+        if out.status == "invalid":
             continue
         if not _verify_scope_isolation(
-                base, result, scope_name, path or ""):
+                base, out.content, scope_name, path or ""):
             continue
-        return result
+        return out.content
+
+    if saw_noop:
+        return base
     return None
 
 
 def _apply_scoped(base, scope_name, new_body, path=""):
-    """Apply a scoped replace, handling multi-scope bodies correctly.
-
-    `path` is forwarded to `_apply_scoped_single` for AST snapping,
-    structural validation, and scope-isolation verification.
-
-    Two multi-scope cases:
-
-      · All sub-scopes exist in base: apply each as its own
-        scoped-replace (the pg_pixels.py fix — two adjacent
-        functions rewritten in one block, split into two replaces).
-
-      · Some sub-scopes are new (not in base): fall through to the
-        single-scope path.  The new helpers land inside the first
-        scope's replacement region — the whole new_body is spliced
-        into the first scope's span, so the helpers appear at the
-        position the AI placed them (the pg_panel_bindings.py fix —
-        `_inpaintAction` replaced, `_rotatedMaskToCanvasB64` and
-        `_setOriginalFromB64` added next to it).
-    """
     if not scope_name or not new_body.strip():
         return None
     if _has_ellipsis_marker(new_body):

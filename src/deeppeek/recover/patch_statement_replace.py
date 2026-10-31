@@ -36,6 +36,31 @@ Cross-language: Python via `ast`, JS/TS via tree-sitter (when
 installed).  When the grammar is unavailable, the matcher returns
 None and the dispatcher falls through — same graceful-degradation
 contract as `ast_anchor`.
+
+ALREADY-APPLIED NO-OP (2026-11-06)
+==================================
+`_splice()` returns the spliced content, or None on structural
+failure.  The pre-fix callers treated *any* result equal to `base`
+as a failure (`if result is None or result == base: return None`).
+That conflates two semantically different outcomes:
+
+  · "the splice is invalid — the candidate does not parse" — this
+    is a fail-closed rejection, and the caller should try the next
+    statement or heuristic.
+
+  · "the splice produced the base — the base already equals the
+    body" — this is "already applied", and the caller should return
+    `base` so `_apply_pairs` / the already-present pre-check records
+    it as a no-op.
+
+When the matched base statement already equals the body's statement
+(idempotent re-run of a conversation, or a body that happens to
+restate the base), the pre-fix version recorded the patch as
+`failed`, dropping the record to LOW trust on a logically-succeeded
+patch.
+
+The callers now return `base` on no-op and `None` only on `_splice`
+failure or `_valid_python` / `_valid_ts` rejection.
 """
 from __future__ import annotations
 import ast
@@ -139,6 +164,11 @@ def try_statement_replace(base: str, body: str,
                           path: str = "") -> Optional[str]:
     """Structural replace of one statement.  Returns new content or
     None.  Never raises.
+
+    Returns `base` (the unchanged input) on a no-op splice — the
+    matched base statement already equals the body.  Callers
+    distinguish "already present" from "invalid" by comparing the
+    result against `base`.
     """
     if not base or not body or not path:
         return None
@@ -189,8 +219,13 @@ def _try_python(base, body, path):
 
     body_lines = _reindent_to(body.splitlines(), indent)
     result = _splice(base_lines, start, end, body_lines)
-    if result is None or result == base:
+    if result is None:
         return None
+    # No-op: the spliced content equals the base.  Return `base` so
+    # the caller records the patch as `already-present` (not
+    # `failed`).  See module docstring, ALREADY-APPLIED NO-OP.
+    if result == base:
+        return base
     if not _valid_python(result):
         return None
     return result
@@ -240,8 +275,11 @@ def _try_ts(base, body, lang, path):
     indent = first_line[:len(first_line) - len(first_line.lstrip())]
     body_lines = _reindent_to(body.splitlines(), indent)
     result = _splice(base_lines, start, end, body_lines)
-    if result is None or result == base:
+    if result is None:
         return None
+    # No-op: same already-present semantics as the Python path.
+    if result == base:
+        return base
     if not _valid_ts(result, lang):
         return None
     return result

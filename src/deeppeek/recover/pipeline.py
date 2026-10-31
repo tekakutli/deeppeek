@@ -20,6 +20,11 @@ PARTS
                       pipeline startup.  Skippable via
                       `--skip-import-check` for latency.
   equivalence.py      Pass 8.10 structural-equivalence check.
+  structural_intent.py
+                      Pass 8.11 structural-intent verification
+                      (warn-only, checks that recorded patches'
+                      declared dict-keys / declarations / decorator
+                      kwargs are present in the final content).
 
 Everything below this docstring is `run()` — the sequential
 invocation of passes 1-9 with the appropriate exception boundary,
@@ -75,6 +80,26 @@ Pass 9 (write) is timed by the outer `try/finally` but is *not* in
 the manifest's `pass_timings` (the manifest is written *by* pass 9,
 before its own duration is known).  It appears in the `total time`
 line and in the stderr profile printout.
+
+AST AVAILABILITY STARTUP WARNING (2026-11-06)
+=============================================
+The pre-fix startup check warned only when a specific grammar
+(`html`, `css`) was missing — and it could not distinguish "the
+grammar is genuinely not installed" from "the grammar is installed
+in the repo `.venv` but the pipeline is running outside it."  The
+2026-10-30 run's `ast: {in_process: false, via_venv: true}`
+diagnostic showed the second state, and `cli.py` was updated to
+re-exec into the venv on that condition (see `cli.py`'s
+`_maybe_reexec_into_ast_venv`).  If the re-exec fails for any
+reason (missing venv, un-importable `deeppeek` in the venv, whatever),
+the pipeline still needs to say so loudly rather than silently
+degrade every `scope_ast.find_scope()` call into a None-returning
+no-op.
+
+The startup check now prints an explicit warning for both
+`in_process: false, via_venv: true` (re-exec expected but did not
+happen) and `in_process: false, via_venv: false` (no tree-sitter
+anywhere).
 """
 
 import hashlib
@@ -113,6 +138,7 @@ from .orchestration import (
 from .preexisting import scan_apply_to
 from .startup_check import validate_pipeline_imports
 from .equivalence import check_structural_equivalence
+from .structural_intent import pass8_11_verify_structural_intent
 # Re-export the moved startup helpers under their pre-refactor names.
 # These lived in this module before the 2026-11-05 split; tests and
 # any out-of-tree callers import them from here.  Keep the aliases
@@ -195,12 +221,63 @@ def run(cfg: RecoverConfig) -> int:
     else:
         print(f"[startup] layout: {layout}", file=sys.stderr)
 
-    # Grammar availability diagnostic.
+    # AST availability diagnostic.
+    #
+    # Two distinct states are worth warning about separately:
+    #
+    #   in_process=false, via_venv=true
+    #       AST is available in the repo .venv but the running
+    #       interpreter cannot import it.  cli.py is supposed to
+    #       re-exec into the venv — if that did not happen (or the
+    #       pipeline is invoked directly, bypassing cli.py), every
+    #       `scope_ast.find_scope()` call degrades to None and every
+    #       embedded-JS / embedded-HTML scope replace fails silently.
+    #
+    #   in_process=false, via_venv=false
+    #       No tree-sitter anywhere.  Same degradation as above; the
+    #       operator needs to install it (or run `deeppeek` from a
+    #       Python that has it).
+    #
+    # Both conditions emit a startup warning.  The check tolerates
+    # `ast_status()` raising — that's a tooling bug, not a pipeline
+    # failure, and the operator-facing message would be unhelpful.
     try:
         from .ast_anchor import ast_status
         _ast = ast_status()
-        _missing = [g for g in ("html", "css")
-                    if not _ast.get(g)]
+    except Exception:
+        _ast = None
+
+    if _ast is not None:
+        _in_proc = bool(_ast.get("in_process"))
+        _via_venv = bool(_ast.get("via_venv"))
+        if not _in_proc and _via_venv:
+            _venv_py = _ast.get("venv_path") or "the repo .venv"
+            print(
+                f"[startup] tree-sitter is NOT importable in-process, "
+                f"but IS available via {_venv_py}.  Some AST-based "
+                f"heuristics (scope lookup for embedded JS/HTML, "
+                f"structural diffs) will fall back to line-based "
+                f"behaviour and are significantly less reliable "
+                f"without the grammar.  If you ran this via the "
+                f"`deeppeek` CLI and it did not re-exec into the "
+                f"venv, run it explicitly as `{_venv_py} -m deeppeek "
+                f"...`, or install tree-sitter in the current "
+                f"interpreter.",
+                file=sys.stderr,
+            )
+        elif not _in_proc and not _via_venv:
+            print(
+                "[startup] tree-sitter is NOT importable anywhere "
+                "(in-process or via the repo .venv).  AST-based "
+                "heuristics (scope lookup, structural diffs, "
+                "embedded-content validation) will be unavailable.  "
+                "Install with: pipx inject deeppeek tree-sitter "
+                "tree-sitter-javascript tree-sitter-html "
+                "tree-sitter-typescript",
+                file=sys.stderr,
+            )
+
+        _missing = [g for g in ("html", "css") if not _ast.get(g)]
         if _missing:
             print(f"[startup] tree-sitter grammar missing: "
                   f"{', '.join(_missing)} — structural checks for "
@@ -209,8 +286,6 @@ def run(cfg: RecoverConfig) -> int:
                   f"`tree-sitter-{'` and `tree-sitter-'.join(_missing)}` "
                   f"(or run .venv/bin/pip install -e '.[ast]')",
                   file=sys.stderr)
-    except Exception:
-        pass
 
     # Startup import sanity check.
     if not cfg.skip_import_check:
@@ -581,6 +656,39 @@ def run(cfg: RecoverConfig) -> int:
                       f"({_c.detail})", file=sys.stderr)
     else:
         print("  no unexpected structural divergences")
+
+    # NEW (2026-11-06): pass 8.11 — structural-intent verification.
+    #
+    # Warn-only.  For every patch recorded as `deterministic`, `llm`,
+    # or `already-present`, check that the structural intent its body
+    # declared (dict keys, top-level decls, function params, decorator
+    # kwargs) is actually present in the final `rec.content`.
+    #
+    # Motivating case (2026-10-30 run, patch 428 in comfyui.py):
+    # `--output_rotation`'s dict entry was recorded `already-present`
+    # but `pass8_7d` flipped it `failed`; the residual named the miss
+    # but nothing said "the enclosing record is about to write
+    # without the arg".  This pass says that explicitly.
+    #
+    # Runs after 8.10 so the operator sees both AST-level divergences
+    # and structural-intent gaps in one pass.  Never demotes — a
+    # `preexisting_base` record with zero patches never reaches the
+    # inner loop; a patch whose `applied_by` is not in
+    # `_APPLIED_STATUSES` (i.e. `failed`, `skipped_*`) is skipped
+    # inside the pass itself.
+    print("[pass 8.11] verifying structural intent...")
+    n_intent_gaps = _run_pass(
+        "8.11 (structural-intent)",
+        pass8_11_verify_structural_intent, 0,
+        run_errors, records, blocks_by_idx,
+        timings=timings,
+    ) or 0
+    if n_intent_gaps:
+        print(f"  {n_intent_gaps} patch(es) declared structural "
+              f"intent absent from the final content "
+              f"(informational; see warnings.txt)", file=sys.stderr)
+    else:
+        print("  all recorded patches' structural intent present")
 
     if cfg.apply_to is not None and cfg.shield_preexisting:
         print("[pass 8.8] shielding target-tree overwrites...")

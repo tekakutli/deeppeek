@@ -341,17 +341,20 @@ def test_splice_region_reindents_dedented_body():
         "    'errors': [],",
         "}",
     ]
-    result = splice_region(base, 4, 5, body_lines, "x.py")
-    assert result is not None, "expected splice to fire"
-    for line in result.split("\n"):
+    out = splice_region(base, 4, 5, body_lines, "x.py")
+    assert out.status == "changed", (
+        f"expected a changed splice; got {out.status!r}"
+    )
+    assert out.content is not None
+    for line in out.content.split("\n"):
         if "'errors': []" in line:
             assert line.startswith("        "), (
-                f"body not reindented to 8 spaces:\n{result}"
+                f"body not reindented to 8 spaces:\n{out.content}"
             )
             break
     else:
         raise AssertionError(
-            f"reindented body missing:\n{result}"
+            f"reindented body missing:\n{out.content}"
         )
 
 
@@ -371,16 +374,17 @@ def test_splice_region_does_not_reindent_already_indented_body():
         "        return 10",
         "        return 20",
     ]
-    result = splice_region(base, 4, 5, body_lines, "x.py")
-    assert result is not None
+    out = splice_region(base, 4, 5, body_lines, "x.py")
+    assert out.status == "changed"
+    assert out.content is not None
     # Should NOT have 16 spaces of indent
-    for line in result.split("\n"):
+    for line in out.content.split("\n"):
         if "return 10" in line:
             assert not line.startswith("                "), (
-                f"body was double-indented:\n{result}"
+                f"body was double-indented:\n{out.content}"
             )
             assert line.startswith("        "), (
-                f"body was not at original indent:\n{result}"
+                f"body was not at original indent:\n{out.content}"
             )
             break
 

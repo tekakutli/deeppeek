@@ -9,69 +9,60 @@ dispatcher returns unchanged content in three situations:
 
   1. The body genuinely is already in base (a reprint; a splice whose
      target has no diff; a deletion whose lines are already gone).
-  2. A heuristic returned `base` on a legitimate no-op transform
-     (object-literal splice whose merge produces no net change).
+  2. A heuristic returned `base` on a legitimate no-op transform.
   3. A heuristic *short-circuited* (`_is_already_applied` or
      `_patch_already_present` fired on a token-equivalence match) even
      though the body's actual content is **not** in base.
 
-The first two are correct.  The third is a bug — the manifest says
-"already-present" and `write.preexisting_unmodified` then skips the
-file, but the file's contents never gained the patch's contribution.
+The first two are correct.  The third is a bug.
 
-Motivating case (comfyui.py, 2026-10-28 run):
+STRUCTURAL VERIFICATION (2026-11-06)
+====================================
+The pre-fix `_body_content_present()` was 95% line-equivalence. The
+2026-10-30 run showed why that is too literal: patch 428's
+`--output_rotation` dict entry was already in `comfyui.py`'s
+`@command(args={...})` decorator, but the help-text wording differed
+enough that line-equivalence said "not present," the pass flipped
+the patch to `failed`, reconcile excluded it, and the file shipped
+without the declaration.
 
-    Block idx=652 body: a rewritten `comfy_set_layer_pixels` whose
-    first ~50 lines (the PNG-decode boilerplate) are byte-identical
-    to the pre-existing method, and whose last ~10 lines
-    (delete-and-recreate via `_collect`) are entirely new.
+Structural verification asks the right question: **is every
+declaration the patch made present somewhere in the target?** For a
+dict entry, that means the key. For a function/method, the name. For
+a signature patch, the parameter name. For a decorator kwarg dict,
+the kwarg key. These are all language-level structural concepts —
+`ast_intent` extracts them uniformly across Python and JS.
 
-    `_is_already_applied` computed a contiguous run of ~50 of 60
-    lines, but the `_max_contiguous_run / total >= 0.95` gate should
-    have refused the claim — the run was under threshold.  Some other
-    heuristic returned `base` for an unrelated reason (see the git
-    history of `apply_patches._try_deterministic_patch_inner`), and
-    the dispatcher marked the patch `already-present`.
+The new check is:
 
-    `write.preexisting_unmodified` then saw all patches in
-    NO_CHANGE_STATUSES, treated the file as untouched, and skipped
-    it.  The user never saw the fix.  The manifest reported
-    `patches_applied: 1` (because that counter used an
-    "everything-not-failed" filter) and `written: false`.  No
-    residual entry either, because `_block_outcome` returns None for
-    `already-present`.
+  1. Fast path: exact substring.
+  2. Line-equivalence at 95%.
+  3. Structural intent — restricted.
 
-Fix
-===
-Pass 8.7d re-verifies every `already-present` claim.  For each such
-patch, check whether the body's content is actually in `rec.content`
-at ≥95% line-equivalence.  If not, flip the patch to `failed` with
-a specific reason and demote the record.  Reconcile then sees the
-corrected status, tries to exclude the failed patch, and either
-promotes the record (rest of the record writes cleanly) or leaves it
-LOW (target preserved, residual surfaces the block).
+STRUCTURAL FALLBACK IS NARROW ON PURPOSE (2026-11-06)
+=====================================================
+Two narrowing rules, each motivated by a real test in the suite:
 
-The pass is deliberately narrow: it only inspects `already-present`
-patches.  Applied-but-missing patches (`deterministic` / `llm` whose
-body isn't in the final content) are already covered by pass 8.7c,
-which warns without demoting (because supersession is common and
-benign — see that pass's docstring).
+  · RULE 1 — key-only bodies.  The fallback only fires when the
+    body declares *nothing but* dict keys or decorator kwarg keys.
+    If the body also declares a function, class, assignment, or
+    parameter, the line-equivalence tier above is the right check
+    for those shapes.  A function whose name matches but whose body
+    differs is not "already present" — the whole function is the
+    declaration, not its name.  (`body content partial below
+    threshold` test.)
 
-Skips
-=====
-Three patch shapes are skipped to avoid false positives:
+  · RULE 2 — no decls, no params.  Excluded from the structural
+    fallback: any intent that mixes a key declaration with a
+    `decl_names` or `param_names` declaration.  Those shapes need
+    the full line-equivalence check to distinguish "the function
+    exists somewhere in the file" from "the function's body is
+    what the patch intended".  (`flips false already-present to
+    failed` test.)
 
-  * Empty body: nothing to verify.
-  * Diff body: the semantics of "already-present" for a diff is "the
-    `+` lines are in content and the `-` lines are gone".  This is
-    already checked by `_diff_already_applied` at apply time, and
-    neither the raw diff text nor the pure-addition subset appears in
-    base as contiguous content.  Verifying literally would flip every
-    correctly-applied diff patch.
-  * Deletion-instruction body: the body being *absent* is the success
-    condition.  Already checked by `_deletion_already_applied`.
-
-Test coverage: `tests/recover/test_consistency.py`.
+The full `intent_satisfied_in` in `ast_intent` is still the right
+check for `pass8_11`'s warn-only verification; it's just too broad
+to use as the sole evidence of "already present" in this pass.
 """
 
 from __future__ import annotations
@@ -94,16 +85,14 @@ def _body_content_present(body: str, content: str) -> bool:
     """True iff `body`'s content can reasonably be said to be in
     `content`.
 
-    Two tiers:
+    Three tiers:
       * Exact substring (after surrounding-whitespace strip).
       * Line-by-line stripped membership at 95%.
+      * Structural intent — restricted.
 
-    The 95% threshold is calibrated against the motivating bug: the
-    comfyui.py patch had ~50 of 60 lines matching base by strip, so
-    0.83 line-equivalence — well under 0.95, correctly flagged as
-    not-present.  A legitimate reprint with a reflowed blank line or
-    a trailing-comment addition typically loses at most one or two
-    lines out of dozens and stays above 0.95.
+    See the module docstring, STRUCTURAL FALLBACK IS NARROW ON
+    PURPOSE, for why the structural tier only fires on pure
+    key-declaration bodies.
     """
     stripped = body.strip()
     if not stripped:
@@ -116,7 +105,43 @@ def _body_content_present(body: str, content: str) -> bool:
     content_lines = {ln.strip() for ln in content.splitlines()
                      if ln.strip()}
     matched = sum(1 for ln in body_lines if ln in content_lines)
-    return matched / len(body_lines) >= _LINE_EQUIVALENCE_THRESHOLD
+    if matched / len(body_lines) >= _LINE_EQUIVALENCE_THRESHOLD:
+        return True
+
+    # Structural fallback — only for pure key-declaration bodies.
+    try:
+        from .ast_intent import extract_intent
+        path = _path_of_current_record or ""
+        body_intent = extract_intent(body, path)
+        # RULE 1 + RULE 2: a body that also declares a function,
+        # class, assignment, or param is more than a key-entry add.
+        # Line-equivalence above is the right check for those
+        # shapes; the structural tier does NOT fire.
+        if body_intent.decl_names or body_intent.param_names:
+            return False
+        if not (body_intent.dict_keys
+                or body_intent.decorator_kwarg_keys):
+            return False
+        target_intent = extract_intent(content, path)
+        if (body_intent.dict_keys
+                and not body_intent.dict_keys.issubset(
+                    target_intent.dict_keys)):
+            return False
+        if (body_intent.decorator_kwarg_keys
+                and not body_intent.decorator_kwarg_keys.issubset(
+                    target_intent.decorator_kwarg_keys)):
+            return False
+        return True
+    except Exception:
+        pass
+    return False
+
+
+# The original file did not thread `path` through `_body_content_present`.
+# Rather than change the signature (breaking every existing call), we
+# thread the record path via a module-level slot. This mirrors the
+# existing pattern for `_LAST_DEDUP_DETAILS` in validate_output.
+_path_of_current_record: str = ""
 
 
 def pass8_7d_verify_already_present(
@@ -126,12 +151,10 @@ def pass8_7d_verify_already_present(
     """Verify every `already-present` patch's claim; flip false
     positives to `failed`.
 
-    `blocks_by_idx` is accepted for API parity with the other passes
-    but is not required — the check only inspects `rec.content`, which
-    is already populated by the time this pass runs.
-
     Returns the number of patches flipped to `failed`.
     """
+    global _path_of_current_record
+
     n_flipped = 0
     for path, rec in records.items():
         if rec.content is None:
@@ -140,6 +163,7 @@ def pass8_7d_verify_already_present(
             continue
         if not rec.patches:
             continue
+        _path_of_current_record = path
 
         for patch in rec.patches:
             if patch.get("applied_by") != _ALREADY_PRESENT:
@@ -158,11 +182,11 @@ def pass8_7d_verify_already_present(
             idx = patch.get("idx")
             patch["applied_by"] = "failed"
             patch["failure_reason"] = (
-                "marked already-present but the body's content is not "
-                "in the current file (the dispatcher returned unchanged "
-                "content from a token-equivalence match that does not "
-                "correspond to the patch's actual bytes; see "
-                "consistency.py's module docstring)"
+                "marked already-present but the body's structural "
+                "intent (declared keys / names / params / decorator "
+                "kwargs) and its line content are both absent from "
+                "the current file; see consistency.py's module "
+                "docstring"
             )
             rec.verification.setdefault(
                 "already_present_unverified", []).append(idx)
@@ -179,4 +203,5 @@ def pass8_7d_verify_already_present(
                       f"already-present but its content is absent; "
                       f"flipped to failed", file=sys.stderr)
 
+    _path_of_current_record = ""
     return n_flipped

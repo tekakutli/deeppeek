@@ -12,40 +12,28 @@ produces flow into:
 
 Every diagnostic function is wrapped in a try/except in its caller
 (`_diagnose_patch_failure` catches `_diagnose_patch_failure_inner`'s
-raises; the pair-failure diagnostics are called from
-`patch_pairs._apply_pairs`, which has its own per-pair exception
-boundary).  A bug in a diagnostic must never turn a fail-closed
+raises).  A bug in a diagnostic must never turn a fail-closed
 patch into a silent skip.
 
-INCOMPLETE SCOPED BODY (FIX 4)
-==============================
-`_diagnose_scoped_failure` used to fall through to the generic
-"replacement produced no change" message for every non-ellipsis
-scoped-replace failure.  That made the pg_pixels.py failure
-unreadable: the actual cause was that the body omitted its final
-`}` (the block ended with a `// ... rest unchanged` comment), so
-`_new_body_is_complete_for_scope` correctly refused a full
-replacement and `_try_scoped_partial_splice` correctly refused to
-splice (nothing to add).
+HONEST SCOPED-FAILURE DIAGNOSTIC (2026-11-06)
+=============================================
+`_diagnose_scoped_failure()` previously used regex `_SCOPE_PATTERNS`
+to decide whether a scope "matched". When the AST grammar was
+unavailable (`ast_status()["in_process"] == false`, the case in the
+2026-10-30 run), `find_scope()` returned None — but the regex still
+matched on raw text, and the diagnostic said "scope X matched but
+replacement produced no change." That is a lie: the AST scope lookup
+never succeeded.
 
-The diagnostic now names that shape directly.  No behaviour
-change to the pipeline; the message the user sees improves.
+The diagnostic now calls `scope_ast.find_scope()` first. If it
+returns None, the diagnostic says so explicitly, with a pointer to
+the missing grammar. Only when the AST scope is genuinely found does
+the diagnostic fall through to the "matched but no change" branch.
 
 STRUCTURAL DIVERGENCE DIAGNOSTIC (2026-11-05)
 =============================================
 `_diagnose_structural_divergence` names what a *candidate* result
 changed structurally beyond what the patch's own body declares.
-It is used by `apply_patches._check_structural_sanity`'s caller
-when a candidate splice passed the structural-parser gate but the
-result is still semantically suspicious: e.g., a scoped replace
-that also dropped a sibling function.  `structural_diff` does the
-tree-level comparison; this module turns its findings into one
-readable line per difference.
-
-The diagnostic is attribution-shaped, not gate-shaped: it never
-raises, never blocks, and never mutates state.  It exists only to
-make the failure_reason on a skipped_structural_damage patch
-readable.
 """
 
 import re
@@ -103,34 +91,45 @@ def _diagnose_scoped_failure(base, scope_name, new_body=""):
     if not scope_name:
         return "scope name is empty"
 
-    # FIX 4: incomplete scoped body.  When the new body omits the
+    # FIX (2026-11-06): use the AST scope finder as the authority.
+    # Regex-only matches mean the AST grammar is unavailable — the
+    # diagnostic must say so, not pretend the AST lookup succeeded
+    # and then claim "replacement produced no change."
+    from .scope_ast import find_scope
+    ast_span = find_scope(base, scope_name, "")
+    if ast_span is None:
+        # AST lookup failed. Two subcases:
+        #  (a) grammar unavailable in-process (ast_status()["in_process"]==False)
+        #  (b) scope genuinely absent from base
+        # Both are more informative than "matched but no change". We
+        # can't distinguish them cheaply here — the pipeline's startup
+        # warning covers (a) — so name both possibilities.
+        return (
+            f"scope {scope_name!r} could not be located structurally "
+            f"(AST scope finder returned None). If tree-sitter is "
+            f"installed only in the repo .venv, run through the venv "
+            f"or re-exec into it; otherwise the scope is genuinely "
+            f"absent from the base."
+        )
+
+    # FIX 4: incomplete scoped body. When the new body omits the
     # scope's closer AND `_try_scoped_partial_splice` cannot build a
     # balance-preserving splice, `_apply_scoped` correctly returns
-    # None to prevent corruption.  Name that shape specifically so
-    # the user can fix the block (add the closer, or use an ellipsis
-    # marker for a partial body).
+    # None to prevent corruption.
     if new_body:
-        for make_pattern in _SCOPE_PATTERNS:
-            try:
-                pattern = make_pattern(scope_name)
-            except re.error:
-                continue
-            m = pattern.search(base)
-            if not m:
-                continue
-            base_scope = base[m.start():m.end()]
-            if not _new_body_is_complete_for_scope(
-                    base_scope, new_body):
-                return (f"scope {scope_name!r} body is incomplete "
-                        f"(missing the scope's closer — a final "
-                        f"`}}` or `</details>`); a scoped-replace "
-                        f"with an incomplete body would corrupt "
-                        f"the file, so it is refused rather than "
-                        f"performed.  Either include the closer, or "
-                        f"use an ellipsis marker (`...`) to request "
-                        f"a partial splice.")
-            break
+        base_scope = base[ast_span[0]:ast_span[1]]
+        if not _new_body_is_complete_for_scope(base_scope, new_body):
+            return (f"scope {scope_name!r} body is incomplete "
+                    f"(missing the scope's closer — a final "
+                    f"`}}` or `</details>`); a scoped-replace "
+                    f"with an incomplete body would corrupt "
+                    f"the file, so it is refused rather than "
+                    f"performed.  Either include the closer, or "
+                    f"use an ellipsis marker (`...`) to request "
+                    f"a partial splice.")
 
+    # Scope WAS found by AST. Now the regex count is only useful
+    # for ambiguity detection.
     for make_pattern in _SCOPE_PATTERNS:
         try:
             pattern = make_pattern(scope_name)
@@ -247,17 +246,6 @@ def _diagnose_replace_failure(base, old_body, new_body=""):
 
 
 def _diagnose_patch_failure(patch, content, base):
-    """Explain why a patch could not be applied.
-
-    Returns a human-readable string suitable for warnings.txt and
-    the manifest's ``patch_failure_reasons``.  This function is on
-    the cold-failure path: if it raises, the whole pass would die.
-    The wrapper below catches any exception and falls back to a
-    generic message so a single weird block can never take out
-    the pass.
-
-    Never raises.
-    """
     try:
         return _diagnose_patch_failure_inner(patch, content, base)
     except Exception as e:
@@ -291,14 +279,6 @@ def _diagnose_patch_failure_inner(patch, content, base):
         return ("looks like a diff but could not be applied to base "
                 "(context mismatch or already applied elsewhere)")
 
-    # Object-literal diagnostic (refined 2026-11-01b): distinguish
-    # "the variable was never declared" from "the declaration exists
-    # but the body could not complete the splice".  Motivating case:
-    # `inpaint_server.py`'s `captured = {...}` + `def on_progress(...)`
-    # body was reported as "no matching base declaration" even though
-    # `captured` IS declared — the real issue was trailing content
-    # after the object literal (fixed by the dedent + multi-statement
-    # apply; the diagnostic is now accurate for future cases).
     if _OBJECT_LITERAL_ASSIGNMENT_RE.match(stripped):
         m = _OBJECT_LITERAL_ASSIGNMENT_RE.match(stripped)
         id_m = re.search(
@@ -353,11 +333,6 @@ def _diagnose_patch_failure_inner(patch, content, base):
         stripped)
     if m_def:
         name = m_def.group(1)
-        # Check both top-level and indented declarations in base to
-        # give a truthful diagnostic.  Motivating case (comfyui.py
-        # 2026-10-28): `_try_indented_def_replace` bailed on a
-        # structural check and reported "no matching scope", which was
-        # misleading — the indented scope WAS present.
         top_level_re = re.compile(
             rf"^(?:async\s+)?(?:def|class)\s+{re.escape(name)}\b",
             re.MULTILINE,
@@ -419,28 +394,6 @@ def _diagnose_patch_failure_inner(patch, content, base):
 
 def _diagnose_structural_divergence(base: str, attempted: str,
                                      path: str, patch_body: str) -> str:
-    """Name what a *candidate* result changed structurally beyond
-    what the patch's own body declares.
-
-    Used by `apply_patches._check_structural_sanity`'s callers when a
-    candidate splice passed the structural-parser gate but the result
-    is still suspicious — the exact failure shape that motivated
-    `structural_diff`'s existence (a scoped replace that also dropped
-    a sibling function, or a region-replace that nested an element
-    inside itself).
-
-    Attribution-only: never raises, never blocks, never mutates
-    state.  An empty return means "no structural divergence found",
-    which is distinct from "the diagnostic itself failed" — a caller
-    that wants to distinguish should check for the `"structural
-    diagnostic raised"` prefix.
-
-    Motivating case (2026-10-29 `pg_panel_bindings.py`): a candidate
-    splice passed the whole-file balance check but had silently
-    swallowed the `_pickMaskAction` function.  `structural_diff` named
-    it; this wrapper turns that into the one line that ends up in the
-    manifest's `failure_reason`.
-    """
     try:
         from .structural_diff import structural_diff
     except Exception as e:

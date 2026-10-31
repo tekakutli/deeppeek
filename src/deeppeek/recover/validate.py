@@ -191,11 +191,14 @@ def pass7_cross_validate(records: dict[str, FileRecord],
                     if not clean:
                         continue
                     top = clean.split(".", 1)[0]
+                    _top_pkg = top + "/__init__.py"
                     top_recovered = any(
                         _rec_will_be_on_disk(r)
-                        and (_basename(p) == top + ".py"
-                             or Path(p).as_posix()
-                                == top + "/__init__.py")
+                        and (
+                            _basename(p) == top + ".py"
+                            or Path(p).as_posix() == _top_pkg
+                            or Path(p).as_posix().endswith("/" + _top_pkg)
+                        )
                         for p, r in records.items()
                     )
                     display = clean if top_recovered else top
@@ -254,6 +257,10 @@ def pass7_5_js_validate(records: dict) -> list:
 
     for path, rec in records.items():
         if rec.content is None:
+            continue
+        if rec.verification.get("preexisting_unchanged"):
+            continue
+        if rec.preexisting_base and not rec.patches and not rec.pairs:
             continue
 
         js_source = None
@@ -607,6 +614,10 @@ def pass7_8_demote_on_any_finding(records: dict,
             if not path or path not in records:
                 continue
             rec = records[path]
+            if rec.verification.get("preexisting_unchanged"):
+                continue
+            if rec.preexisting_base and not rec.patches and not rec.pairs:
+                continue
             if rec.trust == "LOW":
                 continue
             rec.trust = "LOW"
@@ -825,13 +836,15 @@ def _resolve_module(module: str, records: dict[str, FileRecord],
     for path, rec in records.items():
         if not _rec_will_be_on_disk(rec):
             continue
-        if Path(path).as_posix() == top_pkg:
+        posix = Path(path).as_posix()
+        if posix == top_pkg or posix.endswith("/" + top_pkg):
             if sub_file is None:
                 return path
             for sub_path, sub_rec in records.items():
                 if not _rec_will_be_on_disk(sub_rec):
                     continue
-                if Path(sub_path).as_posix() == sub_file:
+                sub_posix = Path(sub_path).as_posix()                          # changed
+                if sub_posix == sub_file or sub_posix.endswith("/" + sub_file):  # changed
                     return sub_path
             return None
 
