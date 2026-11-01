@@ -28,6 +28,16 @@ def register(sub: argparse._SubParsersAction) -> None:
              "needed.",
     )
     p.add_argument(
+        "--print-output", action="store_true",
+        help="echo every text delta the daemon streams back to the "
+             "client (aider) to stdout.  Streaming deltas are "
+             "printed live, one newline after the reply completes; "
+             "non-streaming requests print the full content once. "
+             "Useful for debugging what the model is actually "
+             "producing without having to capture the HTTP stream "
+             "separately.",
+    )
+    p.add_argument(
         "--reuse-tab", action="store_true",
         help="reuse the current DeepSeek tab instead of opening a "
              "new one per request.  WARNING: the model sees the "
@@ -155,6 +165,12 @@ def run(args: argparse.Namespace) -> int:
                 f"{args.container_id}",
                 file=sys.stderr,
             )
+        if args.print_output:
+            print(
+                "[daemon] --print-output: model replies will be echoed "
+                "to stdout",
+                file=sys.stderr,
+            )
         print(f"[daemon]   export OPENAI_API_BASE={base}", file=sys.stderr)
         print(f"[daemon]   export OPENAI_API_KEY=dummy", file=sys.stderr)
         print(
@@ -163,7 +179,7 @@ def run(args: argparse.Namespace) -> int:
         )
         print("", file=sys.stderr)
 
-        serve(bridge, port=args.port)
+        serve(bridge, port=args.port, print_output=args.print_output)
         return 0
     except KeyboardInterrupt:
         print("\n[daemon] stopping.", file=sys.stderr)

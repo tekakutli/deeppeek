@@ -26,6 +26,15 @@ Once the first chunk arrives, headers are sent and the stream runs
 normally — mid-stream bridge errors still surface as SSE error
 frames (retriable, but at that point partial content has already
 been delivered, so retrying is at least defensible).
+
+Output mirroring (`--print-output`, 2026-11-01): when the daemon is
+started with `--print-output`, every text delta written to the
+client is also echoed to the daemon's own stdout, so the operator
+can watch what the model is actually producing without having to
+capture the HTTP stream in another process.  Streaming deltas are
+printed with `end=""` so stdout reconstructs the reply live; a
+newline is appended when the stream completes.  The non-streaming
+path prints the full content once.
 """
 import itertools
 import json
@@ -38,6 +47,7 @@ from .bridge import BridgeError
 
 class OpenAIHandler(BaseHTTPRequestHandler):
     bridge = None  # set by ``serve()`` before ``serve_forever`` runs
+    print_output = False  # set by ``serve()``; mirrors --print-output
 
     def log_message(self, *args, **kwargs):
         pass  # keep the terminal quiet; aider has its own logs
@@ -73,6 +83,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 self._stream_response(model, messages)
             else:
                 content = self.bridge.complete(messages, model)
+                if self.print_output:
+                    print(content, flush=True)
                 usage = _usage_estimate(messages, content)
                 self._json(200, _completion_payload(model, content, usage))
         except BridgeError as e:
@@ -138,6 +150,14 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             for delta in itertools.chain([first], bridge_gen):
                 if not delta:
                     continue
+                if self.print_output:
+                    # Reconstruct the reply on the daemon's own
+                    # stdout.  No trailing newline per delta — a
+                    # single newline is emitted after the stream
+                    # completes (below), so concurrent CLI output
+                    # stays readable and a captured stdout file
+                    # matches the assistant reply exactly.
+                    print(delta, end="", flush=True)
                 chunk = {
                     "id": chat_id,
                     "object": "chat.completion.chunk",
@@ -156,6 +176,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
                 self.wfile.flush()
 
+            if self.print_output:
+                print(flush=True)
+
             final = {
                 "id": chat_id,
                 "object": "chat.completion.chunk",
@@ -173,7 +196,10 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             # Client (aider) disconnected.  The extension's watch loop
             # times out on its own; queued deltas are drained at the
-            # start of the next request.
+            # start of the next request.  No trailing newline —
+            # the operator asked for the reply, and it was truncated
+            # by the client, so a newline here would lie about
+            # completeness.
             return
         except Exception as e:
             # Headers already on the wire; can't change status.
@@ -242,10 +268,21 @@ def _error(message: str, err_type: str) -> dict:
     return {"error": {"message": message, "type": err_type}}
 
 
-def serve(bridge, port: int = 8766) -> None:
+def serve(bridge, port: int = 8766, print_output: bool = False) -> None:
     """Blocking serve loop.  Caller binds ``bridge``, then handles
-    Ctrl+C and shuts down ``ExportServer`` in its own finally block."""
+    Ctrl+C and shuts down ``ExportServer`` in its own finally block.
+
+    ``print_output`` — when True, every text delta the daemon
+    streams back to the client (aider) is echoed to the daemon's
+    own stdout.  Streaming deltas are printed with ``end=""`` so
+    stdout reconstructs the reply live; a newline is appended when
+    the stream completes.  The non-streaming path prints the full
+    content once.  Useful for debugging what the model is actually
+    producing without having to capture the HTTP stream
+    separately.
+    """
     OpenAIHandler.bridge = bridge
+    OpenAIHandler.print_output = print_output
     httpd = ThreadingHTTPServer(("127.0.0.1", port), OpenAIHandler)
     httpd.daemon_threads = True
     httpd.serve_forever()

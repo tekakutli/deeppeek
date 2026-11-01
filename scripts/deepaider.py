@@ -1,51 +1,16 @@
 #!/usr/bin/env python3
-"""Launch aider against a deeppeek daemon; start one if not already up.
-
-Usage (three entry points, all equivalent):
-
-    deeppeek scripts deepaider [args...]      # source checkout only
-    ~/.local/bin/deepaider [args...]          # symlink into this file
-    python3 scripts/deepaider.py [args...]
-
-The launcher runs `dump.py --as-read-args -r` in the current working
-directory and injects the resulting `--read PATH` pairs into aider's
-argv.  This means aider's model sees the whole project (per dump.py's
-DEFAULT_EXTENSIONS / DEFAULT_EXCLUDE_DIRS) as read-only context on
-every turn — no "Add file to the chat?" roundtrips, no architect-mode
-re-fires with no new files.  Skip with `--no-dump`.
-
-Any arguments not consumed by this launcher are passed through to
-`aider` verbatim.
-
-Launcher-consumed flags (not forwarded to aider):
-
-    --keep-daemon    leave the daemon running when aider exits
-    --no-dump        skip the `dump.py --as-read-args` step
-    --no-architect   don't auto-add `--architect`
-
-Unless the caller passes `--architect` themselves (and didn't pass
-`--no-architect`), architect mode is enabled by default.  Unless the
-caller passes an edit-format flag, the architect-mode editor is pinned
-to the reliable `whole` format.
-
-Exit code is aider's exit code (or 1 on startup failure).
-"""
+"""Launch aider against a deeppeek daemon; start one if not already up."""
 import os
 import signal
 import subprocess
 import sys
 import time
 import urllib.request
+import shutil
 from pathlib import Path
 
 PORT, LOG = 8766, "/tmp/deeppeek-daemon.log"
 BASE = f"http://127.0.0.1:{PORT}/v1"
-
-# dump.py lives beside this script under scripts/dumps/.  Resolving the
-# symlink (Path(__file__).resolve()) makes this work from
-# ~/.local/bin/deepaider even when the real file is elsewhere.
-SCRIPT_DIR = Path(__file__).resolve().parent
-DUMP_SCRIPT = SCRIPT_DIR / "dumps" / "dump.py"
 
 
 def up() -> bool:
@@ -56,84 +21,51 @@ def up() -> bool:
         return False
 
 
-def run_dump() -> list[str]:
-    """Run `dump.py --as-read-args -r` and return the parsed aider args.
+def _find_aider_python() -> str | None:
+    """Find the Python interpreter that has aider installed."""
+    aider_bin = shutil.which("aider")
+    if not aider_bin:
+        print("deepaider: 'aider' command not found in PATH", file=sys.stderr)
+        return None
 
-    Returns `["--read", path1, "--read", path2, ...]`.  Empty list on
-    any failure (dump.py missing, non-zero exit, no matching files) —
-    the caller treats that as "no injection" and continues.
-
-    Parsing: dump.py emits `--read path1 --read path2 ...` as one line
-    on stdout.  Splitting on the literal token `"--read "` (note the
-    trailing space) is robust to paths containing spaces, since a real
-    path would have to contain the string `"--read "` to be mis-split —
-    which cannot happen in any sane directory layout.
-    """
-    if not DUMP_SCRIPT.is_file():
-        print(
-            f"deepaider: dump script not found at {DUMP_SCRIPT}; "
-            f"skipping --read injection",
-            file=sys.stderr,
-        )
-        return []
-
-    cmd = [sys.executable, str(DUMP_SCRIPT), "--as-read-args", "-r"]
-    print(f"deepaider: running dump: {' '.join(cmd)}", file=sys.stderr)
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
-    except OSError as e:
-        print(
-            f"deepaider: could not run dump.py ({e}); "
-            f"skipping --read injection",
-            file=sys.stderr,
-        )
-        return []
+        with open(aider_bin, 'rb') as f:
+            first_line = f.readline().decode('utf-8', errors='ignore').strip()
+        if first_line.startswith('#!'):
+            interpreter = first_line[2:].strip()
+            if ' ' in interpreter:
+                parts = interpreter.split()
+                if parts[0].endswith('env'):
+                    interpreter = shutil.which(parts[1])
+                else:
+                    interpreter = parts[0]
+            if interpreter and Path(interpreter).exists():
+                return interpreter
+    except Exception:
+        pass
 
-    if result.returncode != 0:
-        print(
-            f"deepaider: dump.py exited {result.returncode}; "
-            f"continuing without --read injection",
-            file=sys.stderr,
-        )
-        for line in (result.stderr or "").splitlines()[:5]:
-            print(f"  {line}", file=sys.stderr)
-        return []
-
-    parts = result.stdout.split("--read ")
-    paths = [p.strip() for p in parts if p.strip()]
-    if not paths:
-        print("deepaider: dump produced 0 files; no injection",
-              file=sys.stderr)
-        return []
-
-    args: list[str] = []
-    for p in paths:
-        args.extend(["--read", p])
-
-    print(
-        f"deepaider: dumped {len(paths)} file(s) for --read injection",
-        file=sys.stderr,
-    )
-    return args
+    home = Path.home()
+    common = []
+    if sys.platform == "darwin":
+        common.append(home / "Library/Application Support/pipx/venvs/aider-chat/bin/python")
+    common.append(home / ".local/pipx/venvs/aider-chat/bin/python")
+    for p in common:
+        if p.exists():
+            return str(p)
+    return None
 
 
 def main(argv: list[str]) -> int:
     args = list(argv)
 
-    # ---- launcher-consumed flags ----
-    keep = "--keep-daemon" in args
-    if keep:
-        args.remove("--keep-daemon")
+    keep = "--keep-daemon" in argv
+    no_architect = "--no-architect" in argv
+    no_reflection_patch = "--no-reflection-patch" in argv
 
-    no_dump = "--no-dump" in args
-    if no_dump:
-        args.remove("--no-dump")
+    for flag in ("--keep-daemon", "--no-architect", "--no-reflection-patch"):
+        if flag in args:
+            args.remove(flag)
 
-    no_architect = "--no-architect" in args
-    if no_architect:
-        args.remove("--no-architect")
-
-    # ---- daemon: start if not already up ----
     pid: int | None = None
     if not up():
         with open(LOG, "w") as log:
@@ -141,35 +73,103 @@ def main(argv: list[str]) -> int:
                 ["deeppeek", "daemon", "--port", str(PORT)],
                 stdout=log, stderr=subprocess.STDOUT,
             ).pid
-        for _ in range(70):  # ~35 s
+        for _ in range(70):
             if up():
                 break
             time.sleep(0.5)
         else:
             print(f"deepaider: daemon not ready; see {LOG}", file=sys.stderr)
-            subprocess.run(["tail", "-n", "20", LOG], file=sys.stderr)
             os.kill(pid, signal.SIGTERM)
             return 1
 
-    # ---- dump: inject --read args for the whole project ----
-    read_args = [] if no_dump else run_dump()
-
-    # ---- build aider argv ----
     env = {**os.environ,
            "OPENAI_API_BASE": BASE, "OPENAI_BASE_URL": BASE,
            "OPENAI_API_KEY": "dummy"}
 
-    cmd = ["aider", "--model", "openai/deepseek-web"]
+    aider_args = ["--model", "openai/deepseek-web"]
     if not no_architect and "--architect" not in args:
-        cmd += ["--architect"]
+        aider_args += ["--architect"]
     if not any(a.startswith(("--edit-format", "--editor-edit-format"))
                for a in args):
-        cmd += ["--editor-edit-format", "whole"]
-    # Read args go before user args so the user's own flags (including
-    # any additional --read they pass manually) can override or extend.
-    cmd += read_args
-    cmd += args
+        aider_args += ["--editor-edit-format", "whole"]
+    aider_args += args
 
+    if not no_reflection_patch:
+        aider_python = _find_aider_python()
+        if aider_python:
+            patch_script = r"""
+import sys
+
+def patch():
+    try:
+        from aider.coders.base_coder import Coder
+
+        # Layer 1: cap the reflection counter.
+        Coder.max_reflections = 0
+
+        # Layer 2: neutralise send_message so it never leaves a
+        # reflected_message behind.  This is the root cause: every
+        # reflection (edit-format mismatch, lint error, test error)
+        # is armed inside send_message.  Clearing it here means the
+        # loop in run_one has nothing to consume, regardless of
+        # which coder instance (architect, editor, or a newly
+        # created one) is running.
+        original_send_message = Coder.send_message
+
+        def patched_send_message(self, *args, **kwargs):
+            try:
+                return original_send_message(self, *args, **kwargs)
+            finally:
+                self.reflected_message = None
+
+        patched_send_message.__wrapped__ = original_send_message
+        Coder.send_message = patched_send_message
+
+        # Layer 3: belt-and-braces override of run_one that never
+        # re-enters the reflection loop, even if reflected_message
+        # somehow gets set by a path that bypasses send_message.
+        original_run_one = Coder.run_one
+
+        def patched_run_one(self, user_message, preproc):
+            self.init_before_message()
+            if preproc:
+                message = self.preproc_user_input(user_message)
+            else:
+                message = user_message
+            self.reflected_message = None
+            list(self.send_message(message))
+            # Intentionally ignore self.reflected_message.
+
+        patched_run_one.__wrapped__ = original_run_one
+        Coder.run_one = patched_run_one
+
+        print("deepaider: disabled aider reflection loop (multi-layer patch)",
+              file=sys.stderr)
+        return True
+    except Exception as e:
+        print(f"deepaider: failed to patch aider: {e}", file=sys.stderr)
+        return False
+
+if patch():
+    from aider.main import main as aider_main
+    try:
+        sys.exit(aider_main(sys.argv[1:]))
+    except SystemExit as e:
+        sys.exit(e.code if e.code is not None else 0)
+else:
+    sys.exit(1)
+"""
+            cmd = [aider_python, "-c", patch_script] + aider_args
+            try:
+                result = subprocess.run(cmd, env=env)
+                return result.returncode
+            except OSError as e:
+                print(f"deepaider: failed to launch aider: {e}", file=sys.stderr)
+        else:
+            print("deepaider: could not find aider interpreter, running unpatch",
+                  file=sys.stderr)
+
+    cmd = ["aider"] + aider_args
     try:
         return subprocess.run(cmd, env=env).returncode
     finally:

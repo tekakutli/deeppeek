@@ -116,7 +116,7 @@ DEFAULT_SKIP_DUMP_FILES = True
 # also listed in DEFAULT_TREE_EXCLUDE_DIRS below.
 DEFAULT_EXCLUDE_DIRS = [
     ".git", "__pycache__", ".venv", "venv", "node_modules",
-    "lib", "bin", "recover",
+    "lib", "bin", "recover", "tests", 'docker', 'website',
     "kritomatic_xremap", "other_scripts", "playgrounds",
     "data/comfy_panel/history/",
 ]
@@ -125,7 +125,7 @@ DEFAULT_EXCLUDE_DIRS = [
 # DEFAULT_EXCLUDE_DIRS. This only affects the tree rendering — it never
 # changes which files are dumped.
 DEFAULT_TREE_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modules",
-                             "lib", "bin", "recover",
+                             "lib", "bin", "recover", "tests", 'docker', 'website',
                              "target", "release",
                              "data/comfy_panel", "other_scripts/room/leader_optimizer",
 ]
@@ -140,7 +140,7 @@ DEFAULT_INCLUDE_FILE_SUBSTRINGS = []
 
 # Filename substrings blacklist: if a filename contains ANY of these, the
 # file is skipped.
-DEFAULT_EXCLUDE_FILE_SUBSTRINGS = ["project_dump", "shrinking", "tests", 'EMISSION', 'reprint.py']
+DEFAULT_EXCLUDE_FILE_SUBSTRINGS = ["project_dump", "shrinking", 'EMISSION', 'reprint.py']
 # ---------------------------------------------------------------------------
 
 HEADER = "=" * 70
