@@ -10,7 +10,7 @@ element first, strategy list second.  See `injected.js` Part 7.
 import argparse
 import sys
 
-from ._composer import broadcast_and_wait, composer_session
+from ._composer import submit_request
 
 
 def register(sub: argparse._SubParsersAction) -> None:
@@ -30,28 +30,25 @@ def register(sub: argparse._SubParsersAction) -> None:
 def run(args: argparse.Namespace) -> int:
     print("Pressing Enter on composer...", file=sys.stderr)
 
-    with composer_session(port=args.port, timeout=args.timeout) as server:
-        if server is None:
-            return 1
+    rc, result = submit_request(
+        "enter", {},
+        timeout=args.timeout, ack_name="enter",
+        port=args.port,
+    )
 
-        rc, result = broadcast_and_wait(
-            server, "enter", {},
-            timeout=args.timeout, ack_name="enter",
-        )
-
-        if rc == 0:
-            sel = result.get("composer_selector") or "(unknown)"
-            source = result.get("composer_source") or "?"
-            print(f"OK — submitted via {sel} (source={source})",
-                  file=sys.stderr)
-            return 0
-        if rc == 2:
-            print(f"Enter failed: {result.get('reason') or '(no reason)'}",
-                  file=sys.stderr)
-            for k in ("composer_selector", "composer_source",
-                      "submitted", "composer_cleared",
-                      "composer_element_info", "active_element_info"):
-                if k in result:
-                    print(f"  {k}: {result[k]}", file=sys.stderr)
-            return 2
-        return rc
+    if rc == 0:
+        sel = result.get("composer_selector") or "(unknown)"
+        source = result.get("composer_source") or "?"
+        print(f"OK — submitted via {sel} (source={source})",
+              file=sys.stderr)
+        return 0
+    if rc == 2:
+        print(f"Enter failed: {result.get('reason') or '(no reason)'}",
+              file=sys.stderr)
+        for k in ("composer_selector", "composer_source",
+                  "submitted", "composer_cleared",
+                  "composer_element_info", "active_element_info"):
+            if k in result:
+                print(f"  {k}: {result[k]}", file=sys.stderr)
+        return 2
+    return rc

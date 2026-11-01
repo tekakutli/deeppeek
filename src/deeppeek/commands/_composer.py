@@ -19,11 +19,20 @@ Two entry points:
 The second form is what eliminates the port-8765 serialisation
 between `pipe` and `type` that the subprocess-based prompts
 inherit.
+
+`submit_request` is the new top-level dispatch helper: it tries to
+route through a running `deeppeek daemon` on the target port (via
+`POST /internal/relay`) before falling back to opening its own
+`ExportServer`.  That fallback is what keeps the CLI commands
+working when no daemon is running.
 """
 
+import json as _json
 import queue
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
 from contextlib import contextmanager
 
@@ -167,3 +176,97 @@ def broadcast_many(server: ExportServer, specs: list[dict],
             "result": {"error": "timeout waiting for ack"},
         }
     return results
+
+
+def _try_daemon_relay(
+    event_name: str,
+    payload: dict,
+    *,
+    timeout: float,
+    ack_name: str,
+    port: int,
+):
+    """POST one event to a running daemon's /internal/relay.
+
+    Returns:
+      None           — no daemon on `port` (ConnectionRefused);
+                       caller must open a local ExportServer.
+      (rc, result)   — daemon answered with a final result.
+                       rc uses broadcast_and_wait semantics.
+    """
+    batch_id = uuid.uuid4().hex[:12]
+    full_payload = {**payload, "batch_id": batch_id}
+    body = _json.dumps({
+        "event": event_name,
+        "payload": full_payload,
+        "ack_name": ack_name,
+        "timeout": timeout,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/internal/relay",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout + 5) as resp:
+            data = _json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        text = e.read().decode("utf-8", "replace")
+        print(f"error: daemon relay HTTP {e.code}: {text}",
+              file=sys.stderr)
+        return 1, {}
+    except urllib.error.URLError as e:
+        if isinstance(getattr(e, "reason", None), ConnectionRefusedError):
+            return None
+        print(f"error: daemon relay failed: {e}", file=sys.stderr)
+        return 1, {}
+    except (OSError, ValueError) as e:
+        print(f"error: daemon relay failed: {e}", file=sys.stderr)
+        return 1, {}
+
+    if not data.get("ok"):
+        print(f"error: daemon relay: {data.get('error')}",
+              file=sys.stderr)
+        return 1, {}
+
+    ack = data.get("ack") or {}
+    if ack.get("batch_id") != batch_id:
+        print(f"error: response batch_id mismatch "
+              f"(got {ack.get('batch_id')}, expected {batch_id})",
+              file=sys.stderr)
+        return 1, {}
+    print(f"Routed via daemon on port {port}.", file=sys.stderr)
+    result = ack.get("result") or {}
+    if result.get("success"):
+        return 0, result
+    return 2, result
+
+
+def submit_request(
+    event_name: str,
+    payload: dict,
+    *,
+    timeout: float,
+    ack_name: str,
+    port: int = 8765,
+) -> tuple[int, dict]:
+    """Send one event to the extension.
+
+    Uses a running `deeppeek daemon` on `port` if present (relay).
+    Otherwise opens a local ExportServer on `port` — today's
+    behaviour.  Return value matches broadcast_and_wait.
+    """
+    relay = _try_daemon_relay(
+        event_name, payload,
+        timeout=timeout, ack_name=ack_name, port=port,
+    )
+    if relay is not None:
+        return relay
+    with composer_session(port=port, timeout=timeout) as server:
+        if server is None:
+            return 1, {}
+        return broadcast_and_wait(
+            server, event_name, payload,
+            timeout=timeout, ack_name=ack_name,
+        )

@@ -22,8 +22,10 @@ def register(sub: argparse._SubParsersAction) -> None:
         help="extension SSE port (default: 8767).  Kept distinct from "
              "the CLI's 8765 so `deeppeek daemon` and interactive "
              "commands (`type`/`enter`/`pipe`/`capture`) can run "
-             "concurrently.  The browser extension must be configured "
-             "to connect to BOTH 8765 (CLI) and 8767 (daemon).",
+             "concurrently.  While the daemon is running, other "
+             "`deeppeek` commands in other terminals automatically "
+             "route through it — no second extension connection is "
+             "needed.",
     )
     p.add_argument(
         "--reuse-tab", action="store_true",

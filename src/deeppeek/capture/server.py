@@ -22,6 +22,7 @@ class ExportServer:
         self.watch_mode = watch_mode
         self.include_forked = include_forked
         self.result_queue: "queue.Queue[dict]" = queue.Queue()
+        self._pending: "dict[str, queue.Queue[dict]]" = {}
         self.armed = watch_mode
         self.sse_clients: list["queue.Queue[dict]"] = []
         self._lock = threading.Lock()
@@ -91,6 +92,28 @@ class ExportServer:
             "files": files,
             "opts": {"delay_ms": delay_ms},
         })
+
+    # ---- pending-ack router (for /internal/relay) -----------------
+
+    def register_pending(self, batch_id: str) -> "queue.Queue[dict]":
+        q: "queue.Queue[dict]" = queue.Queue()
+        with self._lock:
+            self._pending[batch_id] = q
+        return q
+
+    def unregister_pending(self, batch_id: str) -> None:
+        with self._lock:
+            self._pending.pop(batch_id, None)
+
+    def _deliver_ack(self, data: dict) -> None:
+        batch_id = data.get("batch_id")
+        if batch_id:
+            with self._lock:
+                q = self._pending.get(batch_id)
+            if q is not None:
+                q.put(data)
+                return
+        self.result_queue.put(data)
 
     # ---- lifecycle ------------------------------------------------
 
@@ -190,12 +213,68 @@ class ExportServer:
                     with parent._lock:
                         was_armed = parent.armed
                         parent.armed = False
-                    parent.result_queue.put(data)
+                    parent._deliver_ack(data)
                     if was_armed:
                         parent._broadcast("disarm")
                     self._send_json(200, {"ok": True})
+                elif self.path == "/internal/relay":
+                    self._handle_relay()
                 else:
                     self._send_json(404, {"error": "not found"})
+
+            def _handle_relay(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length else b"{}"
+                try:
+                    req = json.loads(raw)
+                except Exception as e:
+                    self._send_json(400, {"ok": False,
+                                          "error": f"bad json: {e}"})
+                    return
+
+                event = req.get("event")
+                payload = req.get("payload") or {}
+                ack_name = req.get("ack_name")
+                req_timeout = float(req.get("timeout") or 30.0)
+                batch_id = payload.get("batch_id")
+                if not event or not ack_name or not batch_id:
+                    self._send_json(400, {
+                        "ok": False,
+                        "error": "event, payload.batch_id, ack_name required",
+                    })
+                    return
+
+                with parent._lock:
+                    n_clients = len(parent.sse_clients)
+                if n_clients == 0:
+                    self._send_json(200, {
+                        "ok": False,
+                        "error": "no extension connected to daemon",
+                    })
+                    return
+
+                q = parent.register_pending(batch_id)
+                try:
+                    parent._broadcast(event, payload)
+                    try:
+                        ack = q.get(timeout=req_timeout)
+                    except queue.Empty:
+                        self._send_json(200, {
+                            "ok": False,
+                            "error": f"no ack within {req_timeout:.0f}s",
+                        })
+                        return
+                    if ack.get("__ack") != ack_name:
+                        self._send_json(200, {
+                            "ok": False,
+                            "error": f"unexpected ack: "
+                                     f"{ack.get('__ack')!r}",
+                            "ack": ack,
+                        })
+                        return
+                    self._send_json(200, {"ok": True, "ack": ack})
+                finally:
+                    parent.unregister_pending(batch_id)
 
         self._httpd = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
         self._httpd.daemon_threads = True

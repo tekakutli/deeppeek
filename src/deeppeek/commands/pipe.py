@@ -14,16 +14,19 @@ with an error, so typos are caught.
 Constraint: only one CLI can run on port 8765 at a time.  If a
 `capture --watch` (or another `pipe`) is already running, this
 command fails with a clear error.
+
+Dispatch: if a `deeppeek daemon` is running on the target port,
+this command routes through its `/internal/relay` endpoint instead
+of opening a local `ExportServer`.  Otherwise it falls back to the
+local-server path (the original behaviour).
 """
 import argparse
 import base64
 import mimetypes
-import queue
 import sys
-import uuid
 from pathlib import Path
 
-from ..capture.server import ExportServer
+from ._composer import submit_request
 
 
 def register(sub: argparse._SubParsersAction) -> None:
@@ -101,79 +104,48 @@ def run(args: argparse.Namespace) -> int:
     print(f"Total raw: {_human_size(total_raw)} "
           f"→ base64: {_human_size(b64_total)}", file=sys.stderr)
 
-    # ---- open server -----------------------------------------------
-    try:
-        server = ExportServer(port=args.port)
-        server.start()
-    except OSError as e:
-        if "Address already in use" in str(e):
-            print(f"error: port {args.port} is already in use — is "
-                  f"another `deeppeek` command running?", file=sys.stderr)
-            print("  stop it first (Ctrl+C the other command), then retry.",
-                  file=sys.stderr)
-            return 1
-        raise
+    # ---- dispatch via daemon relay or local ExportServer --------
+    delay_ms = int(args.delay * 1000) if args.serial else 0
+    mode = "serial" if args.serial else "batch"
+    print(f"Attaching {len(payload_files)} file(s) in {mode} mode...",
+          file=sys.stderr)
 
-    try:
-        print(f"Waiting for extension on http://127.0.0.1:{args.port}/events "
-              f"(up to {args.timeout:.0f}s)...", file=sys.stderr)
-        if not server.wait_for_extension(timeout=args.timeout):
-            print("error: no extension connected within timeout.",
-                  file=sys.stderr)
-            print("  make sure Zen is open, the extension is loaded, and a "
-                  "deepseek.com tab is available.", file=sys.stderr)
-            return 1
+    rc, result = submit_request(
+        "attach",
+        {"files": payload_files, "opts": {"delay_ms": delay_ms}},
+        timeout=args.timeout, ack_name="attach",
+        port=args.port,
+    )
 
-        batch_id = uuid.uuid4().hex[:12]
-        delay_ms = int(args.delay * 1000) if args.serial else 0
-        mode = "serial" if args.serial else "batch"
-        print(f"Extension connected. Attaching {len(payload_files)} "
-              f"file(s) in {mode} mode...", file=sys.stderr)
+    if rc == 1:
+        return 1
 
-        server.broadcast_attach(payload_files, batch_id, delay_ms=delay_ms)
-
-        try:
-            ack = server.wait_for_result(timeout=args.timeout)
-        except queue.Empty:
-            print("error: extension did not acknowledge within timeout.",
-                  file=sys.stderr)
-            return 1
-
-        if ack.get("__ack") != "attach":
-            print(f"error: unexpected response: {ack!r}", file=sys.stderr)
-            return 1
-        if ack.get("batch_id") != batch_id:
-            print(f"error: response batch_id mismatch "
-                  f"(got {ack.get('batch_id')}, expected {batch_id})",
-                  file=sys.stderr)
-            return 1
-
-        result = ack.get("result") or {}
-        success = bool(result.get("success"))
-        method = result.get("method") or "(unknown)"
+    if rc == 2:
+        print(f"Attach failed: {result.get('reason') or '(no reason given)'}",
+              file=sys.stderr)
         dispatched = int(result.get("dispatched") or 0)
         total = int(result.get("total") or len(payload_files))
         previews_before = int(result.get("previews_before") or 0)
         previews_after = int(result.get("previews_after") or 0)
-        previews_added = previews_after - previews_before
-        reason = result.get("reason")
-
-        if success:
-            print(f"Attached {dispatched}/{total} file(s) via {method}.",
-                  file=sys.stderr)
-            if previews_added > 0:
-                print(f"  {previews_added} new preview(s) rendered in the "
-                      f"chat input.", file=sys.stderr)
-            elif previews_added == 0 and total > 0:
-                print(f"  Warning: no previews appeared.  The drop was "
-                      f"accepted but DeepSeek may have rejected the file(s).",
-                      file=sys.stderr)
-            return 0
-
-        print(f"Attach failed: {reason or '(no reason given)'}",
-              file=sys.stderr)
         print(f"  dispatched: {dispatched}/{total}, "
-              f"previews added: {previews_added}", file=sys.stderr)
+              f"previews added: {previews_after - previews_before}",
+              file=sys.stderr)
         return 2
-    finally:
-        server.stop()
+
+    # rc == 0
+    method = result.get("method") or "(unknown)"
+    dispatched = int(result.get("dispatched") or 0)
+    total = int(result.get("total") or len(payload_files))
+    previews_before = int(result.get("previews_before") or 0)
+    previews_after = int(result.get("previews_after") or 0)
+    previews_added = previews_after - previews_before
+    print(f"Attached {dispatched}/{total} file(s) via {method}.",
+          file=sys.stderr)
+    if previews_added > 0:
+        print(f"  {previews_added} new preview(s) rendered in the "
+              f"chat input.", file=sys.stderr)
+    elif previews_added == 0 and total > 0:
+        print(f"  Warning: no previews appeared.  The drop was "
+              f"accepted but DeepSeek may have rejected the file(s).",
+              file=sys.stderr)
+    return 0
