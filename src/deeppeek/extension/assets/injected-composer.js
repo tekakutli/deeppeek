@@ -10,18 +10,31 @@
 // mount the submit control.
 //
 // Enter is dispatched as keydown/keypress/keyup with key=Enter.
-// DeepSeek's handler does not gate on `isTrusted`, so this works.
+// DeepSeek's handler does not gate on `isTrusted`, so this works
+// in isolation.  But third-party userscripts (notably
+// "DeepSeek Anti-recall") DO intercept Enter keydown to preserve
+// the textarea content, and that blocks DeepSeek's own submit
+// handler — the 2026-10-31 log shows the keystroke is swallowed
+// and the composer never clears.
 //
-// Stability: TIER 2 — DOM shape + the execCommand trick.  Composer
-// discovery is a priority chain (active-matches-strategy →
-// active-largest → first strategy → largest visible editable) so
-// it survives a surprising amount of DOM churn without edits.
+// v6 fix: doEnter now measures `.ds-message` count before and
+// after Enter.  Success = either the composer cleared OR a new
+// message appeared.  If neither happened within 2 * verifyMs,
+// fall back to clicking the Send button (found by aria-label /
+// title proximity to the textarea).  The message-count check is
+// what makes the fallback safe: if a new message appeared, we
+// never click Send, so no double-submit.
+//
+// Composer targeting uses a priority chain
+// (active-matches-strategy → active-largest → first strategy →
+// largest visible editable).
 //
 // Exports on `window.__dsx__`:
 //
-//   findComposer()   → {el, selector, source, active, chosen}
+//   findComposer()      → {el, selector, source, active, chosen}
+//   findSendButton()    → button element or null
 //   doType(text, opts)  → {success, composer_source, ...}
-//   doEnter(opts)       → {success, composer_cleared, ...}
+//   doEnter(opts)       → {success, composer_cleared, submitted, ...}
 //
 // Bridge entry points (defined on `window`):
 //
@@ -142,6 +155,35 @@
              active, chosen: null };
   }
 
+  // Locate the Send button near the composer.  Walks up from the
+  // textarea (up to 5 ancestors) and checks each ancestor's buttons
+  // for aria-label="Send"/"发送", title="Send"/"发送", or
+  // "send message" variants.  Used as a fallback when Enter is
+  // swallowed by a userscript; only called AFTER msgCount has been
+  // verified not to have grown, so it can't double-submit.
+  function findSendButton() {
+    const ta = document.querySelector("textarea");
+    if (!ta) return null;
+    let el = ta.parentElement;
+    for (let i = 0; i < 5 && el; i++) {
+      for (const btn of el.querySelectorAll(
+          'button, [role="button"], div[role="button"]')) {
+        const label = (btn.getAttribute("aria-label") || "")
+          .toLowerCase().trim();
+        const title = (btn.getAttribute("title") || "")
+          .toLowerCase().trim();
+        if (label === "send" || label === "发送"
+            || title === "send" || title === "发送"
+            || label === "send message" || title === "send message") {
+          const rect = btn.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) return btn;
+        }
+      }
+      el = el.parentElement;
+    }
+    return null;
+  }
+
   function setComposerValue(el, text) {
     if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
       el.focus();
@@ -182,6 +224,14 @@
     el.dispatchEvent(new KeyboardEvent("keydown", init));
     el.dispatchEvent(new KeyboardEvent("keypress", init));
     el.dispatchEvent(new KeyboardEvent("keyup", init));
+  }
+
+  function _countMessages() {
+    try {
+      return document.querySelectorAll(".ds-message").length;
+    } catch (_) {
+      return 0;
+    }
   }
 
   async function doType(text, opts) {
@@ -236,6 +286,11 @@
     };
   }
 
+  // v6: Enter now has three states checked — composer cleared,
+  // new message appeared, or neither (fall back to Send click).
+  // The message-count check is the double-submit guard: only when
+  // no new message has appeared AND the composer still has text do
+  // we touch the Send button.
   async function doEnter(opts) {
     const verifyMs = Number(opts.verify_ms) || 700;
     const found = findComposer();
@@ -259,15 +314,94 @@
       };
     }
 
+    const msgCountBefore = _countMessages();
+
     el.focus();
     pressEnter(el);
     await new Promise((r) => setTimeout(r, verifyMs));
 
-    const after = el.value ?? el.textContent ?? "";
-    const composer_cleared = after === "";
+    let after = el.value ?? el.textContent ?? "";
+    let composerCleared = after === "";
+    let msgCountAfter = _countMessages();
+    let newMessageAppeared = msgCountAfter > msgCountBefore;
+
+    if (composerCleared || newMessageAppeared) {
+      return {
+        success: true,
+        composer_selector: found.selector,
+        composer_source: found.source,
+        composer_element_info: _describeEl(el),
+        active_element_info: _describeEl(found.active),
+        value_before: before,
+        value_after: after,
+        submitted: true,
+        composer_cleared: composerCleared,
+        new_message_appeared: newMessageAppeared,
+        msg_count_before: msgCountBefore,
+        msg_count_after: msgCountAfter,
+        entered_via: "keypress",
+      };
+    }
+
+    // Second verify window — Enter can lag on slow pages or when
+    // a userscript delays the event chain.
+    await new Promise((r) => setTimeout(r, verifyMs));
+    after = el.value ?? el.textContent ?? "";
+    composerCleared = after === "";
+    msgCountAfter = _countMessages();
+    newMessageAppeared = msgCountAfter > msgCountBefore;
+
+    if (composerCleared || newMessageAppeared) {
+      return {
+        success: true,
+        composer_selector: found.selector,
+        composer_source: found.source,
+        composer_element_info: _describeEl(el),
+        active_element_info: _describeEl(found.active),
+        value_before: before,
+        value_after: after,
+        submitted: true,
+        composer_cleared: composerCleared,
+        new_message_appeared: newMessageAppeared,
+        msg_count_before: msgCountBefore,
+        msg_count_after: msgCountAfter,
+        entered_via: "keypress (delayed)",
+      };
+    }
+
+    // Enter had no effect.  Try the Send button.
+    const sendBtn = findSendButton();
+    if (sendBtn) {
+      try { sendBtn.click(); } catch (_) {}
+      await new Promise((r) => setTimeout(r, verifyMs));
+      after = el.value ?? el.textContent ?? "";
+      composerCleared = after === "";
+      msgCountAfter = _countMessages();
+      newMessageAppeared = msgCountAfter > msgCountBefore;
+
+      return {
+        success: composerCleared || newMessageAppeared,
+        composer_selector: found.selector,
+        composer_source: found.source,
+        composer_element_info: _describeEl(el),
+        active_element_info: _describeEl(found.active),
+        value_before: before,
+        value_after: after,
+        submitted: true,
+        composer_cleared: composerCleared,
+        new_message_appeared: newMessageAppeared,
+        msg_count_before: msgCountBefore,
+        msg_count_after: msgCountAfter,
+        entered_via: "send-button-fallback",
+        reason: (composerCleared || newMessageAppeared)
+          ? undefined
+          : "Send click had no effect either — userscript likely " +
+            "intercepting both Enter and Send click",
+      };
+    }
 
     return {
-      success: composer_cleared,
+      success: false,
       composer_selector: found.selector,
       composer_source: found.source,
       composer_element_info: _describeEl(el),
@@ -275,14 +409,18 @@
       value_before: before,
       value_after: after,
       submitted: true,
-      composer_cleared,
-      reason: composer_cleared
-        ? undefined
-        : "Enter fired but composer did not clear",
+      composer_cleared: false,
+      new_message_appeared: false,
+      msg_count_before: msgCountBefore,
+      msg_count_after: msgCountAfter,
+      entered_via: "keypress (no effect, no send button found)",
+      reason: "Enter fired but neither composer cleared nor new " +
+              "message appeared; no Send button found to fall back",
     };
   }
 
   window.__dsx__.findComposer = findComposer;
+  window.__dsx__.findSendButton = findSendButton;
   window.__dsx__.doType = doType;
   window.__dsx__.doEnter = doEnter;
 

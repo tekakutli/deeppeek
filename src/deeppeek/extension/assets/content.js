@@ -3,7 +3,7 @@
 // script. Also holds an open port to the background, which keeps the
 // MV3 event page alive.
 //
-// The page-world surface is split across 11 sibling scripts, loaded
+// The page-world surface is split across 12 sibling scripts, loaded
 // in dependency order with `async = false` so execution order is
 // preserved.  Each script is an IIFE that attaches to
 // `window.__dsx__`; the `__dsx_*_json` bridge entry points live on
@@ -72,6 +72,21 @@
     return true;
   }
 
+  // Zero-wait inline check for the watcher functions.  These are
+  // loaded once at content-script startup; if they aren't there by
+  // the time a watch event arrives, the extension is misinstalled
+  // (manifest missing injected-watch.js) and the only correct
+  // behaviour is to fail immediately so background.js uses its
+  // polling fallback.  Waiting 5+3 seconds here is exactly the
+  // 9.5s "pong" regression from 2026-10-31.
+  function pageWorldFn(name) {
+    try {
+      const ww = window.wrappedJSObject;
+      if (ww && typeof ww[name] === "function") return ww[name];
+    } catch (_) {}
+    return null;
+  }
+
   browser.runtime.onMessage.addListener(async (msg) => {
     if (!msg) return null;
 
@@ -92,21 +107,17 @@
       }
     }
 
-    // ---- event-driven streaming watcher (new) ----------------------
+    // ---- event-driven streaming watcher ----------------------------
     //
-    // DSX_WATCH_START spawns a MutationObserver inside the page
-    // world that POSTs watch-delta / watch-done directly to the
-    // CLI's /export endpoint.  The background script only acks the
-    // initial `watch` event; the deltas bypass it entirely, so
-    // first-token and last-token latency are both dominated by
-    // the DOM update itself rather than the polling interval.
+    // Fail fast: if the page-world watcher isn't loaded, let
+    // background.js use its polling fallback immediately.
     if (msg.type === "DSX_WATCH_START") {
-      if (!(await ensurePageWorldFn("__dsx_startWatch"))) {
+      const fn = pageWorldFn("__dsx_startWatch");
+      if (!fn) {
         return { success: false, reason: "page-world watch unavailable" };
       }
       try {
-        const json = await window.wrappedJSObject.__dsx_startWatch(
-          JSON.stringify(msg.opts || {}));
+        const json = await fn(JSON.stringify(msg.opts || {}));
         return JSON.parse(json);
       } catch (e) {
         return { success: false, reason: `watch threw: ${e.message}` };
@@ -114,15 +125,13 @@
     }
 
     if (msg.type === "DSX_WATCH_STOP") {
-      if (!(await ensurePageWorldFn("__dsx_stopWatch"))) {
-        return { success: false };
-      }
+      const fn = pageWorldFn("__dsx_stopWatch");
+      if (!fn) return { success: false, reason: "page-world watch unavailable" };
       try {
-        const json = await window.wrappedJSObject.__dsx_stopWatch(
-          JSON.stringify(msg.opts || {}));
+        const json = await fn(JSON.stringify(msg.opts || {}));
         return JSON.parse(json);
       } catch (e) {
-        return { success: false };
+        return { success: false, reason: `stop threw: ${e.message}` };
       }
     }
 

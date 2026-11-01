@@ -231,6 +231,20 @@ class BrowserBridge:
                     # that produced the 2026-10-31 "daemon saw nothing"
                     # incident — surfacing the reason turns a 120 s
                     # silence into an actionable message.
+                    if reason == "submit_failed":
+                        raise BridgeError(
+                            "submit appears to have been blocked — no "
+                            "new message appeared in the chat within "
+                            "10s of pressing Enter. Common causes:\n"
+                            "  · a userscript intercepted the Enter "
+                            "keypress (e.g. Anti-recall)\n"
+                            "  · another browser extension is "
+                            "listening on the composer\n"
+                            "  · the DeepSeek tab is not responsive\n"
+                            "Try disabling interfering userscripts, or "
+                            "reloading the DeepSeek tab (F5), then "
+                            "retry."
+                        )
                     if reason == "no_first_content":
                         raise BridgeError(
                             "model produced no output within 30s — the "

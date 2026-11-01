@@ -1,8 +1,39 @@
-"""OpenAI-compatible HTTP server — the facade aider dials into."""
+"""OpenAI-compatible HTTP server — the facade aider dials into.
+
+Retry-storm fix (2026-10-31): when the browser bridge fails (submit
+blocked, model produced no output, tab gone, etc.), the failure used
+to surface as a 500 + `server_error` SSE frame mid-stream.  Aider
+retries on that shape — but the underlying cause is *not* transient
+(submit blocked by a userscript stays blocked; a wedged model stays
+wedged), so retrying only makes things worse: each retry opens a
+fresh tab, submits, waits 10-30s, fails again.  Result: a retry
+storm.
+
+The fix is twofold:
+
+  1. `_stream_response` now BUFFERS the first content chunk before
+     committing SSE headers.  If the bridge raises during that
+     buffering window (which covers the whole submit + first-content
+     path), we can return a clean HTTP 400 with a JSON error body.
+
+  2. BridgeError → 400 + `invalid_request_error`.  Aider (and most
+     OpenAI clients) treat `invalid_request_error` as non-retriable,
+     so the storm stops.  5xx / `server_error` (which we still emit
+     for genuine bugs, mid-stream failures) remain retriable, since
+     those really *can* be transient.
+
+Once the first chunk arrives, headers are sent and the stream runs
+normally — mid-stream bridge errors still surface as SSE error
+frames (retriable, but at that point partial content has already
+been delivered, so retrying is at least defensible).
+"""
+import itertools
 import json
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from .bridge import BridgeError
 
 
 class OpenAIHandler(BaseHTTPRequestHandler):
@@ -22,7 +53,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         try:
             req = json.loads(self.rfile.read(length) or b"{}")
         except json.JSONDecodeError as e:
-            self._json(400, _error(f"bad json: {e}", "invalid_request_error"))
+            self._json(400, _error(f"bad json: {e}",
+                                   "invalid_request_error"))
             return
 
         model = req.get("model", "deepseek-web")
@@ -43,6 +75,11 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 content = self.bridge.complete(messages, model)
                 usage = _usage_estimate(messages, content)
                 self._json(200, _completion_payload(model, content, usage))
+        except BridgeError as e:
+            # Non-retriable — retrying won't help (submit blocked,
+            # model wedged, tab gone).  Return 400 with
+            # invalid_request_error so aider does not loop.
+            self._json(400, _error(str(e), "invalid_request_error"))
         except TimeoutError as e:
             self._json(504, _error(str(e), "timeout"))
         except Exception as e:
@@ -67,6 +104,27 @@ class OpenAIHandler(BaseHTTPRequestHandler):
     # ---- streaming -------------------------------------------------
 
     def _stream_response(self, model: str, messages: list[dict]):
+        # Buffer the first chunk before committing SSE headers so a
+        # BridgeError during the submit + first-content window can be
+        # reported as a clean HTTP 400 instead of a mid-stream SSE
+        # error frame (which aider treats as retriable).
+        try:
+            bridge_gen = self.bridge.stream(messages, model)
+            first = next(bridge_gen, None)
+        except BridgeError as e:
+            self._json(400, _error(str(e), "invalid_request_error"))
+            return
+        except Exception as e:
+            self._json(500, _error(str(e), "server_error"))
+            return
+
+        if first is None or first == "":
+            self._json(400, _error(
+                "model produced no output (bridge yielded nothing)",
+                "invalid_request_error",
+            ))
+            return
+
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -74,10 +132,10 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
         chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         created = int(time.time())
-        first = True
+        first_chunk = True
 
         try:
-            for delta in self.bridge.stream(messages, model):
+            for delta in itertools.chain([first], bridge_gen):
                 if not delta:
                     continue
                 chunk = {
@@ -89,12 +147,12 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                         "index": 0,
                         "delta": (
                             {"role": "assistant", "content": delta}
-                            if first else {"content": delta}
+                            if first_chunk else {"content": delta}
                         ),
                         "finish_reason": None,
                     }],
                 }
-                first = False
+                first_chunk = False
                 self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
                 self.wfile.flush()
 
@@ -118,11 +176,12 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             # start of the next request.
             return
         except Exception as e:
-            # Headers are already on the wire; can't change status.
+            # Headers already on the wire; can't change status.
             # Send an SSE error frame + [DONE] so the client sees a
             # clean end instead of a half-written response.
             try:
-                err = {"error": {"message": str(e), "type": "server_error"}}
+                err = {"error": {"message": str(e),
+                                 "type": "server_error"}}
                 self.wfile.write(f"data: {json.dumps(err)}\n\n".encode())
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
