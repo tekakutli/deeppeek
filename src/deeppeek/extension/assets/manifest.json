@@ -33,6 +33,7 @@
         "injected.js",
         "injected-idb.js",
         "injected-fiber.js",
+        "injected-watch.js",
         "injected-extract.js",
         "injected-fetch.js",
         "injected-attach.js",

@@ -669,11 +669,24 @@ function attachHandlers(es) {
   });
 
   // ---- watch (deeppeek daemon, streaming) ----
+  //
+  // Event-driven path (new): the `watch` handler acks immediately,
+  // then asks the content script to spawn a MutationObserver in the
+  // page world.  The observer fires on DOM updates (sub-millisecond),
+  // and separately watches the composer's "Stop generating" button —
+  // its disappearance is the model-finished signal, so `watch-done`
+  // fires the instant the last token renders.  Deltas are POSTed
+  // straight from the page world to /export, so they bypass this
+  // background script entirely.
+  //
+  // Fallback path (kept verbatim): if the content script cannot
+  // spawn the observer (DeepSeek UI change, extension-too-old to
+  // have injected-watch.js), the old setInterval-based poller
+  // still runs so the daemon never breaks.
   es.addEventListener("watch", async (e) => {
     let data = {};
     try { data = JSON.parse(e.data || "{}"); } catch (_) {}
     const batchId = data.batch_id;
-    const includeForked = !!data.include_forked;
     const pollInterval = Math.max(100, data.poll_interval_ms || 300);
     const settleTicks = Math.max(1, data.settle_ticks || 5);
     const maxDuration = Math.max(5000, data.max_duration_ms || 180000);
@@ -681,133 +694,7 @@ function attachHandlers(es) {
       Math.max(5000, data.first_content_timeout_ms || 30000);
     const pinnedTabId = (data.tab_id != null) ? data.tab_id : null;
 
-    let lastContent = "";
-    let stableTicks = 0;
-    let stopped = false;
-    let polling = false;
-    let timer = null;
-    let firstContentAt = null;
-    const startedAt = Date.now();
-
-    const stop = async (reason) => {
-      if (stopped) return;
-      stopped = true;
-      if (timer) { clearInterval(timer); timer = null; }
-      try {
-        await fetch(`${DSX_URL}/export`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            __ack: "watch-done",
-            batch_id: batchId,
-            reason: reason || null,
-          }),
-        });
-      } catch (_) {}
-    };
-
-    const poll = async () => {
-      if (stopped || polling) return;
-      polling = true;
-      try {
-        if (Date.now() - startedAt > maxDuration) {
-          await stop("max_duration");
-          return;
-        }
-
-        // Pin to the submit tab if provided; otherwise re-query active.
-        let tab = null;
-        if (pinnedTabId != null) {
-          try { tab = await browser.tabs.get(pinnedTabId); } catch (_) { tab = null; }
-        }
-        if (!tab) {
-          const [active] = await browser.tabs.query({
-            active: true, currentWindow: true,
-          });
-          tab = active;
-        }
-        if (!tab || !tab.url || !tab.url.startsWith("https://chat.deepseek.com/")) {
-          await stop("no_deepseek_tab");
-          return;
-        }
-
-        let resp;
-        try {
-          resp = await browser.tabs.sendMessage(tab.id, {
-            type: "DSX_EXTRACT",
-            include_forked: includeForked,
-          });
-        } catch (_) {
-          stableTicks = 0;
-          return;
-        }
-        if (!resp) { stableTicks = 0; return; }
-
-        let content = "";
-        const msgs = resp.messages || [];
-        for (let i = msgs.length - 1; i >= 0; i--) {
-          if (msgs[i].role === "assistant") {
-            content = msgs[i].content || "";
-            break;
-          }
-        }
-
-        if (content) {
-          if (firstContentAt === null) firstContentAt = Date.now();
-        } else if (firstContentAt === null
-                   && Date.now() - startedAt > firstContentTimeoutMs) {
-          // No assistant content has EVER appeared. The model did not
-          // start streaming, or its output never reached IDB / fiber.
-          // Waiting maxDuration (180s) just delays the failure.
-          await stop("no_first_content");
-          return;
-        }
-
-        if (content === lastContent) {
-          // stableTicks only counts AFTER content has appeared.
-          // Before that, "stable" means "still empty" — repeating
-          // forever is the bug this fix closes.
-          if (lastContent) stableTicks++;
-        } else if (content.startsWith(lastContent)) {
-          const delta = content.slice(lastContent.length);
-          lastContent = content;
-          stableTicks = 0;
-          if (delta) {
-            await fetch(`${DSX_URL}/export`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                __ack: "watch-delta",
-                batch_id: batchId,
-                delta,
-              }),
-            });
-          }
-        } else {
-          lastContent = content;
-          stableTicks = 0;
-          await fetch(`${DSX_URL}/export`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              __ack: "watch-rewrite",
-              batch_id: batchId,
-              content,
-            }),
-          });
-        }
-
-        if (lastContent && stableTicks >= settleTicks) {
-          await stop("settled");
-        }
-      } catch (err) {
-        console.error("DSX: watch poll error:", err);
-        await stop("poll_error");
-      } finally {
-        polling = false;
-      }
-    };
-
+    // Ack first — the daemon waits for this before consuming deltas.
     try {
       await fetch(`${DSX_URL}/export`, {
         method: "POST",
@@ -820,8 +707,136 @@ function attachHandlers(es) {
       });
     } catch (_) { return; }
 
-    timer = setInterval(poll, pollInterval);
-    poll();
+    // Find the tab (pinned or active).
+    let tab = null;
+    if (pinnedTabId != null) {
+      try { tab = await browser.tabs.get(pinnedTabId); } catch (_) {}
+    }
+    if (!tab) {
+      const [active] = await browser.tabs.query({
+        active: true, currentWindow: true,
+      });
+      tab = active;
+    }
+    if (!tab || !tab.url
+        || !tab.url.startsWith("https://chat.deepseek.com/")) {
+      try {
+        await fetch(`${DSX_URL}/export`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            __ack: "watch-done",
+            batch_id: batchId,
+            reason: "no_deepseek_tab",
+          }),
+        });
+      } catch (_) {}
+      return;
+    }
+
+    // Try the event-driven path first.
+    let started = false;
+    try {
+      const resp = await browser.tabs.sendMessage(tab.id, {
+        type: "DSX_WATCH_START",
+        opts: {
+          batch_id: batchId,
+          // settle_ms derived from the legacy (poll_interval,
+          // settle_ticks) pair so the Python side needs no changes.
+          settle_ms: Math.max(100, settleTicks * pollInterval),
+          max_duration_ms: maxDuration,
+          first_content_timeout_ms: firstContentTimeoutMs,
+        },
+      });
+      started = !!(resp && resp.success);
+    } catch (_) {}
+
+    console.log(
+      `DSX: watch via ${started ? "mutation-observer" : "polling"}`
+      + ` (batch=${batchId})`);
+
+    if (!started) {
+      // Fallback: legacy polling.  Kept verbatim so a DeepSeek UI
+      // change that breaks the observer doesn't break the daemon.
+      let lastContent = "";
+      let stableTicks = 0;
+      let stopped = false;
+      let timer = null;
+      let firstContentAt = null;
+      const startedAt = Date.now();
+
+      const pollStop = async (reason) => {
+        if (stopped) return;
+        stopped = true;
+        if (timer) { clearInterval(timer); timer = null; }
+        try {
+          await fetch(`${DSX_URL}/export`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              __ack: "watch-done",
+              batch_id: batchId, reason: reason || null,
+            }),
+          });
+        } catch (_) {}
+      };
+
+      const poll = async () => {
+        if (stopped) return;
+        if (Date.now() - startedAt > maxDuration) {
+          await pollStop("max_duration"); return;
+        }
+        let resp;
+        try {
+          resp = await browser.tabs.sendMessage(tab.id, {
+            type: "DSX_EXTRACT", include_forked: false,
+          });
+        } catch (_) { stableTicks = 0; return; }
+        if (!resp) { stableTicks = 0; return; }
+        let content = "";
+        const msgs = resp.messages || [];
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          if (msgs[i].role === "assistant") {
+            content = msgs[i].content || ""; break;
+          }
+        }
+        if (content) {
+          if (firstContentAt === null) firstContentAt = Date.now();
+        } else if (firstContentAt === null
+                   && Date.now() - startedAt > firstContentTimeoutMs) {
+          await pollStop("no_first_content"); return;
+        }
+        if (content === lastContent) {
+          if (lastContent) stableTicks++;
+        } else if (content.startsWith(lastContent)) {
+          const delta = content.slice(lastContent.length);
+          lastContent = content; stableTicks = 0;
+          if (delta) {
+            await fetch(`${DSX_URL}/export`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                __ack: "watch-delta", batch_id: batchId, delta,
+              }),
+            });
+          }
+        } else {
+          lastContent = content; stableTicks = 0;
+          await fetch(`${DSX_URL}/export`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              __ack: "watch-rewrite", batch_id: batchId, content,
+            }),
+          });
+        }
+        if (lastContent && stableTicks >= settleTicks) {
+          await pollStop("settled");
+        }
+      };
+      timer = setInterval(poll, pollInterval);
+      poll();
+    }
   });
 
   es.onopen = () => {

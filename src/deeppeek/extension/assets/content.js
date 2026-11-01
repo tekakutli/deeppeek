@@ -20,6 +20,7 @@
     "injected.js",          // bootstrap: __dsx__, config, helpers
     "injected-idb.js",      // T1: IndexedDB schema
     "injected-fiber.js",    // T2: React fiber walk (fallback)
+    "injected-watch.js",    // T2: MutationObserver streaming watcher
     "injected-extract.js",  // T2: extraction orchestrator
     "injected-fetch.js",    // T1: signed-URL → bytes
     "injected-attach.js",   // T2: drop / file-input attach
@@ -88,6 +89,40 @@
       } catch (e) {
         console.error("DSX: extraction threw:", e);
         return null;
+      }
+    }
+
+    // ---- event-driven streaming watcher (new) ----------------------
+    //
+    // DSX_WATCH_START spawns a MutationObserver inside the page
+    // world that POSTs watch-delta / watch-done directly to the
+    // CLI's /export endpoint.  The background script only acks the
+    // initial `watch` event; the deltas bypass it entirely, so
+    // first-token and last-token latency are both dominated by
+    // the DOM update itself rather than the polling interval.
+    if (msg.type === "DSX_WATCH_START") {
+      if (!(await ensurePageWorldFn("__dsx_startWatch"))) {
+        return { success: false, reason: "page-world watch unavailable" };
+      }
+      try {
+        const json = await window.wrappedJSObject.__dsx_startWatch(
+          JSON.stringify(msg.opts || {}));
+        return JSON.parse(json);
+      } catch (e) {
+        return { success: false, reason: `watch threw: ${e.message}` };
+      }
+    }
+
+    if (msg.type === "DSX_WATCH_STOP") {
+      if (!(await ensurePageWorldFn("__dsx_stopWatch"))) {
+        return { success: false };
+      }
+      try {
+        const json = await window.wrappedJSObject.__dsx_stopWatch(
+          JSON.stringify(msg.opts || {}));
+        return JSON.parse(json);
+      } catch (e) {
+        return { success: false };
       }
     }
 
