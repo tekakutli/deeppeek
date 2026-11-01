@@ -117,6 +117,17 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             # times out on its own; queued deltas are drained at the
             # start of the next request.
             return
+        except Exception as e:
+            # Headers are already on the wire; can't change status.
+            # Send an SSE error frame + [DONE] so the client sees a
+            # clean end instead of a half-written response.
+            try:
+                err = {"error": {"message": str(e), "type": "server_error"}}
+                self.wfile.write(f"data: {json.dumps(err)}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
     def _json(self, code: int, payload: dict):
         body = json.dumps(payload).encode()

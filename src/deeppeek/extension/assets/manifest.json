@@ -9,7 +9,7 @@
       "strict_min_version": "115.0"
     }
   },
-  "permissions": ["scripting", "activeTab", "storage"],
+  "permissions": ["scripting", "activeTab", "storage", "contextualIdentities", "cookies"],
   "host_permissions": [
     "https://chat.deepseek.com/*",
     "http://127.0.0.1/*"

@@ -27,7 +27,23 @@ def register(sub: argparse._SubParsersAction) -> None:
              "new one per request.  WARNING: the model sees the "
              "tab's prior conversation as context — usually NOT "
              "what you want with aider, which resends full history "
-             "in each request.  Default: fresh tab per request.",
+             "in each request.  Default: fresh tab per request.  "
+             "Incompatible with --container / --container-id (no "
+             "new tab is opened, so no container to select).",
+    )
+    p.add_argument(
+        "--container", default=None, metavar="NAME",
+        help="open new DeepSeek tabs inside the Firefox/Zen "
+             "Container Tab whose display name matches NAME "
+             "(case-insensitive; exact match preferred).  Mutually "
+             "exclusive with --container-id and --reuse-tab.",
+    )
+    p.add_argument(
+        "--container-id", default=None, metavar="COOKIE_STORE_ID",
+        help="open new DeepSeek tabs inside the container with this "
+             "raw cookieStoreId (e.g. 'firefox-container-3').  "
+             "Skips the name lookup.  Mutually exclusive with "
+             "--container and --reuse-tab.",
     )
     p.add_argument(
         "--tab-wait", type=float, default=2.0,
@@ -43,6 +59,38 @@ def register(sub: argparse._SubParsersAction) -> None:
 
 
 def run(args: argparse.Namespace) -> int:
+    # ---- argument validation (before any resources are bound) ----
+    #
+    # Container flags were added alongside the same flags on
+    # `prompt new`.  Three failure modes need to be caught here
+    # rather than silently ignored:
+    #
+    #   · --container and --container-id together
+    #   · either flag with an empty / whitespace-only value
+    #   · either flag with --reuse-tab (no new tab is opened, so
+    #     the container choice has nowhere to go)
+    #
+    # All return exit code 3, matching the argument-error convention
+    # in `prompt new`, `capture`, and `recover`.
+    if args.container is not None and args.container_id is not None:
+        print("error: --container and --container-id are mutually "
+              "exclusive", file=sys.stderr)
+        return 3
+    if args.container is not None and not args.container.strip():
+        print("error: --container is empty (whitespace-only)",
+              file=sys.stderr)
+        return 3
+    if args.container_id is not None and not args.container_id.strip():
+        print("error: --container-id is empty (whitespace-only)",
+              file=sys.stderr)
+        return 3
+    if ((args.container is not None or args.container_id is not None)
+            and args.reuse_tab):
+        print("error: --container/--container-id cannot be combined "
+              "with --reuse-tab (no new tab is opened, so there is "
+              "no container to select)", file=sys.stderr)
+        return 3
+
     try:
         ext = ExportServer(port=args.extension_port)
         ext.start()
@@ -80,6 +128,8 @@ def run(args: argparse.Namespace) -> int:
             ext,
             new_tab=not args.reuse_tab,
             tab_wait=args.tab_wait,
+            container=args.container,
+            container_id=args.container_id,
         )
 
         base = f"http://127.0.0.1:{args.port}/v1"
@@ -88,6 +138,17 @@ def run(args: argparse.Namespace) -> int:
             f"[daemon] OpenAI-compatible endpoint ready: {base}",
             file=sys.stderr,
         )
+        if args.container:
+            print(
+                f"[daemon] new tabs in container: {args.container}",
+                file=sys.stderr,
+            )
+        elif args.container_id:
+            print(
+                f"[daemon] new tabs in container-id: "
+                f"{args.container_id}",
+                file=sys.stderr,
+            )
         print(f"[daemon]   export OPENAI_API_BASE={base}", file=sys.stderr)
         print(f"[daemon]   export OPENAI_API_KEY=dummy", file=sys.stderr)
         print(

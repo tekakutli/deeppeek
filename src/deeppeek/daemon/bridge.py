@@ -35,6 +35,8 @@ class BrowserBridge:
         poll_interval_ms: int = 300,
         settle_ticks: int = 5,
         max_duration_ms: int = 180_000,
+        container: str | None = None,
+        container_id: str | None = None,
     ):
         self.server = server
         self.new_tab = new_tab
@@ -42,7 +44,17 @@ class BrowserBridge:
         self.poll_interval_ms = poll_interval_ms
         self.settle_ticks = settle_ticks
         self.max_duration_ms = max_duration_ms
+        # Container selection for freshly-opened tabs.  Both are
+        # None by default (open in the browser's default container).
+        # Only `new_tab=True` runs make use of them; with
+        # `new_tab=False` (--reuse-tab) the current tab is reused
+        # and its container is whatever it already is.
+        self.container = container
+        self.container_id = container_id
         self._lock = threading.Lock()
+        # Set by _prepare_tab; passed to submit/watch so they pin to
+        # the same tab even if the user switches windows mid-request.
+        self.tab_id: int | None = None
 
     # ---- public ----------------------------------------------------
 
@@ -54,6 +66,10 @@ class BrowserBridge:
         """Generator of content deltas."""
         with self._lock:
             self._drain_queue()
+            # Reset per-request state: a previous request's tab_id
+            # must not leak into this one (different request, likely
+            # different tab).
+            self.tab_id = None
             try:
                 self._prepare_tab()
                 prompt = serialize_messages(messages)
@@ -77,13 +93,46 @@ class BrowserBridge:
     def _prepare_tab(self) -> None:
         if not self.new_tab:
             return
-        print("[daemon] opening new DeepSeek tab", file=sys.stderr)
-        self._call(
+
+        payload: dict = {"url": "https://chat.deepseek.com/"}
+        if self.container is not None:
+            payload["container"] = self.container
+        if self.container_id is not None:
+            payload["container_id"] = self.container_id
+
+        container_desc = ""
+        if self.container:
+            container_desc = f" in container {self.container!r}"
+        elif self.container_id:
+            container_desc = f" in container-id {self.container_id!r}"
+        print(f"[daemon] opening new DeepSeek tab{container_desc}",
+              file=sys.stderr)
+
+        result = self._call(
             "open-tab",
-            {"url": "https://chat.deepseek.com/"},
+            payload,
             ack="open-tab",
             timeout=TAB_OPEN_TIMEOUT,
         )
+        # The extension acks with `success: false` when, e.g., the
+        # requested container name doesn't resolve or matches more
+        # than one container.  Before this check, the daemon
+        # proceeded with `tab_id = None` and later fell back to
+        # "active tab" semantics in submit/watch — silently using
+        # whichever DeepSeek tab the user happened to have focused,
+        # possibly outside the requested container.  Raising here
+        # surfaces the extension's own reason directly.
+        if not result.get("success"):
+            raise BridgeError(
+                f"open-tab failed: "
+                f"{result.get('reason') or '(no reason)'}"
+            )
+        self.tab_id = result.get("tab_id")
+        cs_id = result.get("cookie_store_id")
+        detail = f"tab {self.tab_id} -> {result.get('url')}"
+        if cs_id:
+            detail += f"  (container: {cs_id})"
+        print(f"[daemon] opened {detail}", file=sys.stderr)
         if self.tab_wait > 0:
             print(
                 f"[daemon] waiting {self.tab_wait:.1f}s for tab load",
@@ -93,6 +142,9 @@ class BrowserBridge:
 
     def _submit(self, prompt: str) -> None:
         print(f"[daemon] submitting {len(prompt):,} chars", file=sys.stderr)
+        payload = {"text": prompt}
+        if self.tab_id is not None:
+            payload["tab_id"] = self.tab_id
         last_error: Exception | None = None
         for attempt in range(3):
             if attempt > 0:
@@ -102,7 +154,7 @@ class BrowserBridge:
                 )
             try:
                 result = self._call(
-                    "submit", {"text": prompt},
+                    "submit", payload,
                     ack="submit", timeout=SUBMIT_TIMEOUT,
                 )
             except BridgeError as e:
@@ -118,13 +170,17 @@ class BrowserBridge:
     def _watch(self):
         batch_id = uuid.uuid4().hex[:12]
         print("[daemon] starting watch", file=sys.stderr)
-        self.server._broadcast("watch", {
+        watch_payload = {
             "batch_id": batch_id,
             "include_forked": False,
             "poll_interval_ms": self.poll_interval_ms,
             "settle_ticks": self.settle_ticks,
             "max_duration_ms": self.max_duration_ms,
-        })
+            "first_content_timeout_ms": 30000,
+        }
+        if self.tab_id is not None:
+            watch_payload["tab_id"] = self.tab_id
+        self.server._broadcast("watch", watch_payload)
 
         # Wait for the watch start ack.
         deadline = time.monotonic() + WATCH_START_TIMEOUT
@@ -167,14 +223,39 @@ class BrowserBridge:
                 total += len(content)
                 yield content
             elif ack == "watch-done":
+                reason = msg.get("reason")
                 if total == 0:
+                    # Distinguish real causes so the caller (and the
+                    # user reading stderr) knows what went wrong.  A
+                    # silent zero-char success is the failure shape
+                    # that produced the 2026-10-31 "daemon saw nothing"
+                    # incident — surfacing the reason turns a 120 s
+                    # silence into an actionable message.
+                    if reason == "no_first_content":
+                        raise BridgeError(
+                            "model produced no output within 30s — the "
+                            "prompt may not have been submitted, or the "
+                            "web UI is not streaming to IndexedDB. "
+                            "Check the tab."
+                        )
+                    if reason == "no_deepseek_tab":
+                        raise BridgeError(
+                            "the DeepSeek tab closed or navigated away "
+                            "mid-watch"
+                        )
+                    if reason == "poll_error":
+                        raise BridgeError(
+                            "watch poll errored — see browser console"
+                        )
                     print(
-                        "[daemon] WARNING: model returned empty response",
+                        f"[daemon] WARNING: watch done with 0 chars "
+                        f"(reason={reason!r})",
                         file=sys.stderr,
                     )
                 else:
                     print(
-                        f"[daemon] watch done ({total:,} chars)",
+                        f"[daemon] watch done ({total:,} chars, "
+                        f"reason={reason!r})",
                         file=sys.stderr,
                     )
                 return

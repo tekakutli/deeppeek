@@ -45,6 +45,26 @@ Two decisions the earlier draft got wrong, corrected here:
    `--guidance TEXT` overrides just the substituted string, and
    `--guidance-words N` overrides just the word limit.
 
+CONTAINER TABS
+==============
+`--container NAME` opens the fresh tab inside the Firefox/Zen
+Container Tab whose display name matches NAME (case-insensitive;
+exact match preferred).  `--container-id COOKIE_STORE_ID` takes a
+raw cookieStoreId (e.g. `firefox-container-3`) and skips the
+name lookup.  Both are threaded into the same `open-tab` event
+that `deeppeek prompt new` uses, so the extension resolves the
+name the same way — via `browser.contextualIdentities.query`,
+which requires the `contextualIdentities` permission.
+
+`resume` always needs the extension (it can't attach files or
+type without it), so unlike `prompt new` there is no
+direct-launch fallback that could silently open in the default
+container.  If the extension is unreachable, the run fails — the
+container flag never has to be second-guessed.  If the container
+name doesn't resolve, the extension acks with `success: false`,
+the error names the reason, and resume exits with code 2 (same
+path as any other open-tab failure).
+
 PLACEHOLDER DEFENCE
 ===================
 A recurring failure mode: this file's own docstring (or a test
@@ -661,9 +681,26 @@ def _stage_emit(files: list[Path], text: str,
             return 1
 
         # ---- open new tab ----
-        print(f"[new-tab] opening {args.url}", file=sys.stderr)
+        #
+        # Container args are threaded into the same `open-tab` payload
+        # that `deeppeek prompt new` uses, so the extension resolves
+        # the name via contextualIdentities.query and passes the
+        # resulting cookieStoreId to browser.tabs.create.
+        open_tab_payload: dict = {"url": args.url}
+        if getattr(args, "container", None) is not None:
+            open_tab_payload["container"] = args.container
+        if getattr(args, "container_id", None) is not None:
+            open_tab_payload["container_id"] = args.container_id
+
+        target_desc = args.url
+        if getattr(args, "container", None):
+            target_desc += f"  (container: {args.container})"
+        elif getattr(args, "container_id", None):
+            target_desc += f"  (container-id: {args.container_id})"
+        print(f"[new-tab] opening {target_desc}", file=sys.stderr)
+
         rc, result = broadcast_and_wait(
-            server, "open-tab", {"url": args.url},
+            server, "open-tab", open_tab_payload,
             timeout=args.tab_timeout, ack_name="open-tab",
         )
         if rc != 0:
@@ -671,7 +708,11 @@ def _stage_emit(files: list[Path], text: str,
             print(f"error: open-tab failed: {reason}",
                   file=sys.stderr)
             return rc
-        print(f"  OK - tab {result.get('tab_id')}", file=sys.stderr)
+        cs_id = result.get("cookie_store_id")
+        detail = f"tab {result.get('tab_id')}"
+        if cs_id:
+            detail += f", container={cs_id}"
+        print(f"  OK - {detail}", file=sys.stderr)
 
         # ---- wait for content script ----
         print(f"[wait] {args.tab_wait:.1f}s for tab load...",
@@ -791,6 +832,20 @@ def _build_text(args: argparse.Namespace,
 # ---------------------------------------------------------------------------
 
 def run(args: argparse.Namespace) -> int:
+    # ---- argument validation (before any resources are created) ----
+    if args.container is not None and args.container_id is not None:
+        print("error: --container and --container-id are mutually "
+              "exclusive", file=sys.stderr)
+        return 3
+    if args.container is not None and not args.container.strip():
+        print("error: --container is empty (whitespace-only)",
+              file=sys.stderr)
+        return 3
+    if args.container_id is not None and not args.container_id.strip():
+        print("error: --container-id is empty (whitespace-only)",
+              file=sys.stderr)
+        return 3
+
     attach_dir = Path(tempfile.mkdtemp(
         prefix="deeppeek_resume_attach_"))
     try:
@@ -860,7 +915,12 @@ def run(args: argparse.Namespace) -> int:
 
         # 4. Dry-run or emit.
         if args.dry_run:
-            print(f"\n[dry-run] would open: {args.url}",
+            target = args.url
+            if args.container:
+                target += f"  (container: {args.container})"
+            elif args.container_id:
+                target += f"  (container-id: {args.container_id})"
+            print(f"\n[dry-run] would open: {target}",
                   file=sys.stderr)
             for f in all_files:
                 try:
@@ -932,6 +992,21 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--url", default=DEFAULT_URL,
         help=f"URL for the new tab (default: {DEFAULT_URL})",
+    )
+    p.add_argument(
+        "--container", default=None, metavar="NAME",
+        help="open the new tab inside the Firefox/Zen Container Tab "
+             "whose display name matches NAME (case-insensitive; "
+             "exact match preferred).  Mutually exclusive with "
+             "--container-id.",
+    )
+    p.add_argument(
+        "--container-id", default=None, metavar="COOKIE_STORE_ID",
+        help="open the new tab inside the container with this raw "
+             "cookieStoreId (e.g. 'firefox-container-3').  Skips "
+             "the name lookup — useful when multiple containers "
+             "share a display name, or for scripting.  Mutually "
+             "exclusive with --container.",
     )
     p.add_argument("--port", type=int, default=8765,
                    help="extension SSE port (default: 8765)")

@@ -193,24 +193,117 @@ function attachHandlers(es) {
     } catch (_) {}
   });
 
-  // ---- open-tab (deeppeek prompt new) ----
+  // ---- open-tab (deeppeek prompt new / daemon) ----
+  //
+  // Optional container support: the payload may include
+  //
+  //   `container`     — display name.  Resolved via
+  //                     contextualIdentities.query({}) and matched
+  //                     case-insensitively; exact match preferred.
+  //                     Ambiguous case-insensitive matches error
+  //                     out so the user can disambiguate with
+  //                     `container_id`.
+  //   `container_id`  — raw cookieStoreId (e.g. 'firefox-container-3').
+  //                     Passed straight to tabs.create; no lookup.
+  //                     Escape hatch for when the display name is
+  //                     ambiguous or for scripting.
+  //
+  // If neither is set, the tab opens in the default container
+  // (backward-compatible with the pre-container behaviour — the
+  // daemon uses the same event and keeps working unchanged).
   es.addEventListener("open-tab", async (e) => {
     let data = {};
     try { data = JSON.parse(e.data || "{}"); } catch (_) {}
     const batchId = data.batch_id;
     const url = data.url || "https://chat.deepseek.com/";
+    const containerName = data.container || null;
+    const containerId = data.container_id || null;
 
-    console.log(`DSX: open-tab received (batch=${batchId}, url=${url})`);
+    console.log(
+      `DSX: open-tab received (batch=${batchId}, url=${url}, ` +
+      `container=${containerName || containerId || "default"})`);
 
-    let result = { success: false, reason: "tabs.create threw" };
+    let result;
     try {
-      const tab = await browser.tabs.create({ url, active: true });
-      result = { success: true, tab_id: tab.id, url: tab.url || url };
+      // ---- step 1: resolve cookieStoreId ----
+      let cookieStoreId = null;
+      if (containerId) {
+        // Direct — the caller passed a raw cookieStoreId.  Trust
+        // it; an invalid value throws from tabs.create below.
+        cookieStoreId = containerId;
+      } else if (containerName) {
+        if (!browser.contextualIdentities) {
+          result = {
+            success: false,
+            reason:
+              "container tabs unavailable in this browser " +
+              "(no contextualIdentities API)",
+          };
+        } else {
+          const all = await browser.contextualIdentities.query({});
+          const exact = all.filter(c => c.name === containerName);
+          const needle = containerName.toLowerCase();
+          const ci = all.filter(
+            c => c.name.toLowerCase() === needle);
+
+          let matched = null;
+          if (exact.length === 1) {
+            matched = exact[0];
+          } else if (ci.length === 1) {
+            matched = ci[0];
+          } else if (ci.length > 1 || exact.length > 1) {
+            const names = (exact.length ? exact : ci)
+              .map(c => JSON.stringify(c.name)).join(", ");
+            result = {
+              success: false,
+              reason:
+                `multiple containers match ` +
+                `${JSON.stringify(containerName)} (${names}); ` +
+                `use --container-id to disambiguate`,
+            };
+          } else {
+            const available = all
+              .map(c => JSON.stringify(c.name)).join(", ");
+            result = {
+              success: false,
+              reason:
+                `no container named ` +
+                `${JSON.stringify(containerName)}` +
+                (available
+                  ? ` (available: ${available})`
+                  : ` (no containers defined in this profile)`),
+            };
+          }
+          if (matched) {
+            cookieStoreId = matched.cookieStoreId;
+            console.log(
+              `DSX: resolved container ` +
+              `${JSON.stringify(containerName)} -> ${cookieStoreId}`);
+          }
+        }
+      }
+
+      // ---- step 2: create the tab (only if step 1 didn't fail) ----
+      if (!result) {
+        const createProps = { url, active: true };
+        if (cookieStoreId) createProps.cookieStoreId = cookieStoreId;
+        const tab = await browser.tabs.create(createProps);
+        result = {
+          success: true,
+          tab_id: tab.id,
+          url: tab.url || url,
+        };
+        if (cookieStoreId) result.cookie_store_id = cookieStoreId;
+      }
     } catch (err) {
-      result = {
-        success: false,
-        reason: `tabs.create threw: ${err.message}`,
-      };
+      // Only overwrite if we haven't already set a specific failure
+      // (e.g. contextualIdentities.query threw after we set a reason).
+      if (!result) {
+        result = {
+          success: false,
+          reason: `open-tab threw: ${err.message || err}`,
+        };
+      }
     }
 
     console.log(`DSX: open-tab result (batch=${batchId}):`, result);
@@ -480,10 +573,6 @@ function attachHandlers(es) {
   });
 
   // ---- submit (deeppeek daemon, atomic clear+type+enter) ----
-  //
-  // Combines three existing events into one round-trip.  The three
-  // sub-results are returned in the ack so the bridge can see which
-  // step failed if the overall success is false.
   es.addEventListener("submit", async (e) => {
     let data = {};
     try { data = JSON.parse(e.data || "{}"); } catch (_) {}
@@ -492,9 +581,21 @@ function attachHandlers(es) {
 
     let result = { success: false, reason: "no active deepseek tab" };
     try {
-      const [tab] = await browser.tabs.query({
-        active: true, currentWindow: true,
-      });
+      // Pin to the daemon-supplied tab_id when present. Without this,
+      // "active tab" semantics can drift between submit and watch if
+      // the user switches tabs — the watch would then watch a
+      // different conversation.
+      let tab = null;
+      if (data.tab_id != null) {
+        try { tab = await browser.tabs.get(data.tab_id); } catch (_) { tab = null; }
+      }
+      if (!tab) {
+        const [active] = await browser.tabs.query({
+          active: true, currentWindow: true,
+        });
+        tab = active;
+      }
+
       if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
         const clear = await browser.tabs.sendMessage(tab.id, {
           type: "DSX_CLEAR", opts: {},
@@ -502,13 +603,51 @@ function attachHandlers(es) {
         const type = await browser.tabs.sendMessage(tab.id, {
           type: "DSX_TYPE", text, opts: { skip_verify: true },
         });
-        const enter = await browser.tabs.sendMessage(tab.id, {
-          type: "DSX_ENTER", opts: { verify_ms: 300 },
-        });
+
+        // Enter is FIRE-AND-FORGET for submit purposes. We cannot
+        // reliably distinguish "submitted" from "composer still
+        // clearing on a slow network" via DOM state within any fixed
+        // timeout. Treating a fired Enter as failure caused the
+        // 2026-10-31 double-submit incident: enter fired, composer
+        // hadn't cleared within 300ms, submit retried, enter fired
+        // AGAIN — a second identical prompt. The watch is the source
+        // of truth for "did content appear"; submit just needs to
+        // guarantee the keys were dispatched.
+        let enter = null;
+        let enterOk = false;
+        try {
+          enter = await browser.tabs.sendMessage(tab.id, {
+            type: "DSX_ENTER", opts: { verify_ms: 1500 },
+          });
+          // doEnter sets `submitted: true` once keys are dispatched;
+          // `success` is `composer_cleared`, which we deliberately
+          // ignore here.
+          enterOk = !!(enter && enter.submitted !== false);
+        } catch (err) {
+          enter = {
+            success: false, submitted: false,
+            reason: `sendMessage threw: ${err.message}`,
+          };
+          enterOk = false;
+        }
+
+        // Per-step failure reasons so the daemon log names the step
+        // instead of saying "(no reason)".
+        const failures = [];
+        if (!(clear && clear.success)) {
+          failures.push(`clear: ${(clear && clear.reason) || "failed"}`);
+        }
+        if (!(type && type.success)) {
+          failures.push(`type: ${(type && type.reason) || "failed"}`);
+        }
+        if (!enterOk) {
+          failures.push(`enter: ${(enter && enter.reason) || "not dispatched"}`);
+        }
+
         result = {
-          success: !!(clear && clear.success
-                      && type && type.success
-                      && enter && enter.success),
+          success: failures.length === 0,
+          reason: failures.length ? failures.join("; ") : undefined,
+          tab_id: tab.id,
           clear, type, enter,
         };
       }
@@ -530,17 +669,6 @@ function attachHandlers(es) {
   });
 
   // ---- watch (deeppeek daemon, streaming) ----
-  //
-  // Keeps a poll loop inside the extension (direct IDB access, no
-  // per-poll HTTP round-trip to the daemon).  Emits one `watch-delta`
-  // per content growth, a `watch-rewrite` when the message is
-  // replaced wholesale (rare), and `watch-done` on stability or
-  // timeout.
-  //
-  // The `polling` guard prevents overlapping polls when a poll takes
-  // longer than `pollInterval` (extract is fast, but let's be safe).
-  // `maxDuration` is a safety net: a watch that never sees content
-  // never settles, so it needs an absolute ceiling.
   es.addEventListener("watch", async (e) => {
     let data = {};
     try { data = JSON.parse(e.data || "{}"); } catch (_) {}
@@ -549,15 +677,19 @@ function attachHandlers(es) {
     const pollInterval = Math.max(100, data.poll_interval_ms || 300);
     const settleTicks = Math.max(1, data.settle_ticks || 5);
     const maxDuration = Math.max(5000, data.max_duration_ms || 180000);
+    const firstContentTimeoutMs =
+      Math.max(5000, data.first_content_timeout_ms || 30000);
+    const pinnedTabId = (data.tab_id != null) ? data.tab_id : null;
 
     let lastContent = "";
     let stableTicks = 0;
     let stopped = false;
     let polling = false;
     let timer = null;
+    let firstContentAt = null;
     const startedAt = Date.now();
 
-    const stop = async () => {
+    const stop = async (reason) => {
       if (stopped) return;
       stopped = true;
       if (timer) { clearInterval(timer); timer = null; }
@@ -565,7 +697,11 @@ function attachHandlers(es) {
         await fetch(`${DSX_URL}/export`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ __ack: "watch-done", batch_id: batchId }),
+          body: JSON.stringify({
+            __ack: "watch-done",
+            batch_id: batchId,
+            reason: reason || null,
+          }),
         });
       } catch (_) {}
     };
@@ -575,16 +711,26 @@ function attachHandlers(es) {
       polling = true;
       try {
         if (Date.now() - startedAt > maxDuration) {
-          await stop();
+          await stop("max_duration");
           return;
         }
-        const [tab] = await browser.tabs.query({
-          active: true, currentWindow: true,
-        });
+
+        // Pin to the submit tab if provided; otherwise re-query active.
+        let tab = null;
+        if (pinnedTabId != null) {
+          try { tab = await browser.tabs.get(pinnedTabId); } catch (_) { tab = null; }
+        }
+        if (!tab) {
+          const [active] = await browser.tabs.query({
+            active: true, currentWindow: true,
+          });
+          tab = active;
+        }
         if (!tab || !tab.url || !tab.url.startsWith("https://chat.deepseek.com/")) {
-          await stop();
+          await stop("no_deepseek_tab");
           return;
         }
+
         let resp;
         try {
           resp = await browser.tabs.sendMessage(tab.id, {
@@ -592,8 +738,6 @@ function attachHandlers(es) {
             include_forked: includeForked,
           });
         } catch (_) {
-          // Tab may still be loading (or no session ID yet on a
-          // fresh tab).  Not fatal; keep polling until maxDuration.
           stableTicks = 0;
           return;
         }
@@ -608,7 +752,21 @@ function attachHandlers(es) {
           }
         }
 
+        if (content) {
+          if (firstContentAt === null) firstContentAt = Date.now();
+        } else if (firstContentAt === null
+                   && Date.now() - startedAt > firstContentTimeoutMs) {
+          // No assistant content has EVER appeared. The model did not
+          // start streaming, or its output never reached IDB / fiber.
+          // Waiting maxDuration (180s) just delays the failure.
+          await stop("no_first_content");
+          return;
+        }
+
         if (content === lastContent) {
+          // stableTicks only counts AFTER content has appeared.
+          // Before that, "stable" means "still empty" — repeating
+          // forever is the bug this fix closes.
           if (lastContent) stableTicks++;
         } else if (content.startsWith(lastContent)) {
           const delta = content.slice(lastContent.length);
@@ -626,9 +784,6 @@ function attachHandlers(es) {
             });
           }
         } else {
-          // Rewrite — message changed non-extending.  Emit the
-          // full content as a rewrite marker; the Python side logs
-          // it and passes it through.
           lastContent = content;
           stableTicks = 0;
           await fetch(`${DSX_URL}/export`, {
@@ -643,11 +798,11 @@ function attachHandlers(es) {
         }
 
         if (lastContent && stableTicks >= settleTicks) {
-          await stop();
+          await stop("settled");
         }
       } catch (err) {
         console.error("DSX: watch poll error:", err);
-        await stop();
+        await stop("poll_error");
       } finally {
         polling = false;
       }
@@ -663,9 +818,7 @@ function attachHandlers(es) {
           result: { success: true },
         }),
       });
-    } catch (_) {
-      return;
-    }
+    } catch (_) { return; }
 
     timer = setInterval(poll, pollInterval);
     poll();
