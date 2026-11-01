@@ -20,11 +20,22 @@ The second form is what eliminates the port-8765 serialisation
 between `pipe` and `type` that the subprocess-based prompts
 inherit.
 
-`submit_request` is the new top-level dispatch helper: it tries to
-route through a running `deeppeek daemon` on the target port (via
-`POST /internal/relay`) before falling back to opening its own
-`ExportServer`.  That fallback is what keeps the CLI commands
-working when no daemon is running.
+`submit_request` is the top-level dispatch helper used by `type`,
+`enter`, `pipe`, and `prompt split`.  It first tries a running
+`deeppeek daemon` via `POST /internal/relay` on the daemon's
+extension port (default 8767 — matching `daemon/cli.py`'s
+`--extension-port` default).  If the daemon is up but has no
+extension connection on that port, or if it's not running at all,
+it falls back to opening a local `ExportServer` on the CLI port
+(default 8765).
+
+Why 8767 and not 8765: the daemon deliberately binds its own port
+so the CLI can run side-by-side with it.  The extension dials both
+(`DSX_PORTS = [8765, 8767]` in `background.js`), which means a CLI
+command that falls back to 8765 always finds a live SSE connection,
+and a CLI command that finds the daemon up on 8767 rides its
+already-connected SSE — saving `ExportServer.start()` plus the
+extension-reconnect wait on the CLI side.
 """
 
 import json as _json
@@ -37,6 +48,12 @@ import uuid
 from contextlib import contextmanager
 
 from ..capture.server import ExportServer
+
+
+# Daemon's default extension-SSE port.  Must match
+# `daemon/cli.py`'s `--extension-port` default.  The CLI's own
+# default extension port is 8765 (see `composer_session`).
+DEFAULT_DAEMON_PORT = 8767
 
 
 @contextmanager
@@ -189,8 +206,13 @@ def _try_daemon_relay(
     """POST one event to a running daemon's /internal/relay.
 
     Returns:
-      None           — no daemon on `port` (ConnectionRefused);
-                       caller must open a local ExportServer.
+      None           — the caller must fall back to a local
+                       ExportServer.  Two cases:
+                         · no daemon on `port` (ConnectionRefused)
+                         · daemon is up but its SSE port has no
+                           connected extension client — the CLI
+                           should try its own port (8765), which
+                           the extension also dials.
       (rc, result)   — daemon answered with a final result.
                        rc uses broadcast_and_wait semantics.
     """
@@ -226,8 +248,17 @@ def _try_daemon_relay(
         return 1, {}
 
     if not data.get("ok"):
-        print(f"error: daemon relay: {data.get('error')}",
-              file=sys.stderr)
+        err = data.get("error") or ""
+        # The daemon answered but its SSE port has no extension
+        # client.  Legitimate reason to fall back: the extension's
+        # retryAfter can be non-zero on 8767 while its 8765 stream
+        # is still live, so opening a local ExportServer on 8765 is
+        # exactly the right move.  If both ports are dead, the
+        # fallback's own wait_for_extension() will time out and
+        # surface a clear "no extension connected" error.
+        if "no extension connected" in err:
+            return None
+        print(f"error: daemon relay: {err}", file=sys.stderr)
         return 1, {}
 
     ack = data.get("ack") or {}
@@ -250,16 +281,21 @@ def submit_request(
     timeout: float,
     ack_name: str,
     port: int = 8765,
+    daemon_port: int = DEFAULT_DAEMON_PORT,
 ) -> tuple[int, dict]:
     """Send one event to the extension.
 
-    Uses a running `deeppeek daemon` on `port` if present (relay).
-    Otherwise opens a local ExportServer on `port` — today's
-    behaviour.  Return value matches broadcast_and_wait.
+    Tries a running `deeppeek daemon` on `daemon_port` (default 8767,
+    matching `daemon/cli.py`'s `--extension-port` default).  Falls
+    back to opening a local ExportServer on `port` (default 8765) —
+    the CLI path, and what keeps the CLI working when no daemon is
+    running.
+
+    Return value matches `broadcast_and_wait`.
     """
     relay = _try_daemon_relay(
         event_name, payload,
-        timeout=timeout, ack_name=ack_name, port=port,
+        timeout=timeout, ack_name=ack_name, port=daemon_port,
     )
     if relay is not None:
         return relay

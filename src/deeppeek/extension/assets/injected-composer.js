@@ -236,7 +236,7 @@
 
   async function doType(text, opts) {
     const skipVerify = !!(opts && opts.skip_verify);
-    const settleMs = skipVerify ? 0 : (Number(opts.settle_ms) || 300);
+    const settleMs = skipVerify ? 0 : (Number(opts.settle_ms) || 150);
     const found = findComposer();
     const el = found.el;
     if (!el) {
