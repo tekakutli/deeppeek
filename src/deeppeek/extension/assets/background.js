@@ -798,13 +798,15 @@ function attachHandlers(es, port) {
     } else {
       s.failures = (s.failures || 0) + 1;
     }
-    // After 2 consecutive failures with no intervening success,
-    // schedule exponential backoff so a not-listening port doesn't
-    // spam the console.  Cap at 16s.
+    // After idle, failures climbs to 6+, so this was scheduling
+    // retryAfter 8–16s into the future.  Meanwhile the watchdog
+    // fires every 500ms and calls ensureConnected() — but
+    // ensureConnected() short-circuits when retryAfter is in the
+    // future, so nothing reconnects until the backoff expires.
+    // Cap at the watchdog cadence: worst-case time to notice a
+    // freshly-bound CLI port drops from ~16s to ~1s.
     if (s.failures >= 2) {
-      const backoff = Math.min(
-        16000, 500 * Math.pow(2, s.failures - 2));
-      s.retryAfter = Date.now() + backoff;
+      s.retryAfter = Date.now() + 500;
     }
   };
 }

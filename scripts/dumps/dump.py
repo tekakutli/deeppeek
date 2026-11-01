@@ -53,6 +53,20 @@ The output filename has two modes:
       to stdout (for piping); the "Total lines" summary then goes to stderr,
       so stdout is purely the dump.
 
+AS-READ-ARGS MODE
+=================
+`--as-read-args` replaces the dump entirely: instead of writing a
+markdown file with FILE blocks, the script emits a single line of
+space-separated `--read PATH` arguments suitable for aider's command
+line.  Example:
+
+    aider $(deeppeek dump.py --as-read-args ...)
+
+Paths are relativised against the current working directory; files
+outside the cwd are emitted as absolute paths.  Writes to stdout by
+default (matching `-o -` semantics, so shell substitution works);
+`-o PATH` saves to a file instead.
+
 CLI flags -a/--affix, -r/--recursive, -t/--tree-only override their
 DEFAULT_* counterparts. --exclude-file PATH (repeatable) excludes one
 exact file by resolved path — useful when another program (e.g.
@@ -451,13 +465,49 @@ def _emit_file_contents(fh, files, display_fn, total):
         fh.write("```\n\n")
 
 
+def _format_as_read_args(files: list[Path]) -> str:
+    """Format `files` as a single space-separated line of `--read PATH` pairs.
+
+    Paths are relativised against the current working directory so they
+    work when aider is launched from the same cwd.  Files outside the cwd
+    fall back to their absolute path — aider accepts either.
+
+    `Path.resolve()` is called defensively: the file list comes either
+    from `find_files` (already confirmed to exist) or from
+    `resolve_listed_files` (which does `.is_file()` and `.resolve()`), so
+    a resolution error here is unexpected and is handled by falling back
+    to the raw string.  This keeps the flag useful even in the face of
+    unusual filesystem states.
+    """
+    cwd = Path.cwd()
+    tokens: list[str] = []
+    for f in files:
+        path_str: str
+        try:
+            abs_f = f.resolve()
+        except OSError:
+            abs_f = None
+        if abs_f is not None:
+            try:
+                path_str = str(abs_f.relative_to(cwd))
+            except ValueError:
+                path_str = str(abs_f)
+        else:
+            path_str = str(f)
+        tokens.append("--read")
+        tokens.append(path_str)
+    return " ".join(tokens) + "\n" if tokens else ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Dump files into a markdown file. "
                     "All paths/extensions come from variables in the script; "
                     "CLI overrides exist for affix, recursion, tree-only, "
                     "output path, and per-file exclusions. Pass one or more "
-                    "FILE arguments to dump only those files.",
+                    "FILE arguments to dump only those files.  "
+                    "Use --as-read-args to emit aider-compatible "
+                    "`--read PATH` arguments instead of a dump.",
     )
     parser.add_argument(
         "files", nargs="*",
@@ -484,6 +534,8 @@ def main() -> int:
         "-o", "--output", type=Path, default=None,
         help=("Write the dump to this exact path. \"-\" writes the dump "
               "to stdout, keeping stdout free of anything but the dump. "
+              "With --as-read-args, this overrides the default stdout "
+              "target and saves the args line to the file at PATH. "
               f"(default: {DEFAULT_OUT} with _<scanned-dir> appended)"),
     )
     parser.add_argument(
@@ -509,6 +561,17 @@ def main() -> int:
               "explicit list with `  [skip]`.  Shows the full project "
               "tree with the excluded files highlighted.  No effect "
               "without FILE arguments."),
+    )
+    parser.add_argument(
+        "--as-read-args", action="store_true", default=False,
+        help=("Instead of building a dump file, emit a single line of "
+              "space-separated `--read PATH` arguments suitable for "
+              "aider's command line.  Example: "
+              "`aider $(deeppeek dump.py --as-read-args -r)`.  "
+              "Paths are relativised to the current working directory; "
+              "files outside the cwd are emitted as absolute paths.  "
+              "Writes to stdout by default; `-o PATH` saves to a file, "
+              "`-o -` forces stdout."),
     )
     args = parser.parse_args()
 
@@ -592,6 +655,27 @@ def main() -> int:
             print(msg, file=sys.stderr)
             return 1
         tree_root = root
+
+    # ---- --as-read-args: bypass the dump machinery entirely ----
+    #
+    # Emit space-separated `--read PATH` pairs to stdout (or to a file
+    # when `-o PATH` is given).  The scan / filter / FILE-argument
+    # machinery above has already chosen the file set — this flag only
+    # changes how it is presented.
+    if args.as_read_args:
+        args_line = _format_as_read_args(files)
+        if args.output is not None and str(args.output) != "-":
+            out_path = args.output
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(args_line, encoding="utf-8")
+            print(f"Wrote {len(files)} --read argument(s) to {out_path}",
+                  file=sys.stderr)
+        else:
+            sys.stdout.write(args_line)
+            sys.stdout.flush()
+            print(f"Wrote {len(files)} --read argument(s) to stdout",
+                  file=sys.stderr)
+        return 0
 
     total = len(files)
     scanned_dir = Path(os.path.abspath(str(tree_root)))
