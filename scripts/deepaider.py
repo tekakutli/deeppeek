@@ -9,6 +9,9 @@ Usage (three entry points, all equivalent):
 
 Any arguments not consumed by this launcher are passed through to
 `aider` verbatim.  `--keep-daemon` is consumed here (not forwarded).
+Unless the caller passes `--architect` themselves, architect mode is
+enabled by default; unless the caller passes an edit-format flag,
+the architect-mode editor is pinned to the reliable `whole` format.
 
 Exit code is aider's exit code (or 1 on startup failure).
 """
@@ -53,8 +56,11 @@ def main(argv: list[str]) -> int:
            "OPENAI_API_BASE": BASE, "OPENAI_BASE_URL": BASE,
            "OPENAI_API_KEY": "dummy"}
     cmd = ["aider", "--model", "openai/deepseek-web"]
-    if not any(a.startswith("--edit-format") for a in args):
-        cmd += ["--edit-format", "whole"]
+    if "--architect" not in args:
+        cmd += ["--architect"]
+    if not any(a.startswith(("--edit-format", "--editor-edit-format"))
+               for a in args):
+        cmd += ["--editor-edit-format", "whole"]
     cmd += args
 
     try:

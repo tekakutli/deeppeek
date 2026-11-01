@@ -18,8 +18,12 @@ def register(sub: argparse._SubParsersAction) -> None:
         help="OpenAI-compatible HTTP port (default: 8766)",
     )
     p.add_argument(
-        "--extension-port", type=int, default=8765,
-        help="extension SSE port (default: 8765)",
+        "--extension-port", type=int, default=8767,
+        help="extension SSE port (default: 8767).  Kept distinct from "
+             "the CLI's 8765 so `deeppeek daemon` and interactive "
+             "commands (`type`/`enter`/`pipe`/`capture`) can run "
+             "concurrently.  The browser extension must be configured "
+             "to connect to BOTH 8765 (CLI) and 8767 (daemon).",
     )
     p.add_argument(
         "--reuse-tab", action="store_true",

@@ -1,50 +1,46 @@
-// =====================================================================
-// injected-watch.js — streaming watcher (v14)
-// =====================================================================
+// Streaming watcher (v16, batch mode).
 //
-// Revert of v13's markdown reconstruction (STRONG / EM / CODE /
-// PRE-fence wrapping).  Reason: the wrapping markers are
-// non-monotonic during streaming.  DeepSeek's incremental markdown
-// parser flips between "plain text" and "<strong>wrapped</strong>"
-// as tokens arrive, so the `<strong>` closing marker MOVES from
-// tick to tick.  The delta logic sees:
+// Why batch mode:
+//   DeepSeek's markdown renderer consumes ``` fence markers before
+//   they hit the DOM.  innerText can never contain fences.  The only
+//   place raw markdown with fences survives is DeepSeek's own
+//   fragment storage — surfaced by the page-world extractor
+//   (`__dsx_extract` in injected-extract.js), which calls the API
+//   with the userToken and reads `message.fragments[].content`.
 //
-//     tick N:    ...around 17 °C–19.
-//     tick N+1:  ...around **17 °C–19.8 °C**
+//   So: don't stream innerText during generation.  Wait for the
+//   Stop button to disappear (model finished), then call the
+//   extractor once, then emit its content as a single delta.
+//   Aider sees nothing for the thinking phase, then the full
+//   correct reply.  One shot, no retries.
 //
-// `raw.startsWith(lastContent)` is false (the `**` markers
-// shifted), so it emits the whole accumulated content again as a
-// rewrite.  Client concatenates -> duplicated text.  Same issue
-// for `<pre>` fence reconstruction: the closing ``` moves forward
-// as the body grows.
+// Thoughts exclusion:
+//   The extractor's `parseFragments` separates THINK/REASON/THOUGHT
+//   fragment text into `.thinking`, leaves RESPONSE/REQUEST in
+//   `.content`.  We take the last assistant message's `.content`
+//   only — no thoughts.
 //
-// v14 restores v11/v12's plain-text extraction:
-//   · textContent of text nodes, verbatim
-//   · citation subtrees (<sup>, <cite>, footnote classes) skipped
-//   · <BR>            -> \n
-//   · <TD>/<TH>       -> \t separators
-//   · <TR>            -> \n row separators
-//   · block elements  -> \n\n around them
-//   · 3+ newlines     -> 2
-//   · leading/trailing whitespace trimmed
+// UI chrome:
+//   The extractor returns raw markdown with no `md-code-block-banner`
+//   labels ("开头 / 结尾 / Copy / Download").  Those are DOM-only
+//   artifacts, injected by the renderer, absent from fragment
+//   content.  filterChrome is only used in the fallback path.
 //
-// Trade-off: aider's whole-edit format needs ``` fences around
-// code content.  Those are lost in v14's plain-text extraction,
-// so aider's file-listing parser will fail.  Fixing that requires
-// a different strategy (buffering code blocks and emitting fences
-// only after they stabilize, or waiting for fiber to become
-// available) — not a streaming-time reconstruction.  Deferred.
-//
-// All other v13 behaviour (submit-failure detection, citation
-// stripping, fiber diagnostic) is unchanged.
-//
-// Bridge entry points: window.__dsx_startWatch / __dsx_stopWatch /
-// __dsx_testFiber.
+// Fallback:
+//   If extraction returns nothing (API unreachable, session not
+//   saved yet, both IndexedDB and API missed), fall back to the
+//   DOM's answer-markdown innerText with filterChrome applied.
+//   That's lossy (no fences) but at least something reaches aider
+//   instead of a 0-char response.
 (function () {
   "use strict";
   if (!window.__dsx__) window.__dsx__ = {};
 
   const watchers = new Map();
+  const _SUBMIT_TIMEOUT_MS = 20000;
+  const _API_EXTRACT_TIMEOUT_MS = 15000;
+
+  const _THINK_CLASS_HINTS = ["think", "reason", "thought"];
 
   const _UI_CHROME_LABELS = new Set([
     "开头", "结尾",
@@ -54,28 +50,6 @@
     "Start", "End",
   ]);
 
-  const _THINK_CLASS_HINTS = ["think", "reason", "thought"];
-  const _ASSISTANT_ROLES = [
-    "assistant", "ai", "bot", "agent", "answer", "model",
-  ];
-  const _USER_ROLES = [
-    "user", "human", "customer", "client", "question",
-  ];
-
-  const _SUBMIT_TIMEOUT_MS = 20000;
-
-  const _MESSAGE_PROP_KEYS = [
-    "message", "msg", "chatMessage", "data", "item",
-    "node", "messageData", "messageObj", "chat_message",
-    "activeMessage", "currentMessage", "selectedMessage",
-  ];
-  const _LIST_PROP_KEYS = [
-    "messages", "chatMessages", "messageList", "list", "items",
-    "chat_messages", "messageList", "activePath",
-  ];
-
-  // ---------- DOM helpers ------------------------------------------
-
   function findChatContainer() {
     return document.querySelector(
       window.__dsx__.config?.chatContainerSelector
@@ -83,22 +57,17 @@
   }
 
   function isGenerating() {
-    const buttons = document.querySelectorAll('button, [role="button"]');
-    for (const btn of buttons) {
-      const rect = btn.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) continue;
-      const label = (btn.getAttribute("aria-label") || "")
-        .toLowerCase().trim();
+    for (const btn of document.querySelectorAll('button, [role="button"]')) {
+      const r = btn.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      const label = (btn.getAttribute("aria-label") || "").toLowerCase().trim();
       const text = (btn.textContent || "").toLowerCase().trim();
-      const testid = (btn.getAttribute("data-testid") || "")
-        .toLowerCase().trim();
+      const testid = (btn.getAttribute("data-testid") || "").toLowerCase().trim();
       if (label === "stop" || label === "stop generating"
           || label === "停止" || label === "停止生成"
           || text === "stop" || text === "停止"
           || testid === "stop" || testid === "stop-button"
-          || testid === "stop-generating") {
-        return true;
-      }
+          || testid === "stop-generating") return true;
     }
     return false;
   }
@@ -116,6 +85,10 @@
     return false;
   }
 
+  // Return the LAST .ds-markdown that is NOT inside a thinking
+  // container — the answer markdown.  DeepSeek renders thoughts
+  // markdown first, answer markdown last.  Iterating from the end
+  // and skipping thinking-ancestored elements lands on the answer.
   function _findAnswerMarkdown(last) {
     const candidates = last.querySelectorAll(
       ".ds-markdown, .markdown-body, .prose");
@@ -129,114 +102,16 @@
     if (!container) return null;
     const msgs = container.querySelectorAll(".ds-message");
     if (msgs.length) return msgs[msgs.length - 1];
-    const assistants = container.querySelectorAll(
-      '[data-role="assistant"]');
-    if (assistants.length) return assistants[assistants.length - 1];
+    const a = container.querySelectorAll('[data-role="assistant"]');
+    if (a.length) return a[a.length - 1];
     return null;
   }
 
-  function _dumpParentChain(el, maxDepth) {
-    const out = [];
-    let node = el;
-    const depth = maxDepth || 6;
-    for (let i = 0; i < depth && node; i++) {
-      out.push({
-        tag: node.tagName || "?",
-        cls: (node.className && typeof node.className === "string")
-          ? node.className.slice(0, 80) : "",
-      });
-      node = node.parentElement;
-    }
-    return out;
-  }
-
-  const _CITATION_SELECTOR =
-    "sup, cite, [class*='citation'], [class*='cite'], " +
-    "[class*='footnote'], [class*='reference'], a[href^='#']";
-
-  const _BLOCK_TAGS = new Set([
-    "DIV", "P", "SECTION", "ARTICLE", "LI", "BLOCKQUOTE",
-    "H1", "H2", "H3", "H4", "H5", "H6",
-    "UL", "OL",
-    "TABLE", "THEAD", "TBODY", "TFOOT",
-    "FIGURE", "FIGCAPTION",
-    "HEADER", "FOOTER", "MAIN", "ASIDE", "NAV",
-  ]);
-
-  function _extractCleanText(el) {
-    if (!el) return "";
-    const parts = [];
-    function push(s) { if (s) parts.push(s); }
-
-    function walk(node) {
-      if (node.nodeType === 3) { push(node.textContent); return; }
-      if (node.nodeType !== 1) return;
-      if (node.matches && node.matches(_CITATION_SELECTOR)) return;
-      const tag = node.tagName;
-
-      if (tag === "BR") { push("\n"); return; }
-
-      if (tag === "TD" || tag === "TH") {
-        if (parts.length) {
-          const last = parts[parts.length - 1];
-          if (last && !/[\t\n]$/.test(last)) push("\t");
-        }
-        for (const c of node.childNodes) walk(c);
-        return;
-      }
-
-      if (tag === "TR") {
-        if (parts.length) {
-          const last = parts[parts.length - 1];
-          if (last && !last.endsWith("\n")) push("\n");
-        }
-        for (const c of node.childNodes) walk(c);
-        if (parts.length) {
-          const last = parts[parts.length - 1];
-          if (last && !last.endsWith("\n")) push("\n");
-        }
-        return;
-      }
-
-      const isBlock = _BLOCK_TAGS.has(tag);
-      if (isBlock) push("\n\n");
-      for (const c of node.childNodes) walk(c);
-      if (isBlock) push("\n\n");
-    }
-
-    walk(el);
-    let text = parts.join("");
-    text = text.replace(/\n{3,}/g, "\n\n");
-    text = text.replace(/\t+/g, "\t");
-    return text.replace(/^\s+|\s+$/g, "");
-  }
-
-  function lastAssistantFromDOM(container) {
+  function readLastAssistantInnerText(container) {
     const last = _lastDsMessage(container);
     if (!last) return "";
-    const body = _findAnswerMarkdown(last);
-    return body ? _extractCleanText(body) : "";
-  }
-
-  function lastAssistantOuterFromDOM(container) {
-    const last = _lastDsMessage(container);
-    return last ? (last.innerText || "") : "";
-  }
-
-  function _mdStatesFor(last) {
-    const out = [];
-    if (!last) return out;
-    const all = last.querySelectorAll(
-      ".ds-markdown, .markdown-body, .prose");
-    for (const md of all) {
-      out.push({
-        len: (md.innerText || "").length,
-        insideThinking: _isInsideThinking(md),
-        cls: (md.className && typeof md.className === "string")
-          ? md.className.slice(0, 60) : "",
-      });
-    }
-    return out;
+    const answer = _findAnswerMarkdown(last);
+    return answer ? (answer.innerText || "") : "";
   }
 
   function filterChrome(content) {
@@ -253,287 +128,73 @@
     return kept.join("\n");
   }
 
-  // ---------- fiber helpers (unchanged; dead but opportunistic) ----
-
-  function _looksLikeMessage(obj) {
-    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
-    if (typeof obj.role === "string") {
-      const r = obj.role.toLowerCase();
-      if (_ASSISTANT_ROLES.includes(r) || _USER_ROLES.includes(r)) {
-        return true;
-      }
-    }
-    if (Array.isArray(obj.fragments)
-        || Array.isArray(obj.content_blocks)
-        || Array.isArray(obj.blocks)) {
-      return true;
-    }
-    if (typeof obj.content === "string" && obj.content.length > 0
-        && typeof obj.isUser === "boolean") {
-      return true;
-    }
-    return false;
-  }
-
-  function _parseFiberMessage(m) {
-    let content = "";
-    let thinking = "";
-    let role = (typeof m.role === "string")
-      ? m.role.toLowerCase() : "";
-    if (!role && typeof m.isUser === "boolean") {
-      role = m.isUser ? "user" : "assistant";
-    }
-    const isStr = (v) => typeof v === "string" && v.length > 0;
-
-    if (isStr(m.content)) content = m.content;
-
-    const frags = m.fragments || m.content_blocks || m.blocks;
-    if (Array.isArray(frags)) {
-      const contentParts = [];
-      const thinkParts = [];
-      for (const f of frags) {
-        if (!f || typeof f !== "object") continue;
-        const type = String(f.type || f.kind || "").toUpperCase();
-        if (type === "FILE") continue;
-        let text = "";
-        if (isStr(f.content)) text = f.content;
-        else if (isStr(f.text)) text = f.text;
-        else if (isStr(f.value)) text = f.value;
-        if (!text) continue;
-        if (/THINK|REASON|THOUGHT/.test(type)) thinkParts.push(text);
-        else contentParts.push(text);
-      }
-      if (contentParts.length) content = contentParts.join("");
-      if (thinkParts.length) thinking = thinkParts.join("\n\n");
-    }
-
-    return { content, thinking, role };
-  }
-
-  function _considerObj(obj, consider) {
-    if (!obj || typeof obj !== "object") return;
-    consider(obj);
-    if (Array.isArray(obj) && obj.length > 0) {
-      consider(obj[obj.length - 1]);
-    }
-    if (!Array.isArray(obj)) {
-      for (const key of _LIST_PROP_KEYS) {
-        const list = obj[key];
-        if (Array.isArray(list) && list.length > 0) {
-          consider(list[list.length - 1]);
-        }
-      }
-      for (const key of _MESSAGE_PROP_KEYS) {
-        const inner = obj[key];
-        if (inner && typeof inner === "object") {
-          consider(inner);
-          if (Array.isArray(inner) && inner.length > 0) {
-            consider(inner[inner.length - 1]);
-          }
-        }
-      }
-    }
-  }
-
-  function _walkUpForMessage(fiber) {
-    let best = null;
-    let node = fiber;
-    let depth = 0;
-    const propsSeen = [];
-    const hooksSeen = [];
-    const consider = (obj) => {
-      if (!_looksLikeMessage(obj)) return;
-      const parsed = _parseFiberMessage(obj);
-      if (!best || (parsed.content || "").length
-                  > (best.content || "").length) {
-        best = parsed;
-      }
-    };
-    while (node && depth < 30) {
-      for (const props of [node.memoizedProps, node.pendingProps]) {
-        if (!props || typeof props !== "object") continue;
-        if (depth < 12) {
-          try {
-            const entry = { depth, keys: Object.keys(props).slice(0, 20) };
-            if ("value" in props) {
-              entry.valueType = (props.value === null)
-                ? "null"
-                : Array.isArray(props.value)
-                  ? `array(len=${props.value.length})`
-                  : typeof props.value;
-              if (props.value && typeof props.value === "object"
-                  && !Array.isArray(props.value)) {
-                entry.valueKeys = Object.keys(props.value).slice(0, 15);
-              }
-            }
-            propsSeen.push(entry);
-          } catch (_) {}
-        }
-        for (const key of _MESSAGE_PROP_KEYS) {
-          _considerObj(props[key], consider);
-        }
-        consider(props);
-        if (props.value !== undefined) {
-          _considerObj(props.value, consider);
-          if (props.value && typeof props.value === "object"
-              && props.value.current !== undefined) {
-            _considerObj(props.value.current, consider);
-          }
-        }
-        if (props.current !== undefined) {
-          _considerObj(props.current, consider);
-        }
-        for (const key of _LIST_PROP_KEYS) {
-          const list = props[key];
-          if (Array.isArray(list) && list.length > 0) {
-            consider(list[list.length - 1]);
-          }
-        }
-      }
-      if (node.memoizedState) {
-        let state = node.memoizedState;
-        let idx = 0;
-        while (state && idx < 50) {
-          const val = state.memoizedState;
-          if (val && typeof val !== "function") {
-            _considerObj(val, consider);
-            if (val && typeof val === "object"
-                && val.current !== undefined) {
-              _considerObj(val.current, consider);
-            }
-            if (val && typeof val === "object"
-                && val.value !== undefined) {
-              _considerObj(val.value, consider);
-            }
-            if (depth < 12) {
-              try {
-                const entry = {
-                  depth, idx,
-                  type: val === null ? "null" : Array.isArray(val) ? "array" : typeof val,
-                };
-                if (val && typeof val === "object") {
-                  if (Array.isArray(val)) {
-                    entry.len = val.length;
-                  } else {
-                    entry.keys = Object.keys(val).slice(0, 15);
-                  }
-                }
-                hooksSeen.push(entry);
-              } catch (_) {}
-            }
-          }
-          state = state.next;
-          idx++;
-        }
-      }
-      node = node.return;
-      depth++;
-    }
-    try {
-      if (!best && propsSeen.length > 0) {
-        window.__dsx_last_fiber_props = propsSeen;
-      }
-      if (hooksSeen.length > 0) {
-        window.__dsx_last_fiber_hooks = hooksSeen;
-      }
-    } catch (_) {}
-    return best;
-  }
-
-  function _fiberLastAssistant(container) {
-    const last = _lastDsMessage(container);
-    if (!last) return null;
-    const fk = Object.keys(last).find(
-      (k) => k.startsWith("__reactFiber$")
-          || k.startsWith("__reactInternalInstance$"));
-    if (!fk) return null;
-    const found = _walkUpForMessage(last[fk]);
-    if (!found) return null;
-    if (found.role && _USER_ROLES.includes(found.role)) {
+  // Call the page-world extractor and pull out the last assistant
+  // message's raw .content (fenced markdown, no thoughts).
+  //
+  // `__dsx_extract` tries API first (with the userToken), then
+  // IndexedDB, then fiber.  Both API and IndexedDB return
+  // fragments with raw .content; fences are intact.
+  //
+  // Hard 15 s timeout so a hung API doesn't stall the settle path
+  // past the daemon's WATCH_MAX_WAIT deadline.
+  async function fetchFinalFromApi(batchId) {
+    if (typeof window.__dsx_extract !== "function") {
+      console.warn(
+        `[DSX-WATCH ${batchId}] __dsx_extract unavailable ` +
+        `(injected-extract.js not loaded)`);
       return null;
     }
-    return found;
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(
+        () => reject(new Error("extract timeout")),
+        _API_EXTRACT_TIMEOUT_MS);
+    });
+    try {
+      const respJson = await Promise.race([
+        window.__dsx_extract(JSON.stringify({ include_forked: false })),
+        timeoutPromise,
+      ]);
+      const data = JSON.parse(respJson);
+      const msgs = data.messages || [];
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].role === "assistant" && msgs[i].content) {
+          return msgs[i].content;
+        }
+      }
+      console.warn(
+        `[DSX-WATCH ${batchId}] extract returned no assistant content ` +
+        `(${msgs.length} msg(s))`);
+      return null;
+    } catch (e) {
+      console.warn(
+        `[DSX-WATCH ${batchId}] extract failed:`,
+        e && e.message ? e.message : e);
+      return null;
+    }
   }
 
-  // ---------- watcher ----------------------------------------------
-
   function createWatcher(batchId, opts, onDelta, onDone) {
-    const settleFastMs = Math.max(50, opts.settle_ms || 250);
-    const settleSlowMs = Math.max(500, opts.settle_slow_ms || 2000);
+    const settleGraceMs = Math.max(100, opts.settle_ms || 400);
     const maxDurationMs = Math.max(5000, opts.max_duration_ms || 180000);
-    const firstContentTimeoutMs = Math.max(
-      5000, opts.first_content_timeout_ms || 30000);
     const submitTimeoutMs = Math.max(
       5000, opts.submit_timeout_ms || _SUBMIT_TIMEOUT_MS);
+
     const startedAt = Date.now();
-    let lastContent = "";
-    let settleTimer = null;
-    let containerPollTimer = null;
-    let safetyPollTimer = null;
     let stopped = false;
     let msgObserver = null;
     let container = null;
-    let sawGenerating = false;
+    let containerPollTimer = null;
+    let safetyPollTimer = null;
+    let settleTimer = null;
     let rafScheduled = false;
-    let loggedFirstContent = false;
-    let loggedSubmitConfirmed = false;
-    let lastWaitLogAt = 0;
-    let initialMsgCount = 0;
-    let initialLastMdLen = 0;
-    let initialLastMsgLen = 0;
-
-    function jlog(tag, obj) {
-      try {
-        if (window.__dsx_watch_debug === false) return;
-        const el = Date.now() - startedAt;
-        console.log(
-          `[DSX-WATCH ${batchId} t+${el}ms] ${tag} ` +
-          (obj === undefined ? "" : JSON.stringify(obj)));
-      } catch (_) {}
-    }
-
-    function logButtonsOnce(tag) {
-      try {
-        if (window.__dsx_watch_debug === false) return;
-        const out = [];
-        for (const btn of document.querySelectorAll(
-            'button, [role="button"]')) {
-          const rect = btn.getBoundingClientRect();
-          const svg = btn.querySelector("svg");
-          out.push({
-            tag: btn.tagName,
-            visible: !(rect.width === 0 || rect.height === 0),
-            label: btn.getAttribute("aria-label") || "",
-            text: (btn.textContent || "").trim().slice(0, 40),
-            testid: btn.getAttribute("data-testid") || "",
-            title: btn.getAttribute("title") || "",
-            ariaPressed: btn.getAttribute("aria-pressed") || "",
-            cls: (btn.className && typeof btn.className === "string")
-              ? btn.className : "",
-            svgCls: svg ? (svg.getAttribute("class") || "") : "",
-          });
-        }
-        jlog(tag, { buttons: out });
-      } catch (_) {}
-    }
+    let sawGenerating = false;
+    let emitted = false;
 
     function stop(reason) {
       if (stopped) return;
       stopped = true;
-      const domNow = lastAssistantFromDOM(container);
-      const outer = lastAssistantOuterFromDOM(container);
-      const msgCount = container
-        ? container.querySelectorAll(".ds-message").length : 0;
-      jlog("STOP", {
-        reason,
-        lastLen: lastContent.length,
-        lastPreview: lastContent.slice(0, 120).replace(/\n/g, "\\n"),
-        domNowLen: domNow.length,
-        domNowPreview: domNow.slice(0, 120).replace(/\n/g, "\\n"),
-        outerLen: outer.length,
-        msgCount,
-        initialMsgCount,
-      });
+      console.log(`[DSX-WATCH ${batchId}] STOP reason=${reason} ` +
+        `emitted=${emitted}`);
       if (msgObserver) msgObserver.disconnect();
       if (settleTimer) clearTimeout(settleTimer);
       if (containerPollTimer) clearInterval(containerPollTimer);
@@ -542,189 +203,87 @@
       onDone(reason);
     }
 
-    function armSettle() {
-      if (settleTimer) clearTimeout(settleTimer);
-      const dur = sawGenerating ? settleFastMs : settleSlowMs;
-      jlog("SETTLE_ARM", { dur, sawGenerating });
-      settleTimer = setTimeout(() => {
-        if (stopped) return;
-        if (!lastContent) {
-          jlog("SETTLE_FIRE_NO_CONTENT", {});
-          return;
-        }
-        const gen = isGenerating();
-        jlog("SETTLE_FIRE", { isGen: gen, sawGenerating });
-        if (gen) {
-          sawGenerating = true;
-          armSettle();
-          return;
-        }
-        stop("settled");
-      }, dur);
+    async function settleNow() {
+      settleTimer = null;
+      if (stopped) return;
+
+      // Generation may have resumed after the grace period started.
+      if (isGenerating()) {
+        sawGenerating = true;
+        return;
+      }
+
+      // Try the API extractor first (fenced markdown, no thoughts,
+      // no chrome).
+      let content = await fetchFinalFromApi(batchId);
+      let source = "api";
+
+      if (!content) {
+        // Fallback: fence-less innerText with chrome stripped.
+        content = filterChrome(readLastAssistantInnerText(container));
+        source = "innerText-fallback";
+      }
+
+      if (content) {
+        emitted = true;
+        console.log(
+          `[DSX-WATCH ${batchId}] EMIT_FINAL ` +
+          `source=${source} len=${content.length} ` +
+          `hasFences=${content.indexOf(String.fromCharCode(96,96,96)) >= 0} ` +
+          `preview=${JSON.stringify(content.slice(0, 150))}`);
+        onDelta(content);
+      } else {
+        console.warn(
+          `[DSX-WATCH ${batchId}] EMIT_FINAL no content available ` +
+          `(api=null, dom='')`);
+      }
+
+      stop("settled");
     }
 
     function extractAndEmit() {
       if (stopped) return;
       if (Date.now() - startedAt > maxDurationMs) {
-        jlog("MAX_DURATION", {});
+        console.warn(`[DSX-WATCH ${batchId}] MAX_DURATION reached`);
         stop("max_duration");
         return;
       }
 
       const gen = isGenerating();
-      if (gen && !sawGenerating) {
-        sawGenerating = true;
-        jlog("SAW_GENERATING", {});
-        logButtonsOnce("BUTTONS_GEN");
-      }
 
-      if (!loggedFirstContent) {
-        const curLast = _lastDsMessage(container);
+      // ---- phase 1: wait for submit confirmation ----
+      if (!sawGenerating) {
         const curCount = container
           ? container.querySelectorAll(".ds-message").length : 0;
-        const curLastMd = curLast
-          ? curLast.querySelector(".ds-markdown") : null;
-        const curLastMdLen = curLastMd
-          ? (curLastMd.innerText || "").length : 0;
-        const curLastMsgLen = curLast
-          ? (curLast.innerText || "").length : 0;
-        const msgCountGrew = curCount > initialMsgCount;
-        const contentGrew = (curLastMdLen > initialLastMdLen)
-                         || (curLastMsgLen > initialLastMsgLen);
-        if (!msgCountGrew && !contentGrew
-            && Date.now() - startedAt > submitTimeoutMs) {
-          jlog("SUBMIT_FAILED", {
-            elapsed: Date.now() - startedAt,
-            initialMsgCount,
-            curCount,
-            initialLastMdLen,
-            curLastMdLen,
-            initialLastMsgLen,
-            curLastMsgLen,
-            note: "no new .ds-message AND no content growth within " +
-                  submitTimeoutMs + "ms; submit likely blocked " +
-                  "by a userscript or extension",
-          });
+        const lastMsg = _lastDsMessage(container);
+        const curMsgLen = lastMsg ? (lastMsg.innerText || "").length : 0;
+        if (gen || curCount > initialMsgCount || curMsgLen > initialLastMsgLen) {
+          sawGenerating = true;
+          console.log(`[DSX-WATCH ${batchId}] SUBMIT_CONFIRMED`);
+        } else if (Date.now() - startedAt > submitTimeoutMs) {
+          console.warn(
+            `[DSX-WATCH ${batchId}] SUBMIT_FAILED after ${submitTimeoutMs}ms`);
           stop("submit_failed");
-          return;
-        }
-        if (contentGrew && !msgCountGrew && !loggedSubmitConfirmed) {
-          loggedSubmitConfirmed = true;
-          jlog("SUBMIT_CONFIRMED_VIA_CONTENT", {
-            initialLastMdLen, curLastMdLen,
-          });
-        }
-      }
-
-      let fiberMsg = null;
-      try { fiberMsg = _fiberLastAssistant(container); } catch (_) {}
-
-      let fiberRaw = null;
-      if (fiberMsg && fiberMsg.content) {
-        fiberRaw = filterChrome(fiberMsg.content);
-      }
-
-      let raw = null;
-      let source = null;
-
-      if (fiberMsg !== null && fiberRaw !== null) {
-        if (!lastContent || fiberRaw.startsWith(lastContent)) {
-          raw = fiberRaw;
-          source = "fiber";
-        } else {
-          const domRaw = filterChrome(lastAssistantFromDOM(container));
-          if (domRaw && domRaw.startsWith(lastContent)) {
-            raw = domRaw;
-            source = "dom";
-          } else {
-            raw = (fiberRaw.length >= (domRaw || "").length)
-              ? fiberRaw : domRaw;
-            source = raw === fiberRaw ? "fiber" : "dom";
-          }
-        }
-      } else {
-        const domRaw = filterChrome(lastAssistantFromDOM(container));
-        if (domRaw) {
-          raw = domRaw;
-          source = "dom";
-        }
-      }
-
-      if (!raw) {
-        const now = Date.now();
-        if (now - startedAt > firstContentTimeoutMs) {
-          jlog("NO_FIRST_CONTENT", {
-            elapsed: now - startedAt,
-            msgCount: container
-              ? container.querySelectorAll(".ds-message").length : 0,
-            initialMsgCount,
-          });
-          stop("no_first_content");
-          return;
-        }
-        if (now - lastWaitLogAt >= 2000) {
-          lastWaitLogAt = now;
-          const lastMsg = _lastDsMessage(container);
-          jlog("WAITING_FOR_CONTENT", {
-            elapsed: now - startedAt,
-            msgCount: container
-              ? container.querySelectorAll(".ds-message").length : 0,
-            initialMsgCount,
-            lastMsgLen: lastMsg ? (lastMsg.innerText || "").length : 0,
-            mdStates: _mdStatesFor(lastMsg),
-            fiberFound: fiberMsg !== null,
-            fiberLen: fiberMsg ? (fiberMsg.content || "").length : null,
-            fiberRole: fiberMsg ? fiberMsg.role : null,
-          });
         }
         return;
       }
 
-      if (!loggedFirstContent) {
-        loggedFirstContent = true;
-        const domForCompare = lastAssistantFromDOM(container);
-        const outer = lastAssistantOuterFromDOM(container);
-        const lastMsg = _lastDsMessage(container);
-        jlog("FIRST_CONTENT", {
-          source,
-          bodyLen: raw.length,
-          bodyPreview: raw.slice(0, 150).replace(/\n/g, "\\n"),
-          fiberLen: fiberRaw ? fiberRaw.length : null,
-          fiberPreview: fiberRaw
-            ? fiberRaw.slice(0, 100).replace(/\n/g, "\\n") : null,
-          domLen: domForCompare.length,
-          domPreview: domForCompare.slice(0, 100).replace(/\n/g, "\\n"),
-          fiberVsDomSame: fiberRaw === domForCompare,
-          msgCount: container
-            ? container.querySelectorAll(".ds-message").length : 0,
-          initialMsgCount,
-          mdStates: _mdStatesFor(lastMsg),
-        });
-        logButtonsOnce("BUTTONS_AT_FIRST_CONTENT");
+      // ---- phase 2: generation in progress ----
+      if (gen) {
+        // Still generating.  If a settle timer somehow fires while
+        // gen is true, settleNow will re-arm by returning early
+        // (see above).  Nothing to do here.
+        if (settleTimer) {
+          clearTimeout(settleTimer);
+          settleTimer = null;
+        }
+        return;
       }
 
-      if (raw === lastContent) return;
-
-      const prevLen = lastContent.length;
-      const newLen = raw.length;
-      let kind, delta;
-      if (raw.startsWith(lastContent)) {
-        kind = "append";
-        delta = raw.slice(lastContent.length);
-      } else {
-        kind = "rewrite";
-        delta = raw;
+      // ---- phase 3: generation stopped, arm settle ----
+      if (!settleTimer) {
+        settleTimer = setTimeout(settleNow, settleGraceMs);
       }
-      lastContent = raw;
-      jlog("DELTA", {
-        source,
-        kind, prevLen, newLen,
-        deltaLen: delta.length,
-        isGen: gen,
-        deltaPreview: delta.slice(0, 80).replace(/\n/g, "\\n"),
-      });
-      if (delta) onDelta(delta);
-      armSettle();
     }
 
     function scheduleExtract() {
@@ -738,20 +297,6 @@
 
     function startObserving(el) {
       container = el;
-      const msgs = el.querySelectorAll(".ds-message");
-      initialMsgCount = msgs.length;
-      const lastMsg = msgs.length ? msgs[msgs.length - 1] : null;
-      const lastMd = lastMsg
-        ? lastMsg.querySelector(".ds-markdown") : null;
-      initialLastMdLen = lastMd ? (lastMd.innerText || "").length : 0;
-      initialLastMsgLen = lastMsg
-        ? (lastMsg.innerText || "").length : 0;
-      jlog("OBSERVE", {
-        nodeCount: el.querySelectorAll("*").length,
-        initialMsgCount,
-        initialLastMdLen,
-        initialLastMsgLen,
-      });
       msgObserver = new MutationObserver(() => scheduleExtract());
       msgObserver.observe(el, {
         childList: true, characterData: true, subtree: true,
@@ -766,27 +311,19 @@
         if (containerPollTimer) clearInterval(containerPollTimer);
         containerPollTimer = null;
         startObserving(el);
-      } else if (Date.now() - startedAt > firstContentTimeoutMs) {
+      } else if (Date.now() - startedAt > submitTimeoutMs) {
         if (containerPollTimer) clearInterval(containerPollTimer);
         containerPollTimer = null;
-        jlog("NO_CONTAINER", {});
         stop("no_deepseek_tab");
       }
     };
     tryObserve();
-    if (!container) {
-      containerPollTimer = setInterval(tryObserve, 50);
-    }
+    if (!container) containerPollTimer = setInterval(tryObserve, 50);
 
     safetyPollTimer = setInterval(() => {
       if (stopped) return;
       const fresh = findChatContainer();
       if (fresh && fresh !== container) {
-        jlog("CONTAINER_CHANGED", {
-          oldNodeCount: container
-            ? container.querySelectorAll("*").length : null,
-          newNodeCount: fresh.querySelectorAll("*").length,
-        });
         if (msgObserver) msgObserver.disconnect();
         container = fresh;
         msgObserver = new MutationObserver(() => scheduleExtract());
@@ -797,17 +334,12 @@
       extractAndEmit();
     }, 200);
 
-    return {
-      stop: () => { if (!stopped) stop("client_stop"); },
-    };
+    return { stop: () => { if (!stopped) stop("client_stop"); } };
   }
-
-  // ---------- bridge entry points ----------------------------------
 
   window.__dsx_startWatch = function (argsJson) {
     let args;
-    try { args = JSON.parse(argsJson); }
-    catch (e) {
+    try { args = JSON.parse(argsJson); } catch (e) {
       return JSON.stringify({
         success: false, reason: `arg parse failed: ${e.message}`,
       });
@@ -819,11 +351,16 @@
       });
     }
 
+    const port = (typeof args.port === "number") ? args.port : 8765;
+    const base = `http://127.0.0.1:${port}`;
+    console.log(
+      `DSX:watch start (batch=${batchId}, port=${port}, mode=batch)`);
+
     const existing = watchers.get(batchId);
     if (existing) existing.stop();
 
     const onDelta = (delta) => {
-      fetch("http://127.0.0.1:8765/export", {
+      fetch(`${base}/export`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -834,7 +371,7 @@
       }).catch(() => {});
     };
     const onDone = (reason) => {
-      fetch("http://127.0.0.1:8765/export", {
+      fetch(`${base}/export`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -845,9 +382,9 @@
       }).catch(() => {});
     };
 
-    const w = createWatcher(batchId, args.opts || {}, onDelta, onDone);
+    const w = createWatcher(batchId, args, onDelta, onDone);
     watchers.set(batchId, w);
-    return JSON.stringify({ success: true, mode: "mutation-observer" });
+    return JSON.stringify({ success: true, mode: "batch-api" });
   };
 
   window.__dsx_stopWatch = function (argsJson) {
@@ -856,33 +393,5 @@
     const w = watchers.get(args.batch_id);
     if (w) { w.stop(); watchers.delete(args.batch_id); }
     return JSON.stringify({ success: true });
-  };
-
-  window.__dsx_testFiber = function () {
-    const c = findChatContainer();
-    if (!c) return JSON.stringify({ error: "no chat container" });
-    let fiber = null;
-    try { fiber = _fiberLastAssistant(c); } catch (e) {
-      return JSON.stringify({ error: String(e) });
-    }
-    const dom = lastAssistantFromDOM(c);
-    const lastMsg = _lastDsMessage(c);
-    return JSON.stringify({
-      msgCount: c.querySelectorAll(".ds-message").length,
-      lastMsgIsAssistant: lastMsg
-        ? !!lastMsg.querySelector(".ds-markdown") : null,
-      fiberFound: fiber !== null,
-      fiberRole: fiber ? fiber.role : null,
-      fiberLen: fiber ? (fiber.content || "").length : 0,
-      fiberPreview: fiber
-        ? (fiber.content || "").slice(0, 200) : null,
-      fiberThinkingLen: fiber
-        ? (fiber.thinking || "").length : 0,
-      domLen: dom.length,
-      domPreview: dom.slice(0, 200),
-      lastFiberProps: window.__dsx_last_fiber_props || [],
-      lastFiberHooks: window.__dsx_last_fiber_hooks || [],
-      mdStates: _mdStatesFor(lastMsg),
-    }, null, 2);
   };
 })();

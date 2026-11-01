@@ -12,7 +12,7 @@ TAB_OPEN_TIMEOUT = 30.0
 SUBMIT_TIMEOUT = 45.0
 WATCH_START_TIMEOUT = 10.0
 TAB_WAIT_DEFAULT = 2.0
-WATCH_MAX_WAIT = 190.0
+WATCH_MAX_WAIT = 600.0
 
 
 class BridgeError(Exception):
@@ -176,7 +176,12 @@ class BrowserBridge:
             "poll_interval_ms": self.poll_interval_ms,
             "settle_ticks": self.settle_ticks,
             "max_duration_ms": self.max_duration_ms,
-            "first_content_timeout_ms": 30000,
+            # Thinking phase can run 60–120 s with no answer content.
+            # 30 s was too aggressive; the injected-watch code already
+            # treats "Stop button visible" as activity, so this timeout
+            # now only fires on genuine idle.  120 s matches realistic
+            # worst-case thinking.
+            "first_content_timeout_ms": 120000,
         }
         if self.tab_id is not None:
             watch_payload["tab_id"] = self.tab_id
@@ -199,11 +204,32 @@ class BrowserBridge:
 
         # Consume deltas until watch-done.
         total = 0
-        deadline = time.monotonic() + WATCH_MAX_WAIT
+        watch_start = time.monotonic()
+        deadline = watch_start + WATCH_MAX_WAIT
+        last_heartbeat = watch_start
         while time.monotonic() < deadline:
             try:
                 msg = self.server.wait_for_result(timeout=0.5)
             except queue.Empty:
+                # NEW (2026-11-01): periodic heartbeat so the user
+                # can tell "browser is generating (thought phase)"
+                # from "stuck".  The heartbeat does NOT extend the
+                # deadline — WATCH_MAX_WAIT still bounds the total
+                # wait — it only makes the wait legible.  Rationale:
+                # the first-content timeout in the extension is now
+                # an *idle* timeout (see injected-watch.js), so a
+                # thinking phase can legitimately run for tens of
+                # seconds with no watch-delta arriving.
+                now = time.monotonic()
+                if now - last_heartbeat >= 10.0:
+                    print(
+                        f"[daemon] still waiting for content "
+                        f"({now - watch_start:.0f}s elapsed, "
+                        f"{total:,} chars so far) — browser is "
+                        f"generating (thought phase)",
+                        file=sys.stderr,
+                    )
+                    last_heartbeat = now
                 continue
             if msg.get("batch_id") != batch_id:
                 continue
@@ -212,6 +238,7 @@ class BrowserBridge:
                 delta = msg.get("delta", "")
                 if delta:
                     total += len(delta)
+                    last_heartbeat = time.monotonic()
                     yield delta
             elif ack == "watch-rewrite":
                 content = msg.get("content", "")
@@ -221,6 +248,7 @@ class BrowserBridge:
                     file=sys.stderr,
                 )
                 total += len(content)
+                last_heartbeat = time.monotonic()
                 yield content
             elif ack == "watch-done":
                 reason = msg.get("reason")
@@ -247,7 +275,7 @@ class BrowserBridge:
                         )
                     if reason == "no_first_content":
                         raise BridgeError(
-                            "model produced no output within 30s — the "
+                            "model produced no output within 120s — the "
                             "prompt may not have been submitted, or the "
                             "web UI is not streaming to IndexedDB. "
                             "Check the tab."

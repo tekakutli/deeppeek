@@ -1,16 +1,55 @@
-// Background script.  SSE client + tab listeners + content-script port.
-// Watchdog state persisted in browser.storage.local.watchdog.
+// Background script.  SSE client for multiple ports + tab listeners
+// + content-script port.  Watchdog state persisted in
+// browser.storage.local.watchdog.
+//
+// MULTI-PORT (2026-11-01)
+// =======================
+// The extension dials every port in DSX_PORTS:
+//
+//   8765 — CLI (`type`/`enter`/`pipe`/`capture`/`hijack`/watchdog)
+//   8767 — daemon (aider via OpenAI-compat facade on 8766)
+//
+// Each EventSource gets its own copy of attachHandlers, closed over
+// its `port`.  Every ack POSTs to `${baseUrl(port)}/export` — the
+// port that delivered the triggering event — never a global URL.
+// `watch` events forward `port` into the content script (and thence
+// to injected-watch.js) so the page-world watcher posts its deltas
+// back to the correct server.
+//
+// `arm` and `include_forked` are tracked per-port: only the CLI arms
+// (daemon never sends `arm`), but keeping them keyed by port means a
+// config event from the daemon can't clobber the CLI's fork setting.
+//
+// Daemon-port backoff: if 8767 isn't listening, EventSource will
+// fail repeatedly and spam the console.  onerror schedules an
+// exponential backoff (`retryAfter`) that ensureConnected respects,
+// so a steady state of "daemon not running" costs one probe per ~16s
+// rather than 2/sec.
 
-const DSX_URL = "http://127.0.0.1:8765";
+const DSX_PORTS = [8765, 8767];
 
-let armed = false;
+// Per-port connection state.
+//   connections.get(port) = {
+//     es,               // EventSource | undefined
+//     wasConnected,     // bool — for one-shot log
+//     failures,         // int — consecutive connect failures
+//     retryAfter,       // ms-since-epoch; watchdog skips until then
+//   }
+const connections = new Map();
+
+// Per-port state (only the CLI actually arms, but keep it keyed).
+const armedByPort = new Set();
+const includeForkedByPort = new Map();
+
+// Global "only one fire in flight at a time" guard.
 let firing = false;
-let includeForked = false;
-let eventSource = null;
-let wasConnected = false;
+
+// Watchdog.
 let watchdogTimer = null;
 let watchdogEnabled = true;
-let activePorts = new Set();
+
+// Content-script keepalive ports.
+const activePorts = new Set();
 
 // ---- watchdog state: persisted in storage.local ----------------
 
@@ -29,19 +68,38 @@ browser.storage.onChanged.addListener((changes, area) => {
   else { console.log("DSX: watchdog OFF"); stopWatchdog(); }
 });
 
-// ---- SSE plumbing ------------------------------------------------
+// ---- SSE plumbing: per-connection handlers ------------------------
 
-function attachHandlers(es) {
+function baseUrl(port) {
+  return `http://127.0.0.1:${port}`;
+}
+
+function attachHandlers(es, port) {
+  const base = baseUrl(port);
+  const tag = `[${port}]`;
+
+  // Post an ack to THIS connection's port.  Swallows errors so a
+  // dead server doesn't unhandled-reject.
+  const postAck = async (payload) => {
+    try {
+      await fetch(`${base}/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } catch (_) {}
+  };
+
   es.addEventListener("arm", () => {
-    console.log("DSX: arm received");
-    armed = true;
+    console.log(`DSX:${tag} arm received`);
+    armedByPort.add(port);
     firing = false;
-    maybeFire();
+    maybeFire(port);
   });
 
   es.addEventListener("disarm", () => {
-    console.log("DSX: disarm received");
-    armed = false;
+    console.log(`DSX:${tag} disarm received`);
+    armedByPort.delete(port);
     firing = false;
   });
 
@@ -50,29 +108,22 @@ function attachHandlers(es) {
     try { data = JSON.parse(e.data || "{}"); } catch (_) {}
 
     if ("include_forked" in data) {
-      includeForked = !!data.include_forked;
-      console.log(`DSX: config include_forked=${includeForked}`);
+      includeForkedByPort.set(port, !!data.include_forked);
+      console.log(
+        `DSX:${tag} config include_forked=${!!data.include_forked}`);
     }
 
     if (!("watchdog" in data)) return;
     const enabled = data.watchdog !== false;
     browser.storage.local.set({ watchdog: enabled }).then(() => {
-      fetch(`${DSX_URL}/export`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ __ack: "watchdog", watchdog: enabled }),
-      }).catch(() => {});
+      postAck({ __ack: "watchdog", watchdog: enabled });
     });
   });
 
   es.addEventListener("request-status", () => {
     browser.storage.local.get("watchdog").then(({ watchdog }) => {
       const enabled = watchdog !== false;
-      fetch(`${DSX_URL}/export`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ __status: "watchdog", watchdog: enabled }),
-      }).catch(() => {});
+      postAck({ __status: "watchdog", watchdog: enabled });
     });
   });
 
@@ -84,7 +135,9 @@ function attachHandlers(es) {
     const files = data.files || [];
     const opts = data.opts || {};
 
-    console.log(`DSX: attach received (batch=${batchId}, ${files.length} file(s))`);
+    console.log(
+      `DSX:${tag} attach received (batch=${batchId}, ` +
+      `${files.length} file(s))`);
 
     let result = { success: false, reason: "no active deepseek tab" };
     try {
@@ -104,19 +157,8 @@ function attachHandlers(es) {
       result = { success: false, reason: `sendMessage threw: ${err.message}` };
     }
 
-    console.log(`DSX: attach result (batch=${batchId}):`, result);
-
-    try {
-      await fetch(`${DSX_URL}/export`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          __ack: "attach",
-          batch_id: batchId,
-          result,
-        }),
-      });
-    } catch (_) {}
+    console.log(`DSX:${tag} attach result (batch=${batchId}):`, result);
+    await postAck({ __ack: "attach", batch_id: batchId, result });
   });
 
   // ---- type (deeppeek type) ----
@@ -127,7 +169,9 @@ function attachHandlers(es) {
     const text = data.text || "";
     const opts = data.opts || {};
 
-    console.log(`DSX: type received (batch=${batchId}, ${text.length} chars)`);
+    console.log(
+      `DSX:${tag} type received (batch=${batchId}, ` +
+      `${text.length} chars)`);
 
     let result = { success: false, reason: "no active deepseek tab" };
     try {
@@ -146,15 +190,8 @@ function attachHandlers(es) {
       result = { success: false, reason: `sendMessage threw: ${err.message}` };
     }
 
-    console.log(`DSX: type result (batch=${batchId}):`, result);
-
-    try {
-      await fetch(`${DSX_URL}/export`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ __ack: "type", batch_id: batchId, result }),
-      });
-    } catch (_) {}
+    console.log(`DSX:${tag} type result (batch=${batchId}):`, result);
+    await postAck({ __ack: "type", batch_id: batchId, result });
   });
 
   // ---- enter (deeppeek enter) ----
@@ -164,7 +201,7 @@ function attachHandlers(es) {
     const batchId = data.batch_id;
     const opts = data.opts || {};
 
-    console.log(`DSX: enter received (batch=${batchId})`);
+    console.log(`DSX:${tag} enter received (batch=${batchId})`);
 
     let result = { success: false, reason: "no active deepseek tab" };
     try {
@@ -182,35 +219,11 @@ function attachHandlers(es) {
       result = { success: false, reason: `sendMessage threw: ${err.message}` };
     }
 
-    console.log(`DSX: enter result (batch=${batchId}):`, result);
-
-    try {
-      await fetch(`${DSX_URL}/export`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ __ack: "enter", batch_id: batchId, result }),
-      });
-    } catch (_) {}
+    console.log(`DSX:${tag} enter result (batch=${batchId}):`, result);
+    await postAck({ __ack: "enter", batch_id: batchId, result });
   });
 
   // ---- open-tab (deeppeek prompt new / daemon) ----
-  //
-  // Optional container support: the payload may include
-  //
-  //   `container`     — display name.  Resolved via
-  //                     contextualIdentities.query({}) and matched
-  //                     case-insensitively; exact match preferred.
-  //                     Ambiguous case-insensitive matches error
-  //                     out so the user can disambiguate with
-  //                     `container_id`.
-  //   `container_id`  — raw cookieStoreId (e.g. 'firefox-container-3').
-  //                     Passed straight to tabs.create; no lookup.
-  //                     Escape hatch for when the display name is
-  //                     ambiguous or for scripting.
-  //
-  // If neither is set, the tab opens in the default container
-  // (backward-compatible with the pre-container behaviour — the
-  // daemon uses the same event and keeps working unchanged).
   es.addEventListener("open-tab", async (e) => {
     let data = {};
     try { data = JSON.parse(e.data || "{}"); } catch (_) {}
@@ -220,16 +233,13 @@ function attachHandlers(es) {
     const containerId = data.container_id || null;
 
     console.log(
-      `DSX: open-tab received (batch=${batchId}, url=${url}, ` +
+      `DSX:${tag} open-tab received (batch=${batchId}, url=${url}, ` +
       `container=${containerName || containerId || "default"})`);
 
     let result;
     try {
-      // ---- step 1: resolve cookieStoreId ----
       let cookieStoreId = null;
       if (containerId) {
-        // Direct — the caller passed a raw cookieStoreId.  Trust
-        // it; an invalid value throws from tabs.create below.
         cookieStoreId = containerId;
       } else if (containerName) {
         if (!browser.contextualIdentities) {
@@ -277,13 +287,12 @@ function attachHandlers(es) {
           if (matched) {
             cookieStoreId = matched.cookieStoreId;
             console.log(
-              `DSX: resolved container ` +
+              `DSX:${tag} resolved container ` +
               `${JSON.stringify(containerName)} -> ${cookieStoreId}`);
           }
         }
       }
 
-      // ---- step 2: create the tab (only if step 1 didn't fail) ----
       if (!result) {
         const createProps = { url, active: true };
         if (cookieStoreId) createProps.cookieStoreId = cookieStoreId;
@@ -296,8 +305,6 @@ function attachHandlers(es) {
         if (cookieStoreId) result.cookie_store_id = cookieStoreId;
       }
     } catch (err) {
-      // Only overwrite if we haven't already set a specific failure
-      // (e.g. contextualIdentities.query threw after we set a reason).
       if (!result) {
         result = {
           success: false,
@@ -306,27 +313,16 @@ function attachHandlers(es) {
       }
     }
 
-    console.log(`DSX: open-tab result (batch=${batchId}):`, result);
-
-    try {
-      await fetch(`${DSX_URL}/export`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          __ack: "open-tab",
-          batch_id: batchId,
-          result,
-        }),
-      });
-    } catch (_) {}
+    console.log(`DSX:${tag} open-tab result (batch=${batchId}):`, result);
+    await postAck({ __ack: "open-tab", batch_id: batchId, result });
   });
 
-  // ---- hijack-install (deeppeek hijack) ----
+  // ---- hijack-install / hijack-uninstall ----
   es.addEventListener("hijack-install", async (e) => {
     let data = {};
     try { data = JSON.parse(e.data || "{}"); } catch (_) {}
     const batchId = data.batch_id;
-    console.log(`DSX: hijack-install received (batch=${batchId})`);
+    console.log(`DSX:${tag} hijack-install received (batch=${batchId})`);
     let result = { success: false, reason: "no active deepseek tab" };
     try {
       const [tab] = await browser.tabs.query({
@@ -341,22 +337,15 @@ function attachHandlers(es) {
     } catch (err) {
       result = { success: false, reason: `sendMessage threw: ${err.message}` };
     }
-    console.log(`DSX: hijack-install result:`, result);
-    try {
-      await fetch(`${DSX_URL}/export`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ __ack: "hijack-install", batch_id: batchId, result }),
-      });
-    } catch (_) {}
+    console.log(`DSX:${tag} hijack-install result:`, result);
+    await postAck({ __ack: "hijack-install", batch_id: batchId, result });
   });
 
-  // ---- hijack-uninstall ----
   es.addEventListener("hijack-uninstall", async (e) => {
     let data = {};
     try { data = JSON.parse(e.data || "{}"); } catch (_) {}
     const batchId = data.batch_id;
-    console.log(`DSX: hijack-uninstall received (batch=${batchId})`);
+    console.log(`DSX:${tag} hijack-uninstall received (batch=${batchId})`);
     let result = { success: false, reason: "no active deepseek tab" };
     try {
       const [tab] = await browser.tabs.query({
@@ -371,14 +360,8 @@ function attachHandlers(es) {
     } catch (err) {
       result = { success: false, reason: `sendMessage threw: ${err.message}` };
     }
-    console.log(`DSX: hijack-uninstall result:`, result);
-    try {
-      await fetch(`${DSX_URL}/export`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ __ack: "hijack-uninstall", batch_id: batchId, result }),
-      });
-    } catch (_) {}
+    console.log(`DSX:${tag} hijack-uninstall result:`, result);
+    await postAck({ __ack: "hijack-uninstall", batch_id: batchId, result });
   });
 
   // ---- clear (deeppeek prompt delete) ----
@@ -388,7 +371,7 @@ function attachHandlers(es) {
     const batchId = data.batch_id;
     const opts = data.opts || {};
 
-    console.log(`DSX: clear received (batch=${batchId})`);
+    console.log(`DSX:${tag} clear received (batch=${batchId})`);
 
     let result = { success: false, reason: "no active deepseek tab" };
     try {
@@ -406,15 +389,8 @@ function attachHandlers(es) {
       result = { success: false, reason: `sendMessage threw: ${err.message}` };
     }
 
-    console.log(`DSX: clear result (batch=${batchId}):`, result);
-
-    try {
-      await fetch(`${DSX_URL}/export`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ __ack: "clear", batch_id: batchId, result }),
-      });
-    } catch (_) {}
+    console.log(`DSX:${tag} clear result (batch=${batchId}):`, result);
+    await postAck({ __ack: "clear", batch_id: batchId, result });
   });
 
   // ---- extract-attachments (deeppeek prompt attachments) ----
@@ -425,7 +401,7 @@ function attachHandlers(es) {
     const opts = data.opts || {};
 
     console.log(
-      `DSX: extract-attachments received (batch=${batchId}, ` +
+      `DSX:${tag} extract-attachments received (batch=${batchId}, ` +
       `mode=${opts.mode})`);
 
     let result = { success: false, ok: false,
@@ -452,23 +428,17 @@ function attachHandlers(es) {
       };
     }
 
-    console.log(`DSX: extract-attachments result:`, {
+    console.log(`DSX:${tag} extract-attachments result:`, {
       ok: result.ok,
       n_files: (result.files || []).length,
       n_errors: (result.files || []).filter(f => f.error).length,
     });
 
-    try {
-      await fetch(`${DSX_URL}/export`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          __ack: "extract-attachments",
-          batch_id: batchId,
-          result,
-        }),
-      });
-    } catch (_) {}
+    await postAck({
+      __ack: "extract-attachments",
+      batch_id: batchId,
+      result,
+    });
   });
 
   // ---- retry-last (deeppeek prompt retry) ----
@@ -478,7 +448,7 @@ function attachHandlers(es) {
     const batchId = data.batch_id;
     const opts = data.opts || {};
 
-    console.log(`DSX: retry-last received (batch=${batchId})`);
+    console.log(`DSX:${tag} retry-last received (batch=${batchId})`);
 
     let result = { success: false,
                    reason: "no active deepseek tab" };
@@ -504,35 +474,25 @@ function attachHandlers(es) {
       };
     }
 
-    console.log(`DSX: retry-last result:`, {
+    console.log(`DSX:${tag} retry-last result:`, {
       ok: result.success,
       message_id: result.message_id,
       files_attached: result.files_attached,
       text_length: result.text_length,
     });
 
-    try {
-      await fetch(`${DSX_URL}/export`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          __ack: "retry-last",
-          batch_id: batchId,
-          result,
-        }),
-      });
-    } catch (_) {}
+    await postAck({
+      __ack: "retry-last",
+      batch_id: batchId,
+      result,
+    });
   });
 
   // ==================================================================
   // deeppeek daemon handlers — extract / submit / watch
   // ==================================================================
 
-  // ---- extract (deeppeek daemon) ----
-  //
-  // Request-response extraction: unlike `arm`, this fires exactly
-  // once per event and acks with the payload.  Used by the daemon's
-  // fallback poller; the primary path is `watch` below.
+  // ---- extract (request-response, single-shot) ----
   es.addEventListener("extract", async (e) => {
     let data = {};
     try { data = JSON.parse(e.data || "{}"); } catch (_) {}
@@ -559,20 +519,10 @@ function attachHandlers(es) {
       result = { success: false, reason: `sendMessage threw: ${err.message}` };
     }
 
-    try {
-      await fetch(`${DSX_URL}/export`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          __ack: "extract",
-          batch_id: batchId,
-          result,
-        }),
-      });
-    } catch (_) {}
+    await postAck({ __ack: "extract", batch_id: batchId, result });
   });
 
-  // ---- submit (deeppeek daemon, atomic clear+type+enter) ----
+  // ---- submit (atomic clear+type+enter) ----
   es.addEventListener("submit", async (e) => {
     let data = {};
     try { data = JSON.parse(e.data || "{}"); } catch (_) {}
@@ -581,10 +531,6 @@ function attachHandlers(es) {
 
     let result = { success: false, reason: "no active deepseek tab" };
     try {
-      // Pin to the daemon-supplied tab_id when present. Without this,
-      // "active tab" semantics can drift between submit and watch if
-      // the user switches tabs — the watch would then watch a
-      // different conversation.
       let tab = null;
       if (data.tab_id != null) {
         try { tab = await browser.tabs.get(data.tab_id); } catch (_) { tab = null; }
@@ -604,24 +550,14 @@ function attachHandlers(es) {
           type: "DSX_TYPE", text, opts: { skip_verify: true },
         });
 
-        // Enter is FIRE-AND-FORGET for submit purposes. We cannot
-        // reliably distinguish "submitted" from "composer still
-        // clearing on a slow network" via DOM state within any fixed
-        // timeout. Treating a fired Enter as failure caused the
-        // 2026-10-31 double-submit incident: enter fired, composer
-        // hadn't cleared within 300ms, submit retried, enter fired
-        // AGAIN — a second identical prompt. The watch is the source
-        // of truth for "did content appear"; submit just needs to
-        // guarantee the keys were dispatched.
+        // Enter is fire-and-forget.  The watch is the source of
+        // truth for "did content appear".
         let enter = null;
         let enterOk = false;
         try {
           enter = await browser.tabs.sendMessage(tab.id, {
             type: "DSX_ENTER", opts: { verify_ms: 1500 },
           });
-          // doEnter sets `submitted: true` once keys are dispatched;
-          // `success` is `composer_cleared`, which we deliberately
-          // ignore here.
           enterOk = !!(enter && enter.submitted !== false);
         } catch (err) {
           enter = {
@@ -631,8 +567,6 @@ function attachHandlers(es) {
           enterOk = false;
         }
 
-        // Per-step failure reasons so the daemon log names the step
-        // instead of saying "(no reason)".
         const failures = [];
         if (!(clear && clear.success)) {
           failures.push(`clear: ${(clear && clear.reason) || "failed"}`);
@@ -655,34 +589,15 @@ function attachHandlers(es) {
       result = { success: false, reason: `submit threw: ${err.message}` };
     }
 
-    try {
-      await fetch(`${DSX_URL}/export`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          __ack: "submit",
-          batch_id: batchId,
-          result,
-        }),
-      });
-    } catch (_) {}
+    await postAck({ __ack: "submit", batch_id: batchId, result });
   });
 
-  // ---- watch (deeppeek daemon, streaming) ----
+  // ---- watch (streaming) ----
   //
-  // Event-driven path (new): the `watch` handler acks immediately,
-  // then asks the content script to spawn a MutationObserver in the
-  // page world.  The observer fires on DOM updates (sub-millisecond),
-  // and separately watches the composer's "Stop generating" button —
-  // its disappearance is the model-finished signal, so `watch-done`
-  // fires the instant the last token renders.  Deltas are POSTed
-  // straight from the page world to /export, so they bypass this
-  // background script entirely.
-  //
-  // Fallback path (kept verbatim): if the content script cannot
-  // spawn the observer (DeepSeek UI change, extension-too-old to
-  // have injected-watch.js), the old setInterval-based poller
-  // still runs so the daemon never breaks.
+  // Primary path: hand off to the page-world MutationObserver,
+  // passing `port` so watch-deltas POST to the same server that
+  // sent the `watch` event.  Fallback path: legacy polling in this
+  // file, also using postAck (bound to this connection's port).
   es.addEventListener("watch", async (e) => {
     let data = {};
     try { data = JSON.parse(e.data || "{}"); } catch (_) {}
@@ -694,20 +609,13 @@ function attachHandlers(es) {
       Math.max(5000, data.first_content_timeout_ms || 30000);
     const pinnedTabId = (data.tab_id != null) ? data.tab_id : null;
 
-    // Ack first — the daemon waits for this before consuming deltas.
-    try {
-      await fetch(`${DSX_URL}/export`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          __ack: "watch",
-          batch_id: batchId,
-          result: { success: true },
-        }),
-      });
-    } catch (_) { return; }
+    // Ack first.
+    await postAck({
+      __ack: "watch",
+      batch_id: batchId,
+      result: { success: true },
+    });
 
-    // Find the tab (pinned or active).
     let tab = null;
     if (pinnedTabId != null) {
       try { tab = await browser.tabs.get(pinnedTabId); } catch (_) {}
@@ -720,29 +628,23 @@ function attachHandlers(es) {
     }
     if (!tab || !tab.url
         || !tab.url.startsWith("https://chat.deepseek.com/")) {
-      try {
-        await fetch(`${DSX_URL}/export`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            __ack: "watch-done",
-            batch_id: batchId,
-            reason: "no_deepseek_tab",
-          }),
-        });
-      } catch (_) {}
+      await postAck({
+        __ack: "watch-done",
+        batch_id: batchId,
+        reason: "no_deepseek_tab",
+      });
       return;
     }
 
-    // Try the event-driven path first.
+    // Try event-driven path, passing `port` down so the page-world
+    // watcher acks back to the correct server.
     let started = false;
     try {
       const resp = await browser.tabs.sendMessage(tab.id, {
         type: "DSX_WATCH_START",
         opts: {
           batch_id: batchId,
-          // settle_ms derived from the legacy (poll_interval,
-          // settle_ticks) pair so the Python side needs no changes.
+          port: port,   // <-- forwarded to injected-watch.js
           settle_ms: Math.max(100, settleTicks * pollInterval),
           max_duration_ms: maxDuration,
           first_content_timeout_ms: firstContentTimeoutMs,
@@ -752,117 +654,144 @@ function attachHandlers(es) {
     } catch (_) {}
 
     console.log(
-      `DSX: watch via ${started ? "mutation-observer" : "polling"}`
-      + ` (batch=${batchId})`);
+      `DSX:${tag} watch via ` +
+      `${started ? "mutation-observer" : "polling"} ` +
+      `(batch=${batchId})`);
 
-    if (!started) {
-      // Fallback: legacy polling.  Kept verbatim so a DeepSeek UI
-      // change that breaks the observer doesn't break the daemon.
-      let lastContent = "";
-      let stableTicks = 0;
-      let stopped = false;
-      let timer = null;
-      let firstContentAt = null;
-      const startedAt = Date.now();
+    if (started) return;
 
-      const pollStop = async (reason) => {
-        if (stopped) return;
-        stopped = true;
-        if (timer) { clearInterval(timer); timer = null; }
-        try {
-          await fetch(`${DSX_URL}/export`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              __ack: "watch-done",
-              batch_id: batchId, reason: reason || null,
-            }),
-          });
-        } catch (_) {}
-      };
+    // ---- legacy polling fallback (all acks via postAck) ----
+    let lastContent = "";
+    let stableTicks = 0;
+    let stopped = false;
+    let timer = null;
+    let firstContentAt = null;
+    const startedAt = Date.now();
+    let lastActivityAt = startedAt;
+    let initialMsgCount = 0;
 
-      const poll = async () => {
-        if (stopped) return;
-        if (Date.now() - startedAt > maxDuration) {
-          await pollStop("max_duration"); return;
+    const pollStop = async (reason) => {
+      if (stopped) return;
+      stopped = true;
+      if (timer) { clearInterval(timer); timer = null; }
+      await postAck({
+        __ack: "watch-done",
+        batch_id: batchId, reason: reason || null,
+      });
+    };
+
+    const poll = async () => {
+      if (stopped) return;
+      if (Date.now() - startedAt > maxDuration) {
+        await pollStop("max_duration"); return;
+      }
+      let resp;
+      try {
+        resp = await browser.tabs.sendMessage(tab.id, {
+          type: "DSX_EXTRACT", include_forked: false,
+        });
+      } catch (_) { stableTicks = 0; return; }
+      if (!resp) { stableTicks = 0; return; }
+      let content = "";
+      let thinking = "";
+      const msgs = resp.messages || [];
+      if (initialMsgCount === 0) {
+        initialMsgCount = msgs.length;
+      }
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].role === "assistant") {
+          content = msgs[i].content || "";
+          thinking = msgs[i].thinking || "";
+          break;
         }
-        let resp;
-        try {
-          resp = await browser.tabs.sendMessage(tab.id, {
-            type: "DSX_EXTRACT", include_forked: false,
-          });
-        } catch (_) { stableTicks = 0; return; }
-        if (!resp) { stableTicks = 0; return; }
-        let content = "";
-        const msgs = resp.messages || [];
-        for (let i = msgs.length - 1; i >= 0; i--) {
-          if (msgs[i].role === "assistant") {
-            content = msgs[i].content || ""; break;
-          }
-        }
-        if (content) {
-          if (firstContentAt === null) firstContentAt = Date.now();
-        } else if (firstContentAt === null
-                   && Date.now() - startedAt > firstContentTimeoutMs) {
-          await pollStop("no_first_content"); return;
-        }
-        if (content === lastContent) {
-          if (lastContent) stableTicks++;
-        } else if (content.startsWith(lastContent)) {
-          const delta = content.slice(lastContent.length);
-          lastContent = content; stableTicks = 0;
-          if (delta) {
-            await fetch(`${DSX_URL}/export`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                __ack: "watch-delta", batch_id: batchId, delta,
-              }),
-            });
-          }
-        } else {
-          lastContent = content; stableTicks = 0;
-          await fetch(`${DSX_URL}/export`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              __ack: "watch-rewrite", batch_id: batchId, content,
-            }),
+      }
+      if (content || thinking || (msgs.length > initialMsgCount)) {
+        lastActivityAt = Date.now();
+      }
+      if (content) {
+        if (firstContentAt === null) firstContentAt = Date.now();
+      } else if (firstContentAt === null
+                 && Date.now() - lastActivityAt > firstContentTimeoutMs) {
+        await pollStop("no_first_content"); return;
+      }
+      if (content === lastContent) {
+        if (lastContent) stableTicks++;
+      } else if (content.startsWith(lastContent)) {
+        const delta = content.slice(lastContent.length);
+        lastContent = content; stableTicks = 0;
+        if (delta) {
+          await postAck({
+            __ack: "watch-delta", batch_id: batchId, delta,
           });
         }
-        if (lastContent && stableTicks >= settleTicks) {
-          await pollStop("settled");
-        }
-      };
-      timer = setInterval(poll, pollInterval);
-      poll();
-    }
+      } else {
+        lastContent = content; stableTicks = 0;
+        await postAck({
+          __ack: "watch-rewrite", batch_id: batchId, content,
+        });
+      }
+      if (lastContent && stableTicks >= settleTicks) {
+        await pollStop("settled");
+      }
+    };
+    timer = setInterval(poll, pollInterval);
+    poll();
   });
 
   es.onopen = () => {
-    console.log("DSX: SSE connected");
-    wasConnected = true;
+    console.log(`DSX:${tag} SSE connected`);
+    const s = connections.get(port);
+    if (s) {
+      s.wasConnected = true;
+      s.failures = 0;
+      s.retryAfter = 0;
+    }
   };
 
   es.onerror = () => {
-    if (wasConnected) {
-      console.log("DSX: SSE disconnected (will retry)");
-      wasConnected = false;
+    const s = connections.get(port);
+    if (!s) return;
+    if (s.wasConnected) {
+      console.log(`DSX:${tag} SSE disconnected (will retry)`);
+      s.wasConnected = false;
+      s.failures = 0;      // reset: prior success means transient
+    } else {
+      s.failures = (s.failures || 0) + 1;
+    }
+    // After 2 consecutive failures with no intervening success,
+    // schedule exponential backoff so a not-listening port doesn't
+    // spam the console.  Cap at 16s.
+    if (s.failures >= 2) {
+      const backoff = Math.min(
+        16000, 500 * Math.pow(2, s.failures - 2));
+      s.retryAfter = Date.now() + backoff;
     }
   };
 }
 
-function ensureConnected() {
-  if (eventSource && eventSource.readyState === EventSource.OPEN) return;
-  if (eventSource) {
-    try { eventSource.close(); } catch (_) {}
+function ensureConnected(port) {
+  const state = connections.get(port);
+  if (state && state.es && state.es.readyState === EventSource.OPEN) return;
+  if (state && state.retryAfter && Date.now() < state.retryAfter) return;
+  if (state && state.es) {
+    try { state.es.close(); } catch (_) {}
   }
   try {
-    eventSource = new EventSource(`${DSX_URL}/events`);
-    attachHandlers(eventSource);
+    const es = new EventSource(`${baseUrl(port)}/events`);
+    connections.set(port, {
+      es,
+      wasConnected: state ? state.wasConnected : false,
+      failures: state ? (state.failures || 0) : 0,
+      retryAfter: 0,
+    });
+    attachHandlers(es, port);
   } catch (e) {
-    console.log("DSX: EventSource construction failed:", e);
+    console.log(`DSX:${port} EventSource construction failed:`, e);
   }
+}
+
+function ensureAllConnected() {
+  for (const port of DSX_PORTS) ensureConnected(port);
 }
 
 // ---- content-script port ----------------------------------------
@@ -871,7 +800,7 @@ browser.runtime.onConnect.addListener((port) => {
   if (port.name !== "deeppeek-keepalive") return;
   activePorts.add(port);
   port.onMessage.addListener((msg) => {
-    ensureConnected();
+    ensureAllConnected();
     if (msg && msg.type === "hello") maybeFire();
   });
   port.onDisconnect.addListener(() => { activePorts.delete(port); });
@@ -890,9 +819,16 @@ function startWatchdog() {
   if (!watchdogEnabled) { stopWatchdog(); return; }
   if (watchdogTimer) clearInterval(watchdogTimer);
   watchdogTimer = setInterval(async () => {
-    if (eventSource && eventSource.readyState === EventSource.OPEN) return;
+    // Fast path: everything is up.
+    const disconnected = DSX_PORTS.filter((p) => {
+      const s = connections.get(p);
+      return !s || !s.es || s.es.readyState !== EventSource.OPEN;
+    });
+    if (disconnected.length === 0) return;
+
     if (!(await isOnDeepSeekTab())) return;
-    ensureConnected();
+
+    for (const port of disconnected) ensureConnected(port);
   }, 500);
 }
 
@@ -902,17 +838,6 @@ function stopWatchdog() {
 
 // ---- extract + fire ----------------------------------------------
 
-async function postToCli(path, payload) {
-  try {
-    const res = await fetch(`${DSX_URL}${path}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    return res.ok;
-  } catch (e) { return false; }
-}
-
 async function getActiveDeepSeekTab() {
   const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
   if (!tab || !tab.url || !tab.url.startsWith("https://chat.deepseek.com/")) {
@@ -921,12 +846,13 @@ async function getActiveDeepSeekTab() {
   return tab;
 }
 
-async function handleExtract() {
+async function handleExtract(port) {
   const tab = await getActiveDeepSeekTab();
   if (!tab) {
     console.warn("DSX: active tab is not chat.deepseek.com");
     return false;
   }
+  const includeForked = includeForkedByPort.get(port) || false;
   let payload;
   try {
     payload = await browser.tabs.sendMessage(tab.id, {
@@ -941,12 +867,21 @@ async function handleExtract() {
     console.error("DSX: extraction returned no data.");
     return false;
   }
-  const ok = await postToCli("/export", payload);
-  if (!ok) {
-    console.warn(`DSX: CLI is not listening on ${DSX_URL}.`);
+  try {
+    const res = await fetch(`${baseUrl(port)}/export`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      console.warn(`DSX:${port} CLI returned non-OK from /export.`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.warn(`DSX:${port} CLI is not listening on ${baseUrl(port)}.`);
     return false;
   }
-  return true;
 }
 
 function clearFiringAfter(ms) {
@@ -955,12 +890,12 @@ function clearFiringAfter(ms) {
   }, ms);
 }
 
-async function fireOnce() {
+async function fireOnce(port) {
   if (firing) return;
   firing = true;
   clearFiringAfter(15000);
   try {
-    const ok = await handleExtract();
+    const ok = await handleExtract(port);
     if (!ok) firing = false;
   } catch (e) {
     console.error("DSX: fireOnce threw:", e);
@@ -968,15 +903,18 @@ async function fireOnce() {
   }
 }
 
-async function maybeFire() {
-  if (!armed) return;
-  const tab = await getActiveDeepSeekTab();
-  if (!tab) {
-    console.log("DSX: armed, but active tab isn't deepseek");
-    return;
+async function maybeFire(port = null) {
+  const portsToTry = port !== null ? [port] : Array.from(armedByPort);
+  for (const p of portsToTry) {
+    if (!armedByPort.has(p)) continue;
+    const tab = await getActiveDeepSeekTab();
+    if (!tab) {
+      console.log(`DSX: armed on ${p}, but active tab isn't deepseek`);
+      continue;
+    }
+    console.log(`DSX: firing extract (armed on ${p})`);
+    await fireOnce(p);
   }
-  console.log("DSX: firing extract (armed)");
-  await fireOnce();
 }
 
 // ---- tab listeners -----------------------------------------------
@@ -984,7 +922,7 @@ async function maybeFire() {
 browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === "complete" &&
       tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
-    ensureConnected();
+    ensureAllConnected();
     maybeFire();
   }
 });
@@ -993,7 +931,7 @@ browser.tabs.onActivated.addListener(async (activeInfo) => {
   try {
     const tab = await browser.tabs.get(activeInfo.tabId);
     if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
-      ensureConnected();
+      ensureAllConnected();
       maybeFire();
     }
   } catch (_) {}
@@ -1001,11 +939,21 @@ browser.tabs.onActivated.addListener(async (activeInfo) => {
 
 // ---- toolbar button ----------------------------------------------
 
-browser.action.onClicked.addListener(() => {
+browser.action.onClicked.addListener(async () => {
   console.log("DSX: toolbar click");
-  fireOnce();
+  // Prefer 8765 (CLI) — that's what the toolbar button
+  // traditionally targets.  Fall through to 8767 if the CLI isn't
+  // listening.
+  for (const port of [8765, 8767]) {
+    const s = connections.get(port);
+    if (s && s.es && s.es.readyState === EventSource.OPEN) {
+      await fireOnce(port);
+      return;
+    }
+  }
+  console.log("DSX: toolbar click but no CLI/daemon connected");
 });
 
 // ---- startup -----------------------------------------------------
 
-ensureConnected();
+ensureAllConnected();
