@@ -14,6 +14,7 @@ POSTed back as base64 and written here.
     deeppeek hijack                  # write to cwd, flat
     deeppeek hijack --dir ./tmp      # write to ./tmp, flat
     deeppeek hijack --preserve-path  # keep declared subdirectories
+    deeppeek hijack --all            # download every code block and exit
     # Ctrl+C to stop (uninstalls the interceptor)
 
 By default, only the basename of a declared path is kept: a block
@@ -26,6 +27,13 @@ basename cannot escape `<dir>`.
 Existing files at the target path are overwritten (last write wins).
 No ` (1)` suffix is generated, so re-clicking a Download button is
 idempotent. This mirrors `deeppeek recover --apply-to` semantics.
+
+`--all` skips the click-interceptor step entirely. The extension
+walks every `.md-code-block` in the active tab, extracts its text,
+derives a filename with the same logic the click handler uses, and
+POSTs each file to the CLI in one burst. The CLI writes them using
+the same `--preserve-path` / overwrite rules and exits when the
+extension reports that it has finished enumerating.
 
 STRUCTURAL FILENAME DERIVATION (2026-11-05)
 ===========================================
@@ -403,6 +411,181 @@ def _send_and_wait(server, event: str, ack_name: str,
     return ack.get("result") or {}
 
 
+def _write_download_ack(ack: dict, out_dir: Path,
+                        preserve_path: bool, n_written: int) -> int:
+    """Write one `download` ack to disk. Returns the updated counter.
+
+    Shared by the interactive click path and `--all`.  Keeps every
+    write rule (basename flattening, --preserve-path, overwrite,
+    structural filename derivation) identical between the two modes.
+    """
+    filename = ack.get("filename") or "download.bin"
+    b64 = ack.get("base64") or ""
+    source = ack.get("source") or "?"
+    lang = ack.get("lang") or ""
+    try:
+        data = base64.b64decode(b64)
+    except Exception as e:
+        print(f"  [skip] {filename}: invalid base64 ({e})",
+              file=sys.stderr)
+        return n_written
+
+    # MODIFIED (2026-11-05): structural filename derivation.
+    #
+    # When the extension's prose-based derivation failed, the
+    # extension sent a timestamped placeholder and marked the
+    # source as 'lang-fallback'.  Try deriving the real name
+    # from the code body's own docstring / leading comment
+    # (structural parse, not regex over prose).  On success,
+    # use the derived name and update `source` for the log.
+    notes: list = []
+    orig_filename = filename
+    if source == "lang-fallback":
+        try:
+            body_text = data.decode("utf-8", errors="replace")
+        except Exception:
+            body_text = ""
+        if body_text:
+            derived = _derive_filename_from_body(body_text, lang)
+            if derived:
+                filename = derived
+                source = "structural-docstring"
+                notes.append(
+                    f"renamed from {orig_filename} "
+                    f"via structural analysis")
+                print(
+                    f"  [derived] {derived} "
+                    f"(structural, lang={lang or '?'})",
+                    file=sys.stderr)
+
+    if preserve_path:
+        try:
+            rel = _safe_relative_path(filename)
+        except ValueError as e:
+            print(f"  [skip] {filename}: {e}",
+                  file=sys.stderr)
+            return n_written
+    else:
+        # Default: flatten to basename. Safe by construction
+        # (basename has no path components), so a malicious
+        # or confused declaration cannot escape out_dir.
+        norm = (filename or "").replace("\\", "/")
+        name = Path(norm).name
+        if not name or name in (".", ".."):
+            name = "download.bin"
+        rel = Path(name)
+
+    # Overwrite semantics: same path replaces whatever was
+    # there. No ` (1)` suffix, so re-clicking a Download
+    # button is idempotent. Matches `deeppeek recover
+    # --apply-to`, which also overwrites.
+    target = out_dir / rel
+    existed = target.exists()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    except OSError as e:
+        print(f"  [error] {filename}: write failed ({e})",
+              file=sys.stderr)
+        return n_written
+
+    n_written += 1
+    try:
+        display = target.relative_to(out_dir)
+    except ValueError:
+        display = target
+    if not preserve_path and filename and (
+            "/" in filename or "\\" in filename):
+        notes.append(f"declared {filename}")
+    if existed:
+        notes.append("overwrote")
+    note = (", " + ", ".join(notes)) if notes else ""
+    print(f"  [{n_written}] {display} "
+          f"({len(data):,} bytes, source={source}{note})",
+          file=sys.stderr)
+    return n_written
+
+
+def _run_all(server, args: argparse.Namespace, out_dir: Path,
+             preserve_path: bool) -> int:
+    """Ask the extension to enumerate every code block and write them.
+
+    No click interception is installed.  The extension walks the
+    active DeepSeek tab's `.md-code-block` elements, derives each
+    filename with the same logic the click handler uses, POSTs each
+    one as a `download` ack, and finally POSTs a `hijack-all` ack
+    with the count and any per-block errors.
+    """
+    batch_id = uuid.uuid4().hex[:12]
+    print(
+        f"Requesting all code blocks via hijack-all "
+        f"(port {args.port})...",
+        file=sys.stderr,
+    )
+    server._broadcast(
+        "hijack-all",
+        {"batch_id": batch_id, "port": args.port},
+    )
+
+    n_written = 0
+    final_result: Optional[dict] = None
+
+    while True:
+        ack = server.wait_for_result(timeout=None)
+        if ack.get("__ack") == "download":
+            n_written = _write_download_ack(
+                ack, out_dir, preserve_path, n_written)
+            continue
+        if (ack.get("__ack") == "hijack-all"
+                and ack.get("batch_id") == batch_id):
+            final_result = ack.get("result") or {}
+            break
+
+    # Drain any download acks that arrived just after the final ack.
+    while True:
+        try:
+            ack = server.wait_for_result(timeout=0.5)
+        except queue.Empty:
+            break
+        if ack.get("__ack") == "download":
+            n_written = _write_download_ack(
+                ack, out_dir, preserve_path, n_written)
+
+    count = int(final_result.get("count") or 0)
+    total = int(final_result.get("total") or count)
+    errors = final_result.get("errors") or []
+
+    print(
+        f"\n[hijack-all] wrote {n_written} file(s) "
+        f"from {total} code block(s)",
+        file=sys.stderr,
+    )
+    if errors:
+        print(f"  {len(errors)} block(s) failed:", file=sys.stderr)
+        for e in errors:
+            print(
+                f"    {e.get('path', '(unknown)')}: "
+                f"{e.get('error', 'unknown')}",
+                file=sys.stderr,
+            )
+        return 2
+    if not final_result.get("success", True):
+        print(
+            f"  extension reported failure: "
+            f"{final_result.get('reason', '(no reason)')}",
+            file=sys.stderr,
+        )
+        return 2
+    if n_written < count:
+        print(
+            f"  warning: extension posted {count} file(s), "
+            f"but only {n_written} were written",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
+
+
 def register(sub: argparse._SubParsersAction) -> None:
     """Wire the `hijack` subcommand into argparse.
 
@@ -438,6 +621,15 @@ def register(sub: argparse._SubParsersAction) -> None:
              "so a malicious or confused declaration cannot escape "
              "<dir>.",
     )
+    p.add_argument(
+        "--all", action="store_true",
+        help="download every code block in the active DeepSeek tab "
+             "and exit.  No click interception is installed; the "
+             "extension enumerates the blocks, derives filenames, "
+             "and POSTs each file to the CLI.  Honors "
+             "--preserve-path and the same overwrite rules as the "
+             "click path.",
+    )
     p.set_defaults(func=run)
 
 
@@ -469,6 +661,9 @@ def run(args: argparse.Namespace) -> int:
                   "deepseek.com tab is active.", file=sys.stderr)
             return 1
 
+        if args.all:
+            return _run_all(server, args, out_dir, preserve_path)
+
         result = _send_and_wait(
             server, "hijack-install", "hijack-install", args.timeout)
         if not result.get("success"):
@@ -494,91 +689,8 @@ def run(args: argparse.Namespace) -> int:
             ack = server.wait_for_result(timeout=None)
             if ack.get("__ack") != "download":
                 continue
-
-            filename = ack.get("filename") or "download.bin"
-            b64 = ack.get("base64") or ""
-            source = ack.get("source") or "?"
-            lang = ack.get("lang") or ""
-            try:
-                data = base64.b64decode(b64)
-            except Exception as e:
-                print(f"  [skip] {filename}: invalid base64 ({e})",
-                      file=sys.stderr)
-                continue
-
-            # MODIFIED (2026-11-05): structural filename derivation.
-            #
-            # When the extension's prose-based derivation failed, the
-            # extension sent a timestamped placeholder and marked the
-            # source as 'lang-fallback'.  Try deriving the real name
-            # from the code body's own docstring / leading comment
-            # (structural parse, not regex over prose).  On success,
-            # use the derived name and update `source` for the log.
-            notes: list = []
-            orig_filename = filename
-            if source == "lang-fallback":
-                try:
-                    body_text = data.decode("utf-8", errors="replace")
-                except Exception:
-                    body_text = ""
-                if body_text:
-                    derived = _derive_filename_from_body(body_text, lang)
-                    if derived:
-                        filename = derived
-                        source = "structural-docstring"
-                        notes.append(
-                            f"renamed from {orig_filename} "
-                            f"via structural analysis")
-                        print(
-                            f"  [derived] {derived} "
-                            f"(structural, lang={lang or '?'})",
-                            file=sys.stderr)
-
-            if preserve_path:
-                try:
-                    rel = _safe_relative_path(filename)
-                except ValueError as e:
-                    print(f"  [skip] {filename}: {e}",
-                          file=sys.stderr)
-                    continue
-            else:
-                # Default: flatten to basename. Safe by construction
-                # (basename has no path components), so a malicious
-                # or confused declaration cannot escape out_dir.
-                norm = (filename or "").replace("\\", "/")
-                name = Path(norm).name
-                if not name or name in (".", ".."):
-                    name = "download.bin"
-                rel = Path(name)
-
-            # Overwrite semantics: same path replaces whatever was
-            # there. No ` (1)` suffix, so re-clicking a Download
-            # button is idempotent. Matches `deeppeek recover
-            # --apply-to`, which also overwrites.
-            target = out_dir / rel
-            existed = target.exists()
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(data)
-            except OSError as e:
-                print(f"  [error] {filename}: write failed ({e})",
-                      file=sys.stderr)
-                continue
-
-            n_written += 1
-            try:
-                display = target.relative_to(out_dir)
-            except ValueError:
-                display = target
-            if not preserve_path and filename and (
-                    "/" in filename or "\\" in filename):
-                notes.append(f"declared {filename}")
-            if existed:
-                notes.append("overwrote")
-            note = (", " + ", ".join(notes)) if notes else ""
-            print(f"  [{n_written}] {display} "
-                  f"({len(data):,} bytes, source={source}{note})",
-                  file=sys.stderr)
+            n_written = _write_download_ack(
+                ack, out_dir, preserve_path, n_written)
 
     except KeyboardInterrupt:
         print("\nStopping...", file=sys.stderr)

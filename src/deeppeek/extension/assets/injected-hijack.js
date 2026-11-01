@@ -10,6 +10,12 @@
 // Only `.md-code-block` blocks are hijacked.  File-chip downloads
 // use a different UI path and are out of scope.
 //
+// `__dsx_hijack_all_json` is the non-interactive path: it walks
+// every `.md-code-block`, extracts each block's text, derives a
+// filename with the same logic the click handler uses, and POSTs
+// each one directly.  No click interception is installed.  This is
+// what `deeppeek hijack --all` uses.
+//
 // Stability: LOW.  Two independent surfaces here are both volatile:
 //
 //   · The click interceptor (`_hijackClickHandler`) depends on
@@ -28,6 +34,7 @@
 //   window.__dsx_hijack_install_json(argsJson)
 //   window.__dsx_hijack_uninstall_json(argsJson)
 //   window.__dsx_hijack_status_json(argsJson)
+//   window.__dsx_hijack_all_json(argsJson)
 (function () {
   "use strict";
   if (!window.__dsx__) window.__dsx__ = {};
@@ -320,11 +327,16 @@
   // the CLI runs structural analysis on the decoded bytes with the
   // correct language hint and derives the real filename from the
   // module docstring / leading comment.
-  async function _postDownload(filename, text, source, lang) {
+  //
+  // `baseUrl` lets the --all path target the CLI's actual port
+  // instead of the hard-coded default.  The click path leaves it
+  // undefined and keeps using DSX_URL.
+  async function _postDownload(filename, text, source, lang, baseUrl) {
     const bytes = new TextEncoder().encode(text);
     const base64 = _bytesToBase64(bytes);
+    const url = (baseUrl || DSX_URL) + '/export';
     try {
-      const resp = await fetch(`${DSX_URL}/export`, {
+      const resp = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -393,6 +405,41 @@
     });
   }
 
+  async function _downloadAllCodeBlocks(opts) {
+    const port = (opts && typeof opts.port === 'number')
+      ? opts.port : 8765;
+    const base = `http://127.0.0.1:${port}`;
+    const blocks = Array.from(document.querySelectorAll('.md-code-block'));
+    const errors = [];
+    let count = 0;
+    let total = 0;
+
+    for (const block of blocks) {
+      const text = _extractCodeText(block);
+      if (!text) continue;
+      total++;
+      const langLabel = _extractLangLabel(block);
+      const derived = _deriveDownloadFilename(block, langLabel, text);
+      console.log(
+        `[deeppeek:hijack-all] ${derived.path} (${text.length} chars, `
+        + `lang=${langLabel || '?'}, source=${derived.source})`);
+      const ok = await _postDownload(
+        derived.path, text, derived.source, langLabel, base);
+      if (ok) {
+        count++;
+      } else {
+        errors.push({ path: derived.path, error: 'POST failed' });
+      }
+    }
+
+    return {
+      success: errors.length === 0,
+      count,
+      total,
+      errors,
+    };
+  }
+
   function _installDownloadHijacker() {
     if (window.__dsx_hijack_installed) {
       return { success: true, already_installed: true };
@@ -441,5 +488,32 @@
       success: true,
       installed: !!window.__dsx_hijack_installed,
     });
+  };
+
+  window.__dsx_hijack_all_json = async function (argsJson) {
+    let opts = {};
+    try {
+      if (typeof argsJson === 'string' && argsJson.length > 0) {
+        opts = JSON.parse(argsJson);
+      }
+    } catch (e) {
+      return JSON.stringify({
+        success: false,
+        reason: `arg parse failed: ${e.message}`,
+      });
+    }
+    try {
+      const result = await _downloadAllCodeBlocks(opts);
+      console.log(
+        `[deeppeek:hijack-all] ${result.count}/${result.total} `
+        + `block(s) posted, ${result.errors.length} error(s)`);
+      return JSON.stringify(result);
+    } catch (e) {
+      console.error('[deeppeek:hijack-all] threw:', e);
+      return JSON.stringify({
+        success: false,
+        reason: `hijack-all threw: ${e.message}`,
+      });
+    }
   };
 })();

@@ -364,6 +364,46 @@ function attachHandlers(es, port) {
     await postAck({ __ack: "hijack-uninstall", batch_id: batchId, result });
   });
 
+  // ---- hijack-all (deeppeek hijack --all) ----
+  es.addEventListener("hijack-all", async (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+    const batchId = data.batch_id;
+    const cliPort = data.port;
+    console.log(
+      `DSX:${tag} hijack-all received ` +
+      `(batch=${batchId}, port=${cliPort})`);
+
+    let result = { success: false, reason: "no active deepseek tab" };
+    try {
+      const [tab] = await browser.tabs.query({
+        active: true, currentWindow: true,
+      });
+      if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+        const resp = await browser.tabs.sendMessage(tab.id, {
+          type: "DSX_HIJACK_ALL",
+          opts: { port: cliPort },
+        });
+        result = resp || {
+          success: false,
+          reason: "no response from content script",
+        };
+      }
+    } catch (err) {
+      result = {
+        success: false,
+        reason: `sendMessage threw: ${err.message}`,
+      };
+    }
+
+    console.log(`DSX:${tag} hijack-all result:`, result);
+    await postAck({
+      __ack: "hijack-all",
+      batch_id: batchId,
+      result,
+    });
+  });
+
   // ---- clear (deeppeek prompt delete) ----
   es.addEventListener("clear", async (e) => {
     let data = {};

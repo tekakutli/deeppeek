@@ -277,6 +277,20 @@
       }
     }
 
+    if (msg.type === "DSX_HIJACK_ALL") {
+      if (!(await ensurePageWorldFn("__dsx_hijack_all_json"))) {
+        return { success: false, reason: "page-world hijack unavailable" };
+      }
+      try {
+        const argsJson = JSON.stringify(msg.opts || {});
+        const json = await window.wrappedJSObject
+          .__dsx_hijack_all_json(argsJson);
+        return JSON.parse(json);
+      } catch (e) {
+        return { success: false, reason: `hijack all threw: ${e.message}` };
+      }
+    }
+
     return null;
   });
 
