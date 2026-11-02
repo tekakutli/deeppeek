@@ -3,12 +3,106 @@
 // =====================================================================
 //
 // AUTO-INJECTION FRAMEWORK.  Contains zero button definitions; the
-// actual buttons live in `injected-button-rules.js`, which loads
-// after this file and calls `window.__dsx__.buttons.rule({...})` per
-// button type.
+// actual buttons live in `button-rules/*.js`, loaded by content.js
+// after this file per `button-rules/_manifest.json`.
 //
-// PUBLIC API (on window.__dsx__.buttons):
-//   rule(spec)          register an injection rule
+// =====================================================================
+// BUTTON REFERENCE — where each button type injects
+// =====================================================================
+//
+// Only the files listed in `button-rules/_manifest.json` actually
+// render.  The rows below are the seven button types identified for
+// deeppeek; use this table when writing a new rule file so you know
+// exactly what `target`, `filter`, and `template` to write.
+//
+//   #  name               pos     injection point
+//   -- ------------------ ------- --------------------------------------
+//   1  default-capsule    end     the icon capsule row — any `.ds-flex`
+//                                 whose direct children are ALL
+//                                 `.ds-button--capsule.ds-button--xs
+//                                 [role="button"]` (currently 5 icon
+//                                 buttons under the assistant message:
+//                                 copy, regenerate, like, dislike, more)
+//
+//   2  continue-btn       start   the wrapper `<div>` around the
+//                                 "Continue" button, visible when the
+//                                 last assistant reply was truncated
+//
+//   3  codeblock-copy     start   the banner row of every
+//                                 `.md-code-block` — children:
+//                                 `.scroll-to-start`, `.scroll-to-end`,
+//                                 Copy, Download
+//
+//   4  message-toolbar    end     the per-message action bar under each
+//                                 assistant message — children: a 1px
+//                                 spacer `<div>` + ≥2
+//                                 `.ds-button--iconLabelPrimary.ds-button--m`
+//                                 icon buttons
+//
+//   5  thought-scroll     end     the reasoning/thinking header row —
+//                                 has BOTH `.scroll-to-start` AND
+//                                 `.scroll-to-end`, but NOT inside a
+//                                 `.md-code-block`
+//
+//   6  attach-btn         start   the composer attach cluster — a
+//                                 `.ds-button--iconLabelPrimary.ds-button--s`
+//                                 adjacent to an `<input type="file">`
+//
+//   7  toggle-btn         end     the DeepThink/Search toggle row —
+//                                 `.ds-toggle-button` elements; the
+//                                 framework appends to the last one
+//
+// =====================================================================
+// HOW PLACEMENT IS DECIDED — target / filter / template / position
+// =====================================================================
+//
+// A rule matches rows, then clones a template into each matched row:
+//
+//   target    CSS selector OR function returning row elements.
+//             "Which rows are candidates?"
+//
+//   filter    optional predicate on those rows.
+//             "Which of those candidates actually qualify?"
+//
+//   template  element | selector | function returning element.
+//             "What should the clone look like?"
+//
+//   position  'start' | 'end' (default 'end').
+//             "Where in the matched row does the clone land?"
+//
+// When multiple rules target the same row, ordering is:
+//
+//     [...start-rules (registration order), ...native children,
+//      ...end-rules (registration order)]
+//
+// Native children keep their React order; injected clones live at
+// the edges (start = prepended, end = appended).  Both rule kinds
+// may coexist on one row.
+//
+// `target` as a function is preferred for anything not selectable by
+// a stable class name — e.g. "the wrapper div around a Continue
+// button" or "the parent of any `input[type=file]`".  See
+// `button-rules/01-default-capsule.js` for the pattern.
+//
+// =====================================================================
+// HOW TO ADD A NEW BUTTON
+// =====================================================================
+//
+//   1. Create `button-rules/NN-<name>.js` — copy
+//      `01-default-capsule.js` as the template.  Change the rule's
+//      `name`, `template`, `target`, `filter`, `onClick`.
+//   2. Append `"NN-<name>.js"` to `button-rules/_manifest.json`'s
+//      "files" array.
+//   3. `deeppeek extension update`, then reload the chat tab.
+//      No edits to content.js, injected-buttons.js, or manifest.json.
+//   4. Verify: `__dsx.buttons.debug(true)` → colored outline + label
+//      on every injected clone; legend at bottom-right.
+//
+// =====================================================================
+// PUBLIC API (window.__dsx__.buttons)
+// =====================================================================
+//   rule(spec)          register an injection rule (see field docs
+//                       on `rule()` below)
 //   amendRule(n, patch) live-patch an existing rule
 //   unrule(n)           remove a rule and its clones
 //   list()              rule names in registration order
@@ -17,31 +111,15 @@
 //   reapply(n)          re-run decorate on all clones of a rule
 //   debug(bool)         toggle debug overlay (persists via localStorage)
 //   isDebug()           current debug state
-//   resetState()        reset every rule's `_state` to its default
+//   resetState()        reset every rule's _state to its default
 //   legend()            console-only colored legend
 //
-// A rule spec supports:
-//   name       unique id
-//   position   'start' | 'end' (default 'end')
-//   target     selector string OR function returning row elements
-//   filter     optional row predicate
-//   template   element | selector | function returning element
-//   onClick    (e, el, rule) => void       REQUIRED
-//   state      { default: bool }           optional — enables rule._state
-//   decorate   (clone, rule) => void       optional — runs on every clone
-//                                          creation AND every rescan
-//   whenActive [{selector, style}]         optional — layout hooks
-//   color      '#rrggbb'                   optional — debug overlay color
-//
-// The framework keeps one shared MutationObserver on <html> and
-// re-asserts every rule's clone with rAF debouncing.  Idempotent
-// against its own DOM mutations (re-insert is a no-op when ordering
-// matches).
-//
+// =====================================================================
 // DEBUG OVERLAY (`__dsx.buttons.debug(true)`, persists in
-// localStorage.dsx_buttons_debug):
-//   · per-clone colored outline, colored via rule.color or the
-//     default palette below
+// localStorage.dsx_buttons_debug)
+// =====================================================================
+//   · per-clone colored outline, color from rule.color or the
+//     default palette in RULE_COLORS
 //   · floating rule-name label above each clone, rAF-repositioned
 //   · bottom-right legend listing every rule with its color and
 //     current clone count
@@ -443,6 +521,63 @@
 
   const api = {
     rule(spec) {
+      // ---- spec fields (see header above for context) ----
+      //
+      // Required:
+      //   name       unique rule id, e.g. "default-capsule".
+      //              Also becomes the data-dsx-injected marker value,
+      //              so it's how clones are located in the DOM later.
+      //
+      //   target     Which rows to consider.
+      //              CSS selector string OR
+      //              a function () => Element[] .
+      //              A function is preferred for rows that don't have
+      //              a stable class name — e.g. "the parent of any
+      //              input[type=file]", or "the wrapper div around a
+      //              Continue button".
+      //
+      //   template   What to clone into the row.
+      //              Element | selector string | function returning one.
+      //              A function is preferred when the source needs
+      //              transformation (see default-capsule, which
+      //              rewrites the clone from icon-only to text-labelled
+      //              before returning it).
+      //
+      //   onClick    (e, el, rule) => void — REQUIRED.
+      //              `e` is the click event, `el` is the injected clone,
+      //              `rule` is this rule's own spec (so a stateful rule
+      //              can read/write `rule._state`).
+      //
+      // Optional:
+      //   filter     Predicate (row) => boolean.  Narrows `target`'s
+      //              candidates further.  Use for structural predicates
+      //              that are hard to express in a selector.
+      //
+      //   position   'start' | 'end' (default 'end').
+      //              Prepends or appends the clone within the row.
+      //              See "HOW PLACEMENT IS DECIDED" in the header for
+      //              ordering when multiple rules target one row.
+      //
+      //   state      { default: bool }.  Enables `rule._state`, a
+      //              mutable boolean that survives React re-renders
+      //              (re-applied by `decorate` on every fresh clone)
+      //              and resets on page reload.  Used by toggle-btn.
+      //
+      //   decorate   (clone, rule) => void.  Runs on every clone
+      //              creation AND every rescan pass.  This is what
+      //              makes stateful rules self-heal after a re-render:
+      //              the framework rebuilds the clone from cache,
+      //              decorate re-applies the current `_state`, done.
+      //
+      //   whenActive [{selector, style}].  Layout side-effects that
+      //              apply while the rule has ≥1 clone on the page,
+      //              and revert when the last clone disappears.
+      //              Used by message-toolbar to push the chat title
+      //              right while the toolbar exists.
+      //
+      //   color      '#rrggbb'.  Debug-overlay color for this rule.
+      //              Defaults to the entry in RULE_COLORS or grey.
+      // ----------------------------------------------------------
       if (!spec || !spec.name) throw new Error("rule.name required");
       if (typeof spec.onClick !== "function") throw new Error("rule.onClick required");
       if (spec.target == null) throw new Error("rule.target required");

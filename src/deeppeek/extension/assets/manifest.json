@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DeepSeek Chat Exporter (DSX)",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Send a DeepSeek conversation to the deeppeek CLI for Markdown export.",
   "browser_specific_settings": {
     "gecko": {
