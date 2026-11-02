@@ -3,7 +3,11 @@ import argparse
 import sys
 
 from ..capture.server import ExportServer
-from .bridge import BrowserBridge
+from .bridge import (
+    BrowserBridge,
+    DEFAULT_MAX_DURATION_MS,
+    FIRST_CONTENT_TIMEOUT_MS,
+)
 from .server import serve
 
 
@@ -70,6 +74,23 @@ def register(sub: argparse._SubParsersAction) -> None:
         "--connect-timeout", type=float, default=30.0,
         help="seconds to wait for the extension to connect "
              "(default: 30)",
+    )
+    p.add_argument(
+        "--first-content-timeout", type=float, default=None,
+        metavar="SECONDS",
+        help="how long the extension will wait for any first content "
+             "(thinking or answer) before reporting submit failure. "
+             f"Default: {FIRST_CONTENT_TIMEOUT_MS // 1000} s (10 min). "
+             "Can also be set with "
+             "DEEPPEEK_FIRST_CONTENT_TIMEOUT_MS (milliseconds).",
+    )
+    p.add_argument(
+        "--max-duration", type=float, default=None,
+        metavar="SECONDS",
+        help="hard cap on a single watch cycle (thinking + answer). "
+             f"Default: {DEFAULT_MAX_DURATION_MS // 1000} s (15 min). "
+             "Can also be set with "
+             "DEEPPEEK_MAX_DURATION_MS (milliseconds).",
     )
     p.set_defaults(func=run)
 
@@ -140,12 +161,31 @@ def run(args: argparse.Namespace) -> int:
             )
             return 1
 
+        # Translate the CLI seconds-flags into the millisecond values
+        # the bridge wants; fall back to the module defaults (which
+        # themselves read DEEPPEEK_FIRST_CONTENT_TIMEOUT_MS /
+        # DEEPPEEK_MAX_DURATION_MS) when the flag is absent.  Flag
+        # beats env beats default — the same precedence callers
+        # expect from other deeppeek subcommands.
+        first_content_ms = (
+            int(args.first_content_timeout * 1000)
+            if args.first_content_timeout is not None
+            else FIRST_CONTENT_TIMEOUT_MS
+        )
+        max_duration_ms = (
+            int(args.max_duration * 1000)
+            if args.max_duration is not None
+            else DEFAULT_MAX_DURATION_MS
+        )
+
         bridge = BrowserBridge(
             ext,
             new_tab=not args.reuse_tab,
             tab_wait=args.tab_wait,
             container=args.container,
             container_id=args.container_id,
+            first_content_timeout_ms=first_content_ms,
+            max_duration_ms=max_duration_ms,
         )
 
         base = f"http://127.0.0.1:{args.port}/v1"
@@ -171,6 +211,12 @@ def run(args: argparse.Namespace) -> int:
                 "to stdout",
                 file=sys.stderr,
             )
+        print(
+            f"[daemon] first-content timeout: "
+            f"{first_content_ms / 1000:.0f}s   "
+            f"max watch duration: {max_duration_ms / 1000:.0f}s",
+            file=sys.stderr,
+        )
         print(f"[daemon]   export OPENAI_API_BASE={base}", file=sys.stderr)
         print(f"[daemon]   export OPENAI_API_KEY=dummy", file=sys.stderr)
         print(

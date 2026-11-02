@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DeepSeek Chat Exporter (DSX)",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Send a DeepSeek conversation to the deeppeek CLI for Markdown export.",
   "browser_specific_settings": {
     "gecko": {
@@ -41,7 +41,10 @@
         "injected-clear.js",
         "injected-attachments.js",
         "injected-retry.js",
-        "injected-hijack.js"
+        "injected-hijack.js",
+        "injected-buttons.js",
+        "button-rules/_manifest.json",
+        "button-rules/*.js"
       ],
       "matches": ["https://chat.deepseek.com/*"]
     }

@@ -3,18 +3,27 @@
 // script. Also holds an open port to the background, which keeps the
 // MV3 event page alive.
 //
-// The page-world surface is split across 12 sibling scripts, loaded
+// The page-world surface is split across 14 sibling scripts, loaded
 // in dependency order with `async = false` so execution order is
 // preserved.  Each script is an IIFE that attaches to
 // `window.__dsx__`; the `__dsx_*_json` bridge entry points live on
 // `window` directly (Xray-safe: content.js accesses them via
 // `window.wrappedJSObject`).
 //
-// Load order matters only in that the bootstrap (`injected.js`) must
-// define `window.__dsx__` before the others run.  Everything else
-// guards `window.__dsx__` at the top of its IIFE, so any individual
-// file could theoretically be reordered — but keeping the current
-// order stable keeps future debugging sane.
+// BUTTON RULES
+// ============
+// Button definitions live in `button-rules/*.js` and are loaded by
+// `injectButtonRules()` below, in the order listed by
+// `button-rules/_manifest.json`.  The framework
+// (`injected-buttons.js`) is loaded first via PAGE_WORLD_SCRIPTS;
+// each rule file is a self-contained IIFE calling
+// `window.__dsx__.buttons.rule({...})`.
+//
+// To add a button:
+//   1. drop `button-rules/NN-some-name.js` (IIFE, one `rule()` call)
+//   2. append "NN-some-name.js" to `button-rules/_manifest.json`'s
+//      "files" array
+//   3. reload the tab — no code change to content.js needed
 (async function () {
   const PAGE_WORLD_SCRIPTS = [
     "injected.js",          // bootstrap: __dsx__, config, helpers
@@ -29,6 +38,8 @@
     "injected-attachments.js", // T3: attachment extraction modes
     "injected-retry.js",    // T3: retry-last
     "injected-hijack.js",   // T3: download-button interception
+    "injected-buttons.js",  // button injector FRAMEWORK (no rules)
+    // button rules load via injectButtonRules() after this block
   ];
 
   function injectPageWorldScript() {
@@ -43,9 +54,68 @@
     }
   }
 
+  // Fetch button-rules/_manifest.json and inject every listed file
+  // as a page-world <script async=false>.  Preserves order: the
+  // PAGE_WORLD_SCRIPTS batch is inserted first (synchronously), so
+  // injected-buttons.js executes before any rule file injected here.
+  async function injectButtonRules() {
+    const baseUrl = browser.runtime.getURL("button-rules/");
+    const manifestUrl = baseUrl + "_manifest.json";
+
+    let files = [];
+    try {
+      const resp = await fetch(manifestUrl, { cache: "no-store" });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      if (Array.isArray(data.files)) {
+        files = data.files;
+      } else {
+        console.warn(
+          "[DSX] button-rules/_manifest.json: 'files' is not an array — " +
+          "no button rules loaded");
+        return;
+      }
+    } catch (e) {
+      console.error("[DSX] button-rules manifest fetch failed:", e);
+      return;
+    }
+
+    if (files.length === 0) {
+      console.log("[DSX] button-rules: manifest lists 0 files");
+      return;
+    }
+
+    const head = document.head || document.documentElement;
+    const injected = [];
+    for (const name of files) {
+      if (typeof name !== "string" || !name.endsWith(".js")) {
+        console.warn("[DSX] button-rules: skipping invalid entry:", name);
+        continue;
+      }
+      const s = document.createElement("script");
+      s.src = baseUrl + name;
+      s.async = false;
+      s.onload = () => s.remove();
+      s.onerror = () => {
+        console.error(
+          `[DSX] button-rules: failed to load ${name} ` +
+          `(check that it exists and is listed in web_accessible_resources)`);
+      };
+      head.appendChild(s);
+      injected.push(name);
+    }
+    console.log(
+      `[DSX] button-rules: injected ${injected.length} file(s): ` +
+      injected.join(", "));
+  }
+
   if (!window.__dsx_content_installed__) {
     window.__dsx_content_installed__ = true;
     injectPageWorldScript();
+    // Fire-and-forget; the ordering between PAGE_WORLD_SCRIPTS (sync)
+    // and this (async, after fetch) is safe because dynamic scripts
+    // with async=false execute in insertion order.
+    injectButtonRules();
   }
 
   async function waitFor(condition, timeoutMs = 5000) {
@@ -64,6 +134,9 @@
     );
     if (!ready) {
       injectPageWorldScript();
+      // Re-inject the button rules too, since the page world has
+      // evidently been reset (SPA nav that wiped <script> tags).
+      injectButtonRules();
       return await waitFor(
         () => window.wrappedJSObject && typeof window.wrappedJSObject[name] === "function",
         3000,

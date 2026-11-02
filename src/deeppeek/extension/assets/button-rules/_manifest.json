@@ -1,0 +1,6 @@
+{
+  "_comment": "Ordered list of button-rule files in this directory. Loaded by content.js in listed order, after injected-buttons.js. Each file must be an IIFE that calls window.__dsx__.buttons.rule({...}). To add a button: drop the file here and append its filename to 'files' below.",
+  "files": [
+    "01-default-capsule.js"
+  ]
+}

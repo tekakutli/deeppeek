@@ -116,8 +116,12 @@ DEFAULT_SKIP_DUMP_FILES = True
 # also listed in DEFAULT_TREE_EXCLUDE_DIRS below.
 DEFAULT_EXCLUDE_DIRS = [
     ".git", "__pycache__", ".venv", "venv", "node_modules",
-    "lib", "bin", "recover", "tests", 'docker', 'website',
-    "kritomatic_xremap", "other_scripts", "playgrounds",
+    "lib", "bin",
+    'playgrounds',
+    # 'deeppeek', '.deeppeek',
+    "recover", "tests", 'docker', 'website',
+    # "daemon", "prompts", "capture",
+    "kritomatic_xremap", "other_scripts",
     "data/comfy_panel/history/",
 ]
 
@@ -125,14 +129,18 @@ DEFAULT_EXCLUDE_DIRS = [
 # DEFAULT_EXCLUDE_DIRS. This only affects the tree rendering — it never
 # changes which files are dumped.
 DEFAULT_TREE_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modules",
-                             "lib", "bin", "recover", "tests", 'docker', 'website',
+                             "lib", "bin",
+                             # 'deeppeek', '.deeppeek',
+                              "recover", "tests", 'docker', 'website',
                              "target", "release",
+                             "kritomatic_xremap", "other_scripts",
                              "data/comfy_panel", "other_scripts/room/leader_optimizer",
 ]
 
 # Directory names whitelist: if NON-EMPTY, only descend into subdirectories
 # whose basename is in this list.
 DEFAULT_INCLUDE_DIRS = []
+# DEFAULT_INCLUDE_DIRS = ["inpaint", "pgkit", "pg_comfy"]
 
 # Filename substrings whitelist: if NON-EMPTY, a file is only kept when its
 # filename contains AT LEAST ONE of these substrings.
@@ -140,7 +148,7 @@ DEFAULT_INCLUDE_FILE_SUBSTRINGS = []
 
 # Filename substrings blacklist: if a filename contains ANY of these, the
 # file is skipped.
-DEFAULT_EXCLUDE_FILE_SUBSTRINGS = ["project_dump", "shrinking", 'EMISSION', 'reprint.py']
+DEFAULT_EXCLUDE_FILE_SUBSTRINGS = ["project_dump", "shrinking", 'EMISSION',]
 # ---------------------------------------------------------------------------
 
 HEADER = "=" * 70

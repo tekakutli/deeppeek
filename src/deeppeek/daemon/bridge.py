@@ -1,4 +1,5 @@
 """BrowserBridge — orchestrates one chat completion through the extension."""
+import os
 import queue
 import sys
 import threading
@@ -13,6 +14,20 @@ SUBMIT_TIMEOUT = 45.0
 WATCH_START_TIMEOUT = 10.0
 TAB_WAIT_DEFAULT = 2.0
 WATCH_MAX_WAIT = 600.0
+
+# How long the extension waits for ANY first content (thinking or
+# answer) before declaring submit failure.  The historical 120s
+# default was tuned for interactive DeepSeek use; reasoning models
+# routinely think for 3-5 minutes on hard prompts.  10 min default,
+# override with DEEPPEEK_FIRST_CONTENT_TIMEOUT_MS (milliseconds).
+FIRST_CONTENT_TIMEOUT_MS = int(
+    os.environ.get("DEEPPEEK_FIRST_CONTENT_TIMEOUT_MS", "600000")
+)
+# Hard cap on a single watch cycle (thinking + answer).  15 min
+# default, override with DEEPPEEK_MAX_DURATION_MS (milliseconds).
+DEFAULT_MAX_DURATION_MS = int(
+    os.environ.get("DEEPPEEK_MAX_DURATION_MS", "900000")
+)
 
 
 class BridgeError(Exception):
@@ -34,7 +49,8 @@ class BrowserBridge:
         tab_wait: float = TAB_WAIT_DEFAULT,
         poll_interval_ms: int = 300,
         settle_ticks: int = 5,
-        max_duration_ms: int = 180_000,
+        max_duration_ms: int = DEFAULT_MAX_DURATION_MS,
+        first_content_timeout_ms: int = FIRST_CONTENT_TIMEOUT_MS,
         container: str | None = None,
         container_id: str | None = None,
     ):
@@ -44,6 +60,7 @@ class BrowserBridge:
         self.poll_interval_ms = poll_interval_ms
         self.settle_ticks = settle_ticks
         self.max_duration_ms = max_duration_ms
+        self.first_content_timeout_ms = first_content_timeout_ms
         # Container selection for freshly-opened tabs.  Both are
         # None by default (open in the browser's default container).
         # Only `new_tab=True` runs make use of them; with
@@ -176,12 +193,13 @@ class BrowserBridge:
             "poll_interval_ms": self.poll_interval_ms,
             "settle_ticks": self.settle_ticks,
             "max_duration_ms": self.max_duration_ms,
-            # Thinking phase can run 60–120 s with no answer content.
-            # 30 s was too aggressive; the injected-watch code already
-            # treats "Stop button visible" as activity, so this timeout
-            # now only fires on genuine idle.  120 s matches realistic
-            # worst-case thinking.
-            "first_content_timeout_ms": 120000,
+            # Thinking phase can run for minutes with no answer
+            # content.  The historical 120s value was tuned for
+            # interactive DeepSeek use; reasoning models routinely
+            # exceed that.  Now sourced from
+            # FIRST_CONTENT_TIMEOUT_MS (10 min default), overridable
+            # via DEEPPEEK_FIRST_CONTENT_TIMEOUT_MS.
+            "first_content_timeout_ms": self.first_content_timeout_ms,
         }
         if self.tab_id is not None:
             watch_payload["tab_id"] = self.tab_id
@@ -211,13 +229,13 @@ class BrowserBridge:
             try:
                 msg = self.server.wait_for_result(timeout=0.5)
             except queue.Empty:
-                # NEW (2026-11-01): periodic heartbeat so the user
-                # can tell "browser is generating (thought phase)"
-                # from "stuck".  The heartbeat does NOT extend the
-                # deadline — WATCH_MAX_WAIT still bounds the total
-                # wait — it only makes the wait legible.  Rationale:
-                # the first-content timeout in the extension is now
-                # an *idle* timeout (see injected-watch.js), so a
+                # Periodic heartbeat so the user can tell "browser
+                # is generating (thought phase)" from "stuck".  The
+                # heartbeat does NOT extend the deadline —
+                # WATCH_MAX_WAIT still bounds the total wait — it
+                # only makes the wait legible.  Rationale: the
+                # first-content timeout in the extension is an
+                # *idle* timeout (see injected-watch.js), so a
                 # thinking phase can legitimately run for tens of
                 # seconds with no watch-delta arriving.
                 now = time.monotonic()
@@ -275,10 +293,13 @@ class BrowserBridge:
                         )
                     if reason == "no_first_content":
                         raise BridgeError(
-                            "model produced no output within 120s — the "
-                            "prompt may not have been submitted, or the "
-                            "web UI is not streaming to IndexedDB. "
-                            "Check the tab."
+                            "model produced no output within the "
+                            "first-content timeout — the prompt may "
+                            "not have been submitted, or the web UI "
+                            "is not streaming to IndexedDB. Check the "
+                            "tab.  (Raise "
+                            "DEEPPEEK_FIRST_CONTENT_TIMEOUT_MS if the "
+                            "thinking phase is legitimately long.)"
                         )
                     if reason == "no_deepseek_tab":
                         raise BridgeError(
