@@ -2,19 +2,29 @@
 // button-rules/01-default-capsule.js — "Copy Thoughts" button
 // =====================================================================
 //
-// Extracts the last Thought Process from the current conversation,
-// attaches it as `thought_process.md`, copies the same markdown to
-// the clipboard, and types the follow-up text — all in memory.
+// INJECTION POINT
+// ---------------
+//   Where:   END of the icon capsule row.
+//   Which:   any `.ds-flex` whose direct non-injected children are
+//            ALL `.ds-button--capsule.ds-button--xs[role="button"]`.
+//   Verify:  __dsx.buttons.debug(true) → red outline on the row,
+//            "default-capsule" label above the clone.
 //
-// Equivalent to:
-//     deeppeek conversation -o /tmp/conversation.md
-//       && deeppeek prompt last-thought
-// plus a clipboard write, but the intermediate file never touches
-// disk.
+// WHAT IT DOES ON CLICK
+// ---------------------
+//   Extracts the last Thought Process, attaches it as
+//   thought_process.md, copies the markdown to the clipboard, and
+//   types the follow-up text — all in memory.
 //
-// Loaded by content.js's injectButtonRules() in the order set by
-// button-rules/_manifest.json.  Must run after injected-buttons.js
-// (which defines window.__dsx__.buttons).
+// USES SHARED HELPER
+// ------------------
+//   `__dsx__.capsule.makeTextPill(row, "Copy Thoughts")` — same
+//   capsule-to-text-pill transform 03-rate-limit-retry uses.
+//
+// LOADED BY
+// ---------
+//   content.js's injectButtonRules() via button-rules/_manifest.json.
+//   Runs after _capsule.js and _resume.js.
 (function () {
   "use strict";
   if (!window.__dsx__ || !window.__dsx__.buttons) {
@@ -23,13 +33,22 @@
       "is injected-buttons.js listed before button-rules in content.js?");
     return;
   }
+  if (!window.__dsx__.capsule) {
+    console.error(
+      "[DSX:button-rules/01-default-capsule] shared capsule helpers " +
+      "not loaded — is _capsule.js listed before 01- in _manifest.json?");
+    return;
+  }
 
   const B = window.__dsx__.buttons;
   const MARKER_ATTR = "data-dsx-injected";
+  const C = window.__dsx__.capsule;
 
   // ---- helpers --------------------------------------------------
 
-  const closeUnclosedFences = (md) => {
+  const b64Of = (s) => btoa(unescape(encodeURIComponent(s)));
+
+  const closeFences = (md) => {
     if (!md) return md;
     let inFence = false;
     for (const line of md.split("\n")) {
@@ -40,23 +59,15 @@
     return inFence ? md + "\n```" : md;
   };
 
-  // Mirrors formatter.py's _format_thinking(): prepend the header and
-  // prefix every line with `> `.  Trailing newline matches the CLI's
-  // last-thought output exactly.
   const formatThought = (thinking) => {
-    const closed = closeUnclosedFences(thinking);
+    const closed = closeFences(thinking);
     const quoted = closed.split("\n").map(ln => "> " + ln).join("\n");
     return "### Thought Process\n\n" + quoted + "\n";
   };
 
-  const b64Of = (s) => btoa(unescape(encodeURIComponent(s)));
-
-  // Same default as prompts/last_thought.py's DEFAULT_COMPOSER_TEXT.
   const FOLLOW_UP_TEXT =
     "you had already thought about this, but you stopped at the end";
 
-  // Disables the button visually while an async action runs; restores
-  // in a finally so a thrown error can't permanently stick the button.
   const withBusy = async (btn, fn) => {
     const prevPe = btn.style.pointerEvents;
     const prevOp = btn.style.opacity;
@@ -72,8 +83,6 @@
   // ---- the pipeline ---------------------------------------------
 
   const runLastThoughtPipeline = async () => {
-    // 1. extract conversation (in-memory; same extraction paths the
-    //    CLI uses: API, then IndexedDB, then fiber)
     if (typeof window.__dsx_extract !== "function") {
       throw new Error("__dsx_extract unavailable — is injected-extract.js loaded?");
     }
@@ -85,7 +94,6 @@
       throw new Error("conversation is empty");
     }
 
-    // 2. find the last assistant message that has non-empty thinking
     let thinking = null;
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
@@ -102,13 +110,8 @@
         "conversation has a non-empty thinking field");
     }
 
-    // 3. format as markdown (matches prompt last-thought's output)
     const thoughtMd = formatThought(thinking);
 
-    // 4. attach + type + clipboard in parallel.
-    //    attach & type mirror the CLI's broadcast_many semantics;
-    //    clipboard is best-effort — a failure there does not fail
-    //    the whole pipeline.
     if (typeof window.__dsx_attach_json !== "function") {
       throw new Error("__dsx_attach_json unavailable — is injected-attach.js loaded?");
     }
@@ -135,10 +138,7 @@
         await navigator.clipboard.writeText(thoughtMd);
         return { ok: true };
       } catch (err) {
-        return {
-          ok: false,
-          reason: String((err && err.message) || err),
-        };
+        return { ok: false, reason: String((err && err.message) || err) };
       }
     })();
 
@@ -180,43 +180,13 @@
     position: "end",
     template: () => {
       for (const row of document.querySelectorAll(".ds-flex")) {
-        const natives = [...row.children].filter(c =>
-          c.nodeType === 1 && !c.hasAttribute(MARKER_ATTR));
-        if (natives.length < 2) continue;
-        if (!natives.every(k => k.matches(
-            ".ds-button--capsule.ds-button--xs[role='button']"))) continue;
-        const base = natives[0].cloneNode(true);
-        // icon-only pill → text-labelled pill:
-        //   · drop `--icon` so the pill isn't locked to a square
-        //   · add `--min-width` so it grows to fit text (same class
-        //     the code block's Copy button uses)
-        //   · clear inline width + gap set by the --icon sizing
-        //   · remove the icon container
-        //   · append the label
-        base.classList.remove("ds-button--icon");
-        base.classList.add("ds-button--min-width");
-        base.style.removeProperty("--dsl-button-width");
-        base.style.removeProperty("--dsl-button-gap");
-        const iconWrap = base.querySelector(".ds-button__icon-container");
-        if (iconWrap) iconWrap.remove();
-        const textEl = document.createElement("span");
-        textEl.textContent = "Copy Thoughts";
-        textEl.style.cssText =
-          "white-space: nowrap; font-size: 12px; line-height: 1; " +
-          "font-weight: 500; padding: 0 8px;";
-        base.appendChild(textEl);
-        return base;
+        const pill = C.makeTextPill(row, "Copy Thoughts");
+        if (pill) return pill;
       }
       return null;
     },
     target: ".ds-flex",
-    filter: (row) => {
-      const natives = [...row.children].filter(c =>
-        c.nodeType === 1 && !c.hasAttribute(MARKER_ATTR));
-      if (natives.length < 2) return false;
-      return natives.every(k => k.matches(
-        ".ds-button--capsule.ds-button--xs[role='button']"));
-    },
+    filter: (row) => C.isCapsuleRow(row),
     onClick: async (e, el) => {
       try {
         const result = await withBusy(el, runLastThoughtPipeline);

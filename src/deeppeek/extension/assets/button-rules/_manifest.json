@@ -1,7 +1,10 @@
 {
-  "_comment": "Ordered list of button-rule files in this directory. Loaded by content.js in listed order, after injected-buttons.js. Each file must be an IIFE that calls window.__dsx__.buttons.rule({...}). To add a button: drop the file here and append its filename to 'files' below.",
+  "_comment": "Ordered list of files in this directory. Files starting with '_' are shared helpers — loaded FIRST, define namespaces on window.__dsx__ but do NOT register rules. Numbered files are rule definitions — each is an IIFE that calls window.__dsx__.buttons.rule({...}). To add a button: drop a numbered file here and append its name to 'files' below.",
   "files": [
+    "_capsule.js",
+    "_resume.js",
     "01-default-capsule.js",
-    "02-continue-btn.js"
+    "02-continue-btn.js",
+    "03-rate-limit-retry.js"
   ]
 }

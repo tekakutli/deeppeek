@@ -121,6 +121,7 @@ DEFAULT_EXCLUDE_DIRS = [
     # 'deeppeek', '.deeppeek',
     "recover", "tests", 'docker', 'website',
     # "daemon", "prompts", "capture",
+    "room", "cable", "shared",
     "kritomatic_xremap", "other_scripts",
     "data/comfy_panel/history/",
 ]
