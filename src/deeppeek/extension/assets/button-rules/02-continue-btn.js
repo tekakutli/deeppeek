@@ -2,76 +2,72 @@
 // button-rules/02-continue-btn.js — "Resume" button
 // =====================================================================
 //
-// =====================================================================
 // INJECTION POINT
-// =====================================================================
-//
+// ---------------
 //   Where:   START of the wrapper <div> around the "Continue" button.
-//
 //   Which:   any DIV whose direct children include a
 //            `.ds-button[role="button"]` with textContent "Continue".
-//            This row is DeepSeek's truncation affordance — it only
-//            appears when the last assistant reply hit the length
-//            limit and the user can ask DeepSeek to keep going.
-//
-//   Pattern: the row is found via `target` (function) which locates
-//            the parent of each "Continue" button, and `filter`
-//            asserting "some child has text 'Continue'".  The
-//            template is the Continue button itself, with its
-//            `.ds-button__content` span rewritten to "Resume" so
-//            the two buttons are visually distinct.
-//
 //   Verify:  __dsx.buttons.debug(true) → teal outline on the row,
-//            "continue-btn" label above the clone, legend entry
-//            with current count.
+//            "continue-btn" label above the clone.
 //
-// =====================================================================
 // WHAT IT DOES ON CLICK
-// =====================================================================
+// ---------------------
+//   Phase 1 (current tab):
+//     · extract conversation via __dsx_extract
+//     · format markdown (mirrors formatter.py)
+//     · extract last-thought guidance (mirrors prompts/resume.py)
+//     · fetch first prompt's attachments as base64
+//     · write payload to localStorage (same-container fallback)
+//       AND to extension storage via the in-memory background
+//       channel (cross-container channel)
+//     · open a new tab via callBridge(DSX_OPEN_TAB)
 //
-//   Equivalent to running `deeppeek prompt resume` from a shell,
-//   minus the disk round-trip:
+//   Phase 2 (new tab, on page load):
+//     · the resume-worker IIFE at the top of this file claims the
+//       pending payload (extension storage first, localStorage
+//       fallback), waits for the composer, attaches conversation +
+//       seed files, types the resume text
 //
-//   Phase 1 (in the CURRENT tab, on click):
-//     1. Extract the conversation via `__dsx_extract` — same
-//        extraction paths (API → IDB → fiber) as the CLI.
-//     2. Format it as markdown — mirrors `formatter.py`'s
-//        `format_conversation`, including the unclosed-fence close.
-//     3. Extract the "last relevant string" — tail of the last
-//        assistant content, or of its thinking, or of the last user
-//        prompt (matches `prompts/resume.py`).
-//     4. Fetch the first user prompt's attachments via
-//        `__dsx_extract_attachments_json({mode:"first",
-//        return_base64:true})` — same underlying code path as
-//        `deeppeek prompt attachments --first --fetch-to`.
-//     5. Bundle {conversation.md, seed_files, resume_text} into a
-//        payload and write it to localStorage.
-//     6. Open a blank tab SYNCHRONOUSLY (before any await, so the
-//        user gesture is still fresh and Firefox won't block the
-//        popup), then navigate it to chat.deepseek.com once the
-//        async work finishes.
+// CONTAINER SELECTION — TWO MODES
+// -------------------------------
+//   Plain click   → opens in the SAME container the current tab is
+//                   in.  Detected at click time via
+//                   callBridge(DSX_CURRENT_CONTAINER), which uses
+//                   browser.tabs.getCurrent() inline in the content
+//                   script (no background hop, no query, no hang).
+//                   This is the "just resume where I am" default.
 //
-//   Phase 2 (in the NEW tab, on page load):
-//     7. The resume-worker IIFE at the top of this file checks
-//        localStorage for `dsx_resume_pending`.  If found and
-//        younger than 30s, it claims it (atomic single-writer),
-//        deletes it, waits for the composer to appear, attaches
-//        everything, and types the resume text.
+//   Shift-click   → opens a container picker.  Two sub-modes:
+//                     · list available → shows every container from
+//                       browser.contextualIdentities.query
+//                     · list unavailable → manual input for a
+//                       container name ("Work") or raw
+//                       cookieStoreId ("firefox-container-3")
+//                   Picks are one-shot: no persistence.  Next plain
+//                   click resumes in the current container again.
 //
-//   Failure modes are all logged to the console and do NOT leave
-//   stray state behind:
-//     · attach/type fail → console error, button restores
-//     · localStorage quota exceeded → clear error
-//     · popup blocked → fall back to navigating current tab
-//     · phase 2 times out waiting for composer → clear warning
+//   No preference is stored between clicks.  The user's original
+//   complaint — "plain click opens in the last picked container" —
+//   is fixed by never reading a stored preference on the plain path.
 //
-// =====================================================================
+// CROSS-REALM BRIDGE (postMessage, not exportFunction)
+// ---------------------------------------------------
+//   Page world cannot `await` a Promise returned by `exportFunction`
+//   — Firefox's Xray barrier rejects `.then` access with
+//   "Permission denied to access property 'then'".  `Promise.race`
+//   and manual `.then()` hit the same wall.
+//
+//   Fix: `callBridge()` uses `window.postMessage`, which crosses
+//   the content-script ↔ page-world boundary via structured clone.
+//   Content script (see content.js's installPostMessageBridge)
+//   listens for `{dsx_req, msg}` and replies with
+//   `{dsx_resp, payload: <json string>}`.  Both directions are
+//   strings/plain-objects; no Xray involvement.
+//
 // LOADED BY
-// =====================================================================
-//
-//   content.js's injectButtonRules() in the order set by
-//   button-rules/_manifest.json.  Runs after injected-buttons.js
-//   (which defines window.__dsx__.buttons).
+// ---------
+//   content.js's injectButtonRules() via button-rules/_manifest.json.
+//   Runs after injected-buttons.js.
 (function () {
   "use strict";
   if (!window.__dsx__ || !window.__dsx__.buttons) {
@@ -84,11 +80,48 @@
   const B = window.__dsx__.buttons;
   const MARKER_ATTR = "data-dsx-injected";
 
-  // localStorage keys used for the two-phase handoff.
-  const PENDING_KEY = "dsx_resume_pending";
-  const CLAIM_PREFIX = "dsx_resume_claim_";
-  const FRESH_MS = 30000;
   const CHAT_URL = "https://chat.deepseek.com/";
+
+  // Firefox/Zen cookieStoreIds look like `firefox-container-N` (or
+  // `<prefix>-container-N`).  Anything matching this shape is
+  // forwarded to the background as a raw `container_id` (no name
+  // resolution, no query call); anything else is treated as a
+  // display name and resolved by the background.
+  const CONTAINER_ID_RE = /^[a-z0-9]+-container-\d+$/i;
+
+  // ---- cross-realm bridge via postMessage -----------------------
+  //
+  // Sends `{dsx_req, msg}` on `window`; content.js's listener
+  // replies with `{dsx_resp: <same reqId>, payload: <json string>}`.
+  // Resolves with the parsed payload object, or throws on timeout.
+  const callBridge = (msg, timeoutMs = 10000) =>
+    new Promise((resolve, reject) => {
+      const reqId =
+        "dsx_" + Math.random().toString(36).slice(2) + "_" + Date.now();
+      const timer = setTimeout(() => {
+        window.removeEventListener("message", handler);
+        reject(new Error(
+          `bridge ${msg.type} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      const handler = (ev) => {
+        if (ev.source !== window) return;
+        const d = ev.data;
+        if (!d || typeof d !== "object") return;
+        if (d.dsx_resp !== reqId) return;
+        window.removeEventListener("message", handler);
+        clearTimeout(timer);
+        try {
+          resolve(JSON.parse(d.payload));
+        } catch (e) {
+          resolve({
+            success: false,
+            reason: `bridge response parse failed: ${e.message}`,
+          });
+        }
+      };
+      window.addEventListener("message", handler);
+      window.postMessage({ dsx_req: reqId, msg }, "*");
+    });
 
   // ---- helpers --------------------------------------------------
 
@@ -105,11 +138,6 @@
     return inFence ? md + "\n```" : md;
   };
 
-  // Mirror of capture/formatter.py::format_conversation().  Produces
-  // the same markdown `deeppeek conversation -o` would have written,
-  // including the `# [title](url)` header, `## User` / `## Assistant`
-  // headings, `### Thought Process` for thinking, and the
-  // `\n\n---\n\n` separator between messages.
   const formatConversation = (data) => {
     const title = data.title;
     const url = data.url;
@@ -141,11 +169,6 @@
     return header + parts.join("\n\n---\n\n");
   };
 
-  // Mirror of prompts/resume.py::_extract_last_relevant_string().
-  // Order: tail of the last assistant's content → tail of its
-  // thinking → tail of the last user prompt.  Flattened to a single
-  // line, trimmed to the last `maxWords` words, capped at
-  // `maxChars` total, `<UPPER CASE>` placeholders stripped.
   const extractGuidance = (messages, maxWords = 40, maxChars = 500) => {
     const trim = (s) => {
       const cleaned = s.replace(/<[A-Z][A-Z0-9 _-]{2,}>/g, "").trim();
@@ -159,20 +182,19 @@
       const paras = text.split(/\n\n+/).map(p => p.trim()).filter(Boolean);
       return paras.length ? paras[paras.length - 1] : "";
     };
-
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
       if (m.role !== "assistant") continue;
-      const content = tailPara(m.content || "");
-      if (content) return trim(content);
-      const thinking = tailPara(m.thinking || "");
-      if (thinking) return trim(thinking);
+      const c = tailPara(m.content || "");
+      if (c) return trim(c);
+      const t = tailPara(m.thinking || "");
+      if (t) return trim(t);
     }
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
       if (m.role !== "user") continue;
-      const content = tailPara(m.content || "");
-      if (content) return trim(content);
+      const c = tailPara(m.content || "");
+      if (c) return trim(c);
     }
     return "";
   };
@@ -182,7 +204,216 @@
     `where you left it: "${guidance}"; ` +
     `dont give me any code yet, simply design it`;
 
-  // ---- Phase 1: gather payload from the current tab -------------
+  // ---- current-container detection ------------------------------
+  //
+  // Detects the container the current tab is in, so plain-click
+  // can open the new tab in the same container.  Returns:
+  //   null                                       → default container
+  //   { cookieStoreId: "firefox-container-N", name? } → specific
+  //
+  // Fails safe: on any bridge error, returns null (default
+  // container).  The cross-container payload channel (extension
+  // storage) still carries the resume payload, so the resume lands
+  // — just in the default container rather than the current one.
+  const detectCurrentContainer = async () => {
+    try {
+      const res = await callBridge(
+        { type: "DSX_CURRENT_CONTAINER" }, 5000);
+      if (res && res.success && res.cookieStoreId) {
+        return {
+          cookieStoreId: res.cookieStoreId,
+          name: res.name || null,
+        };
+      }
+    } catch (err) {
+      console.warn(
+        `[DSX:continue-btn] could not detect current container: ` +
+        `${err && err.message || err} — falling back to browser default`);
+    }
+    return null;
+  };
+
+  // ---- container picker (modal <dialog>) -----------------------
+  //
+  // Renders a modal picker with:
+  //   · "Default (no container)"
+  //   · one entry per available container (name + cookieStoreId)
+  //   · (when allowManual) a free-text input that accepts either a
+  //     container name ("Work") or a raw cookieStoreId
+  //     ("firefox-container-3"), so the button still works when the
+  //     container API is broken
+  //   · "Cancel"
+  //
+  // `currentCid` is used ONLY to highlight the row the user is
+  // currently in — not to persist a default.  Callers pass the
+  // detected current-tab container's cookieStoreId (or null for
+  // default).
+  //
+  // Resolves with:
+  //   { action: "pick", cookieStoreId?, name? }  → one-shot pick
+  //   null                                        → cancel, abort
+  const showContainerPicker = (containers, currentCid, opts = {}) => {
+    return new Promise((resolve) => {
+      const dlg = document.createElement("dialog");
+      dlg.setAttribute("data-dsx-resume-picker", "1");
+      dlg.style.cssText = `
+        padding: 16px;
+        border: 1px solid #3a3a3a;
+        border-radius: 8px;
+        background: #1f1f1f;
+        color: #e0e0e0;
+        min-width: 300px;
+        max-width: 480px;
+        max-height: 70vh;
+        overflow-y: auto;
+        font-family: ui-monospace,SFMono-Regular,Menlo,monospace;
+        font-size: 13px;
+        z-index: 2147483647;
+      `;
+
+      const title = document.createElement("div");
+      title.textContent = "Resume into container:";
+      title.style.cssText =
+        "font-weight: bold; margin-bottom: 12px; font-size: 14px;";
+      dlg.appendChild(title);
+
+      const makeBtn = (label, cid, action, btnOpts = {}) => {
+        const b = document.createElement("button");
+        b.textContent = label;
+        b.style.cssText = `
+          display: block;
+          width: 100%;
+          padding: 8px 12px;
+          margin: 4px 0;
+          text-align: left;
+          background: ${cid === currentCid ? "#3a3a3a" : "transparent"};
+          color: inherit;
+          border: 1px solid #3a3a3a;
+          border-radius: 4px;
+          cursor: pointer;
+          font-family: inherit;
+          font-size: inherit;
+        `;
+        b.addEventListener("mouseover", () => {
+          b.style.background = "#2f2f2f";
+        });
+        b.addEventListener("mouseout", () => {
+          b.style.background = cid === currentCid ? "#3a3a3a" : "transparent";
+        });
+        b.addEventListener("click", () => {
+          dlg.close();
+          resolve({ action, cookieStoreId: cid, name: btnOpts.name ?? null });
+        });
+        return b;
+      };
+
+      dlg.appendChild(makeBtn("Default (no container)", null, "pick"));
+
+      if (containers.length > 0) {
+        for (const c of containers) {
+          const label = `${c.name} (${c.cookieStoreId})`;
+          dlg.appendChild(makeBtn(label, c.cookieStoreId, "pick",
+                                  { name: c.name }));
+        }
+      }
+
+      if (opts.allowManual) {
+        const label = document.createElement("div");
+        label.textContent = containers.length > 0
+          ? "Or type a container name, or paste a cookieStoreId:"
+          : "Container list unavailable — type a container name, " +
+            "or paste a cookieStoreId:";
+        label.style.cssText =
+          "margin-top: 12px; margin-bottom: 6px; font-size: 12px; opacity: 0.85;";
+        dlg.appendChild(label);
+
+        const hint = document.createElement("div");
+        hint.textContent =
+          "(name like \"Work\"; ID like firefox-container-3 from " +
+          "about:preferences#containers)";
+        hint.style.cssText =
+          "margin-bottom: 6px; font-size: 11px; opacity: 0.6;";
+        dlg.appendChild(hint);
+
+        const input = document.createElement("input");
+        input.type = "text";
+        input.placeholder = "Work   or   firefox-container-3";
+        input.style.cssText = [
+          "width: 100%",
+          "padding: 6px 8px",
+          "box-sizing: border-box",
+          "background: #111",
+          "color: #e0e0e0",
+          "border: 1px solid #3a3a3a",
+          "border-radius: 4px",
+          "font-family: inherit",
+          "font-size: 12px",
+        ].join(";");
+        dlg.appendChild(input);
+
+        const useBtn = document.createElement("button");
+        useBtn.textContent = "Use this";
+        useBtn.style.cssText = [
+          "display: block",
+          "width: 100%",
+          "padding: 8px 12px",
+          "margin: 8px 0 4px 0",
+          "text-align: center",
+          "background: #2a4a2a",
+          "color: #d0f0d0",
+          "border: 1px solid #3a5a3a",
+          "border-radius: 4px",
+          "cursor: pointer",
+          "font-family: inherit",
+          "font-size: inherit",
+        ].join(";");
+
+        const submitManual = () => {
+          const v = input.value.trim();
+          if (!v) { input.focus(); return; }
+          const isId = CONTAINER_ID_RE.test(v);
+          dlg.close();
+          if (isId) {
+            resolve({ action: "pick", cookieStoreId: v, name: null });
+          } else {
+            resolve({ action: "pick", cookieStoreId: null, name: v });
+          }
+        };
+        useBtn.addEventListener("click", submitManual);
+        input.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter") { ev.preventDefault(); submitManual(); }
+        });
+        dlg.appendChild(useBtn);
+      }
+
+      const cancel = document.createElement("button");
+      cancel.textContent = "Cancel";
+      cancel.style.cssText = `
+        margin-top: 8px;
+        padding: 6px 12px;
+        background: transparent;
+        color: #888;
+        border: 1px solid #2a2a2a;
+        border-radius: 4px;
+        cursor: pointer;
+        font-family: inherit;
+        font-size: 12px;
+      `;
+      cancel.addEventListener("click", () => { dlg.close(); resolve(null); });
+      dlg.appendChild(cancel);
+
+      dlg.addEventListener("cancel", () => resolve(null));
+      dlg.addEventListener("close", () => {
+        resolve(null);
+        setTimeout(() => dlg.remove(), 0);
+      });
+
+      document.body.appendChild(dlg);
+      dlg.showModal();
+    });
+  };
+
+  // ---- Phase 1: prepare payload --------------------------------
 
   const prepareResumePayload = async () => {
     if (typeof window.__dsx_extract !== "function") {
@@ -199,8 +430,6 @@
     const guidance = extractGuidance(data.messages);
     const resumeText = buildResumeText(guidance);
 
-    // First-prompt attachments, as base64 — same path the CLI uses
-    // for `prompt attachments --first --fetch-to <dir>`.
     const seedFiles = [];
     if (typeof window.__dsx_extract_attachments_json === "function") {
       try {
@@ -219,24 +448,20 @@
           }
         }
       } catch (err) {
-        // Attachments are best-effort; a failure here doesn't abort
-        // the resume — the conversation still attaches.
         console.warn(
           `[DSX:continue-btn] attachment fetch failed (proceeding ` +
           `without seed files): ${err && err.message || err}`);
       }
     }
 
-    const payload = {
-      created_at: Date.now(),
-      conversation_filename: "resume_conversation.md",
-      conversation_base64: b64Of(conversationMd),
-      resume_text: resumeText,
-      seed_files: seedFiles,
-    };
-
     return {
-      payload,
+      payload: {
+        created_at: Date.now(),
+        conversation_filename: "resume_conversation.md",
+        conversation_base64: b64Of(conversationMd),
+        resume_text: resumeText,
+        seed_files: seedFiles,
+      },
       stats: {
         messages: data.messages.length,
         conversationChars: conversationMd.length,
@@ -247,7 +472,7 @@
     };
   };
 
-  // ---- Phase 2: consume payload on the new tab's page load ------
+  // ---- Phase 2: consume payload -------------------------------
 
   const waitForComposer = async (timeoutMs = 15000) => {
     const start = Date.now();
@@ -270,7 +495,6 @@
         "composer did not appear within 15s — the new chat may not " +
         "have loaded correctly");
     }
-    // Let React finish hydrating the composer before we poke it.
     await new Promise(r => setTimeout(r, 500));
 
     const files = [
@@ -291,12 +515,9 @@
     }));
     const attachRes = JSON.parse(attachJson);
     if (!attachRes.success) {
-      throw new Error(
-        `attach failed: ${attachRes.reason || "(no reason)"}`);
+      throw new Error(`attach failed: ${attachRes.reason || "(no reason)"}`);
     }
 
-    // Small settle so chips render before typing — matches the
-    // ordering `deeppeek prompt resume` uses (attach, then type).
     await new Promise(r => setTimeout(r, 300));
 
     if (typeof window.__dsx_type_json !== "function") {
@@ -308,61 +529,102 @@
     }));
     const typeRes = JSON.parse(typeJson);
     if (!typeRes.success) {
-      throw new Error(
-        `type failed: ${typeRes.reason || "(no reason)"}`);
+      throw new Error(`type failed: ${typeRes.reason || "(no reason)"}`);
     }
 
     return { files: files.length };
   };
 
-  // Resume-worker IIFE — runs once on every page load.  Cheap no-op
-  // when there's no pending payload, which is the common case.
+  // Resume worker — runs on every page load.  Claims a pending
+  // payload from extension storage first (cross-container), then
+  // falls back to localStorage (same-container).
   (async () => {
-    let pending;
-    try { pending = localStorage.getItem(PENDING_KEY); }
-    catch (_) { return; }
-    if (!pending) return;
+    console.log("[DSX:resume-worker] page load — checking for pending payload");
 
-    let data;
-    try { data = JSON.parse(pending); }
-    catch (_) {
-      try { localStorage.removeItem(PENDING_KEY); } catch (_) {}
-      return;
-    }
-
-    // Stale payloads are dropped rather than risking a surprise
-    // resume long after the click.
-    if (typeof data.created_at !== "number"
-        || Date.now() - data.created_at > FRESH_MS) {
-      try { localStorage.removeItem(PENDING_KEY); } catch (_) {}
-      return;
-    }
-
-    // Atomic single-writer claim — prevents a second chat tab that
-    // happens to reload within the freshness window from grabbing
-    // the same payload.
-    const claimKey = CLAIM_PREFIX + data.created_at;
-    try {
-      if (localStorage.getItem(claimKey)) return;
-      localStorage.setItem(claimKey, "1");
-    } catch (_) { return; }
+    let payload = null;
+    let payloadSource = null;
 
     try {
-      try { localStorage.removeItem(PENDING_KEY); } catch (_) {}
+      const claim = await callBridge({ type: "DSX_RESUME_CLAIM" }, 10000);
+      if (claim && claim.success && claim.payload) {
+        payload = claim.payload;
+        payloadSource = "extension-storage";
+      }
+    } catch (err) {
+      console.warn(
+        `[DSX:resume-worker] extension-storage claim failed: ` +
+        `${err && err.message || err} — trying localStorage`);
+    }
+
+    if (!payload) {
+      try {
+        const raw = localStorage.getItem("dsx_resume_pending");
+        if (raw) {
+          const data = JSON.parse(raw);
+          if (typeof data.created_at === "number"
+              && Date.now() - data.created_at < 30000) {
+            payload = data;
+            payloadSource = "localStorage";
+          }
+          localStorage.removeItem("dsx_resume_pending");
+        }
+      } catch (_) {}
+    }
+
+    if (!payload) {
       console.log(
-        `[DSX:resume-worker] picked up pending resume payload ` +
-        `(${(data.seed_files || []).length} seed file(s))`);
-      const result = await runResumePhase2(data);
+        "[DSX:resume-worker] no pending payload — nothing to resume");
+      return;
+    }
+
+    try {
+      console.log(
+        `[DSX:resume-worker] claimed payload from ${payloadSource} ` +
+        `(${(payload.seed_files || []).length} seed file(s))`);
+      const result = await runResumePhase2(payload);
       console.log(
         `[DSX:resume-worker] resume complete — ` +
         `${result.files} file(s) attached, resume text typed`);
     } catch (err) {
       console.error(
         `[DSX:resume-worker] failed: ${err && err.message || err}`);
-    } finally {
-      try { localStorage.removeItem(claimKey); } catch (_) {}
     }
   })();
+
+  // ---- open the new tab ----------------------------------------
+  //
+  // Argument shapes:
+  //   null                → browser default (no container args)
+  //   { cookieStoreId }   → raw ID, forwarded as container_id
+  //   { name }            → forwarded as container, resolved by bg
+  //
+  // Callers always pass an explicit pref (never undefined) — no
+  // localStorage read on this path.  Plain click passes the
+  // detected current-tab container; shift-click passes the picker
+  // result.  Both are one-shot.
+  const openNewTab = async (pref) => {
+    try {
+      const args = { url: CHAT_URL };
+      if (pref) {
+        if (pref.cookieStoreId) {
+          args.container_id = pref.cookieStoreId;
+        } else if (pref.name) {
+          args.container = pref.name;
+        }
+      }
+      const res = await callBridge({ type: "DSX_OPEN_TAB", ...args }, 10000);
+      if (res && res.success) {
+        return { ok: true, method: "bridge",
+                 cookie_store_id: res.cookie_store_id };
+      }
+      const reason = res && res.reason ? res.reason : "unknown";
+      return { ok: false, reason, method: "bridge" };
+    } catch (err) {
+      return { ok: false,
+               reason: String((err && err.message) || err),
+               method: "bridge" };
+    }
+  };
 
   // ============================================================
   // Rule: continue-btn — "Resume"
@@ -396,60 +658,134 @@
       !c.hasAttribute(MARKER_ATTR)
       && c.matches(".ds-button[role='button']")
       && (c.innerText || "").trim() === "Continue"),
+    decorate: (clone) => {
+      clone.setAttribute(
+        "title",
+        `[DSX] continue-btn — Resume in the current container ` +
+        `(shift-click to pick a different container)`);
+    },
     onClick: async (e, el) => {
       const prevPe = el.style.pointerEvents;
       const prevOp = el.style.opacity;
-      el.style.pointerEvents = "none";
-      el.style.opacity = "0.5";
-
-      // Open a blank tab synchronously — before any await — so the
-      // user-gesture context is still fresh and Firefox's popup
-      // blocker allows it.  We navigate it AFTER the payload is
-      // ready, so the new tab loads chat.deepseek.com with the
-      // payload already sitting in localStorage.
-      let newTab = null;
-      try { newTab = window.open("about:blank", "_blank"); }
-      catch (_) { newTab = null; }
+      const setBusy = (on) => {
+        el.style.pointerEvents = on ? "none" : prevPe;
+        el.style.opacity = on ? "0.5" : prevOp;
+      };
+      setBusy(true);
 
       try {
+        // ---- pick container: shift-click → user chooses;
+        //      plain click → current container ----
+        let pickedCid;
+
+        if (e.shiftKey) {
+          let containers = [];
+          let listAvailable = false;
+          let listReason = "unavailable";
+
+          try {
+            const listRes = await callBridge(
+              { type: "DSX_LIST_CONTAINERS" }, 10000);
+            if (listRes && listRes.success && listRes.available) {
+              containers = listRes.containers || [];
+              listAvailable = true;
+            } else {
+              listReason = (listRes && listRes.reason) || "unknown";
+            }
+          } catch (err) {
+            listReason = String((err && err.message) || err);
+          }
+
+          if (!listAvailable) {
+            console.warn(
+              `[DSX:continue-btn] container list unavailable ` +
+              `(${listReason}) — falling back to manual entry`);
+          }
+
+          // Highlight the current tab's container in the picker so
+          // the user sees "here's where I am" as a visual reference.
+          const current = await detectCurrentContainer();
+          const currentCid = current ? current.cookieStoreId : null;
+
+          const picked = await showContainerPicker(
+            containers,
+            currentCid,
+            { allowManual: !listAvailable },
+          );
+          if (!picked) {
+            setBusy(false);
+            return;
+          }
+
+          pickedCid = (picked.cookieStoreId || picked.name)
+            ? { cookieStoreId: picked.cookieStoreId || null,
+                name: picked.name || null }
+            : null;
+        } else {
+          // Plain click — same container as the current tab.
+          pickedCid = await detectCurrentContainer();
+        }
+
+        // ---- prepare payload ----
         console.log("[DSX:continue-btn] preparing resume payload...");
         const { payload, stats } = await prepareResumePayload();
 
+        // ---- persist to localStorage (same-container channel) ----
         try {
-          localStorage.setItem(PENDING_KEY, JSON.stringify(payload));
+          localStorage.setItem("dsx_resume_pending", JSON.stringify(payload));
         } catch (err) {
-          throw new Error(
-            `cannot store resume payload (localStorage quota?): ` +
+          console.warn(
+            `[DSX:continue-btn] localStorage save failed: ` +
             `${err && err.message || err}`);
         }
 
+        // ---- persist to extension storage (cross-container channel) ----
+        let extStorageOk = false;
+        try {
+          const saveRes = await callBridge(
+            { type: "DSX_RESUME_SAVE", payload }, 10000);
+          if (saveRes && saveRes.success) {
+            extStorageOk = true;
+          } else {
+            console.warn(
+              `[DSX:continue-btn] extension-storage save failed: ` +
+              `${(saveRes && saveRes.reason) || "unknown"}`);
+          }
+        } catch (err) {
+          console.warn(
+            `[DSX:continue-btn] extension-storage save threw: ` +
+            `${err && err.message || err} — continuing with ` +
+            `localStorage only (cross-container resume will not work)`);
+        }
+
         console.log(
-          `[DSX:continue-btn] payload ready — ` +
+          `[DSX:continue-btn] payload saved ` +
+          `(localStorage${extStorageOk ? " + extension-storage" : ""}) — ` +
           `${stats.messages} msg(s), ${stats.conversationChars} chars, ` +
           `${stats.seedFiles} seed file(s), ` +
           `${stats.resumeTextChars} char resume text`);
 
-        if (newTab && !newTab.closed) {
-          newTab.location.href = CHAT_URL;
-          console.log(
-            "[DSX:continue-btn] new tab opening — resume worker " +
-            "will attach + type there");
-        } else {
-          // Popup was blocked; navigate current tab.  Same user
-          // outcome, just loses the original tab's state.
-          console.log(
-            "[DSX:continue-btn] popup blocked — navigating current " +
-            "tab to fresh chat");
-          window.location.href = CHAT_URL;
+        // ---- open the tab ----
+        const openRes = await openNewTab(pickedCid);
+        if (!openRes.ok) {
+          try { localStorage.removeItem("dsx_resume_pending"); } catch (_) {}
+          try {
+            await callBridge(
+              { type: "DSX_RESUME_SAVE", payload: null }, 5000);
+          } catch (_) {}
+          throw new Error(`open tab failed: ${openRes.reason}`);
         }
+        console.log(
+          `[DSX:continue-btn] new tab opening via ${openRes.method}` +
+          (openRes.cookie_store_id
+            ? ` (container: ${openRes.cookie_store_id})`
+            : "") +
+          " — resume worker will attach + type there");
       } catch (err) {
         console.error(
           `[DSX:continue-btn] failed: ${err && err.message || err}`);
-        if (newTab && !newTab.closed) {
-          try { newTab.close(); } catch (_) {}
-        }
-        el.style.pointerEvents = prevPe;
-        el.style.opacity = prevOp;
+      } finally {
+        setBusy(false);
       }
     },
   });

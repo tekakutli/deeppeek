@@ -9,13 +9,25 @@
       "strict_min_version": "115.0"
     }
   },
-  "permissions": ["scripting", "activeTab", "storage", "contextualIdentities", "cookies"],
+  "permissions": ["scripting", "activeTab", "storage", "unlimitedStorage", "contextualIdentities", "cookies"],
   "host_permissions": [
     "https://chat.deepseek.com/*",
     "http://127.0.0.1/*"
   ],
   "background": {
-    "scripts": ["background.js"]
+    "scripts": [
+      "bg-state.js",
+      "bg-onmessage.js",
+      "bg-handlers-control.js",
+      "bg-handlers-composer.js",
+      "bg-handlers-read.js",
+      "bg-handlers-hijack.js",
+      "bg-sse.js",
+      "bg-watchdog.js",
+      "bg-fire.js",
+      "bg-tabs.js",
+      "bg-main.js"
+    ]
   },
   "action": {
     "default_title": "Send chat to dsx"

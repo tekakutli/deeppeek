@@ -24,6 +24,43 @@
 //   2. append "NN-some-name.js" to `button-rules/_manifest.json`'s
 //      "files" array
 //   3. reload the tab — no code change to content.js needed
+//
+// PAGE-WORLD ↔ BACKGROUND BRIDGE (postMessage, not exportFunction)
+// ================================================================
+// Button rules need to reach the background (open a tab, list
+// containers, save/claim a resume payload, detect the current
+// container).  The obvious mechanism — `exportFunction(async fn, pw)`
+// returning a Promise that page world `await`s — is BLOCKED by
+// Firefox's Xray barrier:
+//
+//   "Permission denied to access property 'then'"
+//
+// This fires for page-world `await crossCompartmentPromise` AND for
+// `Promise.race([crossCompartmentPromise, ...])`, regardless of
+// whether the exportFunction body is sync or async.
+//
+// The reliable mechanism is `window.postMessage`: it crosses the
+// boundary via structured clone, which is Xray-safe for primitives
+// and plain objects/arrays.  Content script listens for
+// `{dsx_req: reqId, msg: {...}}`, forwards `msg` to the background,
+// and replies with `{dsx_resp: reqId, payload: <json string>}`.
+// Page world's `callBridge()` helper wraps this in a Promise that
+// resolves with the parsed JSON.
+//
+// Bridge message types (all handled in the background):
+//   DSX_OPEN_TAB            → tabs.create
+//   DSX_LIST_CONTAINERS     → contextualIdentities.query
+//   DSX_RESUME_SAVE         → in-memory save
+//   DSX_RESUME_CLAIM        → in-memory claim
+//   DSX_CURRENT_CONTAINER   → sender.tab.cookieStoreId
+//
+// DSX_CURRENT_CONTAINER is deliberately forwarded to the
+// background, NOT handled inline in content script.  Content
+// scripts get a *reduced* tabs.Tab object — `tab.cookieStoreId` is
+// often undefined even with the cookies permission, so
+// `tabs.getCurrent()` from here returns a Tab without container
+// info.  The background sees the full Tab via `sender.tab`, with
+// `tabs.query({active, currentWindow})` as a secondary fallback.
 (async function () {
   const PAGE_WORLD_SCRIPTS = [
     "injected.js",          // bootstrap: __dsx__, config, helpers
@@ -42,6 +79,24 @@
     // button rules load via injectButtonRules() after this block
   ];
 
+  const BRIDGE_TYPES = new Set([
+    "DSX_OPEN_TAB",
+    "DSX_LIST_CONTAINERS",
+    "DSX_RESUME_SAVE",
+    "DSX_RESUME_CLAIM",
+    "DSX_CURRENT_CONTAINER",
+  ]);
+
+  const BRIDGE_TIMEOUT_MS = 8000;
+
+  function raceWithTimeout(promise, label) {
+    const timeout = new Promise((_, rej) =>
+      setTimeout(
+        () => rej(new Error(`${label} timed out after ${BRIDGE_TIMEOUT_MS}ms`)),
+        BRIDGE_TIMEOUT_MS));
+    return Promise.race([promise, timeout]);
+  }
+
   function injectPageWorldScript() {
     const head = document.head || document.documentElement;
     for (const name of PAGE_WORLD_SCRIPTS) {
@@ -54,10 +109,6 @@
     }
   }
 
-  // Fetch button-rules/_manifest.json and inject every listed file
-  // as a page-world <script async=false>.  Preserves order: the
-  // PAGE_WORLD_SCRIPTS batch is inserted first (synchronously), so
-  // injected-buttons.js executes before any rule file injected here.
   async function injectButtonRules() {
     const baseUrl = browser.runtime.getURL("button-rules/");
     const manifestUrl = baseUrl + "_manifest.json";
@@ -109,12 +160,51 @@
       injected.join(", "));
   }
 
+  // ---- page-world ↔ bridge listener (postMessage) --------------
+  //
+  // Page world posts `{dsx_req: reqId, msg: {...}}` on `window`.
+  // This listener forwards `msg` to the background via
+  // `browser.runtime.sendMessage` — which gives the background the
+  // `sender` object including `sender.tab` (the tab the content
+  // script runs in).  The reply is posted back as
+  // `{dsx_resp: reqId, payload: <json string>}`.
+  //
+  // No bridge type is handled inline here.  Doing DSX_CURRENT_CONTAINER
+  // inline was tried and reverted: content scripts get a reduced
+  // tabs.Tab object, so `tabs.getCurrent().cookieStoreId` is
+  // undefined.  The background has the full view.
+  function installPostMessageBridge() {
+    window.addEventListener("message", async (ev) => {
+      if (ev.source !== window) return;
+      const data = ev.data;
+      if (!data || typeof data !== "object") return;
+      if (typeof data.dsx_req !== "string") return;
+      if (!data.dsx_req.startsWith("dsx_")) return;
+      const msg = data.msg;
+      if (!msg || typeof msg !== "object") return;
+      if (!BRIDGE_TYPES.has(msg.type)) return;
+
+      const reqId = data.dsx_req;
+      let payload;
+      try {
+        const resp = await raceWithTimeout(
+          browser.runtime.sendMessage(msg),
+          `bridge ${msg.type}`);
+        payload = JSON.stringify(resp || { success: false, reason: "no response" });
+      } catch (e) {
+        payload = JSON.stringify({
+          success: false,
+          reason: `sendMessage threw: ${e.message || e}`,
+        });
+      }
+      window.postMessage({ dsx_resp: reqId, payload }, "*");
+    });
+  }
+
   if (!window.__dsx_content_installed__) {
     window.__dsx_content_installed__ = true;
     injectPageWorldScript();
-    // Fire-and-forget; the ordering between PAGE_WORLD_SCRIPTS (sync)
-    // and this (async, after fetch) is safe because dynamic scripts
-    // with async=false execute in insertion order.
+    installPostMessageBridge();
     injectButtonRules();
   }
 
@@ -134,8 +224,7 @@
     );
     if (!ready) {
       injectPageWorldScript();
-      // Re-inject the button rules too, since the page world has
-      // evidently been reset (SPA nav that wiped <script> tags).
+      installPostMessageBridge();
       injectButtonRules();
       return await waitFor(
         () => window.wrappedJSObject && typeof window.wrappedJSObject[name] === "function",
@@ -145,13 +234,6 @@
     return true;
   }
 
-  // Zero-wait inline check for the watcher functions.  These are
-  // loaded once at content-script startup; if they aren't there by
-  // the time a watch event arrives, the extension is misinstalled
-  // (manifest missing injected-watch.js) and the only correct
-  // behaviour is to fail immediately so background.js uses its
-  // polling fallback.  Waiting 5+3 seconds here is exactly the
-  // 9.5s "pong" regression from 2026-10-31.
   function pageWorldFn(name) {
     try {
       const ww = window.wrappedJSObject;
@@ -180,10 +262,6 @@
       }
     }
 
-    // ---- event-driven streaming watcher ----------------------------
-    //
-    // Fail fast: if the page-world watcher isn't loaded, let
-    // background.js use its polling fallback immediately.
     if (msg.type === "DSX_WATCH_START") {
       const fn = pageWorldFn("__dsx_startWatch");
       if (!fn) {
@@ -214,11 +292,6 @@
         return { success: false, reason: "page-world attach unavailable" };
       }
       try {
-        // Firefox Xray: content-script-owned objects cannot be read by
-        // page-world code (accessing opts.delay_ms triggers "Permission
-        // denied to access property").  Strings cross transparently.
-        // So stringify here, page-world JSON.parses on its side.
-        // Same pattern as __dsx_extract, which already works.
         const argsJson = JSON.stringify({
           files: msg.files || [],
           opts: msg.opts || {},
