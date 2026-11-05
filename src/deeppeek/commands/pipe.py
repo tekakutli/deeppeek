@@ -19,6 +19,15 @@ Dispatch: if a `deeppeek daemon` is running on the target port,
 this command routes through its `/internal/relay` endpoint instead
 of opening a local `ExportServer`.  Otherwise it falls back to the
 local-server path (the original behaviour).
+
+`--append-txt`: for any file whose extension is NOT in
+_RAW_EXTENSIONS, append `.txt` to the payload filename before
+sending.  DeepSeek's uploader accepts only a narrow set of
+extensions; appending `.txt` to a `.json`/`.yaml`/etc. file is a
+pragmatic workaround when the user needs those bytes in the
+conversation.  The MIME type is recomputed from the new name (so
+`config.yaml` becomes `config.yaml.txt` with mime `text/plain`),
+and the original file on disk is untouched.
 """
 import argparse
 import base64
@@ -27,6 +36,12 @@ import sys
 from pathlib import Path
 
 from ._composer import submit_request
+
+
+# File extensions DeepSeek accepts natively.  With --append-txt, a
+# file whose suffix is not in this set gets `.txt` appended to its
+# payload name, so the upload is not rejected by the composer.
+_RAW_EXTENSIONS = frozenset({".py", ".sh", ".txt", ".md", ".js"})
 
 
 def register(sub: argparse._SubParsersAction) -> None:
@@ -48,6 +63,15 @@ def register(sub: argparse._SubParsersAction) -> None:
         help="delay between files in --serial mode (default: 0.3)",
     )
     p.add_argument(
+        "--append-txt", action="store_true",
+        help="for any file whose extension is NOT in "
+             f"{sorted(_RAW_EXTENSIONS)}, append `.txt` to the "
+             "payload filename before sending so DeepSeek's "
+             "uploader accepts it.  The MIME type is recomputed "
+             "from the new name (usually text/plain).  The "
+             "original file on disk is untouched.",
+    )
+    p.add_argument(
         "--timeout", type=float, default=30.0, metavar="SECONDS",
         help="how long to wait for the extension to connect and "
              "acknowledge (default: 30)",
@@ -62,6 +86,27 @@ def _human_size(n: int) -> str:
             return f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} GB"
+
+
+def _payload_name(path: Path, append_txt: bool) -> str:
+    """Return the filename to send in the attach payload.
+
+    Without --append-txt (or when the extension is already one of the
+    accepted ones), this is just the file's basename.  Otherwise a
+    `.txt` suffix is appended, so DeepSeek's uploader sees a
+    supported extension even when the underlying bytes are not text.
+
+    Extension comparison is case-insensitive: `FOO.PY` counts as
+    `.py`.  Files with no suffix (`Makefile`, `.env`) also get the
+    `.txt` treatment, since `''` is never in _RAW_EXTENSIONS.
+    """
+    name = path.name
+    if not append_txt:
+        return name
+    ext = path.suffix.lower()
+    if ext in _RAW_EXTENSIONS:
+        return name
+    return name + ".txt"
 
 
 def run(args: argparse.Namespace) -> int:
@@ -85,9 +130,18 @@ def run(args: argparse.Namespace) -> int:
         except OSError as e:
             print(f"error: cannot read {f}: {e}", file=sys.stderr)
             return 1
-        mime = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
+        name = _payload_name(f, args.append_txt)
+        if name != f.name:
+            print(
+                f"  {f.name} -> {name} "
+                f"(appended .txt; original ext "
+                f"{f.suffix or '(none)'} not in "
+                f"{sorted(_RAW_EXTENSIONS)})",
+                file=sys.stderr,
+            )
+        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
         b64 = base64.b64encode(data).decode("ascii")
-        payload_files.append({"name": f.name, "mime": mime, "base64": b64})
+        payload_files.append({"name": name, "mime": mime, "base64": b64})
         total_raw += len(data)
         print(f"  {f.name} ({_human_size(len(data))}, {mime})", file=sys.stderr)
 
@@ -102,7 +156,7 @@ def run(args: argparse.Namespace) -> int:
 
     b64_total = sum(len(f["base64"]) for f in payload_files)
     print(f"Total raw: {_human_size(total_raw)} "
-          f"→ base64: {_human_size(b64_total)}", file=sys.stderr)
+          f"-> base64: {_human_size(b64_total)}", file=sys.stderr)
 
     # ---- dispatch via daemon relay or local ExportServer --------
     delay_ms = int(args.delay * 1000) if args.serial else 0

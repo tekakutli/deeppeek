@@ -93,7 +93,8 @@ DEFAULT_OUT        = "project_dump.md" # output markdown file
 #   .service  systemd unit files
 #   .md       Markdown
 #   .toml     TOML
-DEFAULT_EXTENSIONS = [".py", ".sh", "yaml", ".md", ".conf", ".toml", ".js", ".el", ".json"]
+#   ".rules", "service",
+DEFAULT_EXTENSIONS = [".py", ".sh", "yaml", ".md", ".conf", ".toml", ".js", ".el", ".json", ]
 DEFAULT_AFFIX      = None             # e.g. "_test" (substring matched in filename)
 DEFAULT_RECURSIVE  = False            # descend into subdirectories
 DEFAULT_TREE_ONLY  = False            # only emit the directory tree, no file contents
@@ -121,7 +122,7 @@ DEFAULT_EXCLUDE_DIRS = [
     # 'deeppeek', '.deeppeek',
     "recover", "tests", 'docker', 'website',
     # "daemon", "prompts", "capture",
-    "room", "cable", "shared",
+    # "room", "shared",
     "kritomatic_xremap", "other_scripts",
     "data/comfy_panel/history/",
 ]
