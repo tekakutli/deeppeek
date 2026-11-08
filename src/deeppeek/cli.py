@@ -34,6 +34,7 @@ _SUBCOMMAND_MODULES = {
     "test":         "test",
     "scripts":      "scripts",
     "daemon":       "daemon",
+    "paths":        "paths",
 }
 
 # Subcommands whose in-process code path consumes tree-sitter via
@@ -46,8 +47,7 @@ _SUBCOMMAND_MODULES = {
 # `prompt` shells out to `deeppeek recover` for its AST-consuming
 # subcommands; the child process runs its own check, so the parent
 # doesn't need to re-exec.
-_AST_DEPENDENT = {"recover", "capture", "conversation"}
-
+_AST_DEPENDENT = {"recover", "capture", "conversation", "paths"}
 
 def _load_command(name: str):
     """Import `deeppeek.commands.<name>` and return the module."""
