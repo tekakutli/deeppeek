@@ -119,7 +119,7 @@ DEFAULT_EXCLUDE_DIRS = [
     ".git", "__pycache__", ".venv", "venv", "node_modules",
     "lib", "bin",
     'playgrounds',
-    # 'deeppeek', '.deeppeek',
+    'deeppeek', '.deeppeek',
     "recover", "tests", 'docker', 'website',
     # "daemon", "prompts", "capture",
     # "room", "shared",
@@ -132,7 +132,7 @@ DEFAULT_EXCLUDE_DIRS = [
 # changes which files are dumped.
 DEFAULT_TREE_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modules",
                              "lib", "bin",
-                             # 'deeppeek', '.deeppeek',
+                             'deeppeek', '.deeppeek',
                               "recover", "tests", 'docker', 'website',
                              "target", "release",
                              "kritomatic_xremap", "other_scripts",
@@ -151,7 +151,7 @@ DEFAULT_INCLUDE_FILE_SUBSTRINGS = []
 
 # Filename substrings blacklist: if a filename contains ANY of these, the
 # file is skipped.
-DEFAULT_EXCLUDE_FILE_SUBSTRINGS = ["project_dump", "shrinking", 'EMISSION',]
+DEFAULT_EXCLUDE_FILE_SUBSTRINGS = ["project_dump", "shrinking", 'EMISSION', 'README.md',]
 # ---------------------------------------------------------------------------
 
 HEADER = "=" * 70

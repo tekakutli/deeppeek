@@ -5,6 +5,7 @@
     "_resume.js",
     "01-default-capsule.js",
     "02-continue-btn.js",
-    "03-rate-limit-retry.js"
+    "03-rate-limit-retry.js",
+    "04-length-limit-reached.js"
   ]
 }

@@ -3,9 +3,10 @@
 // =====================================================================
 //
 // Loaded FIRST (via button-rules/_manifest.json) so `__dsx__.resume`
-// exists before 02-continue-btn.js and 03-rate-limit-retry.js run.
-// Files prefixed with `_` are shared helpers — they define namespaces
-// on `window.__dsx__` but do NOT register rules.
+// exists before 02-continue-btn.js, 03-rate-limit-retry.js, and
+// 04-length-limit-reached.js run.  Files prefixed with `_` are shared
+// helpers — they define namespaces on `window.__dsx__` but do NOT
+// register rules.
 //
 // THE PIPELINE (what `fullPipeline` does)
 // ---------------------------------------
@@ -29,6 +30,34 @@
 //       fallback), waits for the composer, attaches conversation +
 //       seed files, types the resume text
 //     · single-writer claim means only one tab ever gets the payload
+//
+// CHAINED RESUMES (2026-11-08)
+// ----------------------------
+//   A second-or-later GUI resume finds the previous resume file
+//   (or a merge file from an even earlier resume) as one of the
+//   seed attachments — because the first resume attached its
+//   conversation to the new tab's composer, and that attachment
+//   becomes the first user message of the next conversation.  Left
+//   alone, the AI would see the same history twice — once as
+//   `resume_conversation.md`, once as `merged_resume_<ts>.md` — with
+//   no signal that one precedes the other.
+//
+//   Fix: before building the attach list, classify seed files into
+//   prior-resumes and other-seeds, merge the prior resumes with the
+//   current conversation into ONE flat file, and attach only that.
+//   Non-resume seeds (original attachments like images) stay in the
+//   list unchanged — they were the seed of the first resume, are
+//   re-attached by each subsequent one, and the AI still needs them.
+//
+//   This mirrors prompts/resume.py's `_stage_merge_history` exactly:
+//     · detection: content has `MERGED FILE 1/` in the first 2 KB,
+//       OR filename starts with `resume_` / `merged_resume_`
+//     · extraction: recursively unwraps nested merges, so a
+//       GUI→GUI→CLI chain stays flat (A+B+C, not (A+B)+C)
+//     · emission: `merge_md.py`'s `+` separator / backtick fence /
+//       `MERGED FILE i/N` header, byte-for-byte compatible with
+//       the CLI's output — so a GUI merge is detected by a later
+//       CLI resume, and vice versa
 //
 // CROSS-REALM BRIDGE (postMessage, not exportFunction)
 // ---------------------------------------------------
@@ -66,7 +95,8 @@
 //       Complete click handler: pick container, prepare payload,
 //       save, open tab.  `label` is used in console logs to
 //       identify which rule triggered the pipeline.
-//       Used by 02-continue-btn.js and 03-rate-limit-retry.js.
+//       Used by 02-continue-btn.js, 03-rate-limit-retry.js, and
+//       04-length-limit-reached.js.
 //
 //   callBridge(msg, timeoutMs)
 //       Raw postMessage bridge — for rules that need to talk to
@@ -83,6 +113,13 @@
 //
 //   openNewTab(pref)
 //       Open a tab with an optional container.
+//
+//   isMergeContent(text)
+//   isResumeOrMergeAttachment(file)
+//   extractFromMerge(text)
+//   emitMergedBlocks(parts)
+//   buildAttachList(payload)
+//       Merge helpers (2026-11-08) — exposed for console debugging.
 //
 // Nothing here registers a rule.  Rules live in numbered files.
 (function () {
@@ -130,6 +167,7 @@
   // ---- helpers --------------------------------------------------
 
   const b64Of = (s) => btoa(unescape(encodeURIComponent(s)));
+  const b64Decode = (s) => decodeURIComponent(escape(atob(s)));
 
   const closeFences = (md) => {
     if (!md) return md;
@@ -208,7 +246,216 @@
     `where you left it: "${guidance}"; ` +
     `dont give me any code yet, simply design it`;
 
-  // ---- current-container detection ------------------------------
+  // ---- merge helpers (2026-11-08) -------------------------------
+  //
+  // Ported from prompts/resume.py and scripts/merge_md.py so the
+  // GUI resume button handles chained resumes the same way the CLI
+  // command does.  See the module docstring ("CHAINED RESUMES")
+  // for the why, and prompts/resume.py's docstring for the
+  // original rationale.
+  //
+  // Compatibility contract:
+  //   · A merge produced here MUST be detectable by
+  //     prompts/resume.py::_is_resume_or_merge_attachment — which
+  //     checks for `MERGED FILE 1/` in the first 2 KB.
+  //   · The block format MUST match merge_md.py's so that a
+  //     subsequent CLI resume can flatten it via
+  //     _extract_from_merge, and vice versa.
+  // Both hold by construction: same regex, same emit function.
+
+  const _MERGE_SEP_CHAR = "+";
+  const _MERGE_MIN_SEPARATOR_WIDTH = 70;
+  const _MERGE_MIN_FENCE_WIDTH = 3;
+  const _MERGE_FENCE_CHAR = "`";
+
+  // Port of merge_md.py's _MERGE_HEADER_RE.  /m for line-anchored
+  // `^`, /g for matchAll.  The `\1` backreference ensures opener
+  // and closer use the same `+` width, so a `+` run inside the
+  // fenced content cannot be mistaken for a boundary.
+  const _MERGE_HEADER_RE =
+    /^(\+{70,})\nMERGED FILE (\d+)\/(\d+): (.+?)\n\1\n/gm;
+
+  // Port of merge_md.py's _max_run: longest consecutive run of `ch`
+  // in `text`.
+  function _maxRun(text, ch) {
+    if (!text) return 0;
+    let longest = 0, current = 0;
+    for (let i = 0; i < text.length; i++) {
+      if (text[i] === ch) {
+        current++;
+        if (current > longest) longest = current;
+      } else {
+        current = 0;
+      }
+    }
+    return longest;
+  }
+
+  // Separator width strictly exceeds any `+` run in `content`, so
+  // the boundary cannot be faked by content.
+  function _separatorFor(content) {
+    const width = Math.max(
+      _MERGE_MIN_SEPARATOR_WIDTH,
+      _maxRun(content, _MERGE_SEP_CHAR) + 1,
+    );
+    return _MERGE_SEP_CHAR.repeat(width);
+  }
+
+  // Fence width strictly exceeds any backtick run in `content`,
+  // for the same reason.
+  function _fenceFor(content) {
+    const width = Math.max(
+      _MERGE_MIN_FENCE_WIDTH,
+      _maxRun(content, _MERGE_FENCE_CHAR) + 1,
+    );
+    return _MERGE_FENCE_CHAR.repeat(width);
+  }
+
+  // True iff `text` looks like merge_md.py output.  Only the head
+  // is checked (2048 chars, matching the Python helper) — a
+  // `MERGED FILE 1/` appearing that early is decisive.
+  function _isMergeContent(text) {
+    if (typeof text !== "string") return false;
+    return text.slice(0, 2048).indexOf("MERGED FILE 1/") !== -1;
+  }
+
+  // Recursively unwrap a merge_md.py file into a flat list of
+  // {name, content} pairs, in original order.  Ports
+  // prompts/resume.py::_extract_from_merge (which itself is a port
+  // of dumps_evolve.py's parser).  A nested merge contributes its
+  // leaves in place, so a chain A→B→C produces [A, B, C], not
+  // [[A,B], C] or any other shape.
+  function _extractFromMerge(text, depth) {
+    depth = depth || 0;
+    if (depth > 20) {
+      console.warn(
+        "[DSX:resume] merge nesting too deep; stopping recursion");
+      return [{ name: "unknown.md", content: text }];
+    }
+
+    const headers = [...text.matchAll(_MERGE_HEADER_RE)];
+    if (headers.length === 0) {
+      return [{ name: "unknown.md", content: text }];
+    }
+
+    const result = [];
+    for (let i = 0; i < headers.length; i++) {
+      const m = headers[i];
+      const name = m[4];
+      const contentStart = m.index + m[0].length;
+      const contentEnd = (i + 1 < headers.length)
+        ? headers[i + 1].index
+        : text.length;
+      const chunk = text.slice(contentStart, contentEnd);
+
+      // Chunk shape (see _emitMergedBlocks):
+      //   <fence>\n<content>\n<fence>\n\n
+      // The fence width matches the opener, so locate the closer
+      // by exact-match of "\n" + fence + "\n".
+      const opener = chunk.match(/^(`{3,})[^\n]*\n/);
+      let inner;
+      if (!opener) {
+        inner = chunk.replace(/\n+$/, "");
+      } else {
+        const n = opener[1].length;
+        const fence = "`".repeat(n);
+        const closerPat = "\n" + fence + "\n";
+        const last = chunk.lastIndexOf(closerPat);
+        if (last < 0) {
+          // Defensive: closer without trailing newline.
+          const fallback = "\n" + fence;
+          const lastFallback = chunk.lastIndexOf(fallback);
+          inner = (lastFallback < 0)
+            ? chunk.slice(opener[0].length).replace(/\n+$/, "")
+            : chunk.slice(opener[0].length, lastFallback);
+        } else {
+          inner = chunk.slice(opener[0].length, last);
+        }
+      }
+
+      if (_isMergeContent(inner)) {
+        result.push(..._extractFromMerge(inner, depth + 1));
+      } else {
+        result.push({ name, content: inner });
+      }
+    }
+    return result;
+  }
+
+  // Emit `parts` (list of {name, content}) as a merge_md.py-
+  // compatible merged file.  Same format as merge_md.py's
+  // _emit_block loop: per-block `+` separator, MERGED FILE i/N
+  // header, backtick fence, content.  No preamble — the CLI's
+  // preamble is verbose (for human readers); for a chat attachment
+  // the block headers alone communicate structure.  Kept minimal
+  // on purpose to reduce attention dilution.
+  function _emitMergedBlocks(parts) {
+    const total = parts.length;
+    let out = "";
+    for (let i = 0; i < total; i++) {
+      const { name, content } = parts[i];
+      const body = content == null ? "" : content;
+      const sep = _separatorFor(body);
+      const fence = _fenceFor(body);
+      const idx = i + 1;
+      out += sep + "\n";
+      out += `MERGED FILE ${idx}/${total}: ${name}\n`;
+      out += sep + "\n";
+      out += fence + "\n";
+      out += body;
+      if (body && !body.endsWith("\n")) out += "\n";
+      out += fence + "\n\n";
+    }
+    return out;
+  }
+
+  // True iff `file` (a {name, mime, base64} record from the attach
+  // payload) looks like a prior resume.  Port of
+  // prompts/resume.py::_is_resume_or_merge_attachment:
+  //
+  //   · filename starts with `resume_` / `merged_resume_` — fast
+  //     path, catches the JS pipeline's own output and the CLI's
+  //     `resume_<slug>_<ts>.md`
+  //   · OR content has `MERGED FILE 1/` in the first 2 KB —
+  //     catches renamed merges (e.g. a CLI merge whose stem doesn't
+  //     start with `resume_`)
+  //
+  // The content-sniff is gated on text-ish MIME/extension so a
+  // binary seed (PNG, PDF) is never fed to b64Decode — decoding
+  // non-UTF-8 through decodeURIComponent would throw or produce
+  // garbage.
+  function _isResumeOrMergeAttachment(file) {
+    if (!file || typeof file !== "object") return false;
+    const name = file.name || "";
+    if (name.startsWith("resume_") || name.startsWith("merged_resume_")) {
+      return true;
+    }
+    const mime = file.mime || "";
+    const isTexty = mime.startsWith("text/")
+      || mime === "application/json"
+      || mime === "application/octet-stream"
+      || name.endsWith(".md")
+      || name.endsWith(".txt");
+    if (!isTexty || !file.base64) return false;
+    try {
+      const head = b64Decode(file.base64).slice(0, 2048);
+      return _isMergeContent(head);
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  // YYYYMMDD_HHMMSS, matching the convention used by
+  // prompts/resume.py's _timestamp (and injected-hijack.js's
+  // _downloadTimestamp).
+  function _timestamp() {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`
+         + `_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  }
+
+  // ---- container detection --------------------------------------
   //
   // Detects the container the current tab is in, so plain-click
   // can open the new tab in the same container.  Routes through the
@@ -487,6 +734,108 @@
     return false;
   };
 
+  // Build the attach list for a resume payload.  Returns
+  // [{name, mime, base64}, ...] ready for __dsx_attach_json.
+  //
+  // Cases:
+  //   1. No prior resumes in seed_files
+  //        → [current_conversation, ...all_seeds]
+  //        (unchanged from before 2026-11-08 — a first-time GUI
+  //        resume behaves exactly as it did)
+  //   2. Prior resumes present
+  //        → [merged_resume_<ts>.md, ...non_resume_seeds]
+  //        The merged file combines (prior_resume_1_content,
+  //        prior_resume_2_content, …, current_conversation) in
+  //        that order, so it reads oldest → newest.  Prior
+  //        merges are flattened recursively so a chain
+  //        GUI→GUI→CLI stays flat.
+  //
+  // Non-resume seeds (images, docs) are NEVER merged into the
+  // conversation; they were the seed of the first resume, the AI
+  // still needs them, and folding them into the merged text would
+  // corrupt binary content.
+  function _buildAttachList(payload) {
+    const seedFiles = Array.isArray(payload.seed_files)
+      ? payload.seed_files
+      : [];
+    const currentFile = {
+      name: payload.conversation_filename || "resume_conversation.md",
+      mime: "text/markdown",
+      base64: payload.conversation_base64,
+    };
+
+    const resumeSeeds = [];
+    const otherSeeds = [];
+    for (const f of seedFiles) {
+      if (_isResumeOrMergeAttachment(f)) {
+        resumeSeeds.push(f);
+      } else {
+        otherSeeds.push(f);
+      }
+    }
+
+    if (resumeSeeds.length === 0) {
+      console.log(
+        `[DSX:resume] no prior resumes in ${seedFiles.length} ` +
+        `seed file(s); attaching current conversation as-is`);
+      return [currentFile, ...otherSeeds];
+    }
+
+    // Flatten each prior resume.  A prior merge contributes its
+    // leaves; a plain conversation contributes itself.  Any seed
+    // that fails to decode is preserved as a separate attachment
+    // rather than dropped — better to give the AI an unmerged
+    // extra chip than to silently lose a file.
+    const parts = [];
+    for (const r of resumeSeeds) {
+      let text;
+      try {
+        text = b64Decode(r.base64);
+      } catch (e) {
+        console.warn(
+          `[DSX:resume] cannot decode ${r.name} ` +
+          `(${e && e.message || e}); attaching it as a separate file`);
+        otherSeeds.push(r);
+        continue;
+      }
+      if (_isMergeContent(text)) {
+        parts.push(..._extractFromMerge(text));
+      } else {
+        parts.push({ name: r.name, content: text });
+      }
+    }
+
+    // Current conversation goes LAST: the merged file reads
+    // oldest → newest, with the just-captured one at the tail.
+    let currentText;
+    try {
+      currentText = b64Decode(payload.conversation_base64);
+    } catch (e) {
+      console.warn(
+        `[DSX:resume] cannot decode current conversation ` +
+        `(${e && e.message || e}); not merging`);
+      return [currentFile, ...resumeSeeds, ...otherSeeds];
+    }
+    parts.push({ name: currentFile.name, content: currentText });
+
+    const mergedBody = _emitMergedBlocks(parts);
+    const mergedName = `merged_resume_${_timestamp()}.md`;
+
+    console.log(
+      `[DSX:resume] merged ${resumeSeeds.length} prior resume(s) + ` +
+      `current → ${mergedName} ` +
+      `(${parts.length} conversation(s), ${mergedBody.length} chars)`);
+
+    return [
+      {
+        name: mergedName,
+        mime: "text/markdown",
+        base64: b64Of(mergedBody),
+      },
+      ...otherSeeds,
+    ];
+  }
+
   const runResumePhase2 = async (payload) => {
     const ready = await waitForComposer(15000);
     if (!ready) {
@@ -496,14 +845,7 @@
     }
     await new Promise(r => setTimeout(r, 500));
 
-    const files = [
-      {
-        name: payload.conversation_filename || "resume_conversation.md",
-        mime: "text/markdown",
-        base64: payload.conversation_base64,
-      },
-      ...(payload.seed_files || []),
-    ];
+    const files = _buildAttachList(payload);
 
     if (typeof window.__dsx_attach_json !== "function") {
       throw new Error("__dsx_attach_json unavailable");
@@ -758,5 +1100,14 @@
     prepareResumePayload,
     runResumePhase2,
     openNewTab,
+    // Merge helpers (2026-11-08) — exposed for console debugging.
+    // Use __dsx__.resume.extractFromMerge("<merged text>") to see
+    // the flat parts; __dsx__.resume.buildAttachList(payload) to
+    // see the attach list a payload would produce.
+    isMergeContent: _isMergeContent,
+    isResumeOrMergeAttachment: _isResumeOrMergeAttachment,
+    extractFromMerge: _extractFromMerge,
+    emitMergedBlocks: _emitMergedBlocks,
+    buildAttachList: _buildAttachList,
   };
 })();
