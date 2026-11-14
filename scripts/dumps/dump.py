@@ -3,7 +3,7 @@
 Dump files (filtered by extension) into a single markdown file.
 
 Usage:
-    dump.py [-a AFFIX] [-r] [-t] [-o PATH] [--exclude-file PATH]... [FILE ...]
+    dump.py [-a AFFIX] [-r] [-t] [-O OFFSET] [-o PATH] [--exclude-file PATH]... [FILE ...]
 
 If one or more FILE positional arguments are provided, ONLY those files are
 dumped (deduplicated, in sorted order). Their paths are interpreted relative
@@ -13,7 +13,11 @@ what you get. A directory tree is always rendered, rooted at the common
 parent directory of the listed files.
 
 When no FILE arguments are given, the script scans DEFAULT_DIR using the
-configured filters below.
+configured filters below. If DEFAULT_SCAN_OFFSET (or -O/--offset) is set,
+the *scan* is restricted to DEFAULT_DIR/<offset>, and the DIRECTORY TREE is
+pruned to exactly the dumped files — but still rooted at DEFAULT_DIR, so
+the offset path (e.g. `kritomatic_daemon/panel/...`) remains visible as
+ordinary hierarchy rather than being collapsed away.
 
 TREE MODES
 ==========
@@ -35,6 +39,11 @@ Two tree-rendering modes exist:
                          highlighted, so the user can see what was
                          excluded without losing the context of what
                          the project contains.
+
+Offset mode (DEFAULT_SCAN_OFFSET / -O) renders the pruned tree: only
+dumped files appear, and only the directories that lead to them.  The
+offset path itself shows up as ordinary nested directories under the
+project root, so you still see where in the project the dump comes from.
 
 Files whose own content *looks like another dump* — i.e. contains a
 `=====...=====\nFILE i/N: ...` block header at line start — are skipped
@@ -85,6 +94,12 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 DEFAULT_DIR        = "."              # directory to scan
 DEFAULT_OUT        = "project_dump.md" # output markdown file
+# Restrict the *scan* to this subdirectory of DEFAULT_DIR (None = whole dir).
+# The DIRECTORY TREE shows only the dumped files, but is rooted at DEFAULT_DIR
+# so the offset path remains visible as ordinary nested directories.
+# Example: "kritomatic_daemon/panel"
+DEFAULT_SCAN_OFFSET = None
+# DEFAULT_SCAN_OFFSET = "kritomatic_daemon/panel"
 # Common extensions:
 #   .py       Python
 #   .sh       Bash / shell
@@ -94,7 +109,7 @@ DEFAULT_OUT        = "project_dump.md" # output markdown file
 #   .md       Markdown
 #   .toml     TOML
 #   ".rules", "service",
-DEFAULT_EXTENSIONS = [".py", ".sh", "yaml", ".md", ".conf", ".toml", ".js", ".el", ".json", ]
+DEFAULT_EXTENSIONS = [".py", ".sh", "yaml", ".md", ".conf", ".toml", ".js", ".el", ".json", ".area",]
 DEFAULT_AFFIX      = None             # e.g. "_test" (substring matched in filename)
 DEFAULT_RECURSIVE  = False            # descend into subdirectories
 DEFAULT_TREE_ONLY  = False            # only emit the directory tree, no file contents
@@ -112,7 +127,9 @@ DEFAULT_SKIP_DUMP_FILES = True
 #     basename at ANY depth.
 #   - Relative paths, e.g. "thisDirectory/thatDirectory": matched against the
 #     directory's path RELATIVE TO THE SCANNED DIRECTORY, so only that exact
-#     directory (and its subtree) is skipped.
+#     directory (and its subtree) is skipped.  When DEFAULT_SCAN_OFFSET is in
+#     use, these relative paths are still interpreted against DEFAULT_DIR, not
+#     against the offset — so the existing exclusions keep working unchanged.
 # Directories skipped here still appear in the DIRECTORY TREE, unless they are
 # also listed in DEFAULT_TREE_EXCLUDE_DIRS below.
 DEFAULT_EXCLUDE_DIRS = [
@@ -125,6 +142,7 @@ DEFAULT_EXCLUDE_DIRS = [
     # "room", "shared",
     "kritomatic_xremap", "other_scripts",
     "data/comfy_panel/history/",
+    "src/kritomatic",
 ]
 
 # Directories to hide from the DIRECTORY TREE. Same matching rules as
@@ -136,18 +154,25 @@ DEFAULT_TREE_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modul
                               "recover", "tests", 'docker', 'website',
                              "target", "release",
                              "kritomatic_xremap", "other_scripts",
-                             "data/comfy_panel", "other_scripts/room/leader_optimizer",
+                             # "data/comfy_panel", "other_scripts/room/leader_optimizer",
 ]
 
 # Directory names whitelist: if NON-EMPTY, only descend into subdirectories
 # whose basename is in this list.
 DEFAULT_INCLUDE_DIRS = []
-# DEFAULT_INCLUDE_DIRS = ['board', 'pg_comfy', 'pgkit']
-# DEFAULT_INCLUDE_DIRS = ["inpaint", "pgkit", "pg_comfy"]
+# DEFAULT_INCLUDE_DIRS = ['inpaint', 'interceptor', 'board', 'pg_comfy', 'pgkit', 'segment',]
+# DEFAULT_INCLUDE_DIRS = ["inpaint", "pgkit", "pg_comfy", "board", "interceptor",]
+DEFAULT_INCLUDE_DIRS = ["inpaint", "pgkit", "pg_comfy", "multimask", "interceptor",]
+# DEFAULT_INCLUDE_DIRS = ['remote_cli','remote_panel',]
+# DEFAULT_INCLUDE_DIRS = ["inpaint", "pgkit", "pg_comfy", "cable", 'remote_cli','remote_panel',]
+# DEFAULT_INCLUDE_DIRS = ['segment','text_boxes', 'pair']
+# DEFAULT_INCLUDE_DIRS = ["inpaint", "pgkit", "pg_comfy", "board", "text_wall", "multimask", 'remote_cli','remote_panel', 'room', 'interceptor', 'cone', 'segment','text_boxes','cable']
+
 
 # Filename substrings whitelist: if NON-EMPTY, a file is only kept when its
 # filename contains AT LEAST ONE of these substrings.
 DEFAULT_INCLUDE_FILE_SUBSTRINGS = []
+# DEFAULT_INCLUDE_FILE_SUBSTRINGS = ["comfyui"]
 
 # Filename substrings blacklist: if a filename contains ANY of these, the
 # file is skipped.
@@ -222,10 +247,20 @@ def find_files(
     exclude_file_substrings: list[str],
     recursive: bool = True,
     skip_dump_files: bool = True,
+    base_root: Path | None = None,
 ) -> list[Path]:
+    """Walk `root` collecting files that match the filters.
+
+    `base_root` (default: `root`) is used *only* for computing the relative
+    path that path-form exclusion patterns (`"a/b"`) are matched against.
+    This lets a caller scan a subdirectory (e.g. the offset directory) while
+    still interpreting such patterns relative to the original project root.
+    """
+    if base_root is None:
+        base_root = root
     results: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        rel_dir = Path(os.path.relpath(dirpath, root))
+        rel_dir = Path(os.path.relpath(dirpath, base_root))
 
         # prune excluded directories in-place so os.walk skips them
         dirnames[:] = [
@@ -383,8 +418,9 @@ def build_tree_from_files(
     tree (but they will still be dumped — this only affects rendering).
 
     This is the legacy "pruned" tree used when FILE arguments are passed
-    without `--tree-from-scan`.  For the "full tree with [skip] markers"
-    mode, use `build_tree(..., mark_skipped=True, extensions=...)`.
+    without `--tree-from-scan`, and also for offset mode.  For the "full
+    tree with [skip] markers" mode, use
+    `build_tree(..., mark_skipped=True, extensions=...)`.
     """
     tree: dict = {}
     for f in files:
@@ -515,8 +551,8 @@ def main() -> int:
         description="Dump files into a markdown file. "
                     "All paths/extensions come from variables in the script; "
                     "CLI overrides exist for affix, recursion, tree-only, "
-                    "output path, and per-file exclusions. Pass one or more "
-                    "FILE arguments to dump only those files.  "
+                    "scan offset, output path, and per-file exclusions. Pass "
+                    "one or more FILE arguments to dump only those files.  "
                     "Use --as-read-args to emit aider-compatible "
                     "`--read PATH` arguments instead of a dump.",
     )
@@ -540,6 +576,14 @@ def main() -> int:
         "-t", "--tree-only", action="store_true", default=None,
         help=("Only write the directory tree. Implies recursion. "
               f"(hardcoded default: {DEFAULT_TREE_ONLY})"),
+    )
+    parser.add_argument(
+        "-O", "--offset", default=None, metavar="SUBDIR",
+        help=("(scan mode only) Restrict the file scan to this subdirectory "
+              "of DEFAULT_DIR. The DIRECTORY TREE is pruned to exactly the "
+              "dumped files, but rooted at DEFAULT_DIR so the offset path "
+              "stays visible. Pass an empty string to disable. "
+              f"(hardcoded default: {DEFAULT_SCAN_OFFSET!r})"),
     )
     parser.add_argument(
         "-o", "--output", type=Path, default=None,
@@ -602,6 +646,12 @@ def main() -> int:
         else DEFAULT_SKIP_DUMP_FILES
     )
 
+    offset_raw = args.offset if args.offset is not None else DEFAULT_SCAN_OFFSET
+    offset = offset_raw.strip() if offset_raw else None
+    if offset == "":
+        offset = None
+    offset_path = Path(offset) if offset else None
+
     tree_only = True if args.tree_only else DEFAULT_TREE_ONLY
 
     if args.files:
@@ -638,8 +688,21 @@ def main() -> int:
 
         recursive = True if (args.recursive or tree_only) else DEFAULT_RECURSIVE
 
+        # Offset: restrict the *scan* to root/<offset>, but keep the tree
+        # rooted at `root` so the offset path stays visible.
+        if offset_path is not None:
+            scan_root = root / offset_path
+            if not scan_root.is_dir():
+                print(
+                    f"Error: scan offset not found: {scan_root}",
+                    file=sys.stderr,
+                )
+                return 1
+        else:
+            scan_root = root
+
         files = find_files(
-            root,
+            scan_root,
             extensions,
             affix,
             exclude_dirs,
@@ -648,11 +711,12 @@ def main() -> int:
             exclude_file_substrings,
             recursive,
             skip_dump_files,
+            base_root=root,
         )
         if exclude_paths:
             files = [f for f in files if f.resolve() not in exclude_paths]
         if not files:
-            msg = f"No files found in '{root}'"
+            msg = f"No files found in '{scan_root}'"
             if extensions:
                 msg += f" with extensions {extensions}"
             if affix:
@@ -696,7 +760,10 @@ def main() -> int:
 
     fh = io.StringIO()
     fh.write(HEADER + "\n")
-    fh.write(f"SCANNED DIRECTORY: {scanned_dir}\n")
+    header_line = f"SCANNED DIRECTORY: {scanned_dir}"
+    if offset_path is not None and not args.files:
+        header_line += f" (scan offset: {offset})"
+    fh.write(header_line + "\n")
     fh.write(HEADER + "\n\n")
 
     if recursive:
@@ -704,18 +771,18 @@ def main() -> int:
         fh.write("DIRECTORY TREE\n")
         fh.write(HEADER + "\n")
         fh.write("```\n")
-        if args.files and not args.tree_from_scan:
-            # Legacy FILE mode: pruned tree containing only the
-            # listed files' common subtree.
+        # Offset mode is treated just like FILE mode for the tree:
+        # render only the dumped files, rooted at `tree_root` so the
+        # offset path structure stays visible as ordinary hierarchy.
+        # The only mode that shows [skip] markers is --tree-from-scan.
+        if (args.files and not args.tree_from_scan) or (
+            offset_path is not None and not args.tree_from_scan
+        ):
             tree = build_tree_from_files(
                 tree_root, files, tree_exclude_dirs,
             )
         else:
-            # Scan mode OR --tree-from-scan: walk the whole tree
-            # under `tree_root`.  In --tree-from-scan mode, files
-            # not in `files` are shown with `[skip]`; in scan mode,
-            # every file in `files` is added unmarked (identical to
-            # the original behaviour for the scan case).
+            # Scan mode without offset, or --tree-from-scan.
             tree = build_tree(
                 tree_root, include_dirs, tree_exclude_dirs, files,
                 mark_skipped=args.tree_from_scan,
