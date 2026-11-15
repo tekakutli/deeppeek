@@ -4,30 +4,23 @@
 //
 // INJECTION POINT
 // ---------------
-//   Where:   END of the capsule row that belongs to DeepSeek's
-//            context-length notice banner.
-//   Which:   capsule rows whose ancestor chain (up to 4 levels) holds
-//            a <SPAN> whose trimmed text STARTS WITH
-//            "Length limit reached" — i.e. rows under the
-//            context-length notice, not rows under a normal
-//            assistant message.
+//   Where:   END of the row that belongs to DeepSeek's context-
+//            length notice banner.
+//   Which:   any `.ds-flex` row whose ancestor chain (up to 4
+//            levels) holds a <SPAN> whose trimmed text STARTS WITH
+//            "Length limit reached" — AND whose own children
+//            include at least one native capsule button.
 //
 //            The current DeepSeek build renders the notice text as:
 //
 //              "Length limit reached. Please start a new chat."
 //
-//            The " Please start a new chat." suffix is DeepSeek's
-//            action hint and is likely to be reworded between builds,
-//            so the filter matches on the stable prefix with
-//            startsWith() rather than requiring an exact match
-//            against the full sentence.  startsWith (not includes)
-//            keeps the check narrow — an assistant message that
-//            happens to *quote* the phrase mid-sentence does not
-//            qualify.
-//
-//   Verify:  __dsx__.buttons.debug(true) → coloured outline on the
-//            notice row only, "length-limit-reached" label above
-//            the clone.  No label on normal message rows.
+//            and the notice's row contains exactly ONE native
+//            capsule button (older builds had ≥2, matching a normal
+//            assistant message row).  This rule used to delegate to
+//            `C.isCapsuleRow`, which requires ≥2 natives, so it
+//            silently stopped firing when DeepSeek trimmed the row
+//            down to 1 button.  The filter below now accepts ≥1.
 //
 // WHAT IT DOES ON CLICK
 // ---------------------
@@ -39,33 +32,6 @@
 //
 //   Shift-click opens a container picker.
 //   Plain click resumes in the current tab's container.
-//
-// FILTER STRUCTURE — WHY IT WALKS UP 4 LEVELS
-// -------------------------------------------
-//   The rate-limit rule hard-codes `row.parentElement.parentElement`
-//   as the notice, which works for that notice because the capsule
-//   row sits exactly 2 levels below it:
-//
-//     <notice>
-//       ├── <SPAN>…text…</SPAN>
-//       └── <div>
-//             └── <div .ds-flex>       ← row, 2 levels down
-//
-//   The context-length notice, however, wraps the row in one extra
-//   container, so the row is 3 (or more) levels down:
-//
-//     <notice>
-//       ├── <SPAN>…text…</SPAN>
-//       └── <div>                      ← extra action-row wrapper
-//             └── <div>
-//                   └── <div .ds-flex> ← row, 3 levels down
-//
-//   Walking up to 4 ancestors covers both shapes without needing to
-//   know which one we're in.  The check requires the ancestor to
-//   have the notice <SPAN> as a *direct child* (not just somewhere
-//   in its subtree), so it cannot false-match on a sibling capsule
-//   row that happens to share an outer scroll wrapper with the
-//   notice.
 //
 // LOADED BY
 // ---------
@@ -100,14 +66,26 @@
   // update this constant and re-package.
   const NEEDLE = "Length limit reached";
 
-  // How many ancestors above the capsule row to search for the
+  // How many ancestors above the target row to search for the
   // notice.  4 covers both shapes observed so far (2-level rate-
   // limit, 3-level context-length) and leaves one level of slack
   // for future wrappers.
   const MAX_ANCESTOR_WALK = 4;
 
   const rowQualifies = (row) => {
-    if (!C.isCapsuleRow(row)) return false;
+    if (!row || row.nodeType !== 1) return false;
+
+    // Require at least ONE native capsule button in the row.
+    // Historically we required >=2 (via C.isCapsuleRow), matching
+    // a normal assistant message row.  DeepSeek's current length-
+    // limit notice renders only ONE button, so relax to >=1 while
+    // still requiring it to be a capsule — that keeps us from
+    // injecting into arbitrary .ds-flex wrappers that happen to
+    // sit under a notice-shaped ancestor.
+    const natives = [...row.children].filter(
+      c => c.nodeType === 1 && !c.hasAttribute("data-dsx-injected"));
+    if (natives.length === 0) return false;
+    if (!natives.some(k => k.matches(C.CAPSULE_SEL))) return false;
 
     let n = row.parentElement;
     for (let i = 0; i < MAX_ANCESTOR_WALK && n; i++) {
@@ -131,8 +109,15 @@
     name: "length-limit-reached",
     position: "end",
     template: () => {
-      for (const row of document.querySelectorAll(".ds-flex")) {
-        const pill = C.makeTextPill(row, "Retry");
+      // Build the template from ANY native capsule on the page —
+      // not necessarily inside a proper capsule row.  The template
+      // element is only cloned as a shape; it doesn't need to be
+      // in the target row.  This works even when the only native
+      // capsule in the DOM is the single button inside the length-
+      // limit notice itself.
+      const natives = document.querySelectorAll(C.CAPSULE_SEL);
+      for (const nat of natives) {
+        const pill = C.makeTextPillFromNative(nat, "Retry");
         if (pill) return pill;
       }
       return null;

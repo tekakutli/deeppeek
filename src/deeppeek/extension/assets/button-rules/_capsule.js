@@ -3,9 +3,10 @@
 // =====================================================================
 //
 // Loaded FIRST (via button-rules/_manifest.json) so `__dsx__.capsule`
-// exists before 01-default-capsule.js and 03-rate-limit-retry.js run.
-// Files prefixed with `_` are shared helpers — they define namespaces
-// on `window.__dsx__` but do NOT register rules.
+// exists before 01-default-capsule.js, 03-rate-limit-retry.js, and
+// 04-length-limit-reached.js run.  Files prefixed with `_` are shared
+// helpers — they define namespaces on `window.__dsx__` but do NOT
+// register rules.
 //
 // Exported API (window.__dsx__.capsule):
 //   CAPSULE_SEL               CSS selector for a capsule-xs icon button
@@ -16,6 +17,12 @@
 //                             native capsule transformed into a
 //                             text-labelled pill; null if row isn't a
 //                             capsule row
+//   makeTextPillFromNative(native, label)
+//                             same transform, but starting from a
+//                             single native capsule element (no row
+//                             check).  Used by 04-length-limit-reached
+//                             because DeepSeek's length-limit notice
+//                             renders only ONE capsule button.
 (function () {
   "use strict";
   if (!window.__dsx__) window.__dsx__ = {};
@@ -34,18 +41,21 @@
     return natives.every(k => k.matches(CAPSULE_SEL));
   };
 
-  const makeTextPill = (row, label) => {
-    if (!isCapsuleRow(row)) return null;
-    const natives = [...row.children].filter(isNativeCapsule);
-    const base = natives[0].cloneNode(true);
+  // Icon-only capsule → text-labelled pill.  Shared by
+  // makeTextPill (row-based) and makeTextPillFromNative (el-based).
+  //
+  //   · drop `--icon` so the pill isn't locked to a square
+  //   · add `--min-width` so it grows to fit text (same class
+  //     the code block's Copy button uses)
+  //   · clear inline width + gap set by the --icon sizing
+  //   · remove the icon container
+  //   · append the label
+  const makeTextPillFromNative = (native, label) => {
+    if (!native || native.nodeType !== 1) return null;
+    if (native.hasAttribute(MARKER_ATTR)) return null;
+    if (!native.matches(CAPSULE_SEL)) return null;
+    const base = native.cloneNode(true);
     base.removeAttribute(MARKER_ATTR);
-    // icon-only pill → text-labelled pill:
-    //   · drop `--icon` so the pill isn't locked to a square
-    //   · add `--min-width` so it grows to fit text (same class
-    //     the code block's Copy button uses)
-    //   · clear inline width + gap set by the --icon sizing
-    //   · remove the icon container
-    //   · append the label
     base.classList.remove("ds-button--icon");
     base.classList.add("ds-button--min-width");
     base.style.removeProperty("--dsl-button-width");
@@ -61,10 +71,17 @@
     return base;
   };
 
+  const makeTextPill = (row, label) => {
+    if (!isCapsuleRow(row)) return null;
+    const natives = [...row.children].filter(isNativeCapsule);
+    return makeTextPillFromNative(natives[0], label);
+  };
+
   window.__dsx__.capsule = {
     CAPSULE_SEL,
     isNativeCapsule,
     isCapsuleRow,
     makeTextPill,
+    makeTextPillFromNative,
   };
 })();

@@ -1,50 +1,71 @@
 #!/usr/bin/env python3
 """
-dumps_merge.py — merge two dumps of the same project into one.
+dumps_merge.py — merge two or more dumps of the same project into one.
 
-Both dumps must share the same SCANNED DIRECTORY (their absolute root).
-The classic case is two dumps produced with dump.py's DEFAULT_SCAN_OFFSET
-/ -O option pointing at different subdirectories: each dump scans a
-different slice of the project, and dump.py roots both DIRECTORY TREEs at
-the same project root so file paths line up.
+All dumps must share the same SCANNED DIRECTORY (their absolute root).
+The classic case is several dumps produced with dump.py's
+DEFAULT_SCAN_OFFSET / -O option pointing at different subdirectories:
+each dump scans a different slice of the project, and dump.py roots all
+DIRECTORY TREEs at the same project root so file paths line up.
 
-Merge semantics:
+Merging is applied left-to-right and is exactly equivalent to running
+dumps_merge.py pairwise on the running result and the next input:
 
-  · File blocks — union of both dumps' FILE blocks, keyed by relative
-    path.  Identical content is included once with no warning.  When the
-    same path has DIFFERENT content across the two dumps, a warning is
-    printed to stderr and the first dump's version is kept (the caller
+    dumps_merge.py a b -o tmp1
+    dumps_merge.py tmp1 c -o tmp2
+    dumps_merge.py tmp2 d -o out
+
+The only observable difference is the SCANNED DIRECTORY annotation,
+which lists every input rather than only the last pair.  Annotations
+are stripped on parse (see SCANNED_DIR_RE), so re-merging a merged
+dump behaves identically either way.
+
+Merge semantics (applied cumulatively):
+
+  · File blocks — union of all dumps' FILE blocks, keyed by relative
+    path.  Identical content is included once with no warning.  When
+    the same path has DIFFERENT content across dumps, a warning is
+    printed to stderr and the FIRST dump's version is kept (the caller
     is assumed to be merging views of the *same* code state; divergence
     is anomalous and needs human eyes).
 
   · Directory tree — recursively merged.
-        Files are included iff either side included them.
-        A `  [skip]` marker survives only when BOTH sides marked the
-        file `[skip]` — that is, the file lies outside both slices.
+        Files are included iff any dump included them.
+        A `  [skip]` marker survives only when ALL dumps marked the
+        file `[skip]` — that is, the file lies outside every slice.
 
     With modern dump.py this is effectively a plain union: offset mode
     emits a *pruned* tree (only dumped files, no `[skip]` markers), so
-    every file entry carries `included=True` on both sides.  The `[skip]`
+    every file entry carries `included=True` on all sides.  The `[skip]`
     logic is retained for compatibility with `--tree-from-scan` dumps,
     which do emit `[skip]` for files outside the explicit list.
 
   · Header — the SCANNED DIRECTORY root is preserved, annotated with
-    `(merged: <a> + <b>)` describing provenance.  The annotation is
+    `(merged: <a> + <b> + …)` describing provenance.  The annotation is
     stripped again by SCANNED_DIR_RE, so merged dumps can be re-merged
     or diffed alongside their inputs without confusing tooling.
 
 Usage:
 
-    dumps_merge.py DUMP1 DUMP2 [-o OUT]
+    dumps_merge.py DUMP1 DUMP2 [DUMP3 ...] [-o OUT]
 
     # typical offset workflow:
     dump.py -O kritomatic_daemon/panel/foo  -o dump_foo.md
     dump.py -O kritomatic_daemon/panel/bar  -o dump_bar.md
-    dumps_merge.py dump_foo.md dump_bar.md
+    dump.py -O kritomatic_daemon/panel/baz  -o dump_baz.md
+    dumps_merge.py dump_foo.md dump_bar.md dump_baz.md
+    # -> ./project_dump_kritomatic_daemon_merged.md (or whatever the
+    #    common root's basename is), if all three dumps agree on their
+    #    SCANNED DIRECTORY root
 
-    # default output: ./project_dump_merged.md (cwd, overwritten on
-    # every run — never derived from the input filenames, so re-merging
-    # always lands at the same predictable path).
+    # default output: ./project_dump_<root>_merged.md where <root> is
+    # the common SCANNED DIRECTORY basename.  Written to cwd and
+    # overwritten on every run — never derived from the input dump
+    # filenames, so re-merging always lands at the same predictable
+    # path.  Falls back to ./project_dump_merged.md (i.e. the same
+    # template with the <root> slot empty) when the inputs disagree on
+    # the root (a warning is emitted in that case) or the root has no
+    # usable basename (e.g. "/").
 
 Exit codes:
     0  merged successfully
@@ -62,10 +83,23 @@ HEADER = "=" * 70
 _BT3 = "`" * 3
 _FILES = "\0files"
 
-# Fixed default output — deliberately NOT derived from dump1's name or
-# location, so successive merges always overwrite the same file rather
-# than accumulating _merged_merged_merged.md artifacts.
-DEFAULT_OUT = Path("project_dump_merged.md")
+# Default output is `project_dump_<root>_merged.md` (or, without a
+# usable <root>, `project_dump_merged.md` — same template, empty slot).
+# The name is a property of the *project*, not of the input dump
+# filenames, so successive merges always overwrite the same predictable
+# file rather than accumulating _merged_merged_merged.md artifacts.
+DEFAULT_OUT_TEMPLATE = "project_dump_{root}merged.md"
+
+
+def default_output_path(scanned_dir):
+    """project_dump_<root-basename>_merged.md, or the unsuffixed form."""
+    name = Path(scanned_dir).name
+    if not name or name in (".", ".."):
+        root = ""
+    else:
+        root = f"{name}_"
+    return Path(DEFAULT_OUT_TEMPLATE.format(root=root))
+
 
 # Same opener regex dumps_diff.py uses.
 FILE_BLOCK_START = re.compile(
@@ -353,107 +387,142 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="dumps_merge.py",
         description=(
-            "Merge two dumps of the same project (typically made with "
-            "different DEFAULT_SCAN_OFFSET values) into one combined "
-            "dump.  Warns on any file whose content differs between "
+            "Merge two or more dumps of the same project (typically made "
+            "with different DEFAULT_SCAN_OFFSET values) into one combined "
+            "dump.  Merging is applied left-to-right, exactly as if you "
+            "had chained pairwise merges of the running result and the "
+            "next input.  Warns on any file whose content differs across "
             "the inputs."
         ),
     )
-    ap.add_argument("dump1", type=Path, help="first dump")
-    ap.add_argument("dump2", type=Path, help="second dump")
+    ap.add_argument(
+        "dumps", nargs="+", type=Path, metavar="DUMP",
+        help="two or more dumps to merge, in order",
+    )
     ap.add_argument(
         "-o", "--output", type=Path, default=None,
-        help=f"output path.  Default: {DEFAULT_OUT} in the current "
-             f"working directory.  Use \"-\" for stdout.",
+        help=(
+            "output path.  Default: project_dump_<root>_merged.md in the "
+            "current working directory, where <root> is the common "
+            "SCANNED DIRECTORY basename.  Falls back to "
+            "project_dump_merged.md (the same name with no <root>) when "
+            "the inputs disagree on the root (a warning is printed) or "
+            "the root has no usable basename.  Use \"-\" for stdout."
+        ),
     )
     args = ap.parse_args(argv)
 
-    for p in (args.dump1, args.dump2):
+    if len(args.dumps) < 2:
+        ap.error("at least two dumps are required")
+
+    for p in args.dumps:
         if not p.is_file():
             print(f"error: not a file: {p}", file=sys.stderr)
             return 1
 
-    try:
-        text1 = args.dump1.read_text(encoding="utf-8")
-        text2 = args.dump2.read_text(encoding="utf-8")
-    except OSError as e:
-        print(f"error: cannot read input: {e}", file=sys.stderr)
-        return 1
+    texts = []
+    for p in args.dumps:
+        try:
+            texts.append(p.read_text(encoding="utf-8"))
+        except OSError as e:
+            print(f"error: cannot read input {p}: {e}", file=sys.stderr)
+            return 1
 
-    pre1, files1 = parse_dump(text1)
-    pre2, files2 = parse_dump(text2)
+    parsed = [parse_dump(t) for t in texts]
+    preambles = [pr for pr, _ in parsed]
+    file_lists = [fl for _, fl in parsed]
 
-    if not files1:
-        print(f"error: {args.dump1} contains no FILE blocks",
-              file=sys.stderr)
-        return 1
-    if not files2:
-        print(f"error: {args.dump2} contains no FILE blocks",
-              file=sys.stderr)
-        return 1
+    for p, files in zip(args.dumps, file_lists):
+        if not files:
+            print(f"error: {p} contains no FILE blocks", file=sys.stderr)
+            return 1
 
-    root1 = extract_scanned_dir(pre1)
-    root2 = extract_scanned_dir(pre2)
-    if root1 is None:
-        print(f"error: {args.dump1} has no SCANNED DIRECTORY line",
-              file=sys.stderr)
-        return 1
-    if root2 is None:
-        print(f"error: {args.dump2} has no SCANNED DIRECTORY line",
-              file=sys.stderr)
-        return 1
-    if root1 != root2:
-        print(
-            "warning: the two dumps have different SCANNED DIRECTORY "
-            "roots:\n"
-            f"  {args.dump1}: {root1}\n"
-            f"  {args.dump2}: {root2}\n"
-            "  proceeding, using the first as canonical — file paths "
-            "may not line up!",
-            file=sys.stderr,
+    roots = [extract_scanned_dir(pr) for pr in preambles]
+    for p, root in zip(args.dumps, roots):
+        if root is None:
+            print(f"error: {p} has no SCANNED DIRECTORY line",
+                  file=sys.stderr)
+            return 1
+
+    scanned_dir = roots[0]
+    roots_agree = True
+    for i in range(1, len(args.dumps)):
+        if roots[i] != scanned_dir:
+            roots_agree = False
+            print(
+                "warning: the two dumps have different SCANNED DIRECTORY "
+                "roots:\n"
+                f"  {args.dumps[0]}: {scanned_dir}\n"
+                f"  {args.dumps[i]}: {roots[i]}\n"
+                "  proceeding, using the first as canonical — file paths "
+                "may not line up!",
+                file=sys.stderr,
+            )
+
+    # Fold merge_files left-to-right.  Each step keeps the left side's
+    # version on conflict — which, by induction, is always the FIRST
+    # dump's version — so this matches sequential application exactly.
+    # Union of per-step conflicts is the set of paths any pair of dumps
+    # disagreed on.
+    merged_files = list(file_lists[0])
+    all_conflicts = set()
+    for i in range(1, len(file_lists)):
+        merged_files, step_conflicts = merge_files(
+            merged_files, file_lists[i]
         )
-    scanned_dir = root1
+        all_conflicts.update(step_conflicts)
 
-    merged_files, conflicts = merge_files(files1, files2)
-
-    if conflicts:
+    if all_conflicts:
         print(
-            f"warning: {len(conflicts)} file(s) appear in both dumps "
-            f"with DIFFERENT content; keeping {args.dump1.name}'s "
+            f"warning: {len(all_conflicts)} file(s) appear in multiple "
+            f"dumps with DIFFERENT content; keeping {args.dumps[0].name}'s "
             f"version:",
             file=sys.stderr,
         )
-        for p in conflicts:
+        for p in sorted(all_conflicts):
             print(f"  · {p}", file=sys.stderr)
 
-    tree1 = parse_tree(pre1)
-    tree2 = parse_tree(pre2)
-    if tree1 is not None or tree2 is not None:
-        merged_tree = merge_trees(tree1, tree2)
-        # Sanity note: offset-mode trees are pruned and contain no
-        # `[skip]` markers; `--tree-from-scan` trees do.  If the merged
-        # result still carries any, mention it so the caller knows what
-        # they're looking at.
+    # Fold merge_trees left-to-right.  `included = a or b` composes to
+    # "included iff any dump included it", i.e. `[skip]` survives only
+    # when ALL dumps marked it skipped.
+    trees = [parse_tree(pr) for pr in preambles]
+    merged_tree = None
+    for t in trees:
+        if t is None:
+            continue
+        if merged_tree is None:
+            merged_tree = t
+        else:
+            merged_tree = merge_trees(merged_tree, t)
+
+    if merged_tree is not None:
         n_skip = _count_skip_markers(merged_tree)
         if n_skip:
             print(
                 f"note: merged tree retains {n_skip} `[skip]` marker(s) "
-                f"(files marked skipped in BOTH inputs — only possible "
+                f"(files marked skipped in ALL inputs — only possible "
                 f"with --tree-from-scan dumps)",
                 file=sys.stderr,
             )
-    else:
-        merged_tree = None
 
-    annotation = f"(merged: {args.dump1.name} + {args.dump2.name})"
+    annotation = (
+        "(merged: " + " + ".join(p.name for p in args.dumps) + ")"
+    )
 
-    # Fixed default: ./project_dump_merged.md, overwritten every run.
-    # Never derived from dump1's name or location.
+    # Default output: project_dump_<root>_merged.md in cwd when all
+    # inputs agree on the SCANNED DIRECTORY root, else the same name
+    # with the <root> slot empty.  Either way the name is derived from
+    # the project (or nothing), never from the input dump filenames —
+    # successive merges overwrite the same predictable file.
     if args.output is not None:
         out_path = args.output
         to_stdout = str(out_path) == "-"
     else:
-        out_path = DEFAULT_OUT
+        out_path = (
+            default_output_path(scanned_dir)
+            if roots_agree
+            else default_output_path("")
+        )
         to_stdout = False
 
     if to_stdout:
@@ -471,12 +540,10 @@ def main(argv=None):
             return 1
         target = str(out_path)
 
-    summary = (
-        f"Merged {len(files1)} + {len(files2)} file(s) "
-        f"-> {len(merged_files)} unique"
-    )
-    if conflicts:
-        summary += f" ({len(conflicts)} conflict(s))"
+    counts = " + ".join(str(len(fl)) for fl in file_lists)
+    summary = f"Merged {counts} file(s) -> {len(merged_files)} unique"
+    if all_conflicts:
+        summary += f" ({len(all_conflicts)} conflict(s))"
     print(f"{summary}; wrote to {target}", file=sys.stderr)
     return 0
 

@@ -150,13 +150,13 @@ DEFAULT_EXCLUDE_DIRS = [
     ".git", "__pycache__", ".venv", "venv", "node_modules",
     "lib", "bin",
     'playgrounds',
-    'deeppeek', '.deeppeek',
+    # 'deeppeek', '.deeppeek',
     "recover", "tests", 'docker', 'website',
     # "daemon", "prompts", "capture",
     # "room", "shared",
     "kritomatic_xremap", "other_scripts",
     "data/comfy_panel/history/",
-    "src/kritomatic",
+    # "src/kritomatic",
 ]
 
 # Directories to hide from the DIRECTORY TREE. Same matching rules as
@@ -164,7 +164,7 @@ DEFAULT_EXCLUDE_DIRS = [
 # changes which files are dumped.
 DEFAULT_TREE_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modules",
                              "lib", "bin",
-                             'deeppeek', '.deeppeek',
+                             # 'deeppeek', '.deeppeek',
                               "recover", "tests", 'docker', 'website',
                              "target", "release",
                              "kritomatic_xremap", "other_scripts",
@@ -179,13 +179,17 @@ DEFAULT_INCLUDE_DIRS = []
 # DEFAULT_INCLUDE_DIRS = ["inpaint", "pgkit", "pg_comfy", "multimask", "interceptor",]
 # DEFAULT_INCLUDE_DIRS = ['remote_cli','remote_panel',]
 # DEFAULT_INCLUDE_DIRS = ["inpaint", "pgkit", "pg_comfy", "cable", 'remote_cli','remote_panel',]
+# DEFAULT_INCLUDE_DIRS = ['inpaint','multimask','interceptor', 'pgkit', 'pg_comfy',]
+# DEFAULT_INCLUDE_DIRS = ['pgkit', 'pg_comfy', 'multimask', 'inpaint', 'kritomatic_nodes', 'layout',]
 # DEFAULT_INCLUDE_DIRS = ['segment','text_boxes', 'pair']
+# DEFAULT_INCLUDE_DIRS = ['interceptor',]
 # DEFAULT_INCLUDE_DIRS = ["inpaint", "pgkit", "pg_comfy", "board", "text_wall", "multimask", 'remote_cli','remote_panel', 'room', 'interceptor', 'cone', 'segment','text_boxes','cable']
 
 
 # Filename substrings whitelist: if NON-EMPTY, a file is only kept when its
 # filename contains AT LEAST ONE of these substrings.
 DEFAULT_INCLUDE_FILE_SUBSTRINGS = []
+# DEFAULT_INCLUDE_FILE_SUBSTRINGS = ['playground',]
 # DEFAULT_INCLUDE_FILE_SUBSTRINGS = ["comfyui"]
 
 # Filename substrings blacklist: if a filename contains ANY of these, the
