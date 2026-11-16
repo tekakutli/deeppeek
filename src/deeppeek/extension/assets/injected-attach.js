@@ -2,29 +2,23 @@
 // injected-attach.js — DOM-based file attachment (STABILITY TIER 2)
 // =====================================================================
 //
-// Places File objects into the DeepSeek composer:
+// READY-WAIT (2026-11-15, fourth iteration)
+// =========================================
+// Previous versions waited 3000ms (chip floor) or 30s (broken button
+// detection that got stuck on a disabled decoy).  This version uses
+// `waitComposerReady` from injected.js, which returns on the FIRST
+// of: any send-button enabled, no button found past floor, or
+// extended grace elapsed.
 //
-//   primary  — dragover + drop on textarea.parentElement
-//   fallback — input.files = DataTransfer, dispatch change+input
+// Key property: never hangs.  Worst case is bounded by the extended
+// grace (floor + 3s ≈ 3.5s) when button detection is dead, or by
+// --upload-timeout (30s) only when buttons exist but no chip appears
+// (a genuine error).
 //
-// Confirmed against DeepSeek's current DOM.  Synthetic paste is
-// blocked by Firefox's Xray wall and is not used.
-//
-// Stability: MODERATE.  The drop target has been stable for months.
-// The file-input fallback is more fragile.  The overall contract
-// ("given N File objects, place them in the composer") is unlikely
-// to change.
-//
-// Exports on `window.__dsx__`:
-//
-//   doAttach(filesPayload, opts) → {success, method, dispatched, ...}
-//   attachOnce / attachViaDrop / attachViaFileInput (retry caller)
-//   findTextarea / findFileInput / blobCount
-//
-// Bridge entry points (defined on `window`):
-//
-//   window.__dsx_attach(...)           — debug only (object args)
-//   window.__dsx_attach_json(argsJson) — content-script bridge
+// STRICT MODE (unchanged from previous)
+// =====================================
+// `opts.strict_composer` uses boundComposer resolution.  Drop target
+// is the resolved composer's parentElement.
 (function () {
   "use strict";
   if (!window.__dsx__) window.__dsx__ = {};
@@ -33,7 +27,8 @@
     const bin = atob(b64);
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    return new File([bytes], name, { type: mime || "application/octet-stream" });
+    return new File([bytes], name,
+                    { type: mime || "application/octet-stream" });
   }
 
   function findTextarea() {
@@ -48,6 +43,17 @@
     }) || null;
   }
 
+  function _resolveTextarea(strict) {
+    if (!strict) return findTextarea();
+    if (typeof window.__dsx__.resolveTargetComposer === "function") {
+      const r = window.__dsx__.resolveTargetComposer({
+        strict_composer: true,
+      });
+      return r.el || null;
+    }
+    return findTextarea();
+  }
+
   function findFileInput() {
     return document.querySelector('input[type="file"]');
   }
@@ -56,17 +62,26 @@
     return document.querySelectorAll('img[src^="blob:"]').length;
   }
 
-  async function attachViaDrop(files) {
-    const textarea = findTextarea();
+  async function attachViaDrop(files, strict) {
+    const textarea = _resolveTextarea(strict);
     if (!textarea || !textarea.parentElement) {
-      return { success: false, reason: "no textarea parent" };
+      return {
+        success: false,
+        reason: strict
+          ? "strict composer not found (no drop target)"
+          : "no textarea parent",
+      };
     }
     const target = textarea.parentElement;
 
     const dt = new DataTransfer();
     for (const f of files) dt.items.add(f);
     if (dt.files.length !== files.length) {
-      return { success: false, reason: `DataTransfer only holds ${dt.files.length}/${files.length}` };
+      return {
+        success: false,
+        reason: `DataTransfer only holds ` +
+                `${dt.files.length}/${files.length}`,
+      };
     }
 
     try {
@@ -89,7 +104,9 @@
       if (!drop.defaultPrevented) {
         return { success: false, reason: "drop not accepted by target" };
       }
-      return { success: true, method: "drop", dispatched: files.length };
+      return {
+        success: true, method: "drop", dispatched: files.length,
+      };
     } catch (e) {
       return { success: false, reason: `drop threw: ${e.message}` };
     }
@@ -105,7 +122,10 @@
     try {
       input.files = dt.files;
     } catch (e) {
-      return { success: false, reason: `input.files assignment threw: ${e.message}` };
+      return {
+        success: false,
+        reason: `input.files assignment threw: ${e.message}`,
+      };
     }
     if (input.files.length !== files.length) {
       return {
@@ -121,14 +141,17 @@
       return { success: false, reason: `dispatch threw: ${e.message}` };
     }
 
-    return { success: true, method: "file-input", dispatched: files.length };
+    return {
+      success: true, method: "file-input", dispatched: files.length,
+    };
   }
 
-  async function attachOnce(files, skipPreviewWait) {
+  async function attachOnce(files, skipPreviewWait, strict) {
     const previewsBefore = blobCount();
-    let result = await attachViaDrop(files);
+    let result = await attachViaDrop(files, strict);
     if (!result.success) {
-      console.log("[deeppeek:attach] drop failed, trying file-input:", result.reason);
+      console.log(
+        "[deeppeek:attach] drop failed, trying file-input:", result.reason);
       const fallback = await attachViaFileInput(files);
       if (fallback.success) result = fallback;
       else result = {
@@ -138,7 +161,7 @@
     }
 
     if (result.success && !skipPreviewWait) {
-      await new Promise((r) => setTimeout(r, 800));
+      await new Promise((r) => setTimeout(r, 400));
       const previewsAfter = blobCount();
       result.previews_before = previewsBefore;
       result.previews_after = previewsAfter;
@@ -156,6 +179,8 @@
   async function doAttach(filesPayload, opts) {
     const delayMs = Math.max(0, Number(opts && opts.delay_ms) || 0);
     const skipPreviewWait = !!(opts && opts.skip_preview_wait);
+    const strict = !!(opts && opts.strict_composer);
+    const waitReady = !!(opts && opts.wait_upload);
 
     let files;
     try {
@@ -163,41 +188,88 @@
         base64ToFile(f.base64, f.name, f.mime)
       );
     } catch (e) {
-      return { success: false, reason: `base64 decode failed: ${e.message}` };
+      return {
+        success: false,
+        reason: `base64 decode failed: ${e.message}`,
+      };
     }
 
+    let result;
     if (delayMs === 0) {
-      const result = await attachOnce(files, skipPreviewWait);
-      return { ...result, mode: "batch", total: files.length };
+      result = await attachOnce(files, skipPreviewWait, strict);
+      result.mode = "batch";
+      result.total = files.length;
+    } else {
+      let successCount = 0;
+      let lastMethod = null;
+      let lastReason = null;
+      const previewsBefore = blobCount();
+      for (let i = 0; i < files.length; i++) {
+        if (i > 0) await new Promise((r) => setTimeout(r, delayMs));
+        const one = await attachOnce([files[i]], false, strict);
+        if (one.success) {
+          successCount++;
+          lastMethod = one.method;
+        } else {
+          lastReason = `${files[i].name}: ${one.reason}`;
+        }
+      }
+      await new Promise((r) => setTimeout(r, 400));
+      const previewsAfter = blobCount();
+      result = {
+        success: successCount === files.length,
+        mode: "serial", method: lastMethod, total: files.length,
+        dispatched: successCount,
+        previews_before: previewsBefore,
+        previews_after: previewsAfter,
+        previews_added: previewsAfter - previewsBefore,
+        reason: successCount < files.length ? lastReason : undefined,
+      };
     }
 
-    let successCount = 0;
-    let lastMethod = null;
-    let lastReason = null;
-    const previewsBefore = blobCount();
-    for (let i = 0; i < files.length; i++) {
-      if (i > 0) await new Promise((r) => setTimeout(r, delayMs));
-      const one = await attachOnce([files[i]]);
-      if (one.success) {
-        successCount++;
-        lastMethod = one.method;
+    // ---- ready-wait ----
+    if (result.success && waitReady) {
+      const timeoutMs = Number(opts.wait_upload_timeout_ms) || 30000;
+      const floorMs = Number(opts.wait_upload_min_ms) || 500;
+      const composerEl = _resolveTextarea(strict);
+
+      let wait;
+      if (typeof window.__dsx__.waitComposerReady === "function") {
+        console.log(
+          `[deeppeek:attach] waiting for composer ready ` +
+          `(timeout=${timeoutMs}ms, floor=${floorMs}ms)...`);
+        wait = await window.__dsx__.waitComposerReady({
+          timeout_ms: timeoutMs,
+          floor_ms: floorMs,
+          extended_grace_ms: 3000,
+          poll_ms: 100,
+          composer_el: composerEl,
+          require_chip: true,
+        });
       } else {
-        lastReason = `${files[i].name}: ${one.reason}`;
+        // Very old page-world, use chip-only fallback.
+        wait = await window.__dsx__.waitUploadComplete({
+          timeout_ms: timeoutMs,
+          min_wait_ms: Math.max(floorMs, 1000),
+          poll_ms: 200,
+        });
+        wait.method = "chip";
+      }
+
+      result.upload_wait = wait;
+      if (!wait.success) {
+        result.success = false;
+        result.reason = wait.reason || "composer not ready";
+        console.warn(
+          `[deeppeek:attach] ready-wait failed: ${wait.reason}`);
+      } else {
+        console.log(
+          `[deeppeek:attach] ready after ${wait.waited_ms}ms ` +
+          `(method=${wait.method})`);
       }
     }
-    await new Promise((r) => setTimeout(r, 800));
-    const previewsAfter = blobCount();
-    return {
-      success: successCount === files.length,
-      mode: "serial",
-      method: lastMethod,
-      total: files.length,
-      dispatched: successCount,
-      previews_before: previewsBefore,
-      previews_after: previewsAfter,
-      previews_added: previewsAfter - previewsBefore,
-      reason: successCount < files.length ? lastReason : undefined,
-    };
+
+    return result;
   }
 
   window.__dsx__.doAttach = doAttach;
@@ -208,7 +280,6 @@
   window.__dsx__.findFileInput = findFileInput;
   window.__dsx__.blobCount = blobCount;
 
-  // Bridge entry points (defined on `window` for content.js Xray).
   window.__dsx_attach = async function (filesPayload, opts) {
     const result = await doAttach(filesPayload, opts || {});
     console.log("[deeppeek:attach] result:", result);
@@ -226,7 +297,8 @@
       });
     }
     const files = Array.isArray(args.files) ? args.files : [];
-    const opts = (args.opts && typeof args.opts === "object") ? args.opts : {};
+    const opts = (args.opts && typeof args.opts === "object")
+      ? args.opts : {};
     const result = await doAttach(files, opts);
     console.log("[deeppeek:attach] result:", result);
     return JSON.stringify(result);

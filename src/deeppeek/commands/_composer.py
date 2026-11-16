@@ -31,11 +31,39 @@ it falls back to opening a local `ExportServer` on the CLI port
 
 Why 8767 and not 8765: the daemon deliberately binds its own port
 so the CLI can run side-by-side with it.  The extension dials both
-(`DSX_PORTS = [8765, 8767]` in `background.js`), which means a CLI
+(`DSX_PORTS = [8765, 8767]` in background.js), which means a CLI
 command that falls back to 8765 always finds a live SSE connection,
 and a CLI command that finds the daemon up on 8767 rides its
 already-connected SSE — saving `ExportServer.start()` plus the
 extension-reconnect wait on the CLI side.
+
+QUEUE HYGIENE (2026-11-15)
+==========================
+Two stale-ack bugs were killing the second run of split_send after
+the first run had been Ctrl+C'd:
+
+  1. `composer_session` opened a fresh ExportServer without draining
+     its `result_queue`.  A previous run's orphaned watch sends a
+     `watch-done` ack (up to 300s after the run ends) to whichever
+     process happens to own the port.  The new run's first
+     `broadcast_and_wait` grabbed that stale ack, saw the batch_id
+     didn't match, and returned failure immediately.
+
+  2. `broadcast_and_wait` did a single `wait_for_result`, then
+     bailed on any ack whose batch_id wasn't ours.  With multiple
+     orphaned acks queued up, every call returned "response
+     batch_id mismatch" — the cascade in the log.
+
+Fixes:
+  - `composer_session` drains `result_queue` once, right after
+    `wait_for_extension` succeeds.  Cost: O(1) per CLI invocation.
+  - `broadcast_and_wait` now loops, discarding acks whose batch_id
+    doesn't match, until the correct ack arrives or the timeout
+    expires.  Cost: O(stale_acks) per call, negligible.
+
+`broadcast_many` was already correct (its `pending.pop(batch_id,
+None)` skips unknown acks), but its outer loop benefits from the
+drain in `composer_session`.
 """
 
 import json as _json
@@ -87,6 +115,19 @@ def composer_session(port: int = 8765, timeout: float = 30.0):
                   "deepseek.com tab is active.", file=sys.stderr)
             yield None
             return
+
+        # Drain any acks left in the queue from a previous
+        # (abandoned) run — typically a `watch-done` sent up to 300s
+        # after the previous CLI exited.  Without this, the first
+        # `broadcast_and_wait` on the new session sees a stale ack,
+        # its batch_id doesn't match, and the call fails immediately.
+        with server._lock:
+            while True:
+                try:
+                    server.result_queue.get_nowait()
+                except queue.Empty:
+                    break
+
         yield server
     finally:
         server.stop()
@@ -104,34 +145,44 @@ def broadcast_and_wait(
 
     Returns (exit_code, result_dict):
       0 — success (result.success is True)
-      1 — infrastructure failure (timeout, malformed ack, batch_id
-          mismatch)
+      1 — infrastructure failure (timeout, malformed ack)
       2 — command failure (extension reported success:false)
+
+    Loops past acks whose batch_id doesn't match ours; those are
+    stale leftovers from a previous run's in-flight operations.
+    The loop respects the overall `timeout` deadline — stale acks
+    cost ~0s each to discard (queue.get returns immediately).
     """
     batch_id = uuid.uuid4().hex[:12]
     full_payload = {**payload, "batch_id": batch_id}
     server._broadcast(event_name, full_payload)
 
-    try:
-        ack = server.wait_for_result(timeout=timeout)
-    except queue.Empty:
-        print("error: extension did not acknowledge within timeout.",
-              file=sys.stderr)
-        return 1, {}
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print("error: extension did not acknowledge within timeout.",
+                  file=sys.stderr)
+            return 1, {}
+        try:
+            ack = server.wait_for_result(timeout=remaining)
+        except queue.Empty:
+            print("error: extension did not acknowledge within timeout.",
+                  file=sys.stderr)
+            return 1, {}
 
-    if ack.get("__ack") != ack_name:
-        print(f"error: unexpected response: {ack!r}", file=sys.stderr)
-        return 1, {}
-    if ack.get("batch_id") != batch_id:
-        print(f"error: response batch_id mismatch "
-              f"(got {ack.get('batch_id')}, expected {batch_id})",
-              file=sys.stderr)
-        return 1, {}
+        # Stale ack from a previous batch — skip silently.
+        if ack.get("batch_id") != batch_id:
+            continue
+        if ack.get("__ack") != ack_name:
+            print(f"error: unexpected response: {ack!r}",
+                  file=sys.stderr)
+            return 1, {}
 
-    result = ack.get("result") or {}
-    if result.get("success"):
-        return 0, result
-    return 2, result
+        result = ack.get("result") or {}
+        if result.get("success"):
+            return 0, result
+        return 2, result
 
 
 def broadcast_many(server: ExportServer, specs: list[dict],
@@ -172,7 +223,7 @@ def broadcast_many(server: ExportServer, specs: list[dict],
         batch_id = ack.get("batch_id")
         spec = pending.pop(batch_id, None)
         if spec is None:
-            continue  # unknown ack — ignore
+            continue  # stale ack from another batch — ignore
         tag = spec["tag"]
         if ack.get("__ack") != spec["ack_name"]:
             results[tag] = {
@@ -207,14 +258,8 @@ def _try_daemon_relay(
 
     Returns:
       None           — the caller must fall back to a local
-                       ExportServer.  Two cases:
-                         · no daemon on `port` (ConnectionRefused)
-                         · daemon is up but its SSE port has no
-                           connected extension client — the CLI
-                           should try its own port (8765), which
-                           the extension also dials.
+                       ExportServer.
       (rc, result)   — daemon answered with a final result.
-                       rc uses broadcast_and_wait semantics.
     """
     batch_id = uuid.uuid4().hex[:12]
     full_payload = {**payload, "batch_id": batch_id}
@@ -249,13 +294,6 @@ def _try_daemon_relay(
 
     if not data.get("ok"):
         err = data.get("error") or ""
-        # The daemon answered but its SSE port has no extension
-        # client.  Legitimate reason to fall back: the extension's
-        # retryAfter can be non-zero on 8767 while its 8765 stream
-        # is still live, so opening a local ExportServer on 8765 is
-        # exactly the right move.  If both ports are dead, the
-        # fallback's own wait_for_extension() will time out and
-        # surface a clear "no extension connected" error.
         if "no extension connected" in err:
             return None
         print(f"error: daemon relay: {err}", file=sys.stderr)
@@ -285,11 +323,9 @@ def submit_request(
 ) -> tuple[int, dict]:
     """Send one event to the extension.
 
-    Tries a running `deeppeek daemon` on `daemon_port` (default 8767,
-    matching `daemon/cli.py`'s `--extension-port` default).  Falls
-    back to opening a local ExportServer on `port` (default 8765) —
-    the CLI path, and what keeps the CLI working when no daemon is
-    running.
+    Tries a running `deeppeek daemon` on `daemon_port` (default 8767).
+    Falls back to opening a local ExportServer on `port` (default
+    8765).
 
     Return value matches `broadcast_and_wait`.
     """

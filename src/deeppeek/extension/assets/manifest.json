@@ -9,7 +9,7 @@
       "strict_min_version": "115.0"
     }
   },
-  "permissions": ["scripting", "activeTab", "storage", "unlimitedStorage", "contextualIdentities", "cookies"],
+  "permissions": ["scripting", "activeTab", "storage", "unlimitedStorage", "contextualIdentities", "cookies", "tabs"],
   "host_permissions": [
     "https://chat.deepseek.com/*",
     "https://chat.qwen.ai/*",
@@ -19,6 +19,7 @@
   "background": {
     "scripts": [
       "bg-state.js",
+      "bg-bind.js",
       "bg-onmessage.js",
       "bg-handlers-control.js",
       "bg-handlers-composer.js",

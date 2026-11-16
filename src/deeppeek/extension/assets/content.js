@@ -3,64 +3,11 @@
 // script. Also holds an open port to the background, which keeps the
 // MV3 event page alive.
 //
-// The page-world surface is split across 14 sibling scripts, loaded
-// in dependency order with `async = false` so execution order is
-// preserved.  Each script is an IIFE that attaches to
-// `window.__dsx__`; the `__dsx_*_json` bridge entry points live on
-// `window` directly (Xray-safe: content.js accesses them via
-// `window.wrappedJSObject`).
-//
-// BUTTON RULES
-// ============
-// Button definitions live in `button-rules/*.js` and are loaded by
-// `injectButtonRules()` below, in the order listed by
-// `button-rules/_manifest.json`.  The framework
-// (`injected-buttons.js`) is loaded first via PAGE_WORLD_SCRIPTS;
-// each rule file is a self-contained IIFE calling
-// `window.__dsx__.buttons.rule({...})`.
-//
-// To add a button:
-//   1. drop `button-rules/NN-some-name.js` (IIFE, one `rule()` call)
-//   2. append "NN-some-name.js" to `button-rules/_manifest.json`'s
-//      "files" array
-//   3. reload the tab — no code change to content.js needed
-//
-// PAGE-WORLD ↔ BACKGROUND BRIDGE (postMessage, not exportFunction)
-// ================================================================
-// Button rules need to reach the background (open a tab, list
-// containers, save/claim a resume payload, detect the current
-// container).  The obvious mechanism — `exportFunction(async fn, pw)`
-// returning a Promise that page world `await`s — is BLOCKED by
-// Firefox's Xray barrier:
-//
-//   "Permission denied to access property 'then'"
-//
-// This fires for page-world `await crossCompartmentPromise` AND for
-// `Promise.race([crossCompartmentPromise, ...])`, regardless of
-// whether the exportFunction body is sync or async.
-//
-// The reliable mechanism is `window.postMessage`: it crosses the
-// boundary via structured clone, which is Xray-safe for primitives
-// and plain objects/arrays.  Content script listens for
-// `{dsx_req: reqId, msg: {...}}`, forwards `msg` to the background,
-// and replies with `{dsx_resp: reqId, payload: <json string>}`.
-// Page world's `callBridge()` helper wraps this in a Promise that
-// resolves with the parsed JSON.
-//
-// Bridge message types (all handled in the background):
-//   DSX_OPEN_TAB            → tabs.create
-//   DSX_LIST_CONTAINERS     → contextualIdentities.query
-//   DSX_RESUME_SAVE         → in-memory save
-//   DSX_RESUME_CLAIM        → in-memory claim
-//   DSX_CURRENT_CONTAINER   → sender.tab.cookieStoreId
-//
-// DSX_CURRENT_CONTAINER is deliberately forwarded to the
-// background, NOT handled inline in content script.  Content
-// scripts get a *reduced* tabs.Tab object — `tab.cookieStoreId` is
-// often undefined even with the cookies permission, so
-// `tabs.getCurrent()` from here returns a Tab without container
-// info.  The background sees the full Tab via `sender.tab`, with
-// `tabs.query({active, currentWindow})` as a secondary fallback.
+// CHANGES 2026-11-15
+// ==================
+// Added DSX_WAIT_FOR_REPLY message type: forwards to page-world
+// `__dsx_wait_for_reply_json`.  Used by split_send for the fast
+// "AI reply appeared" signal.
 (async function () {
   const PAGE_WORLD_SCRIPTS = [
     "injected.js",          // bootstrap: __dsx__, config, helpers
@@ -76,7 +23,6 @@
     "injected-retry.js",    // T3: retry-last
     "injected-hijack.js",   // T3: download-button interception
     "injected-buttons.js",  // button injector FRAMEWORK (no rules)
-    // button rules load via injectButtonRules() after this block
   ];
 
   const BRIDGE_TYPES = new Set([
@@ -160,19 +106,6 @@
       injected.join(", "));
   }
 
-  // ---- page-world ↔ bridge listener (postMessage) --------------
-  //
-  // Page world posts `{dsx_req: reqId, msg: {...}}` on `window`.
-  // This listener forwards `msg` to the background via
-  // `browser.runtime.sendMessage` — which gives the background the
-  // `sender` object including `sender.tab` (the tab the content
-  // script runs in).  The reply is posted back as
-  // `{dsx_resp: reqId, payload: <json string>}`.
-  //
-  // No bridge type is handled inline here.  Doing DSX_CURRENT_CONTAINER
-  // inline was tried and reverted: content scripts get a reduced
-  // tabs.Tab object, so `tabs.getCurrent().cookieStoreId` is
-  // undefined.  The background has the full view.
   function installPostMessageBridge() {
     window.addEventListener("message", async (ev) => {
       if (ev.source !== window) return;
@@ -190,7 +123,9 @@
         const resp = await raceWithTimeout(
           browser.runtime.sendMessage(msg),
           `bridge ${msg.type}`);
-        payload = JSON.stringify(resp || { success: false, reason: "no response" });
+        payload = JSON.stringify(resp || {
+          success: false, reason: "no response",
+        });
       } catch (e) {
         payload = JSON.stringify({
           success: false,
@@ -219,7 +154,8 @@
 
   async function ensurePageWorldFn(name, timeoutMs = 5000) {
     const ready = await waitFor(
-      () => window.wrappedJSObject && typeof window.wrappedJSObject[name] === "function",
+      () => window.wrappedJSObject
+         && typeof window.wrappedJSObject[name] === "function",
       timeoutMs,
     );
     if (!ready) {
@@ -227,7 +163,8 @@
       installPostMessageBridge();
       injectButtonRules();
       return await waitFor(
-        () => window.wrappedJSObject && typeof window.wrappedJSObject[name] === "function",
+        () => window.wrappedJSObject
+           && typeof window.wrappedJSObject[name] === "function",
         3000,
       );
     }
@@ -259,6 +196,22 @@
       } catch (e) {
         console.error("DSX: extraction threw:", e);
         return null;
+      }
+    }
+
+    if (msg.type === "DSX_WAIT_FOR_REPLY") {
+      if (!(await ensurePageWorldFn("__dsx_wait_for_reply_json"))) {
+        return { success: false,
+                 reason: "page-world wait-for-reply unavailable" };
+      }
+      try {
+        const argsJson = JSON.stringify(msg.opts || {});
+        const resultJson = await window.wrappedJSObject
+          .__dsx_wait_for_reply_json(argsJson);
+        return JSON.parse(resultJson);
+      } catch (e) {
+        return { success: false,
+                 reason: `wait-for-reply threw: ${e.message}` };
       }
     }
 
@@ -296,7 +249,8 @@
           files: msg.files || [],
           opts: msg.opts || {},
         });
-        const resultJson = await window.wrappedJSObject.__dsx_attach_json(argsJson);
+        const resultJson =
+          await window.wrappedJSObject.__dsx_attach_json(argsJson);
         return JSON.parse(resultJson);
       } catch (e) {
         console.error("DSX: attach threw:", e);
@@ -314,7 +268,8 @@
           text: msg.text || "",
           opts: msg.opts || {},
         });
-        const resultJson = await window.wrappedJSObject.__dsx_type_json(argsJson);
+        const resultJson =
+          await window.wrappedJSObject.__dsx_type_json(argsJson);
         return JSON.parse(resultJson);
       } catch (e) {
         console.error("DSX: type threw:", e);
@@ -329,7 +284,8 @@
       }
       try {
         const argsJson = JSON.stringify({ opts: msg.opts || {} });
-        const resultJson = await window.wrappedJSObject.__dsx_enter_json(argsJson);
+        const resultJson =
+          await window.wrappedJSObject.__dsx_enter_json(argsJson);
         return JSON.parse(resultJson);
       } catch (e) {
         console.error("DSX: enter threw:", e);
@@ -344,11 +300,46 @@
       }
       try {
         const argsJson = JSON.stringify({ opts: msg.opts || {} });
-        const resultJson = await window.wrappedJSObject.__dsx_clear_json(argsJson);
+        const resultJson =
+          await window.wrappedJSObject.__dsx_clear_json(argsJson);
         return JSON.parse(resultJson);
       } catch (e) {
         console.error("DSX: clear threw:", e);
         return { success: false, reason: `clear threw: ${e.message}` };
+      }
+    }
+
+    if (msg.type === "DSX_BIND_COMPOSER") {
+      if (!(await ensurePageWorldFn("__dsx_bind_composer_json"))) {
+        console.error("DSX: page-world bind-composer unavailable.");
+        return { success: false,
+                 reason: "page-world bind-composer unavailable" };
+      }
+      try {
+        const argsJson = JSON.stringify(msg.opts || {});
+        const resultJson = await window.wrappedJSObject
+          .__dsx_bind_composer_json(argsJson);
+        return JSON.parse(resultJson);
+      } catch (e) {
+        console.error("DSX: bind-composer threw:", e);
+        return { success: false,
+                 reason: `bind-composer threw: ${e.message}` };
+      }
+    }
+
+    if (msg.type === "DSX_PROBE_COMPOSER") {
+      if (!(await ensurePageWorldFn("__dsx_probe_composer_json"))) {
+        return { success: false,
+                 reason: "page-world probe-composer unavailable" };
+      }
+      try {
+        const argsJson = JSON.stringify(msg.opts || {});
+        const resultJson = await window.wrappedJSObject
+          .__dsx_probe_composer_json(argsJson);
+        return JSON.parse(resultJson);
+      } catch (e) {
+        return { success: false,
+                 reason: `probe-composer threw: ${e.message}` };
       }
     }
 
@@ -393,7 +384,8 @@
           .__dsx_hijack_install_json("{}");
         return JSON.parse(json);
       } catch (e) {
-        return { success: false, reason: `hijack install threw: ${e.message}` };
+        return { success: false,
+                 reason: `hijack install threw: ${e.message}` };
       }
     }
 
@@ -406,7 +398,8 @@
           .__dsx_hijack_uninstall_json("{}");
         return JSON.parse(json);
       } catch (e) {
-        return { success: false, reason: `hijack uninstall threw: ${e.message}` };
+        return { success: false,
+                 reason: `hijack uninstall threw: ${e.message}` };
       }
     }
 
@@ -419,7 +412,8 @@
           .__dsx_hijack_status_json("{}");
         return JSON.parse(json);
       } catch (e) {
-        return { success: false, reason: `hijack status threw: ${e.message}` };
+        return { success: false,
+                 reason: `hijack status threw: ${e.message}` };
       }
     }
 
@@ -433,14 +427,13 @@
           .__dsx_hijack_all_json(argsJson);
         return JSON.parse(json);
       } catch (e) {
-        return { success: false, reason: `hijack all threw: ${e.message}` };
+        return { success: false,
+                 reason: `hijack all threw: ${e.message}` };
       }
     }
 
     return null;
   });
-
-  // ---- keepalive port to background ------------------------------
 
   function connectKeepalive() {
     let port;

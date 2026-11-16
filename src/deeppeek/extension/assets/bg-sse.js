@@ -1,18 +1,26 @@
 // SSE connection management.
 //
-// attachHandlers wires one EventSource up to the per-event
-// dispatchers in bg-handlers-*.js. Each EventSource gets its own
-// wiring, closed over `port`, so acks target the port that
-// delivered the triggering event.
-//
-// Daemon-port backoff: if 8767 isn't listening, EventSource fails
-// repeatedly and would spam the console. onerror schedules a short
-// backoff that ensureConnected respects, so a steady state of
-// "daemon not running" costs one probe per ~500ms worst-case
-// (bounded by the watchdog cadence) rather than 2/sec.
-
+// Added 2026-11-15: wait-for-reply event listener (fast reply
+// detection for split_send).
 function attachHandlers(es, port) {
   const tag = `[${port}]`;
+
+  // ---- bind events ----
+  es.addEventListener("bind-tab", (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+    handleBindTab(data, port);
+  });
+  es.addEventListener("bind-composer", (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+    handleBindComposer(data, port);
+  });
+  es.addEventListener("probe-composer", (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+    handleProbeComposer(data, port);
+  });
 
   // ---- control events ----
   es.addEventListener("arm", (e) => {
@@ -74,6 +82,11 @@ function attachHandlers(es, port) {
     try { data = JSON.parse(e.data || "{}"); } catch (_) {}
     handleExtract(data, port);
   });
+  es.addEventListener("wait-for-reply", (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+    handleWaitForReply(data, port);
+  });
   es.addEventListener("extract-attachments", (e) => {
     let data = {};
     try { data = JSON.parse(e.data || "{}"); } catch (_) {}
@@ -88,6 +101,11 @@ function attachHandlers(es, port) {
     let data = {};
     try { data = JSON.parse(e.data || "{}"); } catch (_) {}
     handleWatch(data, port);
+  });
+  es.addEventListener("stop-watch", (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+    handleStopWatch(data, port);
   });
 
   // ---- hijack events ----
@@ -159,10 +177,6 @@ function ensureAllConnected() {
   for (const port of DSX_PORTS) ensureConnected(port);
 }
 
-// Content-script keepalive port. When the content script connects
-// or sends a heartbeat, ensure all SSEs are up and let maybeFire
-// re-evaluate pending arms (this is how the toolbar-click flow
-// gets its extension connection back after a page reload).
 browser.runtime.onConnect.addListener((port) => {
   if (port.name !== "deeppeek-keepalive") return;
   activePorts.add(port);

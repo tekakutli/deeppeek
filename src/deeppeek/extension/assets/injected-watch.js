@@ -1,37 +1,63 @@
-// Streaming watcher (v16, batch mode).
+// Streaming watcher (v17, batch mode + wait-for-reply fast path).
 //
-// Why batch mode:
-//   DeepSeek's markdown renderer consumes ``` fence markers before
-//   they hit the DOM.  innerText can never contain fences.  The only
-//   place raw markdown with fences survives is DeepSeek's own
-//   fragment storage — surfaced by the page-world extractor
-//   (`__dsx_extract` in injected-extract.js), which calls the API
-//   with the userToken and reads `message.fragments[].content`.
+// =====================================================================
+// watch: heavyweight, extracts full content via API, waits settle ticks
+// =====================================================================
+// Original purpose: stream a chat completion back to the daemon (or
+// aider) as OpenAI-compatible deltas.  Waits for the Stop button to
+// disappear, then extracts the final content via the API extractor,
+// then waits settle ticks.  Total overhead per call: ~2-3s.
 //
-//   So: don't stream innerText during generation.  Wait for the
-//   Stop button to disappear (model finished), then call the
-//   extractor once, then emit its content as a single delta.
-//   Aider sees nothing for the thinking phase, then the full
-//   correct reply.  One shot, no retries.
+// This remains the right tool for the daemon and --use-watch mode.
 //
-// Thoughts exclusion:
-//   The extractor's `parseFragments` separates THINK/REASON/THOUGHT
-//   fragment text into `.thinking`, leaves RESPONSE/REQUEST in
-//   `.content`.  We take the last assistant message's `.content`
-//   only — no thoughts.
+// =====================================================================
+// wait-for-reply: lightweight, DOM-only, returns when content appears
+// =====================================================================
+// Added 2026-11-15 for split_send's inter-part pacing.  The user does
+// NOT need the reply content — it's a "just say roger" acknowledgment.
+// All we need is "the model has visibly responded; the next part can
+// begin".  This polls the DOM for:
 //
-// UI chrome:
-//   The extractor returns raw markdown with no `md-code-block-banner`
-//   labels ("开头 / 结尾 / Copy / Download").  Those are DOM-only
-//   artifacts, injected by the renderer, absent from fragment
-//   content.  filterChrome is only used in the fallback path.
+//   1. msgCount > baseline_msg_count (a new .ds-message has appeared)
+//   2. at least one message at index >= baseline + 1 has a
+//      .ds-markdown child with trimmed text length >= min_reply_chars
 //
-// Fallback:
-//   If extraction returns nothing (API unreachable, session not
-//   saved yet, both IndexedDB and API missed), fall back to the
-//   DOM's answer-markdown innerText with filterChrome applied.
-//   That's lossy (no fences) but at least something reaches aider
-//   instead of a 0-char response.
+// Returns as soon as both conditions hold — typically ~1.5s after
+// submit for short replies.  Falls back to timeout (default 60s).
+//
+// Design decisions:
+//
+//   · Message index baseline.  `baseline_msg_count` is the count
+//     BEFORE submit (captured by doEnter as `msg_count_before`).  The
+//     user's new message lands at index `baseline`, the assistant
+//     placeholder at `baseline + 1`.  We scan for indices >= baseline
+//     + 1 so the user's own message (which can also contain markdown)
+//     never false-matches.
+//
+//   · Content signal.  `.ds-markdown` (or `.markdown-body` or
+//     `.prose`) is what DeepSeek renders answer text into.  A
+//     message that has this child with non-empty trimmed innerText
+//     is considered "responded".  Thinking content is excluded via
+//     `_isInsideThinking` (same check the watch flow uses).
+//
+//   · No Stop-button wait.  We do NOT require the Stop button to be
+//     gone.  The reason: for "just say roger", content appears
+//     ~1.5s before Stop clears (~2s).  Since split_send's between-
+//     parts ready-wait already blocks on the composer being usable,
+//     returning early here just fires the next part's `attach`
+//     event 0.5s sooner — the attach self-blocks on composer
+//     readiness.  Net: we save the extraction round-trip, and the
+//     ready-wait retains its guarantee.
+//
+//   · No content emission.  Unlike watch, we don't emit
+//     watch-delta.  Callers either use the reply_text for logging
+//     or ignore it.  split_send uses it for the log preview.
+//
+//   · Single ack.  No deltas, no done event.  Just one
+//     `__ack: "wait-for-reply"` on completion.  Simpler than watch.
+//
+// Exposed as both a bridge entry point (`__dsx_wait_for_reply_json`)
+// and a page-world function (`__dsx__.waitForReply`).
 (function () {
   "use strict";
   if (!window.__dsx__) window.__dsx__ = {};
@@ -56,7 +82,13 @@
         || ".ds-virtual-list-visible-items");
   }
 
+  // Delegate to the shared isGenerating in injected.js so we have a
+  // single source of truth.
   function isGenerating() {
+    if (typeof window.__dsx__.isGenerating === "function") {
+      try { return !!window.__dsx__.isGenerating(); }
+      catch (_) { /* fall through */ }
+    }
     for (const btn of document.querySelectorAll('button, [role="button"]')) {
       const r = btn.getBoundingClientRect();
       if (r.width === 0 || r.height === 0) continue;
@@ -85,10 +117,6 @@
     return false;
   }
 
-  // Return the LAST .ds-markdown that is NOT inside a thinking
-  // container — the answer markdown.  DeepSeek renders thoughts
-  // markdown first, answer markdown last.  Iterating from the end
-  // and skipping thinking-ancestored elements lands on the answer.
   function _findAnswerMarkdown(last) {
     const candidates = last.querySelectorAll(
       ".ds-markdown, .markdown-body, .prose");
@@ -128,15 +156,124 @@
     return kept.join("\n");
   }
 
-  // Call the page-world extractor and pull out the last assistant
-  // message's raw .content (fenced markdown, no thoughts).
-  //
-  // `__dsx_extract` tries API first (with the userToken), then
-  // IndexedDB, then fiber.  Both API and IndexedDB return
-  // fragments with raw .content; fences are intact.
-  //
-  // Hard 15 s timeout so a hung API doesn't stall the settle path
-  // past the daemon's WATCH_MAX_WAIT deadline.
+  // =====================================================================
+  // wait-for-reply — fast "content appeared" detector
+  // =====================================================================
+
+  async function _waitForReplyImpl(opts) {
+    const baseline = Number(opts.baseline_msg_count) || 0;
+    const minChars = Math.max(1, Number(opts.min_reply_chars) || 1);
+    const maxDurationMs = Number(opts.max_duration_ms) || 60000;
+    const pollMs = Math.max(50, Number(opts.poll_interval_ms) || 200);
+
+    const startedAt = Date.now();
+    let lastSig = null;
+    let sawContainer = false;
+
+    while (Date.now() - startedAt < maxDurationMs) {
+      const container = findChatContainer();
+      if (!container) {
+        await new Promise(r => setTimeout(r, pollMs));
+        continue;
+      }
+      if (!sawContainer) {
+        sawContainer = true;
+        console.log(
+          "[deeppeek:wait-reply] container found, polling for reply");
+      }
+
+      const msgs = container.querySelectorAll(".ds-message");
+      const count = msgs.length;
+
+      // Scan for a new assistant message with content.  We start at
+      // index baseline+1 because index baseline is the user's own
+      // prompt (which can also contain markdown — we don't want to
+      // false-match it).
+      if (count >= baseline + 1) {
+        for (let i = count - 1; i >= baseline + 1; i--) {
+          const msg = msgs[i];
+          const answer = _findAnswerMarkdown(msg);
+          if (!answer) continue;
+          const text = (answer.innerText || "").trim();
+          if (text.length >= minChars) {
+            console.log(
+              `[deeppeek:wait-reply] reply found at index ${i} ` +
+              `(${text.length} chars): ` +
+              JSON.stringify(text.slice(0, 80)));
+            return {
+              success: true,
+              found: true,
+              reply_text: text,
+              reply_index: i,
+              reply_length: text.length,
+              waited_ms: Date.now() - startedAt,
+              msg_count: count,
+              baseline,
+              is_generating: isGenerating(),
+            };
+          }
+        }
+      }
+
+      const gen = isGenerating();
+      const sig = JSON.stringify({ count, gen });
+      if (sig !== lastSig) {
+        console.log("[deeppeek:wait-reply] state:", {
+          elapsed_ms: Date.now() - startedAt,
+          msg_count: count,
+          baseline,
+          needed: baseline + 1,
+          is_generating: gen,
+        });
+        lastSig = sig;
+      }
+
+      await new Promise(r => setTimeout(r, pollMs));
+    }
+
+    const container = findChatContainer();
+    const finalCount = container
+      ? container.querySelectorAll(".ds-message").length : 0;
+    return {
+      success: false,
+      found: false,
+      reason: `no assistant reply with content appeared within ` +
+              `${maxDurationMs}ms`,
+      waited_ms: Date.now() - startedAt,
+      msg_count: finalCount,
+      baseline,
+      is_generating: isGenerating(),
+    };
+  }
+
+  window.__dsx__.waitForReply = _waitForReplyImpl;
+
+  window.__dsx_wait_for_reply_json = async function (argsJson) {
+    let args = {};
+    try {
+      args = JSON.parse(argsJson || "{}");
+    } catch (e) {
+      return JSON.stringify({
+        success: false,
+        reason: `arg parse failed: ${e.message}`,
+      });
+    }
+    try {
+      const result = await _waitForReplyImpl(args);
+      console.log("[deeppeek:wait-reply] result:", result);
+      return JSON.stringify(result);
+    } catch (e) {
+      return JSON.stringify({
+        success: false,
+        reason: `wait-for-reply threw: ${e.message}`,
+      });
+    }
+  };
+
+  // =====================================================================
+  // watch — heavyweight streaming (unchanged from previous version)
+  // =====================================================================
+
   async function fetchFinalFromApi(batchId) {
     if (typeof window.__dsx_extract !== "function") {
       console.warn(
@@ -189,6 +326,8 @@
     let rafScheduled = false;
     let sawGenerating = false;
     let emitted = false;
+    let initialMsgCount = 0;
+    let initialLastMsgLen = 0;
 
     function stop(reason) {
       if (stopped) return;
@@ -207,19 +346,15 @@
       settleTimer = null;
       if (stopped) return;
 
-      // Generation may have resumed after the grace period started.
       if (isGenerating()) {
         sawGenerating = true;
         return;
       }
 
-      // Try the API extractor first (fenced markdown, no thoughts,
-      // no chrome).
       let content = await fetchFinalFromApi(batchId);
       let source = "api";
 
       if (!content) {
-        // Fallback: fence-less innerText with chrome stripped.
         content = filterChrome(readLastAssistantInnerText(container));
         source = "innerText-fallback";
       }
@@ -251,13 +386,13 @@
 
       const gen = isGenerating();
 
-      // ---- phase 1: wait for submit confirmation ----
       if (!sawGenerating) {
         const curCount = container
           ? container.querySelectorAll(".ds-message").length : 0;
         const lastMsg = _lastDsMessage(container);
         const curMsgLen = lastMsg ? (lastMsg.innerText || "").length : 0;
-        if (gen || curCount > initialMsgCount || curMsgLen > initialLastMsgLen) {
+        if (gen || curCount > initialMsgCount
+            || curMsgLen > initialLastMsgLen) {
           sawGenerating = true;
           console.log(`[DSX-WATCH ${batchId}] SUBMIT_CONFIRMED`);
         } else if (Date.now() - startedAt > submitTimeoutMs) {
@@ -268,11 +403,7 @@
         return;
       }
 
-      // ---- phase 2: generation in progress ----
       if (gen) {
-        // Still generating.  If a settle timer somehow fires while
-        // gen is true, settleNow will re-arm by returning early
-        // (see above).  Nothing to do here.
         if (settleTimer) {
           clearTimeout(settleTimer);
           settleTimer = null;
@@ -280,7 +411,6 @@
         return;
       }
 
-      // ---- phase 3: generation stopped, arm settle ----
       if (!settleTimer) {
         settleTimer = setTimeout(settleNow, settleGraceMs);
       }
@@ -297,6 +427,9 @@
 
     function startObserving(el) {
       container = el;
+      initialMsgCount = el.querySelectorAll(".ds-message").length;
+      const last = _lastDsMessage(el);
+      initialLastMsgLen = last ? (last.innerText || "").length : 0;
       msgObserver = new MutationObserver(() => scheduleExtract());
       msgObserver.observe(el, {
         childList: true, characterData: true, subtree: true,

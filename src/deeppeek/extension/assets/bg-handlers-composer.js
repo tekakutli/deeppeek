@@ -1,9 +1,28 @@
 // Composer-affecting events: attach, type, enter, clear, submit.
 //
-// Each handler forwards a single message to the active
-// (or caller-pinned) DeepSeek tab via browser.tabs.sendMessage and
-// posts the resulting ack back to the originating port. Bodies are
-// unchanged from the pre-split background.js.
+// Each handler forwards a single message to the target DeepSeek tab
+// via browser.tabs.sendMessage and posts the resulting ack back to
+// the originating port.
+//
+// TAB TARGETING (2026-11-15)
+// ==========================
+// All four handlers (attach / type / enter / clear) now use
+// `_targetTab(data)` from bg-bind.js instead of hardcoding
+// `tabs.query({active: true, currentWindow: true})`.  The behaviour:
+//
+//   · If `data.tab_id` is present: resolve directly to that tab.
+//     This is the pinned path used by split_send (and any future
+//     pipeline that binds once and stays pinned).  No more dependency
+//     on user focus state — the CLI can Alt-Tab to the terminal and
+//     the extension still finds the tab.
+//
+//   · If `data.tab_id` is absent: fall back to the old active-tab
+//     query.  Existing commands (`deeppeek pipe`, `type`, `enter`,
+//     `prompt resume`) keep working exactly as before.
+//
+// `submit` keeps its existing tab_id handling (which already
+// predated this refactor) but shares the same tab-resolution
+// semantics via `_targetTab`.
 
 async function handleAttach(data, port) {
   const batchId = data.batch_id;
@@ -13,24 +32,28 @@ async function handleAttach(data, port) {
 
   console.log(
     `DSX:${tag} attach received (batch=${batchId}, ` +
-    `${files.length} file(s))`);
+    `${files.length} file(s), tab_id=${data.tab_id ?? "active"})`);
 
-  let result = { success: false, reason: "no active deepseek tab" };
-  try {
-    const [tab] = await browser.tabs.query({
-      active: true, currentWindow: true,
-    });
-    if (isSupportedTab(tab)) {
+  const tab = await _targetTab(data);
+  let result;
+  if (!tab) {
+    result = { success: false, reason: "target tab unavailable" };
+  } else {
+    try {
       const resp = await browser.tabs.sendMessage(tab.id, {
         type: "DSX_ATTACH",
         files,
         opts,
       });
-      if (resp) result = resp;
-      else result = { success: false, reason: "no response from content script" };
+      result = resp || {
+        success: false, reason: "no response from content script",
+      };
+    } catch (err) {
+      result = {
+        success: false,
+        reason: `sendMessage threw: ${err.message}`,
+      };
     }
-  } catch (err) {
-    result = { success: false, reason: `sendMessage threw: ${err.message}` };
   }
 
   console.log(`DSX:${tag} attach result (batch=${batchId}):`, result);
@@ -45,23 +68,28 @@ async function handleType(data, port) {
 
   console.log(
     `DSX:${tag} type received (batch=${batchId}, ` +
-    `${text.length} chars)`);
+    `${text.length} chars, tab_id=${data.tab_id ?? "active"})`);
 
-  let result = { success: false, reason: "no active deepseek tab" };
-  try {
-    const [tab] = await browser.tabs.query({
-      active: true, currentWindow: true,
-    });
-    if (isSupportedTab(tab)) {
+  const tab = await _targetTab(data);
+  let result;
+  if (!tab) {
+    result = { success: false, reason: "target tab unavailable" };
+  } else {
+    try {
       const resp = await browser.tabs.sendMessage(tab.id, {
         type: "DSX_TYPE",
         text,
         opts,
       });
-      result = resp || { success: false, reason: "no response from content script" };
+      result = resp || {
+        success: false, reason: "no response from content script",
+      };
+    } catch (err) {
+      result = {
+        success: false,
+        reason: `sendMessage threw: ${err.message}`,
+      };
     }
-  } catch (err) {
-    result = { success: false, reason: `sendMessage threw: ${err.message}` };
   }
 
   console.log(`DSX:${tag} type result (batch=${batchId}):`, result);
@@ -73,22 +101,29 @@ async function handleEnter(data, port) {
   const opts = data.opts || {};
   const tag = `[${port}]`;
 
-  console.log(`DSX:${tag} enter received (batch=${batchId})`);
+  console.log(
+    `DSX:${tag} enter received (batch=${batchId}, ` +
+    `tab_id=${data.tab_id ?? "active"})`);
 
-  let result = { success: false, reason: "no active deepseek tab" };
-  try {
-    const [tab] = await browser.tabs.query({
-      active: true, currentWindow: true,
-    });
-    if (isSupportedTab(tab)) {
+  const tab = await _targetTab(data);
+  let result;
+  if (!tab) {
+    result = { success: false, reason: "target tab unavailable" };
+  } else {
+    try {
       const resp = await browser.tabs.sendMessage(tab.id, {
         type: "DSX_ENTER",
         opts,
       });
-      result = resp || { success: false, reason: "no response from content script" };
+      result = resp || {
+        success: false, reason: "no response from content script",
+      };
+    } catch (err) {
+      result = {
+        success: false,
+        reason: `sendMessage threw: ${err.message}`,
+      };
     }
-  } catch (err) {
-    result = { success: false, reason: `sendMessage threw: ${err.message}` };
   }
 
   console.log(`DSX:${tag} enter result (batch=${batchId}):`, result);
@@ -100,22 +135,29 @@ async function handleClear(data, port) {
   const opts = data.opts || {};
   const tag = `[${port}]`;
 
-  console.log(`DSX:${tag} clear received (batch=${batchId})`);
+  console.log(
+    `DSX:${tag} clear received (batch=${batchId}, ` +
+    `tab_id=${data.tab_id ?? "active"})`);
 
-  let result = { success: false, reason: "no active deepseek tab" };
-  try {
-    const [tab] = await browser.tabs.query({
-      active: true, currentWindow: true,
-    });
-    if (isSupportedTab(tab)) {
+  const tab = await _targetTab(data);
+  let result;
+  if (!tab) {
+    result = { success: false, reason: "target tab unavailable" };
+  } else {
+    try {
       const resp = await browser.tabs.sendMessage(tab.id, {
         type: "DSX_CLEAR",
         opts,
       });
-      result = resp || { success: false, reason: "no response from content script" };
+      result = resp || {
+        success: false, reason: "no response from content script",
+      };
+    } catch (err) {
+      result = {
+        success: false,
+        reason: `sendMessage threw: ${err.message}`,
+      };
     }
-  } catch (err) {
-    result = { success: false, reason: `sendMessage threw: ${err.message}` };
   }
 
   console.log(`DSX:${tag} clear result (batch=${batchId}):`, result);
@@ -127,26 +169,19 @@ async function handleSubmit(data, port) {
   const text = data.text || "";
   const tag = `[${port}]`;
 
-  let result = { success: false, reason: "no active deepseek tab" };
-  try {
-    let tab = null;
-    if (data.tab_id != null) {
-      try { tab = await browser.tabs.get(data.tab_id); }
-      catch (_) { tab = null; }
-    }
-    if (!tab) {
-      const [active] = await browser.tabs.query({
-        active: true, currentWindow: true,
-      });
-      tab = active;
-    }
-
-    if (isSupportedTab(tab)) {
+  let result;
+  const tab = await _targetTab(data);
+  if (!tab) {
+    result = { success: false, reason: "target tab unavailable" };
+  } else {
+    try {
       const clear = await browser.tabs.sendMessage(tab.id, {
         type: "DSX_CLEAR", opts: {},
       });
       const type = await browser.tabs.sendMessage(tab.id, {
-        type: "DSX_TYPE", text, opts: { skip_verify: true },
+        type: "DSX_TYPE",
+        text,
+        opts: { skip_verify: true },
       });
 
       let enter = null;
@@ -181,9 +216,11 @@ async function handleSubmit(data, port) {
         tab_id: tab.id,
         clear, type, enter,
       };
+    } catch (err) {
+      result = {
+        success: false, reason: `submit threw: ${err.message}`,
+      };
     }
-  } catch (err) {
-    result = { success: false, reason: `submit threw: ${err.message}` };
   }
 
   await postAck(port, { __ack: "submit", batch_id: batchId, result });

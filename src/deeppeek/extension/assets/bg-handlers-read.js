@@ -1,36 +1,85 @@
-// Read-side events: extract, watch, extract-attachments, retry-last.
+// Read-side events: extract, watch, stop-watch, wait-for-reply,
+// extract-attachments, retry-last.
 //
-// extract / watch are the daemon's paths — extract is a one-shot
-// snapshot, watch is the streaming path (event-driven via the page
-// world's MutationObserver, with a legacy polling fallback if the
-// observer path is unavailable). extract-attachments and retry-last
-// are the interactive prompt paths.
-//
-// `watch` forwards `port` to the content script so the page-world
-// watcher posts deltas back to the same server that sent the event.
+// wait-for-reply (2026-11-15): fast reply-appearance detector for
+// split_send.  Forwards one message to the page world, single ack
+// on completion.  The page world polls the DOM for a new assistant
+// message with content; returns as soon as one appears (~1.5s
+// typical).  No content emission, no cleanup tracking.
 
 async function handleExtract(data, port) {
   const batchId = data.batch_id;
   const includeForked = !!data.include_forked;
 
-  let result = { success: false, reason: "no active deepseek tab" };
-  try {
-    const [tab] = await browser.tabs.query({
-      active: true, currentWindow: true,
-    });
-    if (isSupportedTab(tab)) {
+  const tab = await _targetTab(data);
+  let result;
+  if (!tab) {
+    result = { success: false, reason: "target tab unavailable" };
+  } else {
+    try {
       const resp = await browser.tabs.sendMessage(tab.id, {
         type: "DSX_EXTRACT",
         include_forked: includeForked,
       });
       if (resp) result = { success: true, payload: resp };
-      else result = { success: false, reason: "no response from content script" };
+      else result = {
+        success: false,
+        reason: "no response from content script",
+      };
+    } catch (err) {
+      result = {
+        success: false,
+        reason: `sendMessage threw: ${err.message}`,
+      };
     }
-  } catch (err) {
-    result = { success: false, reason: `sendMessage threw: ${err.message}` };
   }
 
   await postAck(port, { __ack: "extract", batch_id: batchId, result });
+}
+
+async function handleWaitForReply(data, port) {
+  const batchId = data.batch_id;
+  const opts = data.opts || {};
+  const tag = `[${port}]`;
+
+  console.log(
+    `DSX:${tag} wait-for-reply received ` +
+    `(batch=${batchId}, baseline=${opts.baseline_msg_count}, ` +
+    `tab_id=${data.tab_id ?? "active"})`);
+
+  const tab = await _targetTab(data);
+  let result;
+  if (!tab) {
+    result = { success: false, reason: "target tab unavailable" };
+  } else {
+    try {
+      const resp = await browser.tabs.sendMessage(tab.id, {
+        type: "DSX_WAIT_FOR_REPLY",
+        opts,
+      });
+      result = resp || {
+        success: false,
+        reason: "no response from content script",
+      };
+    } catch (err) {
+      result = {
+        success: false,
+        reason: `sendMessage threw: ${err.message}`,
+      };
+    }
+  }
+
+  console.log(`DSX:${tag} wait-for-reply result:`, {
+    ok: result.success,
+    waited_ms: result.waited_ms,
+    reply_length: result.reply_length,
+  });
+
+  await postAck(port, {
+    __ack: "wait-for-reply",
+    batch_id: batchId,
+    result,
+  });
 }
 
 async function handleExtractAttachments(data, port) {
@@ -40,15 +89,17 @@ async function handleExtractAttachments(data, port) {
 
   console.log(
     `DSX:${tag} extract-attachments received (batch=${batchId}, ` +
-    `mode=${opts.mode})`);
+    `mode=${opts.mode}, tab_id=${data.tab_id ?? "active"})`);
 
-  let result = { success: false, ok: false,
-                 reason: "no active deepseek tab" };
-  try {
-    const [tab] = await browser.tabs.query({
-      active: true, currentWindow: true,
-    });
-    if (isSupportedTab(tab)) {
+  const tab = await _targetTab(data);
+  let result;
+  if (!tab) {
+    result = {
+      success: false, ok: false,
+      reason: "target tab unavailable",
+    };
+  } else {
+    try {
       const resp = await browser.tabs.sendMessage(tab.id, {
         type: "DSX_EXTRACT_ATTACHMENTS",
         opts,
@@ -57,12 +108,12 @@ async function handleExtractAttachments(data, port) {
         success: false, ok: false,
         reason: "no response from content script",
       };
+    } catch (err) {
+      result = {
+        success: false, ok: false,
+        reason: `sendMessage threw: ${err.message}`,
+      };
     }
-  } catch (err) {
-    result = {
-      success: false, ok: false,
-      reason: `sendMessage threw: ${err.message}`,
-    };
   }
 
   console.log(`DSX:${tag} extract-attachments result:`, {
@@ -83,14 +134,16 @@ async function handleRetryLast(data, port) {
   const opts = data.opts || {};
   const tag = `[${port}]`;
 
-  console.log(`DSX:${tag} retry-last received (batch=${batchId})`);
+  console.log(
+    `DSX:${tag} retry-last received (batch=${batchId}, ` +
+    `tab_id=${data.tab_id ?? "active"})`);
 
-  let result = { success: false, reason: "no active deepseek tab" };
-  try {
-    const [tab] = await browser.tabs.query({
-      active: true, currentWindow: true,
-    });
-    if (isSupportedTab(tab)) {
+  const tab = await _targetTab(data);
+  let result;
+  if (!tab) {
+    result = { success: false, reason: "target tab unavailable" };
+  } else {
+    try {
       const resp = await browser.tabs.sendMessage(tab.id, {
         type: "DSX_RETRY_LAST",
         opts,
@@ -99,12 +152,12 @@ async function handleRetryLast(data, port) {
         success: false,
         reason: "no response from content script",
       };
+    } catch (err) {
+      result = {
+        success: false,
+        reason: `sendMessage threw: ${err.message}`,
+      };
     }
-  } catch (err) {
-    result = {
-      success: false,
-      reason: `sendMessage threw: ${err.message}`,
-    };
   }
 
   console.log(`DSX:${tag} retry-last result:`, {
@@ -129,9 +182,9 @@ async function handleWatch(data, port) {
   const firstContentTimeoutMs =
     Math.max(5000, data.first_content_timeout_ms || 30000);
   const pinnedTabId = (data.tab_id != null) ? data.tab_id : null;
+  const strictPin = !!data.strict_pin;
   const tag = `[${port}]`;
 
-  // Ack first.
   await postAck(port, {
     __ack: "watch",
     batch_id: batchId,
@@ -142,23 +195,24 @@ async function handleWatch(data, port) {
   if (pinnedTabId != null) {
     try { tab = await browser.tabs.get(pinnedTabId); } catch (_) {}
   }
-  if (!tab) {
+  if (!tab && !strictPin) {
     const [active] = await browser.tabs.query({
       active: true, currentWindow: true,
     });
     tab = active;
   }
   if (!isSupportedTab(tab)) {
+    const reason = strictPin
+      ? "pinned tab closed or navigated away"
+      : "no_deepseek_tab";
     await postAck(port, {
       __ack: "watch-done",
       batch_id: batchId,
-      reason: "no_deepseek_tab",
+      reason,
     });
     return;
   }
 
-  // Event-driven path — forward `port` so injected-watch.js posts
-  // deltas back to the correct server.
   let started = false;
   try {
     const resp = await browser.tabs.sendMessage(tab.id, {
@@ -181,7 +235,7 @@ async function handleWatch(data, port) {
 
   if (started) return;
 
-  // Legacy polling fallback (all acks via postAck).
+  // Legacy polling fallback.
   let lastContent = "";
   let stableTicks = 0;
   let stopped = false;
@@ -257,4 +311,37 @@ async function handleWatch(data, port) {
   };
   timer = setInterval(poll, pollInterval);
   poll();
+}
+
+async function handleStopWatch(data, port) {
+  const batchId = data.batch_id;
+  const tag = `[${port}]`;
+
+  const tab = await _targetTab(data);
+  let result;
+  if (!tab) {
+    result = { success: false, reason: "target tab unavailable" };
+  } else {
+    try {
+      const resp = await browser.tabs.sendMessage(tab.id, {
+        type: "DSX_WATCH_STOP",
+        opts: { batch_id: batchId },
+      });
+      result = resp || {
+        success: false,
+        reason: "no response from content script",
+      };
+    } catch (err) {
+      result = {
+        success: false,
+        reason: `sendMessage threw: ${err.message}`,
+      };
+    }
+  }
+
+  console.log(
+    `DSX:${tag} stop-watch result (batch=${batchId}):`, result);
+  await postAck(port, {
+    __ack: "stop-watch", batch_id: batchId, result,
+  });
 }

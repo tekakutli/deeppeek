@@ -1,53 +1,84 @@
 """`deeppeek prompt split_send` — split a dump and send parts sequentially.
 
-The purpose: load a large markdown dump into DeepSeek's conversation
-context across multiple turns.  Each part is attached as a file chip,
-followed by a short acknowledgment prompt ("this is part i/N, just say
-roger").  The model's reply is expected to be brief so the assistant
-side doesn't burn context; over N turns, the full dump content
-accumulates in the conversation history.
+PURPOSE
+=======
+Load a large markdown dump into DeepSeek's conversation context
+across multiple turns.  Each part is attached as a file chip,
+followed by a short acknowledgment prompt.  The model's reply is
+expected to be brief so the assistant side doesn't burn context.
 
-Pipeline:
+PIPELINE
+========
 
-    split   `dumps_split.py <file> -n N -o <ws>`
-              (uses the sibling script under scripts/dumps/; the
-               direct invocation avoids paying the `deeppeek scripts`
-               dispatch cost on every run)
-    send    for each part i/N:
-              attach   file chip via the `attach` SSE event
-              type     "this is part i/N, just say roger" via `type`
-              enter    submit via `enter`
-              watch    wait for the model to finish via `watch`
-                       (skipped with --no-wait; unsafe)
+    bind-tab          pin the pipeline to one specific chat tab
+    bind-composer     pin the pipeline to one specific composer element
+    split             `dumps_split.py <file> -n N -o <ws>`
+    for each part:
+      clear           idempotent reset before each part
+      wait_ready      poll probe-composer until composer ready
+      attach          with `wait_upload: true` (waits for
+                      send-button-enabled via page-world
+                      waitComposerReady)
+      type            in parallel with attach
+      enter           adaptive retry (precheck + 3 attempts +
+                      send-button fallback)
+      wait-reply      fast "reply appeared" signal (~1-2s for
+                      short replies); DOM-only, no API extraction
+      (skip ready)    if reply.is_generating == False, the model
+                      is done; the next attach's internal
+                      waitComposerReady is the readiness gate
+      checkpoint      progress.json updated
 
-The `watch` step is what serializes the pipeline.  DeepSeek's composer
-is disabled while a response is generating; if we didn't wait, part
-N+1's `attach` could fire during part N's generation and either fail
-(drop rejected) or be silently appended to N's attachments.  `watch`
-waits for the "Stop" button to disappear (generation finished) before
-returning, and only then does the next part begin.
+BETWEEN-PARTS LATENCY (2026-11-15, fifth iteration)
+====================================================
+Previous versions slept `--gap` (default 1.5s) + did an
+extra `_wait_for_composer_ready` probe between parts.  Observed
+per-part gap: ~1.6s of dead time even when the reply already
+confirmed `is_generating=False`.
 
-Usage:
+Now:
+  · `--gap` default = 0.0  (kept as a knob for pathological cases)
+  · `_wait_for_composer_ready` is SKIPPED when the reply-wait
+    reported `is_generating == False` — the model is definitively
+    finished, and the next `attach`'s internal `waitComposerReady`
+    (which blocks on the send-button-enabled class) is the actual
+    readiness gate.
+
+Effect: the gap between "reply detected" and "next part starts"
+shrinks to the SSE round-trip time (~50-100ms) instead of ~1.6s.
+
+FAST REPLY DETECTION (unchanged)
+================================
+`wait-for-reply` polls the DOM for a new assistant message with
+non-empty `.ds-markdown` content.  Returns as soon as one appears.
+No API extraction, no settle ticks.
+
+USAGE
+=====
 
     deeppeek prompt split_send /path/to/dump.md
     deeppeek prompt split_send dump.md --parts 5
-    deeppeek prompt split_send dump.md --target-lines 3000
+    deeppeek prompt split_send dump.md --reply-timeout 120
+    deeppeek prompt split_send dump.md --min-reply-chars 3
+    deeppeek prompt split_send dump.md --use-watch    # old behaviour
+    deeppeek prompt split_send dump.md --gap 0.5      # extra safety
     deeppeek prompt split_send dump.md --dry-run
-    deeppeek prompt split_send dump.md -t "part {i}/{n} — reply with ok"
-    deeppeek prompt split_send dump.md --no-wait    # fire-and-forget
+    deeppeek prompt split_send dump.md --tab-id 42
+    deeppeek prompt split_send dump.md --resume
 
-Default parts = 9, matching `dumps_split.py`'s `DEFAULT_NUM_PARTS`.
-
-Failure model: on a per-part failure, the default is to bail
-immediately (the tree is left as-is for inspection).  `--continue-on-error`
-keeps going, which is useful when a single part transiently fails but
-the extension is still healthy.
+Exit codes:
+    0  all parts sent successfully
+    1  infrastructure failure (connection, bind, split)
+    2  at least one part failed (after retries)
+    3  argument error
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
+import json
 import queue
 import subprocess
 import sys
@@ -69,6 +100,16 @@ _SPLIT_SCRIPT = _PROJECT_ROOT / "scripts" / "dumps" / "dumps_split.py"
 
 DEFAULT_PROMPT_TEMPLATE = "this is part {i}/{n}, just say roger"
 DEFAULT_PARTS = 9
+PROGRESS_FILE_NAME = "progress.json"
+
+_RETRY_DELAYS = [10.0, 30.0, 60.0, 120.0]
+
+
+def _retry_delay(attempt_number: int) -> float:
+    if attempt_number <= 1:
+        return 0.0
+    idx = min(attempt_number - 2, len(_RETRY_DELAYS) - 1)
+    return _RETRY_DELAYS[idx]
 
 
 # ---------------------------------------------------------------------------
@@ -103,18 +144,18 @@ def _run_cmd(cmd: list[str], *,
 
 
 # ---------------------------------------------------------------------------
-# Part filename parsing
+# Filesystem helpers
 # ---------------------------------------------------------------------------
 
-def _part_number(path: Path) -> Optional[int]:
-    """Return the part number from `<stem>_part<i>of<N><suffix>`, or
-    None if `path` doesn't match that pattern.
+def _sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-    `dumps_split.py` writes names matching `<dump_stem>_part<i>of<N>
-    <dump_suffix>`.  We control the workspace, so the only files
-    present should be parts; the pattern check keeps unrelated files
-    out if the user passes a shared `--workspace` dir.
-    """
+
+def _part_number(path: Path) -> Optional[int]:
     stem = path.stem
     if "_part" not in stem:
         return None
@@ -124,6 +165,103 @@ def _part_number(path: Path) -> Optional[int]:
         return int(i_str)
     except (ValueError, IndexError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint file
+# ---------------------------------------------------------------------------
+
+def _load_progress(ws: Path, input_sha: str) -> Optional[dict]:
+    p = ws / PROGRESS_FILE_NAME
+    if not p.is_file():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if data.get("input_sha256") != input_sha:
+        print(
+            f"[resume] {PROGRESS_FILE_NAME} exists but its input_sha256 "
+            f"doesn't match this file; starting fresh",
+            file=sys.stderr,
+        )
+        return None
+    return data
+
+
+def _save_progress(ws: Path, data: dict) -> None:
+    p = ws / PROGRESS_FILE_NAME
+    try:
+        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError as e:
+        print(f"[checkpoint] write failed: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Startup stages
+# ---------------------------------------------------------------------------
+
+def _stage_bind_tab(
+    server,
+    timeout: float,
+    explicit_tab_id: Optional[int],
+) -> tuple[int, Optional[int]]:
+    payload = {}
+    if explicit_tab_id is not None:
+        payload["tab_id"] = explicit_tab_id
+
+    rc, result = broadcast_and_wait(
+        server, "bind-tab", payload,
+        timeout=timeout, ack_name="bind-tab",
+    )
+    if rc != 0:
+        reason = (result.get("reason")
+                  or result.get("error")
+                  or "(no reason)")
+        print(f"error: bind-tab failed: {reason}", file=sys.stderr)
+        candidates = result.get("candidates")
+        if candidates:
+            print("  candidates:", file=sys.stderr)
+            for c in candidates:
+                active = " (active)" if c.get("active") else ""
+                print(f"    tab {c['tab_id']}{active}: "
+                      f"{c.get('title')!r}  {c.get('url')}",
+                      file=sys.stderr)
+            print("  pass --tab-id <N> to pick one",
+                  file=sys.stderr)
+        return 1, None
+
+    tab_id = result.get("tab_id")
+    pinned_by = result.get("pinned_by") or "?"
+    url = result.get("url") or "?"
+    title = result.get("title") or "(untitled)"
+    print(f"[bind-tab] pinned tab {tab_id} [{pinned_by}]: "
+          f"{title!r}  {url}", file=sys.stderr)
+    return 0, tab_id
+
+
+def _stage_bind_composer(server, tab_id: int, timeout: float) -> int:
+    rc, result = broadcast_and_wait(
+        server, "bind-composer", {"tab_id": tab_id},
+        timeout=timeout, ack_name="bind-composer",
+    )
+    if rc != 0:
+        reason = (result.get("reason")
+                  or result.get("error")
+                  or "(no reason)")
+        print(f"error: bind-composer failed: {reason}", file=sys.stderr)
+        tried = result.get("tried_selectors")
+        if tried:
+            print("  tried:", file=sys.stderr)
+            for sel in tried:
+                print(f"    {sel}", file=sys.stderr)
+        return 1
+
+    selector = result.get("selector") or "?"
+    source = result.get("source") or "?"
+    print(f"[bind-composer] strict match: {selector} "
+          f"(source={source})", file=sys.stderr)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -137,12 +275,6 @@ def _stage_split(
     target_lines: Optional[int],
     timeout: float,
 ) -> list[Path]:
-    """Run `dumps_split.py` and return the resulting part paths,
-    sorted by part number.
-
-    `-o ws` keeps the parts out of the user's cwd; the default naming
-    is `<stem>_part<i>of<N><suffix>`, which we parse back out.
-    """
     if not _SPLIT_SCRIPT.is_file():
         raise SystemExit(
             f"error: dumps_split.py not found at {_SPLIT_SCRIPT}\n"
@@ -181,7 +313,88 @@ def _stage_split(
 
 
 # ---------------------------------------------------------------------------
-# Send stage
+# Composer readiness
+# ---------------------------------------------------------------------------
+
+def _probe_composer(server, tab_id: int,
+                    timeout: float) -> Optional[dict]:
+    rc, result = broadcast_and_wait(
+        server, "probe-composer", {"tab_id": tab_id},
+        timeout=timeout, ack_name="probe-composer",
+    )
+    if rc != 0:
+        return None
+    return result
+
+
+def _wait_for_composer_ready(
+    server, tab_id: int, *,
+    ready_timeout: float,
+    poll_interval: float,
+) -> bool:
+    deadline = time.monotonic() + ready_timeout
+    attempts = 0
+    while time.monotonic() < deadline:
+        attempts += 1
+        probe = _probe_composer(server, tab_id, timeout=5.0)
+        if probe is None:
+            print(f"  [ready] probe failed (attempt {attempts})",
+                  file=sys.stderr)
+        else:
+            ta = probe.get("textarea_present")
+            dis = probe.get("textarea_disabled")
+            chips = probe.get("chip_count", -1)
+            gen = probe.get("is_generating")
+            ready = bool(ta) and not dis and not gen
+            if ready:
+                return True
+            if attempts == 1 or attempts % 4 == 0:
+                print(
+                    f"  [ready] not yet: "
+                    f"textarea_present={ta} disabled={dis} "
+                    f"chips={chips} generating={gen}",
+                    file=sys.stderr,
+                )
+        time.sleep(poll_interval)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Reply-detection (fast path)
+# ---------------------------------------------------------------------------
+
+def _wait_for_reply(
+    server,
+    tab_id: int,
+    baseline_msg_count: int,
+    *,
+    reply_timeout: float,
+    min_reply_chars: int,
+) -> tuple[int, dict]:
+    """Send `wait-for-reply` and wait for its ack.
+
+    Returns (rc, result) with rc following broadcast_and_wait
+    conventions.  On success, result carries `reply_text`,
+    `reply_length`, `waited_ms`, `is_generating`.
+    """
+    return broadcast_and_wait(
+        server, "wait-for-reply",
+        {
+            "tab_id": tab_id,
+            "opts": {
+                "baseline_msg_count": baseline_msg_count,
+                "min_reply_chars": min_reply_chars,
+                "max_duration_ms": int(reply_timeout * 1000),
+                "poll_interval_ms": 200,
+            },
+        },
+        timeout=reply_timeout + 5,
+        ack_name="wait-for-reply",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-part send
 # ---------------------------------------------------------------------------
 
 def _send_one_part(
@@ -190,31 +403,40 @@ def _send_one_part(
     idx: int,
     total: int,
     text: str,
+    tab_id: int,
     *,
     attach_timeout: float,
     watch_timeout: float,
+    reply_timeout: float,
+    min_reply_chars: int,
     no_wait: bool,
-) -> tuple[int, dict]:
-    """Attach + type + enter + (optionally) watch for one part.
-
-    Return-value convention matches `broadcast_and_wait`:
-      0 = success
-      1 = infrastructure failure (timeout, malformed ack)
-      2 = command failure (extension reported success:false)
-    """
+    use_watch: bool,
+    upload_timeout: float,
+    upload_min_wait: float,
+    enter_attempts: int,
+    outstanding_watches: list[str],
+) -> dict:
     print(
         f"\n[send] part {idx}/{total}: {part_path.name} "
         f"({part_path.stat().st_size:,} bytes)",
         file=sys.stderr,
     )
 
-    # ---- attach + type in parallel ----------------------------------
-    #
-    # Both events are independent — `attach` adds file chips,
-    # `type` sets the textarea — so firing them back-to-back on
-    # one connection halves the per-part round-trip count vs.
-    # sequential.  `broadcast_many` returns only when both acks
-    # arrive, so after this block both are confirmed.
+    # ---- clear ----
+    rc, result = broadcast_and_wait(
+        server, "clear",
+        {"tab_id": tab_id, "opts": {"strict_composer": True}},
+        timeout=attach_timeout, ack_name="clear",
+    )
+    if rc != 0:
+        return {
+            "success": False, "stage": "clear",
+            "reason": result.get("reason") or result.get("error"),
+            "details": result,
+        }
+    print(f"  [ok]   clear", file=sys.stderr)
+
+    # ---- attach (wait_upload) + type in parallel ----
     data = part_path.read_bytes()
     b64 = base64.b64encode(data).decode("ascii")
     specs = [
@@ -222,67 +444,152 @@ def _send_one_part(
             "tag": "attach",
             "event": "attach",
             "payload": {
+                "tab_id": tab_id,
                 "files": [{
                     "name": part_path.name,
                     "mime": "text/markdown",
                     "base64": b64,
                 }],
-                "opts": {"delay_ms": 0},
+                "opts": {
+                    "delay_ms": 0,
+                    "strict_composer": True,
+                    "wait_upload": True,
+                    "wait_upload_timeout_ms": int(upload_timeout * 1000),
+                    "wait_upload_min_ms": int(upload_min_wait * 1000),
+                },
             },
             "ack_name": "attach",
         },
         {
             "tag": "type",
             "event": "type",
-            "payload": {"text": text},
+            "payload": {
+                "tab_id": tab_id,
+                "text": text,
+                "opts": {
+                    "strict_composer": True,
+                    "skip_verify": False,
+                    "settle_ms": 300,
+                },
+            },
             "ack_name": "type",
         },
     ]
     results = broadcast_many(server, specs, timeout=attach_timeout)
+    attach_result: dict = {}
     for tag in ("attach", "type"):
         r = results.get(tag, {"exit_code": 1, "result": {}})
         if r["exit_code"] != 0:
-            reason = (r["result"].get("reason")
-                      or r["result"].get("error")
-                      or "(no reason)")
-            print(f"  [fail] {tag}: {reason}", file=sys.stderr)
-            return r["exit_code"], {
-                "stage": tag, "result": r["result"],
+            return {
+                "success": False, "stage": tag,
+                "reason": (r["result"].get("reason")
+                           or r["result"].get("error")),
+                "details": r["result"],
             }
-        print(f"  [ok]   {tag}", file=sys.stderr)
+        if tag == "attach":
+            attach_result = r["result"]
+            uw = attach_result.get("upload_wait")
+            if uw:
+                print(
+                    f"  [ok]   attach (upload "
+                    f"{uw.get('waited_ms', '?')}ms, "
+                    f"method={uw.get('method', '?')})",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"  [ok]   attach", file=sys.stderr)
+        else:
+            print(f"  [ok]   {tag}", file=sys.stderr)
 
-    # ---- enter ------------------------------------------------------
-    #
-    # `enter` fires the key events and verifies that either the
-    # composer cleared OR a new message appeared — either one is
-    # proof the submit reached DeepSeek's React handler.
+    # ---- enter (adaptive retry inside the page world) ----
     rc, result = broadcast_and_wait(
-        server, "enter", {},
+        server, "enter",
+        {
+            "tab_id": tab_id,
+            "opts": {
+                "strict_composer": True,
+                "expected_text": text,
+                "enter_attempts": enter_attempts,
+            },
+        },
         timeout=attach_timeout, ack_name="enter",
     )
     if rc != 0:
-        reason = (result.get("reason")
-                  or result.get("error")
-                  or "(no reason)")
-        print(f"  [fail] enter: {reason}", file=sys.stderr)
-        return rc, {"stage": "enter", "result": result}
-    print(f"  [ok]   enter", file=sys.stderr)
+        return {
+            "success": False, "stage": "enter",
+            "reason": (result.get("reason")
+                       or result.get("error")
+                       or "enter failed (no reason given)"),
+            "details": {
+                **result,
+                "attach_upload_wait": attach_result.get("upload_wait"),
+            },
+        }
+    entered_via = result.get("entered_via") or "?"
+    attempts_used = result.get("attempts_used", 1)
+    focus_ok = result.get("focus_ok")
+    baseline_msg_count = result.get("msg_count_before", 0)
+    focus_str = "focus=ok" if focus_ok else "focus=FAILED"
+    print(f"  [ok]   enter ({entered_via}, {focus_str}, "
+          f"attempts={attempts_used}, baseline={baseline_msg_count})",
+          file=sys.stderr)
 
     if no_wait:
-        print(f"  [skip] watch (--no-wait)", file=sys.stderr)
-        return 0, {"stage": "complete", "reason": "no-wait"}
+        print(f"  [skip] wait (--no-wait)", file=sys.stderr)
+        return {
+            "success": True, "stage": "complete",
+            "reason": None, "details": {"no_wait": True},
+        }
 
-    # ---- watch ------------------------------------------------------
-    #
-    # `watch` waits for the "Stop" button to disappear (generation
-    # finished) and emits the final content as a `watch-delta`
-    # followed by `watch-done`.  We don't care about the content —
-    # only that the model has finished, so the composer is
-    # re-enabled and part N+1 can be attached without colliding.
-    print(f"  [watch] waiting for model to finish...", file=sys.stderr)
+    # ---- wait for reply ----
+    if not use_watch:
+        print(f"  [reply] waiting for assistant reply "
+              f"(baseline={baseline_msg_count})...", file=sys.stderr)
+        rc, reply_result = _wait_for_reply(
+            server, tab_id, baseline_msg_count,
+            reply_timeout=reply_timeout,
+            min_reply_chars=min_reply_chars,
+        )
+        if rc != 0:
+            return {
+                "success": False, "stage": "wait-reply",
+                "reason": (reply_result.get("reason")
+                           or reply_result.get("error")
+                           or "wait-for-reply failed"),
+                "details": {
+                    **reply_result,
+                    "attach_upload_wait":
+                        attach_result.get("upload_wait"),
+                },
+            }
+        waited_ms = reply_result.get("waited_ms", 0)
+        reply_len = reply_result.get("reply_length", 0)
+        reply_text = reply_result.get("reply_text") or ""
+        preview = reply_text[:60].replace("\n", " ")
+        gen = reply_result.get("is_generating")
+        print(
+            f"  [ok]   reply ({waited_ms}ms, {reply_len} chars, "
+            f"generating={gen}): {preview!r}",
+            file=sys.stderr,
+        )
+        return {
+            "success": True, "stage": "complete",
+            "reason": None,
+            "details": {
+                "reply_wait": reply_result,
+                "attach_upload_wait": attach_result.get("upload_wait"),
+            },
+        }
+
+    # ---- slow path: full watch (opt-in via --use-watch) ----
+    print(f"  [watch] waiting for model to finish (--use-watch)...",
+          file=sys.stderr)
     batch_id = uuid.uuid4().hex[:12]
+    outstanding_watches.append(batch_id)
     server._broadcast("watch", {
         "batch_id": batch_id,
+        "tab_id": tab_id,
+        "strict_pin": True,
         "include_forked": False,
         "poll_interval_ms": 300,
         "settle_ticks": 5,
@@ -304,24 +611,138 @@ def _send_one_part(
             continue
         ack = msg.get("__ack")
         if ack == "watch":
-            # Start ack — keep waiting for watch-done.
             continue
         if ack == "watch-done":
+            try:
+                outstanding_watches.remove(batch_id)
+            except ValueError:
+                pass
             reason = msg.get("reason")
             if reason == "settled":
                 print(f"  [ok]   watch (settled)", file=sys.stderr)
-                return 0, {"stage": "watch", "reason": reason}
+                return {
+                    "success": True, "stage": "complete",
+                    "reason": None,
+                    "details": {"watch_reason": reason},
+                }
             print(
                 f"  [fail] watch: reason={reason!r}",
                 file=sys.stderr,
             )
-            return 2, {"stage": "watch", "reason": reason}
-        # watch-delta / watch-rewrite — ignore content.
+            return {
+                "success": False, "stage": "watch",
+                "reason": f"watch-done reason={reason!r}",
+                "details": msg,
+            }
 
-    return 1, {
-        "stage": "watch",
-        "error": f"watch timeout after {watch_timeout:.0f}s",
+    return {
+        "success": False, "stage": "watch",
+        "reason": f"watch timeout after {watch_timeout:.0f}s",
+        "details": {},
     }
+
+
+# ---------------------------------------------------------------------------
+# Retry wrapper (pipeline level)
+# ---------------------------------------------------------------------------
+
+def _send_part_with_retry(
+    server,
+    part: Path, idx: int, total: int, text: str, tab_id: int,
+    *,
+    retries: int,
+    attach_timeout: float,
+    watch_timeout: float,
+    reply_timeout: float,
+    min_reply_chars: int,
+    no_wait: bool,
+    use_watch: bool,
+    ready_timeout: float,
+    ready_poll: float,
+    upload_timeout: float,
+    upload_min_wait: float,
+    enter_attempts: int,
+    outstanding_watches: list[str],
+) -> dict:
+    last_result: Optional[dict] = None
+    max_attempts = retries + 1
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            delay = _retry_delay(attempt)
+            print(
+                f"  [retry] attempt {attempt}/{max_attempts} "
+                f"(after {delay:.0f}s delay)",
+                file=sys.stderr,
+            )
+            if delay > 0:
+                time.sleep(delay)
+            if not _wait_for_composer_ready(
+                server, tab_id,
+                ready_timeout=ready_timeout,
+                poll_interval=ready_poll,
+            ):
+                print(
+                    f"  [retry] composer never became ready; "
+                    f"attempting anyway",
+                    file=sys.stderr,
+                )
+        result = _send_one_part(
+            server, part, idx, total, text, tab_id,
+            attach_timeout=attach_timeout,
+            watch_timeout=watch_timeout,
+            reply_timeout=reply_timeout,
+            min_reply_chars=min_reply_chars,
+            no_wait=no_wait,
+            use_watch=use_watch,
+            upload_timeout=upload_timeout,
+            upload_min_wait=upload_min_wait,
+            enter_attempts=enter_attempts,
+            outstanding_watches=outstanding_watches,
+        )
+        result["attempts"] = attempt
+        last_result = result
+        if result["success"]:
+            return result
+        if result["stage"] in ("wait-reply", "watch"):
+            return result
+
+    return last_result or {
+        "success": False, "stage": "internal",
+        "reason": "no attempts made", "details": {}, "attempts": 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Between-parts readiness decision
+# ---------------------------------------------------------------------------
+
+def _needs_between_parts_wait(result: dict) -> bool:
+    """Return True if we should run `_wait_for_composer_ready` before
+    the next part.
+
+    Cases where we CAN skip:
+      · The reply-wait returned `is_generating == False`.  The model
+        is definitively done.  The next part's `attach` uses
+        `wait_upload: true`, which internally calls
+        `waitComposerReady` and blocks on the send-button-enabled
+        class — that's the authoritative readiness gate.  Re-probing
+        here just adds an SSE round-trip.
+
+    Cases where we must wait:
+      · `--no-wait` mode (no reply info at all).
+      · `--use-watch` mode (the watch flow returned, but its result
+        may not carry `is_generating`; safe to probe).
+      · reply-wait returned `is_generating == True` (rare — content
+        appeared before the model finished; needs to wait for the
+        Stop button to clear before next attach).
+    """
+    details = result.get("details") or {}
+    reply_wait = details.get("reply_wait") or {}
+    reply_gen = reply_wait.get("is_generating")
+
+    if reply_gen is False:
+        return False  # skip
+    return True  # default: probe
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +755,6 @@ def run(args: argparse.Namespace) -> int:
         print(f"error: not a file: {dump_path}", file=sys.stderr)
         return 1
 
-    # Argument validation (before any resources are created).
     if args.parts is not None and args.target_lines is not None:
         print(
             "error: --parts and --target-lines are mutually exclusive",
@@ -347,8 +767,44 @@ def run(args: argparse.Namespace) -> int:
     if args.target_lines is not None and args.target_lines < 1:
         print("error: --target-lines must be >= 1", file=sys.stderr)
         return 3
+    if args.retries < 0:
+        print("error: --retries must be >= 0", file=sys.stderr)
+        return 3
+    if args.upload_timeout <= 0:
+        print("error: --upload-timeout must be > 0", file=sys.stderr)
+        return 3
+    if args.upload_min_wait < 0:
+        print("error: --upload-min-wait must be >= 0", file=sys.stderr)
+        return 3
+    if args.enter_attempts < 1:
+        print("error: --enter-attempts must be >= 1", file=sys.stderr)
+        return 3
+    if args.reply_timeout <= 0:
+        print("error: --reply-timeout must be > 0", file=sys.stderr)
+        return 3
+    if args.min_reply_chars < 1:
+        print("error: --min-reply-chars must be >= 1", file=sys.stderr)
+        return 3
+    if args.gap < 0:
+        print("error: --gap must be >= 0", file=sys.stderr)
+        return 3
 
-    # ---- workspace --------------------------------------------------
+    min_attach_timeout = max(
+        args.upload_timeout + 20.0,
+        20.0,
+    )
+    effective_attach_timeout = max(
+        args.attach_timeout, min_attach_timeout,
+    )
+    if effective_attach_timeout > args.attach_timeout:
+        print(
+            f"[config] bumping attach_timeout from "
+            f"{args.attach_timeout:.0f}s to "
+            f"{effective_attach_timeout:.0f}s",
+            file=sys.stderr,
+        )
+
+    # ---- workspace ----
     if args.workspace is None:
         ws = Path(tempfile.mkdtemp(prefix="deeppeek_split_send_"))
     else:
@@ -358,7 +814,19 @@ def run(args: argparse.Namespace) -> int:
     print(f"  (kept after run for inspection; rm -rf {ws} when done)",
           file=sys.stderr)
 
-    # ---- split ------------------------------------------------------
+    input_sha = _sha256_of(dump_path)
+
+    prior_progress: Optional[dict] = None
+    if args.resume:
+        prior_progress = _load_progress(ws, input_sha)
+        if prior_progress is not None:
+            completed = prior_progress.get("completed") or []
+            print(
+                f"[resume] {len(completed)} part(s) already completed: "
+                f"{completed}",
+                file=sys.stderr,
+            )
+
     try:
         parts = _stage_split(
             dump_path, ws,
@@ -376,7 +844,6 @@ def run(args: argparse.Namespace) -> int:
         print(f"  {p.name}  ({p.stat().st_size:,} bytes)",
               file=sys.stderr)
 
-    # ---- per-part prompt text --------------------------------------
     texts: list[str] = []
     for i, p in enumerate(parts, 1):
         try:
@@ -390,7 +857,6 @@ def run(args: argparse.Namespace) -> int:
             return 3
         texts.append(t)
 
-    # ---- dry-run ----------------------------------------------------
     if args.dry_run:
         for (p, t) in zip(parts, texts):
             print(f"{p.name}\t{t}")
@@ -401,54 +867,205 @@ def run(args: argparse.Namespace) -> int:
         )
         return 0
 
-    # ---- send -------------------------------------------------------
+    completed: set[int] = set()
+    if prior_progress is not None:
+        for n in (prior_progress.get("completed") or []):
+            try:
+                completed.add(int(n))
+            except (TypeError, ValueError):
+                pass
+    progress = {
+        "input_sha256": input_sha,
+        "input_path": str(dump_path),
+        "total": total,
+        "completed": sorted(completed),
+        "current": None,
+        "status": "starting",
+        "started_at": int(time.time()),
+    }
+    _save_progress(ws, progress)
+
     with composer_session(
         port=args.port, timeout=args.connect_timeout
     ) as server:
         if server is None:
             return 1
 
-        failures: list[tuple[int, str, dict]] = []
-        for i, (part, text) in enumerate(zip(parts, texts), 1):
-            rc, result = _send_one_part(
-                server, part, i, total, text,
-                attach_timeout=args.attach_timeout,
-                watch_timeout=args.watch_timeout,
-                no_wait=args.no_wait,
+        outstanding_watches: list[str] = []
+        tab_id_for_cleanup: Optional[int] = None
+        try:
+            rc, tab_id = _stage_bind_tab(
+                server, timeout=args.bind_timeout,
+                explicit_tab_id=args.tab_id,
+            )
+            if rc != 0 or tab_id is None:
+                return 1
+            tab_id_for_cleanup = tab_id
+
+            rc = _stage_bind_composer(
+                server, tab_id, timeout=args.bind_timeout,
             )
             if rc != 0:
-                failures.append((i, part.name, result))
-                if not args.continue_on_error:
+                return 1
+
+            print(f"[ready] waiting for composer to be usable...",
+                  file=sys.stderr)
+            if not _wait_for_composer_ready(
+                server, tab_id,
+                ready_timeout=args.ready_timeout,
+                poll_interval=args.ready_poll,
+            ):
+                print(
+                    "error: composer never became ready at startup",
+                    file=sys.stderr,
+                )
+                return 1
+            print(f"[ready] composer ready", file=sys.stderr)
+
+            failures: list[dict] = []
+            for i, (part, text) in enumerate(zip(parts, texts), 1):
+                if i in completed:
+                    print(
+                        f"\n[skip] part {i}/{total}: already completed "
+                        f"(from progress.json)", file=sys.stderr,
+                    )
+                    continue
+
+                progress["current"] = i
+                progress["status"] = "sending"
+                _save_progress(ws, progress)
+
+                result = _send_part_with_retry(
+                    server, part, i, total, text, tab_id,
+                    retries=args.retries,
+                    attach_timeout=effective_attach_timeout,
+                    watch_timeout=args.watch_timeout,
+                    reply_timeout=args.reply_timeout,
+                    min_reply_chars=args.min_reply_chars,
+                    no_wait=args.no_wait,
+                    use_watch=args.use_watch,
+                    ready_timeout=args.ready_timeout,
+                    ready_poll=args.ready_poll,
+                    upload_timeout=args.upload_timeout,
+                    upload_min_wait=args.upload_min_wait,
+                    enter_attempts=args.enter_attempts,
+                    outstanding_watches=outstanding_watches,
+                )
+
+                if not result["success"]:
+                    failure_record = {
+                        "part": i,
+                        "name": part.name,
+                        "stage": result.get("stage"),
+                        "reason": result.get("reason"),
+                        "attempts": result.get("attempts", 1),
+                        "details": result.get("details"),
+                    }
+                    failures.append(failure_record)
+                    progress["status"] = "failed"
+                    progress["last_failure"] = failure_record
+                    _save_progress(ws, progress)
                     print(
                         f"\nerror: part {i}/{total} failed "
-                        f"(stage={result.get('stage')!r}, "
-                        f"reason={result.get('reason') or result.get('error')!r})",
+                        f"after {result.get('attempts', 1)} attempt(s)\n"
+                        f"  stage:  {result.get('stage')!r}\n"
+                        f"  reason: {result.get('reason')!r}",
                         file=sys.stderr,
                     )
-                    break
-            elif i < total and args.gap > 0:
-                # Composer needs a beat to re-enable after the
-                # model's response completes; without this the
-                # very next attach can land while the textarea
-                # is still read-only.
-                time.sleep(args.gap)
+                    details = result.get("details") or {}
+                    for k in ("focus_ok", "focus_attempts",
+                              "active_at_enter", "composer_source",
+                              "composer_cleared",
+                              "new_message_appeared",
+                              "is_generating",
+                              "msg_count_before", "msg_count_after",
+                              "attempts_used"):
+                        if k in details:
+                            print(f"    {k}: {details[k]}",
+                                  file=sys.stderr)
+                    if details.get("attach_upload_wait"):
+                        print(
+                            f"    attach_upload_wait: "
+                            f"{details['attach_upload_wait']}",
+                            file=sys.stderr,
+                        )
+                    if not args.continue_on_error:
+                        break
+                else:
+                    completed.add(i)
+                    progress["completed"] = sorted(completed)
+                    progress["current"] = None
+                    progress["status"] = "sending"
+                    _save_progress(ws, progress)
 
-        print(file=sys.stderr)
-        if not failures:
-            print(f"[done] all {total} part(s) sent.", file=sys.stderr)
-            return 0
-        print(
-            f"[done] {len(failures)} of {total} part(s) failed:",
-            file=sys.stderr,
-        )
-        for (i, name, result) in failures:
+                # ---- between-parts pacing ----
+                #
+                # Skip the readiness probe when the reply-wait already
+                # confirmed the model is done (`is_generating == False`).
+                # The next part's `attach` uses `wait_upload: true`,
+                # which calls `waitComposerReady` inside the page world
+                # — that's the authoritative readiness gate.  Re-probing
+                # here just adds an SSE round-trip with no informational
+                # value.
+                if i < total and not args.no_wait:
+                    if _needs_between_parts_wait(result):
+                        if not _wait_for_composer_ready(
+                            server, tab_id,
+                            ready_timeout=args.ready_timeout,
+                            poll_interval=args.ready_poll,
+                        ):
+                            print(
+                                f"  [ready] composer did not become ready "
+                                f"within {args.ready_timeout:.0f}s; "
+                                f"proceeding anyway",
+                                file=sys.stderr,
+                            )
+                    if args.gap > 0:
+                        time.sleep(args.gap)
+
+            progress["status"] = "done" if not failures else "partial"
+            progress["finished_at"] = int(time.time())
+            _save_progress(ws, progress)
+
+            print(file=sys.stderr)
+            if not failures:
+                print(f"[done] all {total} part(s) sent.",
+                      file=sys.stderr)
+                return 0
+
             print(
-                f"  part {i}/{total}: {name}  "
-                f"stage={result.get('stage')!r}  "
-                f"reason={result.get('reason') or result.get('error')!r}",
+                f"[done] {len(failures)} of {total} part(s) failed:",
                 file=sys.stderr,
             )
-        return 2
+            for f in failures:
+                print(
+                    f"  part {f['part']}/{total}: {f['name']}\n"
+                    f"    stage:  {f['stage']!r}\n"
+                    f"    reason: {f['reason']!r}\n"
+                    f"    attempts: {f['attempts']}",
+                    file=sys.stderr,
+                )
+            print(
+                f"\nprogress: {ws / PROGRESS_FILE_NAME}\n"
+                f"  resumable with `--workspace {ws} --resume`",
+                file=sys.stderr,
+            )
+            return 2
+        finally:
+            if outstanding_watches:
+                print(
+                    f"[cleanup] stopping {len(outstanding_watches)} "
+                    f"outstanding watch(es)",
+                    file=sys.stderr,
+                )
+                for bid in outstanding_watches:
+                    try:
+                        payload = {"batch_id": bid}
+                        if tab_id_for_cleanup is not None:
+                            payload["tab_id"] = tab_id_for_cleanup
+                        server._broadcast("stop-watch", payload)
+                    except Exception:
+                        pass
 
 
 # ---------------------------------------------------------------------------
@@ -459,8 +1076,10 @@ def register(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "split_send",
         help="Split a dump file into N parts and send each part "
-             "sequentially to DeepSeek with a short ack prompt "
-             "(\"this is part i/N, just say roger\")",
+             "sequentially to DeepSeek with a short ack prompt.  "
+             "Uses fast reply-appearance detection between parts "
+             "(wait-for-reply) by default; falls back to the full "
+             "watch flow with --use-watch.",
     )
     p.add_argument(
         "file", type=Path, metavar="FILE",
@@ -468,26 +1087,72 @@ def register(sub: argparse._SubParsersAction) -> None:
     )
     p.add_argument(
         "-n", "--parts", type=int, default=None, metavar="N",
-        help=f"number of parts (default: {DEFAULT_PARTS}, matching "
-             f"dumps_split.py).  Mutually exclusive with "
-             f"--target-lines.",
+        help=f"number of parts (default: {DEFAULT_PARTS}).",
     )
     p.add_argument(
         "--target-lines", type=int, default=None, metavar="L",
-        help="alternative to --parts: target L lines per part.  "
-             "Mutually exclusive with --parts.",
+        help="alternative to --parts: target L lines per part.",
     )
     p.add_argument(
         "-t", "--text-template", default=DEFAULT_PROMPT_TEMPLATE,
         metavar="STR",
-        help=f"composer text per part.  {{i}} is the 1-based part "
-             f"index, {{n}} the total, {{name}} the part filename.  "
+        help=f"composer text per part.  {{i}}, {{n}}, {{name}} "
              f"(default: {DEFAULT_PROMPT_TEMPLATE!r})",
     )
     p.add_argument(
+        "--tab-id", type=int, default=None, metavar="N",
+        help="pin to this tab id instead of auto-discovering.",
+    )
+    p.add_argument(
         "--workspace", type=Path, default=None,
-        help="directory for the split parts.  Default: a fresh "
-             "temp dir in /tmp.",
+        help="directory for the split parts and progress.json.",
+    )
+    p.add_argument(
+        "--resume", action="store_true",
+        help="skip parts already marked completed in progress.json.",
+    )
+    p.add_argument(
+        "--reply-timeout", type=float, default=60.0, metavar="SECONDS",
+        help="max wait for the assistant's reply to appear in the "
+             "DOM (default: 60).",
+    )
+    p.add_argument(
+        "--min-reply-chars", type=int, default=1, metavar="N",
+        help="minimum reply length (in characters) before the next "
+             "part is sent (default: 1).",
+    )
+    p.add_argument(
+        "--use-watch", action="store_true",
+        help="use the full watch flow (waits for Stop button + "
+             "extracts content via API + settle ticks) instead of "
+             "wait-for-reply.",
+    )
+    p.add_argument(
+        "--enter-attempts", type=int, default=5, metavar="N",
+        help="how many times doEnter presses Enter before giving up "
+             "(default: 5).",
+    )
+    p.add_argument(
+        "--retries", type=int, default=1, metavar="N",
+        help="pipeline-level retries on failure (default: 1).",
+    )
+    p.add_argument(
+        "--continue-on-error", action="store_true",
+        help="continue sending subsequent parts after a failure.",
+    )
+    p.add_argument(
+        "--no-wait", action="store_true",
+        help="skip the reply-wait step entirely — fire each part "
+             "and move on without waiting for the model.",
+    )
+    p.add_argument(
+        "--upload-timeout", type=float, default=30.0, metavar="SECONDS",
+        help="max wait for a file chip to finish uploading (default: 30).",
+    )
+    p.add_argument(
+        "--upload-min-wait", type=float, default=0.5, metavar="SECONDS",
+        help="minimum wait after a chip appears, even if no upload "
+             "signal is detectable (default: 0.5).",
     )
     p.add_argument(
         "--port", type=int, default=8765,
@@ -498,41 +1163,46 @@ def register(sub: argparse._SubParsersAction) -> None:
         help="initial extension-connection timeout (default: 120)",
     )
     p.add_argument(
+        "--bind-timeout", type=float, default=30.0,
+        help="timeout for bind-tab / bind-composer (default: 30)",
+    )
+    p.add_argument(
         "--attach-timeout", type=float, default=60.0,
-        help="per-event timeout for attach / type / enter "
-             "(default: 60)",
+        help="per-event timeout for clear / type / enter "
+             "(default: 60).",
     )
     p.add_argument(
         "--watch-timeout", type=float, default=300.0,
-        help="max wait per part for the model to finish generating "
-             "(default: 300).  Raise this if the model routinely "
-             "thinks longer than 5 minutes on each part.",
+        help="max wait per part when --use-watch is set "
+             "(default: 300).",
+    )
+    p.add_argument(
+        "--ready-timeout", type=float, default=30.0,
+        help="how long to poll for composer readiness at startup "
+             "and (when needed) between parts (default: 30).",
+    )
+    p.add_argument(
+        "--ready-poll", type=float, default=0.2,
+        help="polling interval for the readiness probe "
+             "(default: 0.2, reduced from 0.5 in the fifth iteration "
+             "because the probe is now only called when we actually "
+             "need to wait).",
     )
     p.add_argument(
         "--split-timeout", type=float, default=300.0,
         help="timeout for dumps_split.py (default: 300)",
     )
     p.add_argument(
-        "--gap", type=float, default=1.5,
-        help="seconds between parts, giving the UI time to re-enable "
-             "the composer (default: 1.5)",
-    )
-    p.add_argument(
-        "--no-wait", action="store_true",
-        help="skip the watch step — fire each part and move on "
-             "without waiting for the model's reply.  Fast but "
-             "risky; the next part may collide with the current "
-             "generation.  Intended for testing.",
-    )
-    p.add_argument(
-        "--continue-on-error", action="store_true",
-        help="continue sending subsequent parts after a failure "
-             "(default: bail on first failure, leaving the tree in "
-             "place for inspection)",
+        "--gap", type=float, default=0.0,
+        help="minimum seconds between parts after readiness settles "
+             "(default: 0.0).  The fifth-iteration flow already "
+             "guarantees the model is done before the next part "
+             "starts, so this sleep was removed as dead time.  "
+             "Raise only if you observe a race on your DeepSeek "
+             "build (unlikely).",
     )
     p.add_argument(
         "--dry-run", action="store_true",
-        help="split but don't send; print the plan (one line per "
-             "part: filename TAB prompt text) and exit",
+        help="split but don't send; print the plan and exit",
     )
     p.set_defaults(func=run)
