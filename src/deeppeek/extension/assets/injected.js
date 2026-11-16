@@ -37,13 +37,18 @@
   // Selectors for the chat scroll container and the title element.
   // Used by getChatTitle() and extractViaFiber().
   window.__dsx__.config = {
-    chatContainerSelector: ".ds-virtual-list-visible-items",
+    // Added Qwen's message containers to the fallback chain
+    chatContainerSelector: ".ds-virtual-list-visible-items, .chat-messages-container, .chat-messages",
     titleSelector: ".afa34042.e37a04e4.e0a1edb7",
   };
 
   window.__dsx__.getChatTitle = function () {
     const el = document.querySelector(window.__dsx__.config.titleSelector);
-    return el ? el.textContent.trim() : null;
+    if (el && el.textContent.trim()) {
+      return el.textContent.trim();
+    }
+    // Fallback for Qwen and other providers
+    return document.title.trim() || null;
   };
 
   // DeepSeek URLs look like:

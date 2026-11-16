@@ -7,7 +7,7 @@
 
 async function getActiveDeepSeekTab() {
   const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
-  if (!tab || !tab.url || !tab.url.startsWith("https://chat.deepseek.com/")) {
+  if (!isSupportedTab(tab)) {
     return null;
   }
   return tab;

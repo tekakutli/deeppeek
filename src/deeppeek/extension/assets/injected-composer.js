@@ -45,11 +45,16 @@
   if (!window.__dsx__) window.__dsx__ = {};
 
   const COMPOSER_STRATEGIES = [
+    // DeepSeek
     'textarea[placeholder*="Message DeepSeek"]',
     'textarea[data-testid="chat-input"]',
     '#chat-input',
-    'div[contenteditable][role="textbox"]',
+    // Qwen (NEW)
+    'textarea.message-input-textarea',
+    'textarea[placeholder="Ask Qwen"]',
+    // Generic fallbacks
     'textarea',
+    'div[contenteditable][role="textbox"]',
   ];
 
   function _isEditable(el) {

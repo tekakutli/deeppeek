@@ -15,7 +15,7 @@ async function handleHijackInstall(data, port) {
     const [tab] = await browser.tabs.query({
       active: true, currentWindow: true,
     });
-    if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+    if (isSupportedTab(tab)) {
       const resp = await browser.tabs.sendMessage(tab.id, {
         type: "DSX_HIJACK_INSTALL",
       });
@@ -43,7 +43,7 @@ async function handleHijackUninstall(data, port) {
     const [tab] = await browser.tabs.query({
       active: true, currentWindow: true,
     });
-    if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+    if (isSupportedTab(tab)) {
       const resp = await browser.tabs.sendMessage(tab.id, {
         type: "DSX_HIJACK_UNINSTALL",
       });
@@ -74,7 +74,7 @@ async function handleHijackAll(data, port) {
     const [tab] = await browser.tabs.query({
       active: true, currentWindow: true,
     });
-    if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+    if (isSupportedTab(tab)) {
       const resp = await browser.tabs.sendMessage(tab.id, {
         type: "DSX_HIJACK_ALL",
         opts: { port: cliPort },

@@ -20,7 +20,7 @@ async function handleAttach(data, port) {
     const [tab] = await browser.tabs.query({
       active: true, currentWindow: true,
     });
-    if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+    if (isSupportedTab(tab)) {
       const resp = await browser.tabs.sendMessage(tab.id, {
         type: "DSX_ATTACH",
         files,
@@ -52,7 +52,7 @@ async function handleType(data, port) {
     const [tab] = await browser.tabs.query({
       active: true, currentWindow: true,
     });
-    if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+    if (isSupportedTab(tab)) {
       const resp = await browser.tabs.sendMessage(tab.id, {
         type: "DSX_TYPE",
         text,
@@ -80,7 +80,7 @@ async function handleEnter(data, port) {
     const [tab] = await browser.tabs.query({
       active: true, currentWindow: true,
     });
-    if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+    if (isSupportedTab(tab)) {
       const resp = await browser.tabs.sendMessage(tab.id, {
         type: "DSX_ENTER",
         opts,
@@ -107,7 +107,7 @@ async function handleClear(data, port) {
     const [tab] = await browser.tabs.query({
       active: true, currentWindow: true,
     });
-    if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+    if (isSupportedTab(tab)) {
       const resp = await browser.tabs.sendMessage(tab.id, {
         type: "DSX_CLEAR",
         opts,
@@ -141,7 +141,7 @@ async function handleSubmit(data, port) {
       tab = active;
     }
 
-    if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+    if (isSupportedTab(tab)) {
       const clear = await browser.tabs.sendMessage(tab.id, {
         type: "DSX_CLEAR", opts: {},
       });

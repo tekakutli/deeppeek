@@ -18,7 +18,7 @@ async function handleExtract(data, port) {
     const [tab] = await browser.tabs.query({
       active: true, currentWindow: true,
     });
-    if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+    if (isSupportedTab(tab)) {
       const resp = await browser.tabs.sendMessage(tab.id, {
         type: "DSX_EXTRACT",
         include_forked: includeForked,
@@ -48,7 +48,7 @@ async function handleExtractAttachments(data, port) {
     const [tab] = await browser.tabs.query({
       active: true, currentWindow: true,
     });
-    if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+    if (isSupportedTab(tab)) {
       const resp = await browser.tabs.sendMessage(tab.id, {
         type: "DSX_EXTRACT_ATTACHMENTS",
         opts,
@@ -90,7 +90,7 @@ async function handleRetryLast(data, port) {
     const [tab] = await browser.tabs.query({
       active: true, currentWindow: true,
     });
-    if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+    if (isSupportedTab(tab)) {
       const resp = await browser.tabs.sendMessage(tab.id, {
         type: "DSX_RETRY_LAST",
         opts,
@@ -148,8 +148,7 @@ async function handleWatch(data, port) {
     });
     tab = active;
   }
-  if (!tab || !tab.url
-      || !tab.url.startsWith("https://chat.deepseek.com/")) {
+  if (!isSupportedTab(tab)) {
     await postAck(port, {
       __ack: "watch-done",
       batch_id: batchId,

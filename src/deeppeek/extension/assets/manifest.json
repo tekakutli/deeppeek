@@ -12,6 +12,8 @@
   "permissions": ["scripting", "activeTab", "storage", "unlimitedStorage", "contextualIdentities", "cookies"],
   "host_permissions": [
     "https://chat.deepseek.com/*",
+    "https://chat.qwen.ai/*",
+    "https://chat.qwen.com/*",
     "http://127.0.0.1/*"
   ],
   "background": {
@@ -34,7 +36,11 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://chat.deepseek.com/*"],
+      "matches": [
+        "https://chat.deepseek.com/*",
+        "https://chat.qwen.ai/*",
+        "https://chat.qwen.com/*"
+      ],
       "js": ["content.js"],
       "run_at": "document_idle"
     }
@@ -58,7 +64,11 @@
         "button-rules/_manifest.json",
         "button-rules/*.js"
       ],
-      "matches": ["https://chat.deepseek.com/*"]
+      "matches": [
+        "https://chat.deepseek.com/*",
+        "https://chat.qwen.ai/*",
+        "https://chat.qwen.com/*"
+      ]
     }
   ]
 }

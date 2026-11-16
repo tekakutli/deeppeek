@@ -9,8 +9,7 @@
 //   through to 8767 (daemon) if only the daemon is listening.
 
 browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.status === "complete" &&
-      tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+  if (changeInfo.status === "complete" && isSupportedTab(tab)) {
     ensureAllConnected();
     maybeFire();
   }
@@ -19,7 +18,7 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 browser.tabs.onActivated.addListener(async (activeInfo) => {
   try {
     const tab = await browser.tabs.get(activeInfo.tabId);
-    if (tab && tab.url && tab.url.startsWith("https://chat.deepseek.com/")) {
+    if (isSupportedTab(tab)) {
       ensureAllConnected();
       maybeFire();
     }

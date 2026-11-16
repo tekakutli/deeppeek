@@ -8,6 +8,16 @@
 
 const DSX_PORTS = [8765, 8767];
 
+const SUPPORTED_DOMAINS = [
+  "https://chat.deepseek.com/",
+  "https://chat.qwen.ai/",
+  "https://chat.qwen.com/",
+];
+
+function isSupportedTab(tab) {
+  return tab && tab.url && SUPPORTED_DOMAINS.some(domain => tab.url.startsWith(domain));
+}
+
 // Per-port SSE connection state: connections.get(port) = {
 //   es,          // EventSource | undefined
 //   wasConnected,// bool — for one-shot log
