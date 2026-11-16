@@ -194,7 +194,7 @@ DEFAULT_INCLUDE_FILE_SUBSTRINGS = []
 
 # Filename substrings blacklist: if a filename contains ANY of these, the
 # file is skipped.
-DEFAULT_EXCLUDE_FILE_SUBSTRINGS = ["project_dump", "shrinking", 'EMISSION', 'README.md',]
+DEFAULT_EXCLUDE_FILE_SUBSTRINGS = [".aider.chat.history.md","project_dump", "shrinking", 'EMISSION', 'README.md',]
 # ---------------------------------------------------------------------------
 
 HEADER = "=" * 70
