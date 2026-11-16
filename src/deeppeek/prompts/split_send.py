@@ -12,56 +12,50 @@ PIPELINE
 
     bind-tab          pin the pipeline to one specific chat tab
     bind-composer     pin the pipeline to one specific composer element
-    split             `dumps_split.py <file> -n N -o <ws>`
+    split             `dumps_split.py <file> -o <ws>`
+                      (fit-parts mode: iteratively increases part count
+                      until every part is < DEFAULT_MAX_PART_BYTES,
+                      defined in dumps_split.py's CONFIGURATION section)
     for each part:
       clear           idempotent reset before each part
       wait_ready      poll probe-composer until composer ready
-      attach          with `wait_upload: true` (waits for
-                      send-button-enabled via page-world
-                      waitComposerReady)
+      attach          with `wait_upload: true`
       type            in parallel with attach
-      enter           adaptive retry (precheck + 3 attempts +
-                      send-button fallback)
-      wait-reply      fast "reply appeared" signal (~1-2s for
-                      short replies); DOM-only, no API extraction
-      (skip ready)    if reply.is_generating == False, the model
-                      is done; the next attach's internal
-                      waitComposerReady is the readiness gate
+      enter           adaptive retry
+      wait-reply      fast "reply appeared" signal
+      (skip ready)    if reply.is_generating == False, skip the probe
       checkpoint      progress.json updated
 
-BETWEEN-PARTS LATENCY (2026-11-15, fifth iteration)
-====================================================
-Previous versions slept `--gap` (default 1.5s) + did an
-extra `_wait_for_composer_ready` probe between parts.  Observed
-per-part gap: ~1.6s of dead time even when the reply already
-confirmed `is_generating=False`.
+SPLIT MODE (2026-11-15, sixth iteration)
+========================================
+Previously, `split_send.py` forced `-n 9` unless the user passed
+`-n` or `--target-lines`.  Now it defers to `dumps_split.py`'s
+fit-parts default: the split tool computes how many parts are
+needed so every chunk is under `DEFAULT_MAX_PART_BYTES` (125 KiB),
+checks the largest chunk, and increments parts count until the
+whole set fits.
 
-Now:
-  · `--gap` default = 0.0  (kept as a knob for pathological cases)
-  · `_wait_for_composer_ready` is SKIPPED when the reply-wait
-    reported `is_generating == False` — the model is definitively
-    finished, and the next `attach`'s internal `waitComposerReady`
-    (which blocks on the send-button-enabled class) is the actual
-    readiness gate.
-
-Effect: the gap between "reply detected" and "next part starts"
-shrinks to the SSE round-trip time (~50-100ms) instead of ~1.6s.
-
-FAST REPLY DETECTION (unchanged)
-================================
-`wait-for-reply` polls the DOM for a new assistant message with
-non-empty `.ds-markdown` content.  Returns as soon as one appears.
-No API extraction, no settle ticks.
+To override:
+  · `-n N`             — explicit part count (old behavior)
+  · `--target-lines L` — target lines per part
+  · `--max-part-bytes N`— fit mode with a custom byte limit
+                          (single source of truth: edit
+                          DEFAULT_MAX_PART_BYTES in dumps_split.py)
 
 USAGE
 =====
 
     deeppeek prompt split_send /path/to/dump.md
-    deeppeek prompt split_send dump.md --parts 5
-    deeppeek prompt split_send dump.md --reply-timeout 120
-    deeppeek prompt split_send dump.md --min-reply-chars 3
-    deeppeek prompt split_send dump.md --use-watch    # old behaviour
-    deeppeek prompt split_send dump.md --gap 0.5      # extra safety
+       → splits to fit under 125 KiB per part (default)
+
+    deeppeek prompt split_send dump.md -n 9
+       → explicit 9 parts
+
+    deeppeek prompt split_send dump.md --max-part-bytes 200000
+       → fit to 200 KB
+
+    deeppeek prompt split_send dump.md --target-lines 3000
+
     deeppeek prompt split_send dump.md --dry-run
     deeppeek prompt split_send dump.md --tab-id 42
     deeppeek prompt split_send dump.md --resume
@@ -99,8 +93,12 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _SPLIT_SCRIPT = _PROJECT_ROOT / "scripts" / "dumps" / "dumps_split.py"
 
 DEFAULT_PROMPT_TEMPLATE = "this is part {i}/{n}, just say roger"
-DEFAULT_PARTS = 9
 PROGRESS_FILE_NAME = "progress.json"
+
+# Legacy fallback — used only by `--no-fit` in dumps_split.py, kept
+# here so `--no-fit` behaves identically to the pre-6th-iteration
+# default.
+DEFAULT_PARTS = 9
 
 _RETRY_DELAYS = [10.0, 30.0, 60.0, 120.0]
 
@@ -138,7 +136,7 @@ def _run_cmd(cmd: list[str], *,
         tag = "(allowed)" if allow_failure else ""
         print(f"    exit {proc.returncode} {tag}".rstrip(),
               file=sys.stderr)
-        for line in (proc.stderr or "").splitlines()[:5]:
+        for line in (proc.stderr or "").splitlines()[:8]:
             print(f"      {line}", file=sys.stderr)
     return proc.returncode, proc.stdout, proc.stderr
 
@@ -273,8 +271,18 @@ def _stage_split(
     ws: Path,
     n_parts: Optional[int],
     target_lines: Optional[int],
+    max_part_bytes: Optional[int],
     timeout: float,
 ) -> list[Path]:
+    """Invoke `dumps_split.py` and return the part paths.
+
+    Mode resolution (deferred to dumps_split.py):
+      · If `n_parts` is not None → pass `-n N` (explicit count).
+      · Else if `target_lines` is not None → pass `--target-lines L`.
+      · Else if `max_part_bytes` is not None → pass `--max-part-bytes N`.
+      · Else → pass nothing; dumps_split.py uses fit mode with its
+        default DEFAULT_MAX_PART_BYTES.
+    """
     if not _SPLIT_SCRIPT.is_file():
         raise SystemExit(
             f"error: dumps_split.py not found at {_SPLIT_SCRIPT}\n"
@@ -285,11 +293,13 @@ def _stage_split(
         raise SystemExit(f"error: not a file: {dump_path}")
 
     cmd = [sys.executable, str(_SPLIT_SCRIPT), str(dump_path)]
-    if target_lines is not None:
+    if n_parts is not None:
+        cmd.extend(["-n", str(n_parts)])
+    elif target_lines is not None:
         cmd.extend(["--target-lines", str(target_lines)])
-    else:
-        n = n_parts if n_parts is not None else DEFAULT_PARTS
-        cmd.extend(["-n", str(n)])
+    elif max_part_bytes is not None:
+        cmd.extend(["--max-part-bytes", str(max_part_bytes)])
+    # else: no mode flag → dumps_split.py uses fit mode by default
     cmd.extend(["-o", str(ws)])
 
     print(f"[split] dumps_split {dump_path.name}", file=sys.stderr)
@@ -371,12 +381,6 @@ def _wait_for_reply(
     reply_timeout: float,
     min_reply_chars: int,
 ) -> tuple[int, dict]:
-    """Send `wait-for-reply` and wait for its ack.
-
-    Returns (rc, result) with rc following broadcast_and_wait
-    conventions.  On success, result carries `reply_text`,
-    `reply_length`, `waited_ms`, `is_generating`.
-    """
     return broadcast_and_wait(
         server, "wait-for-reply",
         {
@@ -501,7 +505,7 @@ def _send_one_part(
         else:
             print(f"  [ok]   {tag}", file=sys.stderr)
 
-    # ---- enter (adaptive retry inside the page world) ----
+    # ---- enter ----
     rc, result = broadcast_and_wait(
         server, "enter",
         {
@@ -581,7 +585,7 @@ def _send_one_part(
             },
         }
 
-    # ---- slow path: full watch (opt-in via --use-watch) ----
+    # ---- slow path: full watch ----
     print(f"  [watch] waiting for model to finish (--use-watch)...",
           file=sys.stderr)
     batch_id = uuid.uuid4().hex[:12]
@@ -643,7 +647,7 @@ def _send_one_part(
 
 
 # ---------------------------------------------------------------------------
-# Retry wrapper (pipeline level)
+# Retry wrapper
 # ---------------------------------------------------------------------------
 
 def _send_part_with_retry(
@@ -712,37 +716,15 @@ def _send_part_with_retry(
     }
 
 
-# ---------------------------------------------------------------------------
-# Between-parts readiness decision
-# ---------------------------------------------------------------------------
-
 def _needs_between_parts_wait(result: dict) -> bool:
-    """Return True if we should run `_wait_for_composer_ready` before
-    the next part.
+    """True if we should probe before the next part.
 
-    Cases where we CAN skip:
-      · The reply-wait returned `is_generating == False`.  The model
-        is definitively done.  The next part's `attach` uses
-        `wait_upload: true`, which internally calls
-        `waitComposerReady` and blocks on the send-button-enabled
-        class — that's the authoritative readiness gate.  Re-probing
-        here just adds an SSE round-trip.
-
-    Cases where we must wait:
-      · `--no-wait` mode (no reply info at all).
-      · `--use-watch` mode (the watch flow returned, but its result
-        may not carry `is_generating`; safe to probe).
-      · reply-wait returned `is_generating == True` (rare — content
-        appeared before the model finished; needs to wait for the
-        Stop button to clear before next attach).
+    False when the reply-wait reported `is_generating == False` —
+    the next attach's internal `waitComposerReady` is the gate.
     """
     details = result.get("details") or {}
     reply_wait = details.get("reply_wait") or {}
-    reply_gen = reply_wait.get("is_generating")
-
-    if reply_gen is False:
-        return False  # skip
-    return True  # default: probe
+    return reply_wait.get("is_generating") is not False
 
 
 # ---------------------------------------------------------------------------
@@ -755,9 +737,15 @@ def run(args: argparse.Namespace) -> int:
         print(f"error: not a file: {dump_path}", file=sys.stderr)
         return 1
 
-    if args.parts is not None and args.target_lines is not None:
+    # ---- argument validation ----
+    explicit_modes = sum(
+        1 for v in (args.parts, args.target_lines, args.max_part_bytes)
+        if v is not None
+    )
+    if explicit_modes > 1:
         print(
-            "error: --parts and --target-lines are mutually exclusive",
+            "error: -n/--parts, --target-lines, and --max-part-bytes "
+            "are mutually exclusive",
             file=sys.stderr,
         )
         return 3
@@ -766,6 +754,9 @@ def run(args: argparse.Namespace) -> int:
         return 3
     if args.target_lines is not None and args.target_lines < 1:
         print("error: --target-lines must be >= 1", file=sys.stderr)
+        return 3
+    if args.max_part_bytes is not None and args.max_part_bytes < 1:
+        print("error: --max-part-bytes must be >= 1", file=sys.stderr)
         return 3
     if args.retries < 0:
         print("error: --retries must be >= 0", file=sys.stderr)
@@ -789,10 +780,7 @@ def run(args: argparse.Namespace) -> int:
         print("error: --gap must be >= 0", file=sys.stderr)
         return 3
 
-    min_attach_timeout = max(
-        args.upload_timeout + 20.0,
-        20.0,
-    )
+    min_attach_timeout = max(args.upload_timeout + 20.0, 20.0)
     effective_attach_timeout = max(
         args.attach_timeout, min_attach_timeout,
     )
@@ -832,6 +820,7 @@ def run(args: argparse.Namespace) -> int:
             dump_path, ws,
             n_parts=args.parts,
             target_lines=args.target_lines,
+            max_part_bytes=args.max_part_bytes,
             timeout=args.split_timeout,
         )
     except SystemExit as e:
@@ -998,15 +987,6 @@ def run(args: argparse.Namespace) -> int:
                     progress["status"] = "sending"
                     _save_progress(ws, progress)
 
-                # ---- between-parts pacing ----
-                #
-                # Skip the readiness probe when the reply-wait already
-                # confirmed the model is done (`is_generating == False`).
-                # The next part's `attach` uses `wait_upload: true`,
-                # which calls `waitComposerReady` inside the page world
-                # — that's the authoritative readiness gate.  Re-probing
-                # here just adds an SSE round-trip with no informational
-                # value.
                 if i < total and not args.no_wait:
                     if _needs_between_parts_wait(result):
                         if not _wait_for_composer_ready(
@@ -1075,24 +1055,34 @@ def run(args: argparse.Namespace) -> int:
 def register(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "split_send",
-        help="Split a dump file into N parts and send each part "
+        help="Split a dump file into parts and send each part "
              "sequentially to DeepSeek with a short ack prompt.  "
-             "Uses fast reply-appearance detection between parts "
-             "(wait-for-reply) by default; falls back to the full "
-             "watch flow with --use-watch.",
+             "By default uses fit-parts mode (each part under "
+             "125 KiB); override with -n, --target-lines, or "
+             "--max-part-bytes.",
     )
     p.add_argument(
         "file", type=Path, metavar="FILE",
         help="dump file to split and send",
     )
-    p.add_argument(
+
+    mode_group = p.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "-n", "--parts", type=int, default=None, metavar="N",
-        help=f"number of parts (default: {DEFAULT_PARTS}).",
+        help="explicit number of parts (overrides fit mode).",
     )
-    p.add_argument(
+    mode_group.add_argument(
         "--target-lines", type=int, default=None, metavar="L",
-        help="alternative to --parts: target L lines per part.",
+        help="target L lines per part (overrides fit mode).",
     )
+    mode_group.add_argument(
+        "--max-part-bytes", type=int, default=None, metavar="N",
+        help="fit mode with a custom byte limit.  Default: the "
+             "constant DEFAULT_MAX_PART_BYTES in dumps_split.py "
+             "(125 KiB).  Parts are iteratively recomputed with "
+             "more splits until every part is smaller than N.",
+    )
+
     p.add_argument(
         "-t", "--text-template", default=DEFAULT_PROMPT_TEMPLATE,
         metavar="STR",
@@ -1118,14 +1108,13 @@ def register(sub: argparse._SubParsersAction) -> None:
     )
     p.add_argument(
         "--min-reply-chars", type=int, default=1, metavar="N",
-        help="minimum reply length (in characters) before the next "
-             "part is sent (default: 1).",
+        help="minimum reply length before next part is sent "
+             "(default: 1).",
     )
     p.add_argument(
         "--use-watch", action="store_true",
-        help="use the full watch flow (waits for Stop button + "
-             "extracts content via API + settle ticks) instead of "
-             "wait-for-reply.",
+        help="use the full watch flow (Stop button + API extraction) "
+             "instead of wait-for-reply.",
     )
     p.add_argument(
         "--enter-attempts", type=int, default=5, metavar="N",
@@ -1142,17 +1131,16 @@ def register(sub: argparse._SubParsersAction) -> None:
     )
     p.add_argument(
         "--no-wait", action="store_true",
-        help="skip the reply-wait step entirely — fire each part "
-             "and move on without waiting for the model.",
+        help="skip the reply-wait step entirely.",
     )
     p.add_argument(
         "--upload-timeout", type=float, default=30.0, metavar="SECONDS",
-        help="max wait for a file chip to finish uploading (default: 30).",
+        help="max wait for a file chip to finish uploading "
+             "(default: 30).",
     )
     p.add_argument(
         "--upload-min-wait", type=float, default=0.5, metavar="SECONDS",
-        help="minimum wait after a chip appears, even if no upload "
-             "signal is detectable (default: 0.5).",
+        help="minimum wait after a chip appears (default: 0.5).",
     )
     p.add_argument(
         "--port", type=int, default=8765,
@@ -1178,15 +1166,12 @@ def register(sub: argparse._SubParsersAction) -> None:
     )
     p.add_argument(
         "--ready-timeout", type=float, default=30.0,
-        help="how long to poll for composer readiness at startup "
-             "and (when needed) between parts (default: 30).",
+        help="how long to poll for composer readiness (default: 30).",
     )
     p.add_argument(
         "--ready-poll", type=float, default=0.2,
         help="polling interval for the readiness probe "
-             "(default: 0.2, reduced from 0.5 in the fifth iteration "
-             "because the probe is now only called when we actually "
-             "need to wait).",
+             "(default: 0.2).",
     )
     p.add_argument(
         "--split-timeout", type=float, default=300.0,
@@ -1195,14 +1180,10 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--gap", type=float, default=0.0,
         help="minimum seconds between parts after readiness settles "
-             "(default: 0.0).  The fifth-iteration flow already "
-             "guarantees the model is done before the next part "
-             "starts, so this sleep was removed as dead time.  "
-             "Raise only if you observe a race on your DeepSeek "
-             "build (unlikely).",
+             "(default: 0.0).",
     )
     p.add_argument(
         "--dry-run", action="store_true",
-        help="split but don't send; print the plan and exit",
+        help="split but don't send; print the plan and exit.",
     )
     p.set_defaults(func=run)

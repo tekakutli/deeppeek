@@ -184,6 +184,7 @@ DEFAULT_INCLUDE_DIRS = []
 # DEFAULT_INCLUDE_DIRS = ['segment','text_boxes', 'pair']
 # DEFAULT_INCLUDE_DIRS = ['interceptor',]
 # DEFAULT_INCLUDE_DIRS = ["inpaint", "pgkit", "pg_comfy", "board", "text_wall", "multimask", 'remote_cli','remote_panel', 'room', 'interceptor', 'cone', 'segment','text_boxes','cable']
+DEFAULT_INCLUDE_DIRS = ["layout", "pgkit", "pg_comfy", "inpaint", ]
 
 
 # Filename substrings whitelist: if NON-EMPTY, a file is only kept when its
