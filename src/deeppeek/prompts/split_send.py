@@ -42,6 +42,57 @@ To override:
                           (single source of truth: edit
                           DEFAULT_MAX_PART_BYTES in dumps_split.py)
 
+MANUAL RESUME FROM A WORKSPACE (2026-11-16)
+===========================================
+When `split_send` fails partway through a run, the workspace (under
+/tmp, or wherever --workspace pointed) retains the split parts and
+progress.json.  To finish the run without re-splitting and without
+re-sending the parts that already went through, `cd` into the
+workspace and run:
+
+    cd /tmp/deeppeek_split_send_xxxxxxxx
+    deeppeek prompt split_send --resume_index_at 4
+
+That means "start at part 4, then 5, 6, …, N".  Parts 1..N-1 are
+skipped unconditionally — the explicit N is authoritative and
+progress.json's completed list is NOT consulted.  Use this when a
+part hung mid-run and you need to pick up exactly there.
+
+Without the N (plain `--resume_index_at`), the completed list in
+progress.json is honoured instead — only parts NOT already marked
+completed are sent.  This matches the pre-2026-11-16 behaviour and
+is the right choice when a run was cleanly stopped between parts.
+
+In both resume modes, the positional FILE argument may be omitted
+when the cwd looks like a split_send workspace (co-presence of
+progress.json and at least one `<stem>_part<i>of<N>.md` file).
+The split step is skipped entirely; the workspace's existing parts
+are used.  If --workspace DIR is given, that directory is used
+instead of cwd.
+
+A "workspace" is recognised by the co-presence of:
+  · `progress.json` — written by this command
+  · at least one file matching `<anything>_part<i>of<N>.md`
+
+That pair cannot occur accidentally, so the detection is
+unambiguous and side-effect-free.
+
+ACKNOWLEDGMENT PHRASE (2026-11-16)
+==================================
+Previously the per-part composer text always ended with the same
+suffix (`this is part i/n, just say roger`), which after a few
+parts felt mechanical.  The default template is now
+`"this is part {i}/{n}, {ack}"`, with `{ack}` picked uniformly at
+random per part from `_ACK_VARIANTS` — four short "Roger"
+phrasings.  The per-part choice is independent; nothing forces the
+same phrasing to appear twice.
+
+Custom `--text-template` strings that don't reference `{ack}` are
+unaffected — the extra placeholder is simply ignored by
+`str.format`.  Templates that do reference `{ack}` get the
+randomised value; the rest of `{i}` / `{n}` / `{name}` behave as
+before.
+
 USAGE
 =====
 
@@ -58,7 +109,15 @@ USAGE
 
     deeppeek prompt split_send dump.md --dry-run
     deeppeek prompt split_send dump.md --tab-id 42
-    deeppeek prompt split_send dump.md --resume
+    deeppeek prompt split_send dump.md --resume_index_at
+       → split then resume from completed-list
+
+    cd /tmp/deeppeek_split_send_xxxxxxxx
+    deeppeek prompt split_send --resume_index_at 4
+       → use cwd's parts, skip 1..3, send 4..N
+
+    deeppeek prompt split_send --workspace /tmp/ws --resume_index_at 4
+       → use /tmp/ws's parts, skip 1..3, send 4..N
 
 Exit codes:
     0  all parts sent successfully
@@ -74,6 +133,7 @@ import base64
 import hashlib
 import json
 import queue
+import random
 import subprocess
 import sys
 import tempfile
@@ -92,7 +152,19 @@ from ..commands._composer import (
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _SPLIT_SCRIPT = _PROJECT_ROOT / "scripts" / "dumps" / "dumps_split.py"
 
-DEFAULT_PROMPT_TEMPLATE = "this is part {i}/{n}, just say roger"
+# Randomised per-part acknowledgment phrases.  The default template
+# pulls one of these via `{ack}`; templates that don't reference
+# `{ack}` never see them.  Kept as a module-level list so extending
+# the variety is a one-line edit — nothing else references them by
+# index.
+_ACK_VARIANTS = [
+    "Just say “Roger”",
+    "Just confirm with “Roger”",
+    "Just acknowledge with “Roger”",
+    "Just give me a “Roger”",
+]
+
+DEFAULT_PROMPT_TEMPLATE = "this is part {i}/{n}, {ack}"
 PROGRESS_FILE_NAME = "progress.json"
 
 # Legacy fallback — used only by `--no-fit` in dumps_split.py, kept
@@ -101,6 +173,18 @@ PROGRESS_FILE_NAME = "progress.json"
 DEFAULT_PARTS = 9
 
 _RETRY_DELAYS = [10.0, 30.0, 60.0, 120.0]
+
+
+def _pick_ack() -> str:
+    """Uniformly pick one acknowledgment phrase for a single part.
+
+    Called once per part inside the composer-text build loop, so
+    adjacent parts can coincidentally share a phrase — the contract
+    is "random per part", not "guaranteed distinct".  If the user's
+    template doesn't reference `{ack}`, calling this is harmless
+    (the value is dropped by `str.format`).
+    """
+    return random.choice(_ACK_VARIANTS)
 
 
 def _retry_delay(attempt_number: int) -> float:
@@ -166,10 +250,76 @@ def _part_number(path: Path) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
+# Workspace detection (2026-11-16)
+# ---------------------------------------------------------------------------
+
+def _detect_workspace_from_cwd() -> Optional[Path]:
+    """Return cwd if it looks like a split_send workspace, else None.
+
+    A workspace is a directory containing BOTH of:
+      · progress.json (written by this command)
+      · at least one file matching <stem>_part<i>of<N>.md
+
+    Both checks are cheap and side-effect-free.  Any directory that
+    isn't a workspace falls through to the "fresh tempdir" path.
+    """
+    cwd = Path.cwd()
+    if not (cwd / PROGRESS_FILE_NAME).is_file():
+        return None
+    for p in cwd.iterdir():
+        if p.is_file() and _part_number(p) is not None:
+            return cwd
+    return None
+
+
+def _get_parts_from_workspace(ws: Path) -> list[Path]:
+    """Return the sorted list of numbered part files in `ws`.
+
+    Non-fatal about gaps: if parts are numbered [1, 2, 4] (a missing
+    part 3), we return them in that order and log a warning.  The
+    caller decides whether the gap is acceptable for its mode
+    (--resume_index_at N validates that N is present; plain resume
+    does not require contiguous numbering).
+    """
+    numbered: list[tuple[int, Path]] = []
+    for p in ws.iterdir():
+        if not p.is_file():
+            continue
+        n = _part_number(p)
+        if n is None:
+            continue
+        numbered.append((n, p))
+    if not numbered:
+        return []
+    numbered.sort(key=lambda t: t[0])
+    nums = [n for n, _ in numbered]
+    for expected, actual in enumerate(nums, 1):
+        if actual != expected:
+            print(
+                f"warning: part numbering is not 1..N: {nums} "
+                f"(missing part {expected})",
+                file=sys.stderr,
+            )
+            break
+    return [p for _, p in numbered]
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint file
 # ---------------------------------------------------------------------------
 
-def _load_progress(ws: Path, input_sha: str) -> Optional[dict]:
+def _load_progress(ws: Path,
+                   input_sha: Optional[str] = None) -> Optional[dict]:
+    """Load progress.json from `ws`.
+
+    When `input_sha` is None (used when resuming from inside a
+    split_send workspace, where the original input file may not be
+    available), the sha stored in progress.json is trusted as-is —
+    no validation is attempted.  When `input_sha` is a real digest,
+    it must match the stored value or the function returns None
+    (with an explanatory message), which is the pre-existing
+    behaviour.
+    """
     p = ws / PROGRESS_FILE_NAME
     if not p.is_file():
         return None
@@ -177,7 +327,7 @@ def _load_progress(ws: Path, input_sha: str) -> Optional[dict]:
         data = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    if data.get("input_sha256") != input_sha:
+    if input_sha is not None and data.get("input_sha256") != input_sha:
         print(
             f"[resume] {PROGRESS_FILE_NAME} exists but its input_sha256 "
             f"doesn't match this file; starting fresh",
@@ -728,15 +878,92 @@ def _needs_between_parts_wait(result: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Workspace + parts resolution (2026-11-16)
+# ---------------------------------------------------------------------------
+
+def _resolve_workspace_and_parts(
+    args: argparse.Namespace,
+) -> tuple[Optional[Path], bool, Optional[Path], list[Path]]:
+    """Determine (ws, need_split, dump_path, parts) up front.
+
+    Four cases:
+
+      1. --workspace DIR + FILE  → split FILE into DIR  (need_split=True)
+      2. --workspace DIR alone   → use DIR's parts      (need_split=False)
+      3. no --workspace, cwd is a split_send workspace
+                                 → use cwd's parts      (need_split=False)
+      4. no --workspace, cwd is not a workspace
+                                 → FILE required; split into fresh tempdir
+                                                       (need_split=True)
+
+    `dump_path` is None when we don't need to split (workspace mode),
+    and required otherwise.  `parts` is empty when need_split=True
+    (the caller runs _stage_split); non-empty otherwise.
+
+    Returns (ws, need_split, dump_path, parts).  ws is None on error.
+    """
+    explicit_workspace = args.workspace is not None
+
+    # ---- Case 1: explicit workspace + FILE → split into it ----
+    if explicit_workspace and args.file is not None:
+        ws = args.workspace.resolve()
+        ws.mkdir(parents=True, exist_ok=True)
+        print(f"[workspace] {ws} (will split FILE into it)",
+              file=sys.stderr)
+        return ws, True, args.file.resolve(), []
+
+    # ---- Case 2: explicit workspace, no FILE → use it ----
+    if explicit_workspace and args.file is None:
+        ws = args.workspace.resolve()
+        if not ws.is_dir():
+            print(
+                f"error: --workspace {ws} does not exist; "
+                f"either create it, provide a FILE positional "
+                f"argument to split into it, or run from inside an "
+                f"existing workspace.",
+                file=sys.stderr,
+            )
+            return None, False, None, []
+        print(f"[workspace] {ws} (existing workspace, no split)",
+              file=sys.stderr)
+        return ws, False, None, _get_parts_from_workspace(ws)
+
+    # ---- Case 3 & 4: no --workspace ----
+    detected = _detect_workspace_from_cwd()
+    if detected is not None:
+        ws = detected
+        print(f"[workspace] {ws} (detected from cwd, no split)",
+              file=sys.stderr)
+        if args.file is not None:
+            print(
+                f"  ignoring positional FILE arg {args.file} — "
+                f"using the parts already present in {ws}",
+                file=sys.stderr,
+            )
+        return ws, False, None, _get_parts_from_workspace(ws)
+
+    # ---- Case 4: not a workspace, FILE required ----
+    if args.file is None:
+        print(
+            "error: FILE is required when not run from inside a "
+            "split_send workspace (cwd has no progress.json + "
+            "part files).  Either:\n"
+            "  · cd into an existing workspace and retry, or\n"
+            "  · pass a FILE positional argument, or\n"
+            "  · pass --workspace DIR along with FILE.",
+            file=sys.stderr,
+        )
+        return None, False, None, []
+    ws = Path(tempfile.mkdtemp(prefix="deeppeek_split_send_"))
+    print(f"[workspace] {ws} (fresh tempdir)", file=sys.stderr)
+    return ws, True, args.file.resolve(), []
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
 def run(args: argparse.Namespace) -> int:
-    dump_path = args.file.resolve()
-    if not dump_path.is_file():
-        print(f"error: not a file: {dump_path}", file=sys.stderr)
-        return 1
-
     # ---- argument validation ----
     explicit_modes = sum(
         1 for v in (args.parts, args.target_lines, args.max_part_bytes)
@@ -757,6 +984,11 @@ def run(args: argparse.Namespace) -> int:
         return 3
     if args.max_part_bytes is not None and args.max_part_bytes < 1:
         print("error: --max-part-bytes must be >= 1", file=sys.stderr)
+        return 3
+    if args.resume_index_at is not None and args.resume_index_at < 0:
+        print("error: --resume_index_at must be >= 0 (0 = skip "
+              "completed list, N>=1 = start at part N)",
+              file=sys.stderr)
         return 3
     if args.retries < 0:
         print("error: --retries must be >= 0", file=sys.stderr)
@@ -792,40 +1024,96 @@ def run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    # ---- workspace ----
-    if args.workspace is None:
-        ws = Path(tempfile.mkdtemp(prefix="deeppeek_split_send_"))
-    else:
-        ws = args.workspace.resolve()
-        ws.mkdir(parents=True, exist_ok=True)
-    print(f"[workspace] {ws}", file=sys.stderr)
+    # ---- workspace + parts resolution ----
+    ws, need_split, dump_path, parts = _resolve_workspace_and_parts(args)
+    if ws is None:
+        return 3
     print(f"  (kept after run for inspection; rm -rf {ws} when done)",
           file=sys.stderr)
 
-    input_sha = _sha256_of(dump_path)
-
+    # ---- input_sha + prior_progress ----
     prior_progress: Optional[dict] = None
-    if args.resume:
-        prior_progress = _load_progress(ws, input_sha)
-        if prior_progress is not None:
-            completed = prior_progress.get("completed") or []
+    if need_split:
+        assert dump_path is not None
+        if not dump_path.is_file():
+            print(f"error: not a file: {dump_path}", file=sys.stderr)
+            return 1
+        input_sha = _sha256_of(dump_path)
+        if args.resume_index_at is not None:
+            prior_progress = _load_progress(ws, input_sha)
+            if prior_progress is not None:
+                prior_completed = prior_progress.get("completed") or []
+                print(
+                    f"[resume] {len(prior_completed)} part(s) "
+                    f"already completed: {prior_completed}",
+                    file=sys.stderr,
+                )
+    else:
+        # Workspace mode: load progress.json directly (no input file
+        # available, so don't validate the sha).
+        progress_path = ws / PROGRESS_FILE_NAME
+        if not progress_path.is_file():
             print(
-                f"[resume] {len(completed)} part(s) already completed: "
-                f"{completed}",
-                file=sys.stderr,
-            )
+                f"error: {ws} has no {PROGRESS_FILE_NAME} — not a "
+                f"split_send workspace", file=sys.stderr)
+            return 1
+        try:
+            existing = json.loads(
+                progress_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            print(
+                f"error: cannot read {progress_path}: {e}",
+                file=sys.stderr)
+            return 1
+        input_sha = existing.get("input_sha256", "")
+        if not input_sha:
+            print(
+                f"error: {progress_path} has no input_sha256; "
+                f"cannot verify part continuity",
+                file=sys.stderr)
+            return 1
+        prior_progress = existing
+        prior_completed = prior_progress.get("completed") or []
+        print(
+            f"[resume] loaded progress from {progress_path} "
+            f"({len(prior_completed)} part(s) already completed: "
+            f"{prior_completed})",
+            file=sys.stderr)
 
-    try:
-        parts = _stage_split(
-            dump_path, ws,
-            n_parts=args.parts,
-            target_lines=args.target_lines,
-            max_part_bytes=args.max_part_bytes,
-            timeout=args.split_timeout,
-        )
-    except SystemExit as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
+        # Ignore split-mode flags that were passed but can't apply.
+        ignored = []
+        if args.parts is not None:
+            ignored.append(f"--parts {args.parts}")
+        if args.target_lines is not None:
+            ignored.append(f"--target-lines {args.target_lines}")
+        if args.max_part_bytes is not None:
+            ignored.append(f"--max-part-bytes {args.max_part_bytes}")
+        if ignored:
+            print(
+                f"[workspace] ignoring {', '.join(ignored)} — using "
+                f"parts already present in the workspace",
+                file=sys.stderr)
+
+    # ---- split or use existing parts ----
+    if need_split:
+        try:
+            parts = _stage_split(
+                dump_path, ws,
+                n_parts=args.parts,
+                target_lines=args.target_lines,
+                max_part_bytes=args.max_part_bytes,
+                timeout=args.split_timeout,
+            )
+        except SystemExit as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+    else:
+        if not parts:
+            print(
+                f"error: no part files found in {ws} — the "
+                f"workspace appears to be empty or corrupted",
+                file=sys.stderr)
+            return 1
 
     total = len(parts)
     print(f"[split] {total} part(s)", file=sys.stderr)
@@ -833,29 +1121,7 @@ def run(args: argparse.Namespace) -> int:
         print(f"  {p.name}  ({p.stat().st_size:,} bytes)",
               file=sys.stderr)
 
-    texts: list[str] = []
-    for i, p in enumerate(parts, 1):
-        try:
-            t = args.text_template.format(i=i, n=total, name=p.name)
-        except (KeyError, IndexError) as e:
-            print(
-                f"error: text template format failed: {e}\n"
-                f"  available placeholders: {{i}}, {{n}}, {{name}}",
-                file=sys.stderr,
-            )
-            return 3
-        texts.append(t)
-
-    if args.dry_run:
-        for (p, t) in zip(parts, texts):
-            print(f"{p.name}\t{t}")
-        print(
-            f"\n[dry-run] {total} part(s) would be sent "
-            f"sequentially; nothing sent.",
-            file=sys.stderr,
-        )
-        return 0
-
+    # ---- resolve skip_set from --resume_index_at mode ----
     completed: set[int] = set()
     if prior_progress is not None:
         for n in (prior_progress.get("completed") or []):
@@ -863,15 +1129,106 @@ def run(args: argparse.Namespace) -> int:
                 completed.add(int(n))
             except (TypeError, ValueError):
                 pass
-    progress = {
-        "input_sha256": input_sha,
-        "input_path": str(dump_path),
-        "total": total,
-        "completed": sorted(completed),
-        "current": None,
-        "status": "starting",
-        "started_at": int(time.time()),
-    }
+
+    skip_set: set[int] = set()
+    if args.resume_index_at is None:
+        pass  # send every part
+    elif args.resume_index_at <= 0:
+        # Boolean resume: skip the completed list from progress.json.
+        skip_set = set(completed)
+        print(
+            f"[resume] skipping {len(skip_set)} already-completed "
+            f"part(s): {sorted(skip_set)}",
+            file=sys.stderr,
+        )
+    else:
+        # Manual resume from part N.
+        start = args.resume_index_at
+        actual_nums = [_part_number(p) for p in parts]
+        if start < 1 or start > total:
+            print(
+                f"error: --resume_index_at {start} is out of range "
+                f"(valid: 1..{total})", file=sys.stderr)
+            return 3
+        if start not in actual_nums:
+            print(
+                f"error: --resume_index_at {start} but part {start} "
+                f"does not exist in {ws} (found parts: "
+                f"{sorted(actual_nums)})",
+                file=sys.stderr)
+            return 3
+        # Skip everything before N — the explicit N is authoritative.
+        # The completed list is deliberately NOT consulted: if you ask
+        # to start at 4, parts 1..3 are skipped and parts 4..N are
+        # attempted regardless of what progress.json recorded.
+        skip_set = set(range(1, start))
+        print(
+            f"[resume] manual resume: starting at part {start}/{total} "
+            f"(parts 1..{start - 1} skipped)",
+            file=sys.stderr,
+        )
+
+    # ---- build composer texts ----
+    #
+    # `{ack}` is randomised per part via `_pick_ack()`.  Templates
+    # supplied via `--text-template` that don't reference `{ack}`
+    # are unaffected — the extra kwarg is silently ignored by
+    # `str.format`.  This is what keeps the default template
+    # non-repetitive across a run of many parts.
+    texts: list[str] = []
+    for i, p in enumerate(parts, 1):
+        try:
+            t = args.text_template.format(
+                i=i, n=total, name=p.name, ack=_pick_ack(),
+            )
+        except (KeyError, IndexError) as e:
+            print(
+                f"error: text template format failed: {e}\n"
+                f"  available placeholders: {{i}}, {{n}}, {{name}}, "
+                f"{{ack}}",
+                file=sys.stderr,
+            )
+            return 3
+        texts.append(t)
+
+    if args.dry_run:
+        for i, (p, t) in enumerate(zip(parts, texts), 1):
+            marker = " (SKIP)" if i in skip_set else ""
+            print(f"{p.name}\t{t}{marker}")
+        send_count = total - len(skip_set)
+        print(
+            f"\n[dry-run] {send_count} of {total} part(s) would be "
+            f"sent sequentially; nothing sent.",
+            file=sys.stderr,
+        )
+        return 0
+
+    # ---- progress dict ----
+    # Start from prior (if any) so we never lose history; otherwise
+    # build a fresh one.
+    if prior_progress is not None:
+        progress = {
+            "input_sha256": input_sha,
+            "input_path": prior_progress.get("input_path", ""),
+            "total": total,
+            "completed": sorted(completed),
+            "current": None,
+            "status": ("resuming" if args.resume_index_at is not None
+                       else "starting"),
+            "started_at": prior_progress.get("started_at",
+                                             int(time.time())),
+        }
+    else:
+        progress = {
+            "input_sha256": input_sha,
+            "input_path": (str(dump_path) if dump_path is not None
+                           else ""),
+            "total": total,
+            "completed": sorted(completed),
+            "current": None,
+            "status": "starting",
+            "started_at": int(time.time()),
+        }
     _save_progress(ws, progress)
 
     with composer_session(
@@ -913,10 +1270,10 @@ def run(args: argparse.Namespace) -> int:
 
             failures: list[dict] = []
             for i, (part, text) in enumerate(zip(parts, texts), 1):
-                if i in completed:
+                if i in skip_set:
                     print(
-                        f"\n[skip] part {i}/{total}: already completed "
-                        f"(from progress.json)", file=sys.stderr,
+                        f"\n[skip] part {i}/{total}: skipped "
+                        f"(resume mode)", file=sys.stderr,
                     )
                     continue
 
@@ -1027,7 +1384,10 @@ def run(args: argparse.Namespace) -> int:
                 )
             print(
                 f"\nprogress: {ws / PROGRESS_FILE_NAME}\n"
-                f"  resumable with `--workspace {ws} --resume`",
+                f"  resumable with `--workspace {ws} --resume_index_at` "
+                f"(skip completed) or\n"
+                f"                  `--workspace {ws} "
+                f"--resume_index_at <N>` (start at part N)",
                 file=sys.stderr,
             )
             return 2
@@ -1059,11 +1419,16 @@ def register(sub: argparse._SubParsersAction) -> None:
              "sequentially to DeepSeek with a short ack prompt.  "
              "By default uses fit-parts mode (each part under "
              "125 KiB); override with -n, --target-lines, or "
-             "--max-part-bytes.",
+             "--max-part-bytes.  When run from inside an existing "
+             "split_send workspace, FILE may be omitted and the "
+             "workspace's parts are used directly.",
     )
     p.add_argument(
-        "file", type=Path, metavar="FILE",
-        help="dump file to split and send",
+        "file", type=Path, nargs="?", default=None, metavar="FILE",
+        help="dump file to split and send.  Optional when run from "
+             "inside a split_send workspace (or with --workspace "
+             "pointing at one) — in that case the workspace's "
+             "existing parts are used and the split step is skipped.",
     )
 
     mode_group = p.add_mutually_exclusive_group()
@@ -1086,7 +1451,11 @@ def register(sub: argparse._SubParsersAction) -> None:
     p.add_argument(
         "-t", "--text-template", default=DEFAULT_PROMPT_TEMPLATE,
         metavar="STR",
-        help=f"composer text per part.  {{i}}, {{n}}, {{name}} "
+        help=f"composer text per part.  Available placeholders: "
+             f"{{i}}, {{n}}, {{name}}, {{ack}}.  {{ack}} is a short "
+             f"'Roger' acknowledgment phrase randomised per part "
+             f"from {_ACK_VARIANTS!r}; the default template uses it. "
+             f"Templates that don't reference {{ack}} are unaffected.  "
              f"(default: {DEFAULT_PROMPT_TEMPLATE!r})",
     )
     p.add_argument(
@@ -1095,11 +1464,23 @@ def register(sub: argparse._SubParsersAction) -> None:
     )
     p.add_argument(
         "--workspace", type=Path, default=None,
-        help="directory for the split parts and progress.json.",
+        help="directory for the split parts and progress.json.  When "
+             "FILE is also given, the parts are written there.  When "
+             "FILE is omitted, the directory must already be a "
+             "split_send workspace (contain progress.json + part "
+             "files) and its existing parts are used instead of "
+             "re-splitting.",
     )
     p.add_argument(
-        "--resume", action="store_true",
-        help="skip parts already marked completed in progress.json.",
+        "--resume_index_at", nargs="?", const=0, default=None, type=int,
+        metavar="N",
+        help="Without N: skip parts already marked completed in "
+             "progress.json (pre-2026-11-16 behaviour).  With N>=1: "
+             "start at part N — parts 1..N-1 are skipped "
+             "unconditionally and progress.json's completed list is "
+             "NOT consulted; useful when a part hung mid-run.  In "
+             "either mode, if the cwd (or --workspace DIR) is an "
+             "existing split_send workspace, FILE may be omitted.",
     )
     p.add_argument(
         "--reply-timeout", type=float, default=60.0, metavar="SECONDS",
@@ -1184,6 +1565,8 @@ def register(sub: argparse._SubParsersAction) -> None:
     )
     p.add_argument(
         "--dry-run", action="store_true",
-        help="split but don't send; print the plan and exit.",
+        help="split (or use existing parts) but don't send; print the "
+             "plan — with `(SKIP)` markers for parts that resume mode "
+             "would skip — and exit.",
     )
     p.set_defaults(func=run)

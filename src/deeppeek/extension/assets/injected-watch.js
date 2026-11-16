@@ -1,4 +1,4 @@
-// Streaming watcher (v17, batch mode + wait-for-reply fast path).
+// Streaming watcher (v18, batch mode + wait-for-reply fast path).
 //
 // =====================================================================
 // watch: heavyweight, extracts full content via API, waits settle ticks
@@ -16,29 +16,60 @@
 // Added 2026-11-15 for split_send's inter-part pacing.  The user does
 // NOT need the reply content — it's a "just say roger" acknowledgment.
 // All we need is "the model has visibly responded; the next part can
-// begin".  This polls the DOM for:
+// begin".
 //
-//   1. msgCount > baseline_msg_count (a new .ds-message has appeared)
-//   2. at least one message at index >= baseline + 1 has a
-//      .ds-markdown child with trimmed text length >= min_reply_chars
+// DETECTION (last-message-identity, 2026-11-16)
+// ==============================================
+// The historical implementation compared `msg_count > baseline + 1`
+// and scanned for an answer at index >= baseline + 1.  That assumed
+// the `.ds-message` count grows monotonically with each turn.  On
+// long conversations DeepSeek's virtualized list stops growing (or
+// stops at some viewport-dependent cap), so `msg_count` gets stuck
+// at N; `msg_count >= baseline + 1` becomes `N >= N` (true), but the
+// scan `for (i = N-1; i >= baseline+1; i--)` iterates zero times.
+// The reply IS in the DOM — it just isn't reachable via the count
+// arithmetic.  First observed on part 4 of a 12-part split_send,
+// after 6 previous messages had scrolled the virtual list to its cap.
+//
+// The fix drops count-based detection entirely.  We capture the
+// DOM identity of the container's LAST `.ds-message` node once, at
+// baseline, and then poll:
+//
+//   1. Has a NEW last `.ds-message` node appeared (different DOM
+//      identity than the baseline node)?  OR has the SAME node's
+//      innerText grown?
+//   2. Does that new/grown node have a `.ds-markdown` child
+//      (excluding thinking content via `_isInsideThinking`) with
+//      trimmed text length >= min_reply_chars?
 //
 // Returns as soon as both conditions hold — typically ~1.5s after
 // submit for short replies.  Falls back to timeout (default 60s).
 //
+// `baseline_msg_count` is still reported in the response for
+// diagnostic purposes but is NEVER used to gate detection.
+//
 // Design decisions:
 //
-//   · Message index baseline.  `baseline_msg_count` is the count
-//     BEFORE submit (captured by doEnter as `msg_count_before`).  The
-//     user's new message lands at index `baseline`, the assistant
-//     placeholder at `baseline + 1`.  We scan for indices >= baseline
-//     + 1 so the user's own message (which can also contain markdown)
-//     never false-matches.
+//   · DOM identity baseline, not count baseline.  `baselineLastEl`
+//     is captured on the first poll that sees a container (by which
+//     time doEnter has already inserted the user's prompt for the
+//     current part).  Any future last-message node that differs
+//     from this reference is a candidate reply.  Scrolling and
+//     virtualization can shuffle the middle of the visible window,
+//     but the LAST node is always the most recently added one
+//     (auto-scroll keeps the newest at the bottom).
 //
 //   · Content signal.  `.ds-markdown` (or `.markdown-body` or
 //     `.prose`) is what DeepSeek renders answer text into.  A
 //     message that has this child with non-empty trimmed innerText
 //     is considered "responded".  Thinking content is excluded via
 //     `_isInsideThinking` (same check the watch flow uses).
+//
+//   · Growth signal (defensive).  If some future build reuses the
+//     same `.ds-message` node for streaming instead of appending a
+//     fresh one, `currentLastText !== baselineLastText` catches it.
+//     Costs nothing on the normal path (same node, same text →
+//     short-circuit).
 //
 //   · No Stop-button wait.  We do NOT require the Stop button to be
 //     gone.  The reason: for "just say roger", content appears
@@ -161,13 +192,15 @@
   // =====================================================================
 
   async function _waitForReplyImpl(opts) {
-    const baseline = Number(opts.baseline_msg_count) || 0;
     const minChars = Math.max(1, Number(opts.min_reply_chars) || 1);
     const maxDurationMs = Number(opts.max_duration_ms) || 60000;
-    const pollMs = Math.max(50, Number(opts.poll_interval_ms) || 200);
+    const pollMs = Math.max(100, Number(opts.poll_interval_ms) || 200);
+    const baselineReported = Number(opts.baseline_msg_count) || 0;
 
     const startedAt = Date.now();
-    let lastSig = null;
+    let baselineLastEl = undefined;  // sentinel: "not yet captured"
+    let baselineLastText = "";
+    let lastLogAt = 0;
     let sawContainer = false;
 
     while (Date.now() - startedAt < maxDurationMs) {
@@ -182,52 +215,100 @@
           "[deeppeek:wait-reply] container found, polling for reply");
       }
 
-      const msgs = container.querySelectorAll(".ds-message");
-      const count = msgs.length;
-
-      // Scan for a new assistant message with content.  We start at
-      // index baseline+1 because index baseline is the user's own
-      // prompt (which can also contain markdown — we don't want to
-      // false-match it).
-      if (count >= baseline + 1) {
-        for (let i = count - 1; i >= baseline + 1; i--) {
-          const msg = msgs[i];
-          const answer = _findAnswerMarkdown(msg);
-          if (!answer) continue;
-          const text = (answer.innerText || "").trim();
-          if (text.length >= minChars) {
-            console.log(
-              `[deeppeek:wait-reply] reply found at index ${i} ` +
-              `(${text.length} chars): ` +
-              JSON.stringify(text.slice(0, 80)));
-            return {
-              success: true,
-              found: true,
-              reply_text: text,
-              reply_index: i,
-              reply_length: text.length,
-              waited_ms: Date.now() - startedAt,
-              msg_count: count,
-              baseline,
-              is_generating: isGenerating(),
-            };
-          }
+      // First observation with a container: capture baseline.
+      // At this point the current part's user prompt is already in
+      // the DOM — doEnter completes (submit ack) before we get here,
+      // so any future last-message node that differs from this
+      // reference is the assistant's reply.
+      if (baselineLastEl === undefined) {
+        const el = _lastDsMessage(container);
+        if (el === null) {
+          // No messages yet.  Rare in practice — this branch fires
+          // only if the submit ack raced ahead of the DOM insert.
+          // Wait for the user's prompt to appear.
+          await new Promise(r => setTimeout(r, pollMs));
+          continue;
         }
+        baselineLastEl = el;
+        baselineLastText = el.innerText || "";
+        const count = container.querySelectorAll(".ds-message").length;
+        console.log(
+          `[deeppeek:wait-reply] baseline captured: ` +
+          `${count} visible message(s), ` +
+          `reported_baseline=${baselineReported}, ` +
+          `baseline_last=${JSON.stringify(baselineLastText.trim().slice(0, 80))}`);
+        await new Promise(r => setTimeout(r, pollMs));
+        continue;
       }
 
-      const gen = isGenerating();
-      const sig = JSON.stringify({ count, gen });
-      if (sig !== lastSig) {
-        console.log("[deeppeek:wait-reply] state:", {
-          elapsed_ms: Date.now() - startedAt,
-          msg_count: count,
-          baseline,
-          needed: baseline + 1,
-          is_generating: gen,
-        });
-        lastSig = sig;
+      const currentLastEl = _lastDsMessage(container);
+
+      // Detect either a NEW last message (the usual case — DeepSeek
+      // appends a fresh `.ds-message` node for each reply) OR growth
+      // of the SAME last node (defensive against a future build
+      // that streams into a reused node).
+      const isNewNode = currentLastEl !== baselineLastEl;
+      const currentLastText = currentLastEl ? (currentLastEl.innerText || "") : "";
+      const isContentGrown = currentLastText !== baselineLastText;
+
+      if (!isNewNode && !isContentGrown) {
+        // Nothing observable has changed in the last message.  The
+        // virtual list may have reshuffled its visible window, but
+        // the LAST node is stable.  Heartbeat every 5s so long
+        // waits are legible.
+        const now = Date.now();
+        if (now - lastLogAt >= 5000) {
+          const count = container.querySelectorAll(".ds-message").length;
+          console.log(
+            `[deeppeek:wait-reply] no change in last message ` +
+            `(elapsed=${now - startedAt}ms, ` +
+            `visible=${count}, ` +
+            `reported_baseline=${baselineReported})`);
+          lastLogAt = now;
+        }
+        await new Promise(r => setTimeout(r, pollMs));
+        continue;
       }
 
+      // The last message is new or has grown.  Check whether it
+      // carries visible answer content (not just thinking).
+      // `_findAnswerMarkdown` excludes thinking-only content via
+      // `_isInsideThinking`, so a still-streaming thought phase
+      // does not trigger success.
+      const answer = currentLastEl
+        ? _findAnswerMarkdown(currentLastEl) : null;
+      const text = answer ? (answer.innerText || "").trim() : "";
+
+      if (text.length >= minChars) {
+        console.log(
+          `[deeppeek:wait-reply] reply detected after ` +
+          `${Date.now() - startedAt}ms (${text.length} chars, ` +
+          `new_node=${isNewNode}, grown=${isContentGrown}): ` +
+          JSON.stringify(text.slice(0, 80)));
+        return {
+          success: true,
+          found: true,
+          reply_text: text,
+          reply_length: text.length,
+          waited_ms: Date.now() - startedAt,
+          baseline: baselineReported,
+          msg_count: container.querySelectorAll(".ds-message").length,
+          is_generating: isGenerating(),
+          detection: "new-or-grown-last-message",
+        };
+      }
+
+      // New/grown message but no answer content yet — thinking
+      // phase, or partial paint.  Keep polling.  Log every 5s.
+      const now = Date.now();
+      if (now - lastLogAt >= 5000) {
+        console.log(
+          `[deeppeek:wait-reply] last message changed, ` +
+          `waiting for answer content ` +
+          `(elapsed=${now - startedAt}ms, ` +
+          `current_last_len=${text.length})`);
+        lastLogAt = now;
+      }
       await new Promise(r => setTimeout(r, pollMs));
     }
 
@@ -238,11 +319,15 @@
       success: false,
       found: false,
       reason: `no assistant reply with content appeared within ` +
-              `${maxDurationMs}ms`,
+              `${maxDurationMs}ms ` +
+              `(new-or-grown-last-message detection; ` +
+              `baseline=${baselineReported}, ` +
+              `final_visible=${finalCount})`,
       waited_ms: Date.now() - startedAt,
+      baseline: baselineReported,
       msg_count: finalCount,
-      baseline,
       is_generating: isGenerating(),
+      detection: "new-or-grown-last-message",
     };
   }
 
