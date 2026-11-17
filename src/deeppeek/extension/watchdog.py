@@ -14,7 +14,7 @@ import queue
 import sys
 import time
 
-from ..capture.server import ExportServer
+from ..transport.server import ExportServer
 
 CONNECT_TIMEOUT_S = 5.0
 ACK_TIMEOUT_S = 3.0

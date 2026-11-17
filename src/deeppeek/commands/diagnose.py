@@ -18,6 +18,15 @@ def run(args: argparse.Namespace) -> int:
         print("markdown-it-py: MISSING — `pip install markdown-it-py`")
 
     try:
+        import tree_sitter  # noqa: F401
+        print("AST (tree-sitter): ok")
+    except ImportError:
+        print("AST (tree-sitter): not installed")
+        print("  optional; `deeppeek paths` falls back to markdown-only")
+        print("  install: pipx inject deeppeek tree-sitter "
+              "tree-sitter-javascript tree-sitter-python")
+
+    try:
         from ..extension.paths import source_dir, zen_root
         from ..extension.pack import extension_version, extension_id
         src = source_dir()
@@ -31,12 +40,6 @@ def run(args: argparse.Namespace) -> int:
     except Exception as e:
         print(f"extension: {e}")
 
-    # Status is a best-effort report.  `resolve_profile()` raises
-    # `SystemExit` when there are multiple Zen profiles and none was
-    # named via `--profile` / `$ZEN_PROFILE` — that is correct
-    # behaviour for `extension status` (refuse to guess), but it
-    # must not make `diagnose` look like a failure.  Catch it,
-    # explain it, keep going.
     try:
         from ..extension.status import print_status
         print("\n--- installed extension status ---")
@@ -44,26 +47,6 @@ def run(args: argparse.Namespace) -> int:
     except SystemExit as e:
         print(f"  status unavailable: {e}")
         print("  (use `deeppeek extension status --profile <name>` to check)")
-
-    try:
-        from ..recover.ast_anchor import ast_status
-        st = ast_status()
-        if st["in_process"]:
-            print("AST anchoring: ok (in-process)")
-        elif st["via_venv"]:
-            print(f"AST anchoring: ok (via repo .venv subprocess: "
-                  f"{st['venv_path']})")
-        else:
-            print("AST anchoring: unavailable")
-            print("  AST is optional; text heuristics still work.")
-            print("  To enable it, install in the pipx venv:")
-            print("    pipx inject deeppeek tree-sitter "
-                  "tree-sitter-javascript tree-sitter-python")
-            print("  Or install in the repo .venv (deeppeek will "
-                  "load it at runtime):")
-            print("    .venv/bin/pip install -e '.[ast]'")
-    except Exception as e:
-        print(f"AST anchoring: probe failed ({e})")
 
     if shutil.which("zen") or shutil.which("zen-browser"):
         print("zen binary: ok")

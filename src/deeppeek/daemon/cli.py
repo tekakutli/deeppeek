@@ -2,7 +2,7 @@
 import argparse
 import sys
 
-from ..capture.server import ExportServer
+from ..transport.server import ExportServer
 from .bridge import (
     BrowserBridge,
     DEFAULT_MAX_DURATION_MS,

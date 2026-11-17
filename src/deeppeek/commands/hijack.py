@@ -85,7 +85,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from ..capture.server import ExportServer
+from ..transport.server import ExportServer
 
 
 # Language label → canonical file extension.  Used when the
@@ -214,7 +214,7 @@ def _derive_filename_from_python(source_text: str) -> Optional[str]:
 
 
 def _stem_from_module_reference(line: str) -> Optional[str]:
-    """Given a candidate first line like `recover.write — Pass 9 ...`,
+    """Given a candidate first line like `pkg.module.write — Pass 9 ...`,
     return the *stem* of the leaf module (`"write"`).
 
     Returns None when the line doesn't follow the
@@ -231,7 +231,7 @@ def _stem_from_module_reference(line: str) -> Optional[str]:
          shape is too likely to be prose).
 
     The last component of the dotted chain becomes the filename
-    stem.  `deeppeek.recover.write — ...` → `write`.  `recover.write
+    stem.  `pkg.module.write — ...` → `write`.  `module.write
     — ...` → `write`.  `foo.py — ...` → `foo` (the leaf already
     carries an extension; the stem trims it).
     """
@@ -269,8 +269,8 @@ def _split_dotted_path(text: str) -> Optional[list]:
     (which means `text` isn't a module path — it's prose that
     happens to contain a dot).
 
-    `recover.write` → `["recover", "write"]`
-    `deeppeek.recover.write` → `["deeppeek", "recover", "write"]`
+    `pkg.module` → `["pkg", "module"]`
+    `a.b.c` → `["a", "b", "c"]`
     `foo bar` → None (contains a space)
     `1.2` → None (digits aren't identifiers)
     `self.foo` → `["self", "foo"]` (accepted — treat as hint)

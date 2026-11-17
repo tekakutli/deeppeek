@@ -75,7 +75,7 @@ import urllib.request
 import uuid
 from contextlib import contextmanager
 
-from ..capture.server import ExportServer
+from ..transport.server import ExportServer
 
 
 # Daemon's default extension-SSE port.  Must match
