@@ -28,6 +28,7 @@ _SUBCOMMAND_MODULES = {
     "scripts":      "scripts",
     "daemon":       "daemon",
     "paths":        "paths",
+    "answer":       "answer",
 }
 
 

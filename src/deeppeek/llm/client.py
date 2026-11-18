@@ -23,19 +23,23 @@ from typing import Optional
 # Defaults (relocated from recover/core.py — adjust as needed)
 # ---------------------------------------------------------------------------
 
-# OpenAI-compatible endpoint.  `http://localhost:11434/v1/chat/completions`
-# is Ollama's default; llama.cpp uses `http://localhost:8080/v1/chat/completions`
-# and LM Studio `http://localhost:1234/v1/chat/completions`.
-DEFAULT_LLM_URL = "http://localhost:11434/v1/chat/completions"
+# llama-swap endpoint (see ~/files/org/dotfiles/llama-swap/config.yaml).
+# llama-swap lazy-loads models on first request, so the first call after
+# startup can block for 30–90s while the gguf mmaps and CUDA context warms.
+DEFAULT_LLM_URL = "http://localhost:6006/v1/chat/completions"
 
-# Model to request.  Callers can override at construction time.
-DEFAULT_LLM_MODEL = "qwen2.5:7b"
+# Model key from llama-swap config.yaml — must match a `models:` entry
+# exactly, not the gguf filename.
+DEFAULT_LLM_MODEL = "qwen3.5-35b-heretic-mtp-mini"
 
-# Per-call timeout in seconds.
-DEFAULT_LLM_TIMEOUT = 120
+# Per-call timeout in seconds.  None = no timeout — wait however long the
+# model needs for cold-start + generation.
+DEFAULT_LLM_TIMEOUT = None
 
-# Health-probe timeout in seconds (probe sends a tiny "hi" request).
-DEFAULT_PROBE_TIMEOUT = 10
+# Health-probe timeout.  Deliberately generous so a cold-start warmup on
+# the first probe doesn't false-negative.  A truly-down endpoint still
+# fails fast because the TCP connect is refused immediately.
+DEFAULT_PROBE_TIMEOUT = 180
 
 
 class LLMClient:
@@ -43,7 +47,7 @@ class LLMClient:
                  model: str = DEFAULT_LLM_MODEL,
                  cache_dir: Optional[Path] = None,
                  max_calls: Optional[int] = None,
-                 timeout: int = DEFAULT_LLM_TIMEOUT):
+                 timeout: Optional[int] = DEFAULT_LLM_TIMEOUT):
         self.url = url
         self.model = model
         self.cache_dir = cache_dir
