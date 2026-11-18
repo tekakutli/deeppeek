@@ -129,16 +129,31 @@
 
   // ---- DOM helpers ---------------------------------------------
 
+  // Returns the OUTERMOST `.ds-markdown`-family element preceding
+  // `el` in document order.  DeepSeek nests per-code-block wrappers
+  // (and sometimes `.markdown-body` / `.prose`) INSIDE the message's
+  // `.ds-markdown`, and a naive "last match" picks the final code
+  // block — whose innerText is a single snippet, not the message.
+  // Collapsing to outermost ensures we compare against the full
+  // message body, which is what `prefixSim` needs to clear 0.4.
   const nearestPrecedingMarkdown = (el) => {
-    const all = document.querySelectorAll(MARKDOWN_SEL);
-    let best = null;
-    for (const md of all) {
+    const all = [...document.querySelectorAll(MARKDOWN_SEL)];
+
+    // Elements that precede `el` and are not ancestors of it.
+    const preceding = all.filter(md => {
       const pos = md.compareDocumentPosition(el);
       const follows = !!(pos & Node.DOCUMENT_POSITION_FOLLOWING);
       const containedBy = !!(pos & Node.DOCUMENT_POSITION_CONTAINED_BY);
-      if (follows && !containedBy) best = md;
-    }
-    return best;
+      return follows && !containedBy;
+    });
+
+    // Keep only the outermost ones — drop anything contained by
+    // another preceding element.
+    const outermost = preceding.filter(md =>
+      !preceding.some(other => other !== md && other.contains(md))
+    );
+
+    return outermost[outermost.length - 1] || null;
   };
 
   const hasMarkdownAfter = (pill) => {
@@ -177,6 +192,14 @@
   const _totalTurns = (msgs) =>
     msgs.filter(m => m.role === "user").length;
 
+  // Resolves the message index the pill belongs to.  Tries the
+  // outermost preceding `.ds-markdown`, then walks up its ancestors
+  // (up to 6 levels, bailing as soon as an ancestor contains the
+  // pill — we've walked past the message row).  The first node whose
+  // innerText scores > 0.4 against some extracted message wins.  The
+  // ancestor walk is a safety net for the case where DeepSeek wraps
+  // a fragment (callout, embedded preview) in its own markdown-y
+  // container outside the message's own `.ds-markdown`.
   const resolvePosition = (pill, msgs) => {
     if (!msgs || !msgs.length) {
       return { ok: false, reason: "no extracted messages" };
@@ -188,41 +211,51 @@
         reason: "no .ds-markdown precedes the pill in document order",
       };
     }
-    const domText = (md.innerText || "").trim();
-    if (!domText) {
-      return {
-        ok: false,
-        reason: "nearest preceding .ds-markdown is empty",
-        mdClasses: md.className || null,
-      };
-    }
-    const candidates = [];
-    for (let i = 0; i < msgs.length; i++) {
-      const m = msgs[i];
-      const sc = m.content ? prefixSim(domText, m.content) : 0;
-      const st = m.thinking ? prefixSim(domText, m.thinking) : 0;
-      const score = Math.max(sc, st);
-      if (score > 0.4) {
-        candidates.push({
-          i,
-          role: m.role,
-          score,
-          field: sc >= st ? "content" : "thinking",
-        });
+
+    const tried = new Set();
+    let node = md;
+    let chosen = null;
+    let chosenAmbiguous = false;
+
+    for (let i = 0; i < 6 && node; i++) {
+      if (i > 0 && node.contains(pill)) break; // walked past the row
+      const domText = (node.innerText || "").trim();
+      if (domText && !tried.has(domText)) {
+        tried.add(domText);
+        const candidates = [];
+        for (let j = 0; j < msgs.length; j++) {
+          const m = msgs[j];
+          const sc = m.content ? prefixSim(domText, m.content) : 0;
+          const st = m.thinking ? prefixSim(domText, m.thinking) : 0;
+          const score = Math.max(sc, st);
+          if (score > 0.4) {
+            candidates.push({
+              i: j, role: m.role, score,
+              field: sc >= st ? "content" : "thinking",
+            });
+          }
+        }
+        if (candidates.length) {
+          candidates.sort((a, b) => b.score - a.score);
+          const best = candidates[0];
+          const tied = candidates.filter(c => best.score - c.score < 0.05);
+          chosen = tied.length > 1 ? tied[tied.length - 1] : best;
+          chosenAmbiguous = tied.length > 1;
+          break;
+        }
       }
+      node = node.parentElement;
     }
-    if (!candidates.length) {
+
+    if (!chosen) {
       return {
         ok: false,
         reason: "no extracted message matched the preceding .ds-markdown",
-        domTextHead: domText.slice(0, 100),
+        domTextHead: (md.innerText || "").trim().slice(0, 100),
         mdClasses: md.className || null,
       };
     }
-    candidates.sort((a, b) => b.score - a.score);
-    const best = candidates[0];
-    const tied = candidates.filter(c => best.score - c.score < 0.05);
-    const chosen = tied.length > 1 ? tied[tied.length - 1] : best;
+
     return {
       ok: true,
       index: chosen.i,
@@ -233,7 +266,7 @@
       role: chosen.role,
       score: chosen.score,
       matchedField: chosen.field,
-      ambiguous: tied.length > 1,
+      ambiguous: chosenAmbiguous,
       method: "nearest-preceding-markdown",
       mdClasses: md.className || null,
     };

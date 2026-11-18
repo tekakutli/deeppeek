@@ -3,16 +3,22 @@
 Opens an SSE connection to the extension, tells it to arm the injected
 `Copy Turn` buttons so that clicking one POSTs the resolved turn's
 markdown back here (instead of writing to the clipboard), and writes
-each intercepted turn to a .md file in the current working directory.
+each intercepted turn to a .md file under a per-invocation timestamped
+subdirectory.
 
-    deeppeek hijack_turn                  # write to cwd
-    deeppeek hijack_turn --dir ./turns    # write to ./turns
+    deeppeek hijack_turn                  # → /tmp/20261117_143022/
+    deeppeek hijack_turn --dir ./turns    # → ./turns/20261117_143022/
     # Ctrl+C to stop (uninstalls the arming)
 
-Filename is generated on the extension side as
+Filenames are generated on the extension side as
 `<title-slug>_turn_<N>_of_<T>.md`; if the chat title is empty the slug
-is omitted (`turn_<N>_of_<T>.md`).  Re-clicking the same turn writes
-the same filename — idempotent, matches `deeppeek hijack` semantics.
+is omitted (`turn_<N>_of_<T>.md`).
+
+Each invocation creates a fresh timestamped subdirectory, so re-running
+`hijack_turn` never overwrites a previous session's files.  Matches the
+daemon-style `deeppeek editor` convention (Q6, 2026-11-17).  The
+resolved subdirectory path is printed at startup so the user always
+knows where to look.
 
 The CLI side is a thin install/uninstall broadcast plus a write loop.
 The extension side (2026-11-17):
@@ -111,13 +117,15 @@ def register(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser(
         "hijack_turn",
         help="Intercept Copy Turn buttons; write each clicked turn "
-             "to a .md file in the current directory instead of "
-             "copying to clipboard",
+             "to a .md file in a fresh timestamped directory "
+             "instead of copying to clipboard",
     )
     p.add_argument(
         "--dir", type=Path, default=None, metavar="PATH",
-        help="directory to write intercepted turns into "
-             "(default: current working directory)",
+        help="parent directory for the per-invocation session "
+             "subdirectory (default: /tmp).  Each run creates "
+             "PATH/<YYYYMMDD_HHMMSS>/ so re-runs never overwrite "
+             "earlier sessions.",
     )
     p.add_argument(
         "--port", type=int, default=8765,
@@ -131,8 +139,15 @@ def register(sub: argparse._SubParsersAction) -> None:
 
 
 def run(args: argparse.Namespace) -> int:
-    out_dir = (args.dir if args.dir is not None else Path.cwd()).resolve()
+    # Q6: each invocation gets a fresh timestamped subdir so
+    # re-running `hijack_turn` never overwrites earlier sessions.
+    # With --dir, the subdir sits inside the given dir
+    # (./out/20261117_143022/); without --dir, directly under /tmp.
+    base = (args.dir if args.dir is not None else Path("/tmp")).resolve()
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = base / ts
     out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Session dir: {out_dir}", file=sys.stderr)
 
     try:
         server = ExportServer(port=args.port)
@@ -196,21 +211,17 @@ def run(args: argparse.Namespace) -> int:
         return 0
     finally:
         if installed:
-            # Fire-and-forget: do NOT wait for an ack.  The ack
-            # would consume from the same wait_for_result queue as
-            # in-flight `download` acks, racing with a click that
-            # lands during shutdown.  All the extension needs is the
-            # broadcast bytes — background sends CLEAR to the
-            # content script, which relays to the page world.  A
-            # 0.3s sleep gives the SSE writer thread time to flush
-            # before server.stop() closes the socket.
+            # Fire-and-forget uninstall — do NOT wait for an ack,
+            # which would race with in-flight `download` acks in
+            # the same result_queue.  0.3s sleep lets the SSE
+            # writer thread flush before server.stop() closes the
+            # socket.
             try:
                 server._broadcast(
                     "hijack-turn-uninstall",
                     {"batch_id": "shutdown"},
                 )
-                import time as _time
-                _time.sleep(0.3)
+                time.sleep(0.3)
             except BaseException:
                 pass
         server.stop()

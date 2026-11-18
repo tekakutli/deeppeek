@@ -1,5 +1,6 @@
 import json
 import queue
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +30,34 @@ class ExportServer:
         self._stop_event = threading.Event()
         self._httpd = None
         self._thread = None
+        self._post_gate = None
+
+    # ---- refusal gate (daemon modes) ------------------------------
+
+    def set_post_gate(self, fn) -> None:
+        """Install a refusal gate for incoming POSTs to /export.
+
+        `fn(ack_dict) -> bool`.  Called before queueing each POST.
+        Returning False makes the server respond 200 with
+        {"success": false, "reason": "busy"} and drop the payload
+        without touching result_queue, so the extension sees the
+        refusal via HTTP and can decide to preserve hijack state
+        and fall back to clipboard.
+
+        Interactive callers (hijack, hijack_turn, hijack-all)
+        leave the gate unset — every POST is accepted, preserving
+        the original fire-and-forget semantics.
+
+        Daemon-style callers (deeppeek editor) install a gate that
+        refuses `download` acks while the LLM is busy.  The gate
+        callback is expected to return True for any ack whose
+        __ack is not `download`, so install/uninstall acks keep
+        flowing during daemon processing.
+
+        A gate that raises is treated as "accept" (fail-open):
+        a buggy callback must never lose the user's payload.
+        """
+        self._post_gate = fn
 
     # ---- SSE plumbing ---------------------------------------------
 
@@ -210,13 +239,37 @@ class ExportServer:
                     except Exception as e:
                         self._send_json(400, {"error": f"bad json: {e}"})
                         return
+
+                    # Refusal gate — daemon modes (editor) use this
+                    # to reject clicks while the LLM is busy.
+                    # Default: no gate, every POST accepted.  A
+                    # gate that raises is treated as accept (fail-
+                    # open) so a buggy callback can never lose the
+                    # user's payload.
+                    if parent._post_gate is not None:
+                        try:
+                            accept = parent._post_gate(data)
+                        except Exception as e:
+                            accept = True
+                            print(
+                                f"[server] post_gate threw: {e} — "
+                                f"accepting",
+                                file=sys.stderr,
+                            )
+                        if not accept:
+                            self._send_json(200, {
+                                "success": False,
+                                "reason": "busy",
+                            })
+                            return
+
                     with parent._lock:
                         was_armed = parent.armed
                         parent.armed = False
                     parent._deliver_ack(data)
                     if was_armed:
                         parent._broadcast("disarm")
-                    self._send_json(200, {"ok": True})
+                    self._send_json(200, {"success": True, "ok": True})
                 elif self.path == "/internal/relay":
                     self._handle_relay()
                 else:
