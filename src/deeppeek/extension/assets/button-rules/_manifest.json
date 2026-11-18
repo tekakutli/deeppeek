@@ -1,11 +1,12 @@
 {
-  "_comment": "Ordered list of files in this directory. Files starting with '_' are shared helpers — loaded FIRST, define namespaces on window.__dsx__ but do NOT register rules. Numbered files are rule definitions — each is an IIFE that calls window.__dsx__.buttons.rule({...}). To add a button: drop a numbered file here and append its name to 'files' below.",
+  "_comment": "...",
   "files": [
     "_capsule.js",
     "_resume.js",
     "01-default-capsule.js",
     "02-continue-btn.js",
     "03-rate-limit-retry.js",
-    "04-length-limit-reached.js"
+    "04-length-limit-reached.js",
+    "05-copy-turn.js"
   ]
 }

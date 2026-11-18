@@ -147,7 +147,8 @@ DEFAULT_SKIP_DUMP_FILES = True
 # Directories skipped here still appear in the DIRECTORY TREE, unless they are
 # also listed in DEFAULT_TREE_EXCLUDE_DIRS below.
 DEFAULT_EXCLUDE_DIRS = [
-    ".git", "__pycache__", ".venv", "venv", "node_modules",
+    ".git", "__pycache__", ".venv", "venv", "node_modules", ".pytest_cache/",
+    ".aider.tags.cache.v4",
     "lib", "bin",
     'playgrounds',
     'docker', 'website',
@@ -162,6 +163,7 @@ DEFAULT_EXCLUDE_DIRS = [
 # DEFAULT_EXCLUDE_DIRS. This only affects the tree rendering — it never
 # changes which files are dumped.
 DEFAULT_TREE_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modules",
+                             ".aider.tags.cache.v4", ".pytest_cache/",
                              "lib", "bin",
                              'docker', 'website',
                              "target", "release",
@@ -194,7 +196,7 @@ DEFAULT_INCLUDE_FILE_SUBSTRINGS = []
 
 # Filename substrings blacklist: if a filename contains ANY of these, the
 # file is skipped.
-DEFAULT_EXCLUDE_FILE_SUBSTRINGS = [".aider.chat.history.md","project_dump", "shrinking", 'EMISSION', 'README.md',]
+DEFAULT_EXCLUDE_FILE_SUBSTRINGS = [".aider.model.metadata.json", ".aider.chat.history.md","project_dump", "shrinking", 'EMISSION', 'README.md',]
 # ---------------------------------------------------------------------------
 
 HEADER = "=" * 70
