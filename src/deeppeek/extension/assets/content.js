@@ -432,6 +432,18 @@
       }
     }
 
+    if (msg.type === "DSX_HIJACK_TURN_SET") {
+      window.postMessage(
+        { dsx_hijack_turn_set: { port: msg.port } }, "*");
+      return { success: true, port: msg.port };
+    }
+
+    if (msg.type === "DSX_HIJACK_TURN_CLEAR") {
+      window.postMessage(
+        { dsx_hijack_turn_set: { port: null } }, "*");
+      return { success: true };
+    }
+
     return null;
   });
 

@@ -125,6 +125,18 @@ function attachHandlers(es, port) {
     handleHijackAll(data, port);
   });
 
+  // ---- hijack-turn events ----
+  es.addEventListener("hijack-turn-install", (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+    handleHijackTurnInstall(data, port);
+  });
+  es.addEventListener("hijack-turn-uninstall", (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+    handleHijackTurnUninstall(data, port);
+  });
+
   // ---- lifecycle ----
   es.onopen = () => {
     console.log(`DSX:${tag} SSE connected`);

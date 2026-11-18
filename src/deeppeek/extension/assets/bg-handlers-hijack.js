@@ -98,3 +98,60 @@ async function handleHijackAll(data, port) {
     result,
   });
 }
+
+async function handleHijackTurnInstall(data, port) {
+  const batchId = data.batch_id;
+  const tag = `[${port}]`;
+  console.log(`DSX:${tag} hijack-turn-install received (batch=${batchId})`);
+
+  let result = { success: false, reason: "no active deepseek tab" };
+  try {
+    const [tab] = await browser.tabs.query({
+      active: true, currentWindow: true,
+    });
+    if (isSupportedTab(tab)) {
+      const resp = await browser.tabs.sendMessage(tab.id, {
+        type: "DSX_HIJACK_TURN_SET",
+        port: port,
+      });
+      result = resp || {
+        success: false, reason: "no response from content script",
+      };
+    }
+  } catch (err) {
+    result = { success: false, reason: `sendMessage threw: ${err.message}` };
+  }
+
+  console.log(`DSX:${tag} hijack-turn-install result:`, result);
+  await postAck(port, {
+    __ack: "hijack-turn-install", batch_id: batchId, result,
+  });
+}
+
+async function handleHijackTurnUninstall(data, port) {
+  const batchId = data.batch_id;
+  const tag = `[${port}]`;
+  console.log(`DSX:${tag} hijack-turn-uninstall received (batch=${batchId})`);
+
+  let result = { success: false, reason: "no active deepseek tab" };
+  try {
+    const [tab] = await browser.tabs.query({
+      active: true, currentWindow: true,
+    });
+    if (isSupportedTab(tab)) {
+      const resp = await browser.tabs.sendMessage(tab.id, {
+        type: "DSX_HIJACK_TURN_CLEAR",
+      });
+      result = resp || {
+        success: false, reason: "no response from content script",
+      };
+    }
+  } catch (err) {
+    result = { success: false, reason: `sendMessage threw: ${err.message}` };
+  }
+
+  console.log(`DSX:${tag} hijack-turn-uninstall result:`, result);
+  await postAck(port, {
+    __ack: "hijack-turn-uninstall", batch_id: batchId, result,
+  });
+}

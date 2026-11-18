@@ -20,6 +20,7 @@ _SUBCOMMAND_MODULES = {
     "type":         "type",
     "enter":        "enter",
     "hijack":       "hijack",
+    "hijack_turn":  "hijack_turn",
     "prompt":       "prompt",
     "extension":    "extension",
     "diagnose":     "diagnose",
