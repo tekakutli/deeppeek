@@ -14,6 +14,7 @@ import hashlib
 import json
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Optional
@@ -40,6 +41,14 @@ DEFAULT_LLM_TIMEOUT = None
 # the first probe doesn't false-negative.  A truly-down endpoint still
 # fails fast because the TCP connect is refused immediately.
 DEFAULT_PROBE_TIMEOUT = 180
+
+
+def _http_error_body(e: urllib.error.HTTPError) -> str:
+    """Return the response body of an HTTPError as text, or '' on failure."""
+    try:
+        return e.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
 
 
 class LLMClient:
@@ -87,6 +96,13 @@ class LLMClient:
             with urllib.request.urlopen(req, timeout=probe_timeout) as resp:
                 resp.read()
             return True
+        except urllib.error.HTTPError as e:
+            detail = _http_error_body(e)
+            print(
+                f"  [LLM] probe failed: HTTP {e.code} {e.reason}"
+                + (f"\n  {detail}" if detail else ""),
+                file=sys.stderr)
+            return False
         except Exception as e:
             print(f"  [LLM] probe failed: {e}", file=sys.stderr)
             return False
@@ -136,6 +152,13 @@ class LLMClient:
             if cp:
                 cp.write_text(json.dumps({"content": content}))
             return content
+        except urllib.error.HTTPError as e:
+            detail = _http_error_body(e)
+            print(
+                f"  [LLM:{tag or '?'}] call failed: HTTP {e.code} {e.reason}"
+                + (f"\n  {detail}" if detail else ""),
+                file=sys.stderr)
+            return None
         except Exception as e:
             print(f"  [LLM:{tag or '?'}] call failed: {e}", file=sys.stderr)
             return None

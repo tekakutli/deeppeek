@@ -21,6 +21,17 @@ Three modes:
         deeppeek answer --literal "passthrough"
 
 See llm_scripts/__init__.py for the script contract.
+
+File input
+----------
+--file PATH (or -f PATH) reads the given file as the input text; '-' reads
+stdin.  When positional args are also present, they are prepended as an
+instruction, separated from the file contents by a blank line:
+
+    deeppeek answer --file notes.txt
+    deeppeek answer "Summarize the following:" --file notes.txt
+    cat notes.txt | deeppeek answer --file -
+    deeppeek answer --script passthrough --file notes.txt
 """
 from __future__ import annotations
 
@@ -44,8 +55,9 @@ def register(sub):
         help="Send a one-shot question to the local OpenAI-compatible LLM",
     )
     p.add_argument(
-        "args", nargs="+", metavar="ARG",
-        help="either a literal prompt, or <script-name> <input-text>",
+        "args", nargs="*", metavar="ARG",
+        help="either a literal prompt, or <script-name> <input-text> "
+             "(optional when --file is given)",
     )
     p.add_argument("--url", default=DEFAULT_LLM_URL)
     p.add_argument("--model", default=DEFAULT_LLM_MODEL)
@@ -71,11 +83,27 @@ def register(sub):
              "script name",
     )
     p.add_argument(
+        "-f", "--file", default=None, metavar="PATH",
+        help="Read input text from PATH ('-' = stdin). If positional args "
+             "are also given, they are prepended as an instruction.",
+    )
+    p.add_argument(
         "--list", action="store_true",
         help="List registered scripts and exit",
     )
     p.set_defaults(func=run)
     return p
+
+
+def _read_path(path: str) -> Optional[str]:
+    """Return the contents of `path` (or stdin for '-'). None on error."""
+    try:
+        if path == "-":
+            return sys.stdin.read()
+        return Path(path).read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"error: cannot read {path!r}: {e}", file=sys.stderr)
+        return None
 
 
 def run(args) -> int:
@@ -89,14 +117,20 @@ def run(args) -> int:
             print(f"{name}\t{desc}")
         return 0
 
+    file_text: Optional[str] = None
+    if args.file is not None:
+        file_text = _read_path(args.file)
+        if file_text is None:
+            return 1
+
     script_name: Optional[str] = args.script
-    input_text = " ".join(args.args)
+    positional_text = " ".join(args.args)
 
     if not script_name and not args.literal and args.args:
         candidate = args.args[0]
         if llm_scripts.is_script(candidate):
             script_name = candidate
-            input_text = " ".join(args.args[1:])
+            positional_text = " ".join(args.args[1:])
 
     if script_name and not llm_scripts.is_script(script_name):
         print(
@@ -104,6 +138,19 @@ def run(args) -> int:
             f"`deeppeek answer --list`",
             file=sys.stderr)
         return 1
+
+    if file_text is not None:
+        if positional_text:
+            input_text = positional_text + "\n\n" + file_text
+        else:
+            input_text = file_text
+    else:
+        if not positional_text and not script_name:
+            print(
+                "error: no input — provide a prompt or use --file",
+                file=sys.stderr)
+            return 1
+        input_text = positional_text
 
     client = LLMClient(
         url=args.url,

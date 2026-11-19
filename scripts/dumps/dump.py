@@ -186,6 +186,11 @@ DEFAULT_INCLUDE_DIRS = []
 # DEFAULT_INCLUDE_DIRS = ["layout", "pgkit", "pg_comfy", "inpaint", ]
 # DEFAULT_INCLUDE_DIRS = ['pgkit', 'pg_comfy', 'magi', 'layout',]
 # DEFAULT_INCLUDE_DIRS = ['controlnets', 'pgkit', 'pg_comfy', 'inpaint', ]
+# DEFAULT_INCLUDE_DIRS = ['controlnets', 'pgkit', 'pg_comfy', 'segment', 'layout', 'magi']
+# DEFAULT_INCLUDE_DIRS = ['multimask', 'segment', 'controlnets', ]
+#
+# DEFAULT_INCLUDE_DIRS = ['multimask', 'segment', 'controlnets', 'layout', 'magi']
+
 
 
 # Filename substrings whitelist: if NON-EMPTY, a file is only kept when its
