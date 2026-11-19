@@ -150,7 +150,7 @@ DEFAULT_EXCLUDE_DIRS = [
     ".git", "__pycache__", ".venv", "venv", "node_modules", ".pytest_cache/",
     ".aider.tags.cache.v4",
     "lib", "bin",
-    'playgrounds',
+    # 'playgrounds',
     'docker', 'website',
     # "daemon", "prompts", "capture",
     # "room", "shared",

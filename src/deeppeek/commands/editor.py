@@ -390,7 +390,7 @@ def _run_daemon(args, script_mod, script_name, session_dir,
 
 # ---- argparse wiring ----------------------------------------------
 
-def register(sub, script_name="passthrough"):
+def register(sub, script_name=None):
     p = sub.add_parser(
         "editor",
         help="Run each Copy Turn (or file, or arg string) through the "
@@ -432,11 +432,23 @@ def register(sub, script_name="passthrough"):
     p.add_argument("--max-tokens", type=int, default=2048)
     p.add_argument("--temperature", type=float, default=0.2)
 
-    # Script-conditional flags.  `cli.py` peeks the `--script` value
-    # from argv before argparse runs; if the target script defines a
-    # `register_flags(parser)` hook, invoke it so its flags are
-    # recognised — and only for this script.
-    if llm_scripts.is_script(script_name):
+    # Register script-conditional flags.  `script_name` is the
+    # peeked `--script` value passed by `cli.py`, or None when the
+    # user did not specify `--script` at all (and when the full
+    # parser is being built for `--help` / bare `deeppeek`).
+    #
+    # Skipping discovery when None keeps bare `deeppeek`,
+    # `deeppeek --help`, `deeppeek editor`, and `deeppeek editor
+    # --help` quiet — no `llm_scripts` discovery, no warnings about
+    # unrelated .py files that happen to live next to the bundled
+    # scripts.  Only an explicit `--script <NAME>` on the command
+    # line triggers the target script's `register_flags`.
+    #
+    # `argparse` still defaults `args.script` to "passthrough"
+    # inside the subparser, so the runtime behaviour of
+    # `deeppeek editor "text"` is unchanged — `run()` sees
+    # `args.script == "passthrough"` and loads that script there.
+    if script_name is not None and llm_scripts.is_script(script_name):
         mod = llm_scripts.load_script(script_name)
         reg_flags = getattr(mod, "register_flags", None)
         if callable(reg_flags):
@@ -453,19 +465,17 @@ def register(sub, script_name="passthrough"):
 
 
 def run(args) -> int:
-    script_name = args.script or "passthrough"
-
-    if not llm_scripts.is_script(script_name):
-        print(f"error: unknown script {script_name!r} — try "
-              f"`deeppeek answer --list`", file=sys.stderr)
-        return 1
-
     if args.file is not None and args.text:
         print("error: --file and positional TEXT are mutually exclusive",
               file=sys.stderr)
         return 1
 
-    script_mod = llm_scripts.load_script(script_name)
+    try:
+        script_mod = llm_scripts.load_script(args.script)
+    except KeyError as e:
+        msg = e.args[0] if e.args else "unknown script"
+        print(f"error: {msg}", file=sys.stderr)
+        return 1
 
     # Script-supplied ctx contributions (from this script's flags).
     script_ctx = {}
@@ -481,11 +491,11 @@ def run(args) -> int:
                     f"{type(got).__name__}, expected dict")
             script_ctx = got
         except Exception as e:
-            print(f"error: {script_name}.ctx_from_args threw: {e}",
+            print(f"error: {args.script}.ctx_from_args threw: {e}",
                   file=sys.stderr)
             return 1
     elif callable(getattr(script_mod, "register_flags", None)):
-        print(f"[editor] warning: {script_name} defines register_flags "
+        print(f"[editor] warning: {args.script} defines register_flags "
               f"but not ctx_from_args — its flags will parse but be "
               f"ignored", file=sys.stderr)
 
@@ -504,7 +514,7 @@ def run(args) -> int:
 
     one_shot = args.file is not None or bool(args.text)
     if one_shot:
-        return _run_one_shot(args, script_mod, script_name,
+        return _run_one_shot(args, script_mod, args.script,
                              session_dir, client, script_ctx)
-    return _run_daemon(args, script_mod, script_name,
+    return _run_daemon(args, script_mod, args.script,
                        session_dir, client, script_ctx)

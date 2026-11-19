@@ -4,6 +4,12 @@ Lazy subcommand loading: only the command module for the subcommand
 being run is imported.  Full-parser construction (which imports every
 command module) is reserved for `--help`, `--version`, and
 unknown-subcommand error paths.
+
+Script discovery is deferred: parser construction never triggers
+`llm_scripts` discovery.  Discovery runs only when the user actually
+names a script via `--script <NAME>` on the `editor` subcommand.
+This keeps bare `deeppeek` quiet even when `~/.deeppeek/scripts/`
+holds unrelated .py files that aren't LLM scripts.
 """
 import argparse
 import importlib
@@ -54,10 +60,25 @@ def _new_root_parser() -> argparse.ArgumentParser:
 
 
 def _build_full_parser() -> argparse.ArgumentParser:
+    """Full parser — imports every command module.
+
+    Only used for --help, --version, and unknown-subcommand error
+    paths.
+
+    `editor` is registered with `script_name=None`, which tells it
+    not to look up any script's `register_flags` — so no `llm_scripts`
+    discovery happens during parser build.  If the user actually runs
+    `editor --script <NAME>`, `_build_targeted_parser` re-registers
+    `editor` with the real peeked name and discovery happens there.
+    """
     p = _new_root_parser()
     sub = p.add_subparsers(dest="command", required=True)
     for name in _SUBCOMMAND_MODULES:
-        _load_command(name).register(sub)
+        mod = _load_command(name)
+        if name == "editor":
+            mod.register(sub, script_name=None)
+        else:
+            mod.register(sub)
     return p
 
 
@@ -66,16 +87,20 @@ def _build_targeted_parser(command: str, argv=None) -> argparse.ArgumentParser:
 
     For `editor`, the parser is built with the `--script` value
     peeked from `argv` so the target script can install its own
-    flags via `register_flags(parser)` before argparse runs.  This
-    is how `--paths_absolute` and any future script-specific flag
-    gets recognised without being globally registered.
+    flags via `register_flags(parser)` before argparse runs.
+
+    The peek default is `None`, not `"passthrough"` — so
+    `deeppeek editor "text"` (no `--script`) skips discovery
+    entirely, while `deeppeek editor --script foo "text"` triggers
+    it for `foo` only.  `argparse` still defaults `args.script` to
+    `"passthrough"` inside the editor subparser, so the runtime
+    behaviour is unchanged.
     """
     p = _new_root_parser()
     sub = p.add_subparsers(dest="command", required=True)
     mod = _load_command(command)
     if command == "editor":
-        script_name = _peek_flag_value(
-            argv or [], "--script", "passthrough")
+        script_name = _peek_flag_value(argv or [], "--script", None)
         mod.register(sub, script_name=script_name)
     else:
         mod.register(sub)
