@@ -1,85 +1,81 @@
 #!/usr/bin/env python3
-"""extract_edit_requests.py — extract code blocks, classify each as
-"edit request" or not, collect the target files, retrieve their
-current contents from one or more `dump.py` outputs, and optionally
-have the LLM produce the fully-edited files.
+"""extract_edit_requests.py — detect which files a conversation is
+asking to edit, retrieve those files from dumps, and have the LLM
+produce surgical diff patches — ONE LLM call per target file.
 
 Pipeline
 --------
-  1. Run `extract_code_blocks.py --top-level-only` — blockquoted
-     ("thinking process") blocks stay verbatim in the stripped file.
+  1. Run `extract_code_blocks.py --top-level-only` to get the
+     *stripped* conversation (fenced code blocks replaced with
+     `{{handle}}` placeholders).  Only the stripped prose is scanned
+     for target filenames, so paths inside code examples ("python
+     extract_edit_requests.py chat.txt") do not count as targets.
 
-  2. Pre-filter FULL-FILE blocks via `code_blob_analysis.analyze`.
-     Confidently-full files with no edit header in context are
-     skipped (they're new-file creations).  Disable with
-     `--no-full-file-filter`.
+  2. Scan the stripped prose for edit-target phrases:
+       "add X to foo.py", "modify bar.py", "edits to baz.py", ...
+     → dict of filename -> mention count.
 
-  3. For each remaining blob, run `edit_blob_analysis.analyze_edit`:
-     a signed edit-vs-not score, a confidence band, an `edit_kind`,
-     and ranked target-file candidates.  Heuristic, no LLM.
+  3. Pick the target(s) to edit.  If one file clearly dominates
+     (>= 2x the runner-up), only that file is edited — the common
+     case where a chat is about one file and other files are
+     mentioned incidentally.  Otherwise every target above a
+     min-count threshold is edited.
 
-  4. Decide per block:
-       · full file (pre-filter)  → skip
-       · high_edit               → record (no LLM)
-       · high_not_edit           → skip (no LLM)
-       · ambiguous               → LLM call, heuristic hints as
-                                   evidence
-     `--force-ai`, `--no-ai` override.
+  4. Load the dump corpus (`--dump-file PATH`, repeatable).
 
-  5. Write each edit-request blob flat into `files/` as
-     `<stem>__blkNNN.<ext>` (or `unknown__blkNNN.<ext>`).
+  5. Strip blockquoted (thinking-process) lines from the
+     conversation before sending it to the LLM — typically 50–70%
+     of a DeepSeek log and irrelevant to the edits.
 
-  6. OPTIONAL — retrieval: if `--dump-file PATH` is passed (one or
-     more times), every target path is looked up in an in-memory
-     `DumpCorpus` built from those dumps.  Matches are recorded on
-     each record (`retrieved = {...}`), and uniquely-resolved file
-     contents are written under `retrieved/<dump-stem>/<relpath>`.
+  6. For each target:
+       · resolve against the dump (exact → suffix → basename)
+       · if resolved: ONE LLM call with
+           (shrunk conversation, current file content)
+         asking for a unified diff → apply via POSIX `patch -p0`
+         → write the patched file to `edited/<target>`
+       · if not resolved: log, skip.
 
-  7. OPTIONAL — implement-edits: if `--implement-edits` is set
-     (requires `--dump-file`), one LLM call is made per resolved
-     target.  Context: the current file content from the dump + a
-     *purged conversation* where full-file blocks are stripped out
-     and the edit fragments for this target are inlined.  The LLM
-     is asked to output the complete edited file, which is written
-     under `edited/<target-path>`.
+  7. Write `_report.json`.
+
+There is no per-block extraction, no heuristic classification, no
+per-block LLM calls.  The LLM sees the conversation and the current
+file, and is asked to produce a unified diff.  The diff is applied
+by `patch`; on failure the target is logged and skipped.
 
 Output layout
 -------------
     /tmp/deeppeek_edits_<stem>_<YYYYmmdd_HHMMSS>/
-        files/                     ← flat edit-request blobs
-        retrieved/                 ← dump-sourced target file contents
-        edited/                    ← LLM-produced full edited files
-        _raw/                      ← intermediate extraction
-        _edit_map.json             flat name → target + metadata
-        _edit_targets.json         target file → edits (reverse index)
-        _retrieved_files.json      per-target retrieval report
-        _implement_log.json        per-target implement-edits log
-        _classification_log.json   one record per block
+        edited/                  ← fully-patched files
+        _raw/                    ← stripped conversation, dumps,
+                                   LLM diffs, failed patches
+        _report.json             ← detected targets + per-target results
 
 Flags
 -----
-    --dump-file PATH          dump.py output to index (repeatable).
-    --implement-edits         run the LLM per resolved target; writes
-                              to edited/.
-    --implement-max-tokens N  max_tokens per implement call
-                              (default: 4096)
-    --implement-temperature F temperature for implement (default: 0.1)
-    --no-full-file-filter, --no-ai, --force-ai, --include-non-edits,
-    --include-blockquotes, --verbose-heuristics, -q: unchanged.
+    --dump-file PATH          dump.py output (repeatable, required
+                              for anything to be edited)
+    --implement-max-tokens N  max_tokens per LLM call
+                              (default: 16384 — diff output is much
+                              smaller than a full file; lower it
+                              further if your model is verbose)
+    --implement-temperature F temperature for LLM calls (default: 0.1)
+    --out-dir PATH, --extractor PATH, --model, -q: as before
 
-Framework hooks (llm_scripts)
------------------------------
-Standalone CLI AND module.  Hook flags are prefixed `--eer-`.
+Legacy flags (--context-lines, --no-ai, --force-ai,
+--no-full-file-filter, --include-non-edits,
+--verbose-heuristics, --implement-edits, --temperature, --max-tokens)
+are accepted for backward compatibility but ignored.
 """
 from __future__ import annotations
 
 import argparse
 import importlib.util
 import json
+import re
 import shutil
 import subprocess
 import sys
-import re
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -89,44 +85,7 @@ from deeppeek.llm import (
 )
 
 
-# ---- load sibling heuristic modules -----------------------------
-
-try:
-    import edit_blob_analysis as _eba
-except ImportError:
-    _here = Path(__file__).resolve().parent
-    _spec = importlib.util.spec_from_file_location(
-        "edit_blob_analysis", _here / "edit_blob_analysis.py")
-    if _spec is None or _spec.loader is None:
-        raise ImportError(
-            "could not import edit_blob_analysis.py — place it "
-            "next to this script or on PYTHONPATH")
-    _eba = importlib.util.module_from_spec(_spec)
-    sys.modules["edit_blob_analysis"] = _eba
-    _spec.loader.exec_module(_eba)
-
-analyze_edit_blob = _eba.analyze_edit
-_near_handle_lines = _eba.near_handle_lines
-_check_edit_header = _eba._check_edit_header
-
-# `code_blob_analysis` is optional.
-_cba = None
-try:
-    import code_blob_analysis as _cba
-except ImportError:
-    _here = Path(__file__).resolve().parent
-    _spec = importlib.util.spec_from_file_location(
-        "code_blob_analysis", _here / "code_blob_analysis.py")
-    if _spec is not None and _spec.loader is not None:
-        _cba = importlib.util.module_from_spec(_spec)
-        sys.modules["code_blob_analysis"] = _cba
-        _spec.loader.exec_module(_cba)
-
-analyze_code_blob = _cba.analyze if _cba is not None else None
-_HAS_CODE_BLOB_ANALYSIS = _cba is not None
-
-
-# ---- load sibling pipeline modules ------------------------------
+# ---- load sibling modules ---------------------------------------
 
 def _load_sibling(name: str):
     try:
@@ -145,21 +104,72 @@ def _load_sibling(name: str):
         return mod
 
 
-_dc = _load_sibling("dump_corpus")     # dump parsing + retrieval
-_ep = _load_sibling("edit_prompts")    # prompt build / parse
-_eo = _load_sibling("edit_outputs")    # file naming + writing
+_dc = _load_sibling("dump_corpus")
 
 
-# ---- defaults ----------------------------------------------------
+# ---- defaults ---------------------------------------------------
 
-_DEFAULT_CONTEXT_LINES = 30
-_DEFAULT_TEMPERATURE = 0.1
-_DEFAULT_MAX_TOKENS = 600
-_DEFAULT_IMPLEMENT_MAX_TOKENS = 4096
+_DEFAULT_IMPLEMENT_MAX_TOKENS = 16384
 _DEFAULT_IMPLEMENT_TEMPERATURE = 0.1
 
 
-# ---- extractor invocation ----------------------------------------
+# ---- edit-target detection --------------------------------------
+
+_EDIT_TARGET_RE = re.compile(
+    r"\b(?:add|apply|modify|change|edit|update|patch|extend)\b"
+    r"[^\n]*?\b(?:to|in)\b[^\n]*?"
+    r"`?([\w\-./]+\.(?:py|js|ts|tsx|jsx|md|json|yaml|yml|sh|txt"
+    r"|toml|conf|rs|go|c|cpp|h|hpp))`?",
+    re.IGNORECASE,
+)
+_EDITS_TO_RE = re.compile(
+    r"\b(?:edits?|changes?|patches?|modifications?|updates?)\b"
+    r"[^\n]*?\b(?:to|in|for)\b[^\n]*?"
+    r"`?([\w\-./]+\.(?:py|js|ts|tsx|jsx|md|json|yaml|yml|sh|txt"
+    r"|toml|conf|rs|go|c|cpp|h|hpp))`?",
+    re.IGNORECASE,
+)
+
+
+def _scan_edit_targets(stripped_text: str) -> dict[str, int]:
+    """Scan stripped prose for edit-target filenames.
+
+    Matches "add X to foo.py", "edits to bar.py", "modify baz.py",
+    etc.  Skips placeholder-only lines — those are code stand-ins,
+    not prose.  Returns dict filename -> mention count.
+    """
+    counts: dict[str, int] = {}
+    for line in stripped_text.splitlines():
+        if "{{" in line and "}}" in line:
+            continue
+        for pat in (_EDIT_TARGET_RE, _EDITS_TO_RE):
+            for m in pat.finditer(line):
+                name = m.group(1)
+                counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _pick_targets_to_edit(edit_targets: dict[str, int]) -> list[str]:
+    """Return the list of targets to actually edit.
+
+    · Dominant target (>= 2x the runner-up) → edit only that one.
+    · Otherwise → edit every target whose mention count is at least
+      max(2, top_count // 4).
+    """
+    if not edit_targets:
+        return []
+    ordered = sorted(edit_targets.items(), key=lambda x: -x[1])
+    if len(ordered) == 1:
+        return [ordered[0][0]]
+    top_name, top_count = ordered[0]
+    second_count = ordered[1][1]
+    if top_count >= 2 and top_count >= 2 * second_count:
+        return [top_name]
+    min_count = max(2, top_count // 4)
+    return [name for name, count in ordered if count >= min_count]
+
+
+# ---- extractor invocation --------------------------------------
 
 def _locate_extractor(explicit: Optional[str]) -> Path:
     if explicit:
@@ -180,7 +190,8 @@ def _locate_extractor(explicit: Optional[str]) -> Path:
 
 def _run_extractor(extractor: Path, input_path: Path,
                    raw_dir: Path, *,
-                   top_level_only: bool = True) -> list[dict]:
+                   top_level_only: bool = True) -> Path:
+    """Run the extractor; return the stripped-text path."""
     raw_dir.mkdir(parents=True, exist_ok=True)
     args = [
         sys.executable, str(extractor), str(input_path),
@@ -195,301 +206,257 @@ def _run_extractor(extractor: Path, input_path: Path,
             f"extract_code_blocks.py exited {result.returncode}\n"
             f"stdout:\n{result.stdout}\n"
             f"stderr:\n{result.stderr}")
-    manifest_path = raw_dir / "manifest.json"
-    if not manifest_path.is_file():
-        raise RuntimeError(f"missing manifest: {manifest_path}")
-    return json.loads(manifest_path.read_text(encoding="utf-8"))
-
-
-def _find_stripped(raw_dir: Path) -> Optional[Path]:
+    manifest = raw_dir / "manifest.json"
+    if not manifest.is_file():
+        raise RuntimeError(f"missing manifest: {manifest}")
     for p in raw_dir.iterdir():
         if "_stripped" in p.name:
             return p
-    return None
+    raise RuntimeError(f"no stripped file found in {raw_dir}")
 
 
-# ---- context extraction ------------------------------------------
+# ---- conversation shrinking ------------------------------------
 
-def _extract_context(stripped_text: str, handle: str,
-                     n_lines: int) -> str:
-    if not handle:
-        return ""
-    lines = stripped_text.splitlines()
-    idx = None
-    for i, line in enumerate(lines):
-        if handle in line:
-            idx = i
-            break
-    if idx is None:
-        return ""
-    start = max(0, idx - n_lines)
-    end = min(len(lines), idx + n_lines + 1)
-    return "\n".join(lines[start:end])
+def _strip_blockquotes(text: str) -> str:
+    """Drop blockquoted (thinking-process) lines from a chat log.
 
-# ---- conversation-level edit-target detection --------------------
-
-_EDIT_TARGET_RE = re.compile(
-    r"\b(?:add|apply|modify|change|edit|update|patch|extend)\b"
-    r"[^\n]*?\b(?:to|in)\b[^\n]*?"
-    r"`?([\w\-./]+\.(?:py|js|ts|tsx|jsx|md|json|yaml|yml|sh|txt"
-    r"|toml|conf|rs|go|c|cpp|h|hpp))`?",
-    re.IGNORECASE,
-)
-_EDITS_TO_RE = re.compile(
-    r"\b(?:edits?|changes?|patches?|modifications?|updates?)\b"
-    r"[^\n]*?\b(?:to|in|for)\b[^\n]*?"
-    r"`?([\w\-./]+\.(?:py|js|ts|tsx|jsx|md|json|yaml|yml|sh|txt"
-    r"|toml|conf|rs|go|c|cpp|h|hpp))`?",
-    re.IGNORECASE,
-)
-
-
-def _scan_edit_targets(stripped_text: str) -> dict[str, int]:
-    """Scan prose for phrases that establish an edit target file.
-
-    Matches "add X to foo.py", "edits to bar.py", "modify baz.py",
-    etc.  Skips placeholder-only lines — those are code stand-ins,
-    not prose.  Returns dict filename -> mention count.
+    A blockquote line is one whose first non-space char is `>`.
+    Lines inside a fenced ``` block are preserved — a diff or
+    shell snippet may legitimately contain `>` (`cmd > file`).
     """
-    counts: dict[str, int] = {}
-    for line in stripped_text.splitlines():
-        if "{{" in line and "}}" in line:
+    out: list[str] = []
+    in_fence = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            out.append(line)
             continue
-        for pat in (_EDIT_TARGET_RE, _EDITS_TO_RE):
-            for m in pat.finditer(line):
-                name = m.group(1)
-                counts[name] = counts.get(name, 0) + 1
-    return counts
+        if not in_fence and line.lstrip().startswith(">"):
+            continue
+        out.append(line)
+    return "\n".join(out)
 
 
-def _build_edit_target_hint(targets: dict[str, int]) -> str:
-    if not targets:
-        return ""
-    top = sorted(targets.items(), key=lambda x: -x[1])[:3]
-    return ("[Files being edited in this conversation: "
-            + ", ".join(f"{n} ({c}x)" for n, c in top) + "]")
+# ---- prompt ----------------------------------------------------
+
+_IMPLEMENT_PROMPT = """\
+You are a precise code editor.
+
+Below is a conversation in which edits to files were requested.  The
+conversation is shown verbatim, including every fenced code block
+(blocks may be patches, fragments, new files, or illustrations — use
+your judgement to determine which apply to the target file).
+
+<conversation>
+{conversation}
+</conversation>
+
+Below is the current, on-disk content of the file `{target}`.
+
+<current-file target="{target}">
+{current_content}
+</current-file>
+
+Implement ALL the edits that the conversation requests for
+`{target}`.  Do not invent edits that were not requested.
+
+Respond with ONE unified diff (as produced by `diff -u` or
+`git diff`) that applies cleanly to the current file above.  Put
+the diff in a single fenced ```diff block.  Do NOT reprint the
+whole file — include only the hunks that change, with three lines
+of unchanged context on each side.  The context lines must match
+the current file exactly, byte for byte.
+
+Minimal, surgical hunks.  One diff block, no prose before or
+after.
+"""
 
 
-def _pick_dominant_target(targets: dict[str, int]) -> Optional[str]:
-    """Top edit target if it clearly dominates, else None.
+def _build_implement_prompt(target: str, conversation: str,
+                            current_content: str) -> str:
+    return _IMPLEMENT_PROMPT.format(
+        target=target,
+        conversation=conversation,
+        current_content=current_content,
+    )
 
-    Dominant = mentioned at least twice AND either the only target
-    or at least 2x the runner-up.  Guards the fallback against
-    multi-file conversations where nothing stands out.
+
+# ---- diff extraction + application ----------------------------
+
+def _fenced_blocks(response: str) -> list[str]:
+    """Contents of every fenced ``` block in `response`."""
+    lines = response.splitlines()
+    blocks: list[str] = []
+    i = 0
+    while i < len(lines):
+        if lines[i].lstrip().startswith("```"):
+            j = i + 1
+            body: list[str] = []
+            while (j < len(lines)
+                   and not lines[j].lstrip().startswith("```")):
+                body.append(lines[j])
+                j += 1
+            if body:
+                blocks.append("\n".join(body))
+            i = j + 1
+        else:
+            i += 1
+    return blocks
+
+
+def _looks_like_diff(text: str) -> bool:
+    lines = text.splitlines()
+    return (any(l.startswith("--- ") for l in lines)
+            and any(l.startswith("+++ ") for l in lines)
+            and any(l.startswith("@@ ") for l in lines))
+
+
+def _extract_diff_block(
+        response: Optional[str]) -> tuple[Optional[str], bool]:
+    """Return (block, is_diff).
+
+    Prefers the largest fenced block that parses as a unified diff.
+    Falls back to the largest fenced block of any kind — treated as
+    full file content by the caller.
     """
-    if not targets:
-        return None
-    ordered = sorted(targets.items(), key=lambda x: -x[1])
-    top_name, top_count = ordered[0]
-    if top_count < 2:
-        return None
-    if len(ordered) > 1 and top_count < 2 * ordered[1][1]:
-        return None
-    return top_name
+    if not response:
+        return None, False
+    blocks = _fenced_blocks(response)
+    if not blocks:
+        return None, False
+    diffs = [b for b in blocks if _looks_like_diff(b)]
+    if diffs:
+        return max(diffs, key=len), True
+    return max(blocks, key=len), False
 
 
-# ---- heuristic adapters ------------------------------------------
+def _sanitize_for_filename(s: str, max_len: int = 80) -> str:
+    s = s.replace("/", "__").replace("\\", "__")
+    s = re.sub(r"[^A-Za-z0-9_.\-]", "_", s)
+    return s[:max_len] or "target"
 
-def _run_heuristic(block: dict, context: str) -> dict:
-    return analyze_edit_blob(block, context)
+
+def _normalize_patch(patch_text: str, target: str) -> str:
+    """Rewrite ---/+++ headers to point at `target` directly.
+
+    Keeps /dev/null (file add/delete), keeps hunk bodies, drops
+    `diff --git`, `index`, `mode` lines — those carry junk paths
+    and confuse `patch`.
+    """
+    out: list[str] = []
+    for line in patch_text.splitlines():
+        if line.startswith("--- ") or line.startswith("+++ "):
+            prefix = line[:4]
+            rest = line[4:].strip()
+            if rest == "/dev/null":
+                out.append(line)
+                continue
+            tab_part = ""
+            if "\t" in rest:
+                tab_part = "\t" + rest.split("\t", 1)[1]
+            out.append(f"{prefix}{target}{tab_part}")
+            continue
+        if line.startswith((
+                "diff --git ", "index ", "new file mode ",
+                "deleted file mode ", "old mode ", "new mode ",
+                "similarity index ", "rename from ",
+                "rename to ")):
+            continue
+        out.append(line)
+    body = "\n".join(out)
+    if not body.endswith("\n"):
+        body += "\n"
+    return body
 
 
-def _run_code_blob_analysis(block: dict, context: str):
-    if analyze_code_blob is None:
-        return None
+def _apply_patch(target: str, current_content: str, patch_text: str,
+                 raw_dir: Path) -> tuple[bool, str, str]:
+    """Apply `patch_text` to `current_content`.
+
+    Returns (ok, new_content_or_empty, detail).  Runs POSIX `patch`
+    in a scratch directory seeded with the current file.  On
+    failure, the normalized patch and the command's stderr are
+    written under `raw_dir/patches/` for inspection.
+    """
+    normalized = _normalize_patch(patch_text, target)
+    safe = _sanitize_for_filename(target)
+
     try:
-        return analyze_code_blob(block, context)
-    except Exception as e:
-        print(f"  ! code_blob_analysis failed for "
-              f"{block.get('filename')}: {e}", file=sys.stderr)
-        return None
+        work_dir = Path(tempfile.mkdtemp(
+            prefix=f"eer_patch_{safe}_", dir=str(raw_dir)))
+    except OSError as e:
+        return False, "", f"could not create work dir: {e}"
 
-
-def _is_replacement_edit_context(context: str, handle: str) -> bool:
-    if not context or not handle:
-        return False
-    near = _near_handle_lines(context, handle, before_lines=10)
-    is_edit_hdr, _is_full_hdr, _is_create_hdr, _ = \
-        _check_edit_header(near)
-    return is_edit_hdr
-
-
-# ---- record construction ----------------------------------------
-
-def _classify_via_ai(block: dict, context: str, analysis: dict,
-                     client: LLMClient, temperature: float,
-                     max_tokens: int) -> dict:
-    prompt = _ep._build_prompt(block, context, analysis)
-    record = {
-        "index":            block["index"],
-        "block_filename":   block.get("filename"),
-        "lang":             block.get("lang"),
-        "is_edit_request":  False,
-        "edit_kind":        None,
-        "target_file":      None,
-        "flat_filename":    None,
-        "target_path":      None,
-        "confidence":       analysis["confidence"],
-        "classification":   "ai_error",
-        "reasoning":        "",
-        "raw_response":     None,
-        "error":            None,
-        "heuristic": {
-            "score":      analysis["score"],
-            "confidence": analysis["confidence"],
-            "signals":    [{"name": s.name, "weight": s.weight}
-                            for s in analysis["signals"]],
-            "edit_kind":  analysis.get("edit_kind"),
-        },
-        "ai": None,
-    }
+    target_path = work_dir / target
     try:
-        response = client.call(
-            prompt, max_tokens=max_tokens, temperature=temperature,
-            tag=f"edit:{block['index']:03d}")
-    except Exception as e:
-        record["error"] = f"LLM call failed: {e}"
-        record["is_edit_request"] = bool(analysis["is_edit_request"])
-        record["edit_kind"] = analysis.get("edit_kind")
-        record["classification"] = (
-            "ai_edit" if record["is_edit_request"]
-            else "ai_not_edit")
-        if analysis["is_edit_request"] and analysis["target_candidates"]:
-            record["target_file"] = _eo._clean_target_path(
-                analysis["target_candidates"][0]["name"])
-        return record
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(current_content, encoding="utf-8")
+    except OSError as e:
+        return False, "", f"could not seed target file: {e}"
 
-    if response is None:
-        record["error"] = "LLM returned None"
-        record["is_edit_request"] = bool(analysis["is_edit_request"])
-        record["edit_kind"] = analysis.get("edit_kind")
-        record["classification"] = (
-            "ai_edit" if record["is_edit_request"]
-            else "ai_not_edit")
-        return record
+    patch_file = work_dir / "edit.patch"
+    patch_file.write_text(normalized, encoding="utf-8")
 
-    record["raw_response"] = response
-    parsed = _ep._parse_json_response(response)
-    if parsed is None:
-        record["error"] = "could not parse JSON from response"
-        record["is_edit_request"] = bool(analysis["is_edit_request"])
-        record["edit_kind"] = analysis.get("edit_kind")
-        record["classification"] = (
-            "ai_edit" if record["is_edit_request"]
-            else "ai_not_edit")
-        return record
+    try:
+        proc = subprocess.run(
+            ["patch", "-p0", "-u", "-i", str(patch_file),
+             "--batch", "--no-backup-if-mismatch"],
+            cwd=str(work_dir),
+            capture_output=True, text=True, timeout=60)
+    except FileNotFoundError:
+        return False, "", "'patch' command not found on PATH"
+    except subprocess.TimeoutExpired:
+        return False, "", "patch command timed out after 60s"
 
-    record["ai"] = parsed
-    record["is_edit_request"] = bool(parsed.get("is_edit_request"))
-    record["classification"] = (
-        "ai_edit" if record["is_edit_request"]
-        else "ai_not_edit")
-    kind = parsed.get("edit_kind")
-    if isinstance(kind, str) and kind.strip():
-        record["edit_kind"] = kind.strip()
-    elif record["is_edit_request"]:
-        record["edit_kind"] = analysis.get("edit_kind") or "fragment"
+    if proc.returncode != 0:
+        try:
+            diag = raw_dir / "patches"
+            diag.mkdir(parents=True, exist_ok=True)
+            (diag / f"{safe}.failed.diff").write_text(
+                normalized, encoding="utf-8")
+            (diag / f"{safe}.patch.stderr").write_text(
+                proc.stderr or proc.stdout or "", encoding="utf-8")
+        except OSError:
+            pass
+        snippet = (proc.stderr or proc.stdout or "").strip()
+        if len(snippet) > 400:
+            snippet = "…" + snippet[-400:]
+        return False, "", f"patch exited {proc.returncode}: {snippet}"
 
-    tgt = parsed.get("target_file")
-    if isinstance(tgt, str) and tgt.strip():
-        record["target_file"] = _eo._clean_target_path(tgt.strip())
-    if record["is_edit_request"] and not record["target_file"]:
-        if analysis["target_candidates"]:
-            record["target_file"] = _eo._clean_target_path(
-                analysis["target_candidates"][0]["name"])
-    record["reasoning"] = str(parsed.get("reasoning") or "")
-    return record
+    try:
+        new_content = target_path.read_text(encoding="utf-8")
+    except OSError as e:
+        return False, "", f"could not read patched file: {e}"
+
+    try:
+        shutil.rmtree(work_dir)
+    except OSError:
+        pass
+
+    n_hunks = sum(1 for l in normalized.splitlines()
+                  if l.startswith("@@ "))
+    return True, new_content, f"patch -p0, {n_hunks} hunk(s)"
 
 
-def _record_from_heuristic(block: dict, analysis: dict) -> dict:
-    is_edit = bool(analysis.get("is_edit_request"))
-    target = None
-    if is_edit and analysis["target_candidates"]:
-        target = _eo._clean_target_path(
-            analysis["target_candidates"][0]["name"])
-    return {
-        "index":            block["index"],
-        "block_filename":   block.get("filename"),
-        "lang":             block.get("lang"),
-        "is_edit_request":  is_edit,
-        "edit_kind":        analysis.get("edit_kind") if is_edit else None,
-        "target_file":      target,
-        "flat_filename":    None,
-        "target_path":      None,
-        "confidence":       analysis["confidence"],
-        "classification":   ("heuristic_edit" if is_edit
-                              else "heuristic_not_edit"),
-        "reasoning": (
-            f"heuristic (score {analysis['score']:+.2f}, "
-            f"{analysis['confidence']})"),
-        "raw_response":     None,
-        "error":            None,
-        "heuristic": {
-            "score":      analysis["score"],
-            "confidence": analysis["confidence"],
-            "signals":    [{"name": s.name, "weight": s.weight}
-                            for s in analysis["signals"]],
-            "edit_kind":  analysis.get("edit_kind"),
-        },
-        "ai": None,
-    }
+# ---- file writing ----------------------------------------------
+
+def _write_edited_file(target: str, content: str,
+                       out_dir: Path) -> Path:
+    """Write `content` to `<out_dir>/edited/<target>`."""
+    edir = out_dir / "edited"
+    parts = [p for p in Path(target).parts
+             if p not in ("", ".", "..", "/")]
+    if not parts:
+        raise OSError(f"empty target path: {target!r}")
+    dst = edir
+    for p in parts:
+        dst = dst / p
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(content, encoding="utf-8")
+    return dst
 
 
-def _record_from_full_file_skip(block: dict,
-                                code_analysis: dict) -> dict:
-    return {
-        "index":            block["index"],
-        "block_filename":   block.get("filename"),
-        "lang":             block.get("lang"),
-        "is_edit_request":  False,
-        "edit_kind":        None,
-        "target_file":      None,
-        "flat_filename":    None,
-        "target_path":      None,
-        "confidence":       "full_file",
-        "classification":   "full_file_skip",
-        "reasoning": (
-            f"pre-filter: full file per code_blob_analysis "
-            f"(score {code_analysis['score']:+.2f}, "
-            f"{code_analysis['confidence']}); no edit header "
-            f"nearby"),
-        "raw_response":     None,
-        "error":            None,
-        "code_blob_analysis": {
-            "score":      code_analysis["score"],
-            "confidence": code_analysis["confidence"],
-            "is_full_file": code_analysis["is_full_file"],
-            "signals":    [{"name": s.name, "weight": s.weight}
-                            for s in code_analysis["signals"]],
-            "filename_candidates":
-                code_analysis["filename_candidates"],
-        },
-        "heuristic":        None,
-        "ai":               None,
-    }
-
-
-def _fallback_record(block: dict, error: Exception) -> dict:
-    return {
-        "index":            block["index"],
-        "block_filename":   block.get("filename"),
-        "lang":             block.get("lang"),
-        "is_edit_request":  False,
-        "edit_kind":        None,
-        "target_file":      None,
-        "flat_filename":    None,
-        "target_path":      None,
-        "confidence":       "ambiguous",
-        "classification":   "error",
-        "reasoning":        "",
-        "raw_response":     None,
-        "error":            f"heuristic analysis failed: {error}",
-        "heuristic":        None,
-        "ai":               None,
-    }
-
-
-# ---- core pipeline (shared by CLI and hooks) --------------------
+# ---- core pipeline ---------------------------------------------
 
 def _run_pipeline(input_path: Path, opts: dict) -> dict:
     if not input_path.is_file():
@@ -512,57 +479,109 @@ def _run_pipeline(input_path: Path, opts: dict) -> dict:
         shutil.rmtree(raw_dir)
 
     quiet = opts.get("quiet", False)
-    verbose_h = opts.get("verbose_heuristics", False)
-    no_ai = opts.get("no_ai", False)
-    force_ai = opts.get("force_ai", False)
-    context_lines = opts.get("context_lines", _DEFAULT_CONTEXT_LINES)
-    include_non_edits = opts.get("include_non_edits", False)
-    include_blockquotes = opts.get("include_blockquotes", False)
-    no_full_file_filter = opts.get("no_full_file_filter", False)
-
-    if no_full_file_filter:
-        use_prefilter = False
-        prefilter_reason = "disabled via --no-full-file-filter"
-    elif _HAS_CODE_BLOB_ANALYSIS:
-        use_prefilter = True
-        prefilter_reason = "using code_blob_analysis"
-    else:
-        use_prefilter = False
-        prefilter_reason = ("warning: code_blob_analysis not "
-                            "available; running edit analysis on "
-                            "all blocks")
 
     if not quiet:
         print(f"input:     {input_path}", file=sys.stderr)
         print(f"extractor: {extractor}", file=sys.stderr)
         print(f"out_dir:   {out_dir}", file=sys.stderr)
-        if not include_blockquotes:
-            print("filter:    blockquoted (thinking-process) blocks "
-                  "skipped via --top-level-only", file=sys.stderr)
-        print(f"prefilter: {prefilter_reason}", file=sys.stderr)
 
+    # 1. Read the original conversation — this is what the LLM sees.
+    conversation_text = input_path.read_text(
+        encoding="utf-8", errors="replace")
+
+    # Strip blockquoted (thinking-process) sections before sending
+    # to the LLM — 50–70% of a typical DeepSeek log, and they
+    # describe reasoning, not edits.
+    llm_conversation = _strip_blockquotes(conversation_text)
+    if not quiet:
+        saved = len(conversation_text) - len(llm_conversation)
+        if saved:
+            print(
+                f"conversation: {len(conversation_text):,} → "
+                f"{len(llm_conversation):,} chars "
+                f"(stripped {saved:,} of blockquoted thinking)",
+                file=sys.stderr)
+
+    # 2. Run the extractor only to get the stripped prose (clean scan).
     try:
-        manifest = _run_extractor(
+        stripped_path = _run_extractor(
             extractor, input_path, raw_dir,
-            top_level_only=not include_blockquotes,
-        )
+            top_level_only=not opts.get("include_blockquotes", False))
     except (RuntimeError, FileNotFoundError) as e:
         return {"rc": 1, "error": str(e)}
 
-    if not quiet:
-        print(f"{len(manifest)} block(s) extracted → {raw_dir}/",
-              file=sys.stderr)
+    stripped_text = stripped_path.read_text(
+        encoding="utf-8", errors="replace")
 
-    stripped_path = _find_stripped(raw_dir)
-    stripped_text = (stripped_path.read_text(encoding="utf-8")
-                     if stripped_path else "")
+    # 3. Detect edit targets from prose.
     edit_targets = _scan_edit_targets(stripped_text)
-    edit_target_hint = _build_edit_target_hint(edit_targets)
-    dominant_target = _pick_dominant_target(edit_targets)
-    if not quiet and edit_targets:
-        print(f"edit-targets: {edit_target_hint}", file=sys.stderr)
+    targets_to_edit = _pick_targets_to_edit(edit_targets)
 
-    _client_cache = {"client": opts.get("client")}
+    if not quiet:
+        if edit_targets:
+            summary = ", ".join(
+                f"{n} ({c}x)" for n, c
+                in sorted(edit_targets.items(), key=lambda x: -x[1]))
+            print(f"detected:  {summary}", file=sys.stderr)
+        else:
+            print("detected:  (no edit targets in prose)",
+                  file=sys.stderr)
+        if targets_to_edit:
+            print(f"edit list: {', '.join(targets_to_edit)}",
+                  file=sys.stderr)
+
+    report: dict = {
+        "input":               str(input_path),
+        "conversation_length": len(conversation_text),
+        "llm_conversation_length": len(llm_conversation),
+        "detected_targets":    edit_targets,
+        "targets_to_edit":     targets_to_edit,
+        "results":             [],
+    }
+
+    def _write_report():
+        (out_dir / "_report.json").write_text(
+            json.dumps(report, indent=2, default=str),
+            encoding="utf-8")
+
+    if not targets_to_edit:
+        if not quiet:
+            print("\nno edit targets — nothing to do",
+                  file=sys.stderr)
+        _write_report()
+        return {
+            "rc": 0, "out_dir": str(out_dir),
+            "target_count": 0, "implemented_count": 0,
+            "report": str(out_dir / "_report.json"),
+        }
+
+    # 4. Load dumps.
+    dump_files = opts.get("dump_files") or []
+    if not dump_files:
+        if not quiet:
+            print(
+                "\nno --dump-file provided — cannot retrieve "
+                "target contents", file=sys.stderr)
+        _write_report()
+        return {
+            "rc": 0, "out_dir": str(out_dir),
+            "target_count": len(targets_to_edit),
+            "implemented_count": 0,
+            "report": str(out_dir / "_report.json"),
+            "warning": "no --dump-file; would have edited: "
+                       + ", ".join(targets_to_edit),
+        }
+
+    corpus, dump_errors = _dc._load_dump_corpus(dump_files)
+    for e in dump_errors:
+        print(f"  ! {e}", file=sys.stderr)
+    if not quiet:
+        total = sum(len(d.files) for d in corpus.dumps)
+        print(f"dumps:     {len(corpus.dumps)} loaded, "
+              f"{total} file(s) indexed", file=sys.stderr)
+
+    # 5. Per target: resolve → one LLM call → diff → apply → write.
+    _client_cache: dict = {"client": opts.get("client")}
 
     def _get_client():
         if _client_cache["client"] is None:
@@ -571,458 +590,215 @@ def _run_pipeline(input_path: Path, opts: dict) -> dict:
                 timeout=DEFAULT_LLM_TIMEOUT)
         return _client_cache["client"]
 
-    # ---- per-block classification --------------------------------
-    records: list[dict] = []
-    for b in manifest:
-        context = _extract_context(
-            stripped_text, b.get("handle", ""), context_lines)
+    max_tokens = opts.get(
+        "implement_max_tokens", _DEFAULT_IMPLEMENT_MAX_TOKENS)
+    temperature = opts.get(
+        "implement_temperature", _DEFAULT_IMPLEMENT_TEMPERATURE)
 
-        if edit_target_hint:
-            context = edit_target_hint + "\n\n" + context
+    implemented_count = 0
 
-        if use_prefilter:
-            code_analysis = _run_code_blob_analysis(b, context)
-            if (code_analysis is not None
-                    and code_analysis.get("is_full_file") is True):
-                if not _is_replacement_edit_context(
-                        context, b.get("handle", "")):
-                    if verbose_h and not quiet:
-                        print(f"  [prefilter] {b['filename']}: "
-                              f"FULL FILE "
-                              f"(score={code_analysis['score']:+.2f},"
-                              f" confidence="
-                              f"{code_analysis['confidence']}) → "
-                              f"skipped", file=sys.stderr)
-                    rec = _record_from_full_file_skip(b, code_analysis)
-                    if not quiet:
-                        print(f"  · {b['filename']}  "
-                              f"[skip/full-file]", file=sys.stderr)
-                    records.append(rec)
-                    continue
-                elif verbose_h and not quiet:
-                    print(f"  [prefilter] {b['filename']}: "
-                          f"full-file shape but edit header in "
-                          f"context — running edit analysis",
-                          file=sys.stderr)
+    for target in targets_to_edit:
+        res = corpus.resolve(target)
+        entry: dict = {
+            "target":          target,
+            "resolve_status":  res["status"],
+            "resolve_method":  res.get("method"),
+            "abs_path":        res.get("abs_path"),
+            "current_length":  res.get("content_length"),
+            "output_path":     None,
+            "edited_length":   None,
+            "response_format": None,
+            "error":           None,
+        }
 
-        try:
-            analysis = _run_heuristic(b, context)
-        except Exception as e:
-            print(f"  ! heuristic analysis failed for "
-                  f"{b.get('filename')}: {e}", file=sys.stderr)
-            records.append(_fallback_record(b, e))
+        if res["status"] == "not_found":
+            if not quiet:
+                print(f"  × not found {target}", file=sys.stderr)
+            entry["error"] = "not found in dump"
+            report["results"].append(entry)
+            continue
+        if res["status"] == "ambiguous":
+            if not quiet:
+                print(f"  ? ambiguous {target} "
+                      f"({len(res['candidates'])} candidate(s))",
+                      file=sys.stderr)
+            entry["error"] = (
+                f"ambiguous ({len(res['candidates'])} candidate(s))")
+            report["results"].append(entry)
             continue
 
-        if verbose_h and not quiet:
-            print(f"  [heuristic] {b['filename']}: "
-                  f"score={analysis['score']:+.2f} "
-                  f"confidence={analysis['confidence']} "
-                  f"is_edit={analysis['is_edit_request']} "
-                  f"kind={analysis.get('edit_kind')}",
+        if not quiet:
+            print(f"  ← retrieved {target}  ← "
+                  f"{res['dump_file']}::{res['relpath']}",
                   file=sys.stderr)
-            for s in analysis["signals"]:
-                sign = "+" if s.weight > 0 else ""
-                print(f"      {sign}{s.weight:.2f}  {s.name}",
-                      file=sys.stderr)
-            for c in analysis["target_candidates"][:5]:
-                print(f"      target: {c['name']}  "
-                      f"(source={c['source']}, "
-                      f"confidence={c['confidence']})",
-                      file=sys.stderr)
 
-        use_ai = (not no_ai) and (
-            force_ai or analysis["confidence"] == "ambiguous")
-
-        if use_ai:
-            try:
-                client = _get_client()
-            except Exception as e:
-                return {"rc": 1,
-                        "error": f"could not init LLM client: {e}"}
-            rec = _classify_via_ai(
-                b, context, analysis, client,
-                temperature=opts.get("temperature",
-                                     _DEFAULT_TEMPERATURE),
-                max_tokens=opts.get("max_tokens",
-                                    _DEFAULT_MAX_TOKENS))
-            if force_ai and rec.get("ai") is not None:
-                ai_edit = bool(rec["is_edit_request"])
-                h_edit = bool(analysis["is_edit_request"])
-                if ai_edit != h_edit:
-                    rec["disagreement"] = True
-                    if not quiet:
-                        print(f"  ! disagreement {b['filename']}: "
-                              f"heuristic={h_edit}, ai={ai_edit}",
-                              file=sys.stderr)
-        else:
-            rec = _record_from_heuristic(b, analysis)
+        current_content = res["content"]
+        prompt = _build_implement_prompt(
+            target, llm_conversation, current_content)
 
         if not quiet:
-            kind = "edit" if rec["is_edit_request"] else "skip"
-            src = "ai" if use_ai else "heuristic"
-            target = rec.get("target_file") or "(unresolved)"
-            print(f"  · {b['filename']}  [{kind}/{src}] → {target}",
+            print(f"  [LLM:{target}] call "
+                  f"(prompt {len(prompt)} chars)",
                   file=sys.stderr)
-        records.append(rec)
 
-    # ---- fallback: assign dominant edit target to unresolved edits --
-    if dominant_target:
-        patched = 0
-        for rec in records:
-            if (rec.get("is_edit_request")
-                    and not rec.get("target_file")
-                    and rec.get("classification") != "full_file_skip"):
-                rec["target_file"] = dominant_target
-                rec["target_source"] = "conversation_fallback"
-                patched += 1
-        if not quiet and patched:
-            print(f"fallback:   assigned {patched} unresolved "
-                  f"edit(s) to {dominant_target}", file=sys.stderr)
-
-    # ---- retrieval from dumps ------------------------------------
-    dump_files = opts.get("dump_files") or []
-    corpus: Optional[_dc.DumpCorpus] = None
-    retrieved_by_target: dict[str, dict] = {}
-    retrieved_written = 0
-    retrieval_report = None
-
-    if dump_files:
-        corpus, dump_errors = _dc._load_dump_corpus(dump_files)
-        for e in dump_errors:
-            print(f"  ! {e}", file=sys.stderr)
-        if not quiet:
-            total_in_dumps = sum(len(d.files) for d in corpus.dumps)
-            print(f"dumps:     {len(corpus.dumps)} loaded, "
-                  f"{total_in_dumps} file(s) indexed", file=sys.stderr)
-
-        for rec in records:
-            target = rec.get("target_file")
-            if not target:
-                continue
-            res = retrieved_by_target.get(target)
-            if res is None:
-                res = corpus.resolve(target)
-                retrieved_by_target[target] = res
-            rec["retrieved"] = {
-                "status":          res["status"],
-                "method":          res.get("method"),
-                "dump_file":       res.get("dump_file"),
-                "relpath":         res.get("relpath"),
-                "abs_path":        res.get("abs_path"),
-                "content_length":  res.get("content_length"),
-                "candidate_count": (
-                    len(res.get("candidates", []))
-                    if res["status"] == "ambiguous" else 0),
-            }
+        try:
+            client = _get_client()
+            response = client.call(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                tag=f"implement:{Path(target).name}",
+            )
+        except Exception as e:
             if not quiet:
-                if res["status"] == "resolved":
-                    print(f"  ← retrieved  {target}  "
-                          f"← {res['dump_file']}::{res['relpath']}",
+                print(f"  ! LLM call failed for {target}: {e}",
+                      file=sys.stderr)
+            entry["error"] = f"LLM call failed: {e}"
+            report["results"].append(entry)
+            continue
+
+        block, is_diff = _extract_diff_block(response or "")
+        if block is None:
+            if not quiet:
+                print(f"  ! no fenced block in response for {target}",
+                      file=sys.stderr)
+            entry["error"] = "no fenced block in response"
+            report["results"].append(entry)
+            continue
+
+        # Persist the raw block for inspection.
+        try:
+            patches_dir = raw_dir / "patches"
+            patches_dir.mkdir(parents=True, exist_ok=True)
+            safe = _sanitize_for_filename(target)
+            ext = ".diff" if is_diff else ".full.txt"
+            (patches_dir / f"{safe}{ext}").write_text(
+                block, encoding="utf-8")
+        except OSError:
+            pass
+
+        if is_diff:
+            ok, new_content, detail = _apply_patch(
+                target, current_content, block, raw_dir)
+            if not ok:
+                if not quiet:
+                    print(f"  ! patch failed for {target}: {detail}",
                           file=sys.stderr)
-                elif res["status"] == "ambiguous":
-                    print(f"  ? ambiguous   {target}  "
-                          f"({len(res['candidates'])} candidate(s))",
-                          file=sys.stderr)
-                else:
-                    print(f"  × not found  {target}", file=sys.stderr)
-
-        retrieved_written = _dc._write_retrieved(
-            retrieved_by_target, out_dir, quiet=quiet)
-
-        retrieval_report = {
-            "description": (
-                "Target-file retrieval report.  `dumps` lists each "
-                "dump parsed (with the absolute SCANNED DIRECTORY "
-                "it recorded).  `by_target` maps each target-path "
-                "suggestion to the resolved file — including every "
-                "dump that provided it.  Resolved contents are "
-                "written under `retrieved/`."),
-            "dumps": [
-                {
-                    "dump_file":   str(d.path),
-                    "scanned_dir": d.scanned_dir,
-                    "file_count":  len(d.files),
-                }
-                for d in corpus.dumps
-            ],
-            "by_target": {
-                t: {k: v for k, v in r.items() if k != "content"}
-                for t, r in retrieved_by_target.items()
-            },
-        }
-        (out_dir / "_retrieved_files.json").write_text(
-            json.dumps(retrieval_report, indent=2, default=str),
-            encoding="utf-8",
-        )
-
-    # ---- implement edits -----------------------------------------
-    implement_edits = opts.get("implement_edits", False)
-    implemented_count = 0
-    implement_log: list[dict] = []
-    implement_log_path: Optional[Path] = None
-
-    if implement_edits:
-        if no_ai:
-            print("  ! --implement-edits requires LLM; skipped "
-                  "because --no-ai is set", file=sys.stderr)
-        elif not dump_files:
-            print("  ! --implement-edits requires --dump-file; "
-                  "skipped", file=sys.stderr)
-        elif corpus is None:
-            print("  ! no dump corpus loaded; implement-edits "
-                  "skipped", file=sys.stderr)
+                entry["error"] = f"patch failed: {detail}"
+                entry["response_format"] = "diff"
+                report["results"].append(entry)
+                continue
+            entry["response_format"] = "diff"
+            entry["patch_method"] = detail
+            entry["diff_length"] = len(block)
         else:
-            handle_by_index = {
-                b["index"]: b.get("handle", "") for b in manifest}
-            resolved_targets = [
-                (t, r) for t, r in retrieved_by_target.items()
-                if r["status"] == "resolved" and r.get("content")
-            ]
-            if not resolved_targets:
-                print("  ! no resolved targets to implement; "
-                      "skipping", file=sys.stderr)
-            else:
-                # Build the SHARED context ONCE.  Every implement
-                # call gets the exact same context — only the
-                # prompt's "<this-file>" slot varies.
-                shared_context = _ep._build_implement_context(
-                    stripped_text, handle_by_index, records,
-                    raw_dir, retrieved_by_target)
-                if not quiet:
-                    print(f"\nimplementing edits for "
-                          f"{len(resolved_targets)} resolved "
-                          f"target(s) "
-                          f"(shared context: "
-                          f"{len(shared_context)} chars)",
-                          file=sys.stderr)
+            # Model ignored the format — treat block as full content.
+            if not quiet:
+                print(f"  ! {target}: response was not a diff — "
+                      f"treating block as full file",
+                      file=sys.stderr)
+            new_content = block
+            entry["response_format"] = "full_file_fallback"
 
-                edited_by_target: dict[str, str] = {}
-                for target, _res in resolved_targets:
-                    prompt = _ep._build_implement_prompt(
-                        target, shared_context)
-                    try:
-                        client = _get_client()
-                        response = client.call(
-                            prompt,
-                            max_tokens=opts.get(
-                                "implement_max_tokens",
-                                _DEFAULT_IMPLEMENT_MAX_TOKENS),
-                            temperature=opts.get(
-                                "implement_temperature",
-                                _DEFAULT_IMPLEMENT_TEMPERATURE),
-                            tag=f"implement:{Path(target).name}",
-                        )
-                    except Exception as e:
-                        print(f"  ! implement call failed for "
-                              f"{target}: {e}", file=sys.stderr)
-                        implement_log.append({
-                            "target": target,
-                            "error":  f"LLM call failed: {e}",
-                        })
-                        continue
-                    edited = _ep._extract_edited_file_from_response(
-                        response or "")
-                    if edited is None:
-                        implement_log.append({
-                            "target":        target,
-                            "error":         "could not extract "
-                                             "fenced block from "
-                                             "response",
-                            "raw_response":  response,
-                        })
-                        continue
-                    edited_by_target[target] = edited
-                    if not quiet:
-                        print(f"  ✓ edited  {target}  "
-                              f"({len(edited)} chars)",
-                              file=sys.stderr)
+        try:
+            out_path = _write_edited_file(
+                target, new_content, out_dir)
+        except OSError as e:
+            if not quiet:
+                print(f"  ! failed to write {target}: {e}",
+                      file=sys.stderr)
+            entry["error"] = f"write failed: {e}"
+            report["results"].append(entry)
+            continue
 
-                implemented_count, write_log = \
-                    _eo._write_edited_files(
-                        edited_by_target, out_dir)
-                implement_log.extend(write_log)
-                implement_log_path = out_dir / "_implement_log.json"
-                implement_log_path.write_text(
-                    json.dumps(implement_log, indent=2, default=str),
-                    encoding="utf-8",
-                )
-                if not quiet:
-                    print(f"implement: {implemented_count} file(s) "
-                          f"written to {out_dir / 'edited'}/",
-                          file=sys.stderr)
+        implemented_count += 1
+        entry["output_path"] = str(out_path)
+        entry["edited_length"] = len(new_content)
+        if not quiet:
+            fmt = entry["response_format"]
+            extra = (f", {entry['patch_method']}"
+                     if fmt == "diff" else "")
+            print(f"  ✓ edited {target}  "
+                  f"({len(current_content)} → {len(new_content)} chars, "
+                  f"{fmt}{extra})", file=sys.stderr)
+        report["results"].append(entry)
 
-    # ---- build edit map + write blobs ----------------------------
-    files_dir = out_dir / "files"
-    edit_map, target_index = _eo._build_edit_map(
-        records, files_dir, include_non_edits=include_non_edits)
-
-    (out_dir / "_edit_map.json").write_text(
-        json.dumps(edit_map, indent=2, default=str),
-        encoding="utf-8",
-    )
-    (out_dir / "_edit_targets.json").write_text(
-        json.dumps(target_index, indent=2, default=str),
-        encoding="utf-8",
-    )
-
-    written, skipped = _eo._write_blobs(
-        raw_dir, files_dir, records, quiet=quiet)
-
-    (out_dir / "_classification_log.json").write_text(
-        json.dumps(records, indent=2, default=str),
-        encoding="utf-8",
-    )
-
-    edit_count = sum(1 for r in records if r.get("is_edit_request"))
-    full_file_count = sum(
-        1 for r in records
-        if r.get("classification") == "full_file_skip")
-    target_count = len(target_index["targets"])
-    unresolved_count = len(target_index["unresolved_edits"])
-
-    retrieved_resolved = sum(
-        1 for r in retrieved_by_target.values()
-        if r["status"] == "resolved")
-    retrieved_ambiguous = sum(
-        1 for r in retrieved_by_target.values()
-        if r["status"] == "ambiguous")
-    retrieved_not_found = sum(
-        1 for r in retrieved_by_target.values()
-        if r["status"] == "not_found")
+    _write_report()
 
     if not quiet:
-        if full_file_count:
-            print(f"\npre-filter: {full_file_count} full-file "
-                  f"block(s) skipped via code_blob_analysis",
-                  file=sys.stderr)
-        print(f"\nwrote {written} file(s) to {files_dir}/ "
-              f"({skipped} skipped)", file=sys.stderr)
-        print(f"edit requests: {edit_count} across {target_count} "
-              f"target file(s); {unresolved_count} unresolved",
+        print(f"\nimplemented: {implemented_count} file(s) in "
+              f"{out_dir / 'edited'}/", file=sys.stderr)
+        print(f"report:      {out_dir / '_report.json'}",
               file=sys.stderr)
-        if corpus is not None:
-            print(f"retrieved: {retrieved_resolved} resolved / "
-                  f"{retrieved_ambiguous} ambiguous / "
-                  f"{retrieved_not_found} not-found across "
-                  f"{len(corpus.dumps)} dump(s)",
-                  file=sys.stderr)
-            print(f"retrieved: {out_dir / 'retrieved'}/",
-                  file=sys.stderr)
-            print(f"report:    "
-                  f"{out_dir / '_retrieved_files.json'}",
-                  file=sys.stderr)
-        if implement_edits:
-            print(f"implemented: {implemented_count} file(s) in "
-                  f"{out_dir / 'edited'}/", file=sys.stderr)
-            if implement_log_path:
-                print(f"implement:   {implement_log_path}",
-                      file=sys.stderr)
-        print(f"map:     {out_dir / '_edit_map.json'}",
-              file=sys.stderr)
-        print(f"targets: {out_dir / '_edit_targets.json'}",
-              file=sys.stderr)
-        print(f"log:     {out_dir / '_classification_log.json'}",
-              file=sys.stderr)
-        print(f"raw:     {raw_dir}/", file=sys.stderr)
+        print(f"raw:         {raw_dir}/", file=sys.stderr)
 
     return {
-        "rc":                   0,
-        "out_dir":              str(out_dir),
-        "raw_dir":              str(raw_dir),
-        "files_dir":            str(files_dir),
-        "edit_map":             str(out_dir / "_edit_map.json"),
-        "targets":              str(out_dir / "_edit_targets.json"),
-        "written":              written,
-        "skipped":              skipped,
-        "record_count":         len(records),
-        "edit_count":           edit_count,
-        "target_count":         target_count,
-        "unresolved_count":     unresolved_count,
-        "full_file_count":      full_file_count,
-        "dump_count":           len(corpus.dumps) if corpus else 0,
-        "retrieved_resolved":   retrieved_resolved,
-        "retrieved_ambiguous":  retrieved_ambiguous,
-        "retrieved_not_found":  retrieved_not_found,
-        "retrieved_written":    retrieved_written,
-        "retrieved":            retrieved_by_target,
-        "retrieved_json":       (str(out_dir / "_retrieved_files.json")
-                                 if retrieval_report is not None
-                                 else None),
-        "implemented_count":    implemented_count,
-        "implement_log":        (str(implement_log_path)
-                                 if implement_log_path else None),
+        "rc":               0,
+        "out_dir":          str(out_dir),
+        "raw_dir":          str(raw_dir),
+        "target_count":     len(targets_to_edit),
+        "implemented_count": implemented_count,
+        "report":           str(out_dir / "_report.json"),
+        "detected_targets": edit_targets,
+        "targets_to_edit":  targets_to_edit,
+        "results":          report["results"],
     }
 
 
-# ---- standalone CLI ----------------------------------------------
+# ---- CLI -------------------------------------------------------
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="extract_edit_requests.py",
         description=(
-            "Extract code blocks, pre-filter confidently-full files, "
-            "classify the rest as edit requests, retrieve target-file "
-            "contents from one or more dump.py outputs, and "
-            "(optionally) have the LLM produce the fully-edited "
-            "files."),
+            "Detect which files a conversation asks to edit, "
+            "retrieve them from dumps, and have the LLM produce "
+            "surgical diff patches — one LLM call per file."),
     )
     p.add_argument("input", metavar="INPUT", help="input file")
-    p.add_argument("--out-dir", metavar="PATH", default=None,
-                   help="output dir (default: /tmp/"
-                        "deeppeek_edits_<stem>_<ts>)")
-    p.add_argument("--extractor", metavar="PATH", default=None,
-                   help="path to extract_code_blocks.py")
-    p.add_argument("--model", default=DEFAULT_LLM_MODEL,
-                   help=f"LLM model (default: {DEFAULT_LLM_MODEL})")
-    p.add_argument("--temperature", type=float,
-                   default=_DEFAULT_TEMPERATURE, metavar="F",
-                   help=f"LLM temperature (default: "
-                        f"{_DEFAULT_TEMPERATURE})")
-    p.add_argument("--max-tokens", type=int,
-                   default=_DEFAULT_MAX_TOKENS, metavar="N",
-                   help=f"LLM max_tokens per classification call "
-                        f"(default: {_DEFAULT_MAX_TOKENS})")
-    p.add_argument("--context-lines", type=int,
-                   default=_DEFAULT_CONTEXT_LINES, metavar="N",
-                   help=f"context lines per side (default: "
-                        f"{_DEFAULT_CONTEXT_LINES})")
-    p.add_argument("--include-blockquotes", action="store_true",
-                   help="also classify blocks detected inside "
-                        "markdown blockquotes")
-    p.add_argument("--include-non-edits", action="store_true",
-                   help="also write non-edit blobs into files/")
-    p.add_argument("--no-full-file-filter", action="store_true",
-                   help="skip the code_blob_analysis pre-filter")
-    p.add_argument("--no-ai", action="store_true",
-                   help="no LLM; heuristic-only classification")
-    p.add_argument("--force-ai", action="store_true",
-                   help="always call LLM, log disagreements")
-    p.add_argument("--verbose-heuristics", action="store_true",
-                   help="print per-block heuristic breakdown")
-    p.add_argument("-q", "--quiet", action="store_true",
-                   help="suppress per-blob progress")
-
-    # ---- new: dump retrieval + implement-edits -------------------
+    p.add_argument("--out-dir", metavar="PATH", default=None)
+    p.add_argument("--extractor", metavar="PATH", default=None)
+    p.add_argument("--model", default=DEFAULT_LLM_MODEL)
     p.add_argument("--dump-file", action="append", default=[],
                    dest="dump_files", metavar="PATH",
-                   help="dump.py output to index for target-file "
-                        "retrieval. Repeatable; files are indexed "
-                        "into one in-memory corpus.")
-    p.add_argument("--implement-edits", action="store_true",
-                   help="after retrieval, call the LLM per resolved "
-                        "target to produce a fully-edited version "
-                        "of the file, written under edited/.  "
-                        "Requires --dump-file and an LLM.")
+                   help="dump.py output (repeatable)")
     p.add_argument("--implement-max-tokens", type=int,
                    default=_DEFAULT_IMPLEMENT_MAX_TOKENS,
                    metavar="N",
-                   help=f"max_tokens per implement-edits call "
-                        f"(default: {_DEFAULT_IMPLEMENT_MAX_TOKENS})")
+                   help=f"max_tokens per LLM call (default: "
+                        f"{_DEFAULT_IMPLEMENT_MAX_TOKENS})")
     p.add_argument("--implement-temperature", type=float,
                    default=_DEFAULT_IMPLEMENT_TEMPERATURE,
                    metavar="F",
-                   help=f"temperature for implement-edits "
-                        f"(default: {_DEFAULT_IMPLEMENT_TEMPERATURE})")
+                   help=f"temperature for LLM calls (default: "
+                        f"{_DEFAULT_IMPLEMENT_TEMPERATURE})")
+    p.add_argument("--include-blockquotes", action="store_true",
+                   help="keep blockquoted (thinking-process) blocks "
+                        "in the stripped prose (only affects target "
+                        "detection — the LLM conversation is always "
+                        "stripped)")
+    p.add_argument("-q", "--quiet", action="store_true",
+                   help="suppress per-target progress")
+
+    # Legacy no-op flags — accepted so old wrappers don't break.
+    p.add_argument("--context-lines", type=int, default=30,
+                   help=argparse.SUPPRESS)
+    p.add_argument("--include-non-edits", action="store_true",
+                   help=argparse.SUPPRESS)
+    p.add_argument("--no-full-file-filter", action="store_true",
+                   help=argparse.SUPPRESS)
+    p.add_argument("--no-ai", action="store_true",
+                   help=argparse.SUPPRESS)
+    p.add_argument("--force-ai", action="store_true",
+                   help=argparse.SUPPRESS)
+    p.add_argument("--verbose-heuristics", action="store_true",
+                   help=argparse.SUPPRESS)
+    p.add_argument("--temperature", type=float, default=0.1,
+                   help=argparse.SUPPRESS)
+    p.add_argument("--max-tokens", type=int, default=600,
+                   help=argparse.SUPPRESS)
+    p.add_argument("--implement-edits", action="store_true",
+                   help=argparse.SUPPRESS)
     return p
 
 
@@ -1030,23 +806,14 @@ def main(argv=None) -> int:
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
     opts = {
-        "out_dir":              args.out_dir,
-        "extractor":            args.extractor,
-        "model":                args.model,
-        "temperature":          args.temperature,
-        "max_tokens":           args.max_tokens,
-        "context_lines":        args.context_lines,
-        "include_blockquotes":  args.include_blockquotes,
-        "include_non_edits":    args.include_non_edits,
-        "no_full_file_filter":  args.no_full_file_filter,
-        "no_ai":                args.no_ai,
-        "force_ai":             args.force_ai,
-        "verbose_heuristics":   args.verbose_heuristics,
-        "quiet":                args.quiet,
-        "dump_files":           args.dump_files,
-        "implement_edits":      args.implement_edits,
-        "implement_max_tokens": args.implement_max_tokens,
-        "implement_temperature": args.implement_temperature,
+        "out_dir":                args.out_dir,
+        "extractor":              args.extractor,
+        "model":                  args.model,
+        "dump_files":             args.dump_files,
+        "implement_max_tokens":   args.implement_max_tokens,
+        "implement_temperature":  args.implement_temperature,
+        "include_blockquotes":    args.include_blockquotes,
+        "quiet":                  args.quiet,
     }
     result = _run_pipeline(Path(args.input), opts)
     if result["rc"] != 0:
@@ -1055,14 +822,13 @@ def main(argv=None) -> int:
     return result["rc"]
 
 
-# ---- llm_scripts hooks -------------------------------------------
+# ---- llm_scripts hooks -----------------------------------------
 
 NAME = "extract_edit_requests"
 DESCRIPTION = (
-    "Extract fenced code blocks, pre-filter confidently-full files, "
-    "classify the rest as edit requests, retrieve target-file contents "
-    "from one or more dump.py outputs, and (optionally) have the LLM "
-    "produce the fully-edited files.")
+    "Detect which files a conversation asks to edit, retrieve them "
+    "from dumps, and have the LLM produce surgical diff patches — "
+    "one LLM call per file.")
 requires_llm = False
 
 
@@ -1078,63 +844,53 @@ def register_flags(parser):
     parser.add_argument(
         "--eer-include-blockquotes", action="store_true",
         dest="eer_include_blockquotes",
-        help="(extract_edit_requests) also classify blocks inside "
-             "markdown blockquotes")
-    parser.add_argument(
-        "--eer-include-non-edits", action="store_true",
-        dest="eer_include_non_edits",
-        help="(extract_edit_requests) also write non-edit blobs")
-    parser.add_argument(
-        "--eer-no-full-file-filter", action="store_true",
-        dest="eer_no_full_file_filter",
-        help="(extract_edit_requests) skip the code_blob_analysis "
-             "pre-filter")
-    parser.add_argument(
-        "--eer-no-ai", action="store_true",
-        dest="eer_no_ai",
-        help="(extract_edit_requests) heuristic-only; no LLM calls")
-    parser.add_argument(
-        "--eer-force-ai", action="store_true",
-        dest="eer_force_ai",
-        help="(extract_edit_requests) always call the LLM and log "
-             "disagreements with the heuristic")
-    parser.add_argument(
-        "--eer-verbose-heuristics", action="store_true",
-        dest="eer_verbose_heuristics",
-        help="(extract_edit_requests) print per-block heuristic "
-             "breakdown to stderr")
-    parser.add_argument(
-        "--eer-context-lines", type=int,
-        default=_DEFAULT_CONTEXT_LINES, dest="eer_context_lines",
-        metavar="N",
-        help="(extract_edit_requests) lines of surrounding context "
-             f"per side (default: {_DEFAULT_CONTEXT_LINES})")
+        help="(extract_edit_requests) keep blockquoted blocks in "
+             "the stripped prose (target detection only)")
     parser.add_argument(
         "--eer-quiet", action="store_true",
         dest="eer_quiet",
-        help="(extract_edit_requests) suppress per-blob progress")
+        help="(extract_edit_requests) suppress per-target progress")
     parser.add_argument(
         "--eer-dump-file", action="append", default=[],
         dest="eer_dump_files", metavar="PATH",
-        help="(extract_edit_requests) dump.py output for target-file "
-             "retrieval. Repeatable.")
-    parser.add_argument(
-        "--eer-implement-edits", action="store_true",
-        dest="eer_implement_edits",
-        help="(extract_edit_requests) after retrieval, call the LLM "
-             "per resolved target and write edited/.")
+        help="(extract_edit_requests) dump.py output for "
+             "target-file retrieval. Repeatable.")
     parser.add_argument(
         "--eer-implement-max-tokens", type=int,
         default=_DEFAULT_IMPLEMENT_MAX_TOKENS,
         dest="eer_implement_max_tokens", metavar="N",
-        help="(extract_edit_requests) max_tokens per implement call "
+        help=f"(extract_edit_requests) max_tokens per LLM call "
              f"(default: {_DEFAULT_IMPLEMENT_MAX_TOKENS})")
     parser.add_argument(
         "--eer-implement-temperature", type=float,
         default=_DEFAULT_IMPLEMENT_TEMPERATURE,
         dest="eer_implement_temperature", metavar="F",
-        help="(extract_edit_requests) temperature for implement "
+        help=f"(extract_edit_requests) temperature for LLM calls "
              f"(default: {_DEFAULT_IMPLEMENT_TEMPERATURE})")
+
+    # Legacy no-op flags.
+    parser.add_argument("--eer-include-non-edits", action="store_true",
+                        dest="eer_include_non_edits",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--eer-no-full-file-filter",
+                        action="store_true",
+                        dest="eer_no_full_file_filter",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--eer-no-ai", action="store_true",
+                        dest="eer_no_ai", help=argparse.SUPPRESS)
+    parser.add_argument("--eer-force-ai", action="store_true",
+                        dest="eer_force_ai", help=argparse.SUPPRESS)
+    parser.add_argument("--eer-verbose-heuristics",
+                        action="store_true",
+                        dest="eer_verbose_heuristics",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--eer-context-lines", type=int, default=30,
+                        dest="eer_context_lines",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--eer-implement-edits",
+                        action="store_true",
+                        dest="eer_implement_edits",
+                        help=argparse.SUPPRESS)
 
 
 def ctx_from_args(args):
@@ -1142,29 +898,18 @@ def ctx_from_args(args):
         "_eer_input_file": (str(args.file.resolve())
                             if args.file is not None else None),
         "_eer_out_dir": (str(args.eer_out_dir.resolve())
-                         if getattr(args, "eer_out_dir", None) else None),
+                         if getattr(args, "eer_out_dir", None)
+                         else None),
         "_eer_extractor": getattr(args, "eer_extractor", None),
         "_eer_include_blockquotes": getattr(
             args, "eer_include_blockquotes", False),
-        "_eer_include_non_edits": getattr(
-            args, "eer_include_non_edits", False),
-        "_eer_no_full_file_filter": getattr(
-            args, "eer_no_full_file_filter", False),
-        "_eer_no_ai": getattr(args, "eer_no_ai", False),
-        "_eer_force_ai": getattr(args, "eer_force_ai", False),
-        "_eer_verbose_heuristics": getattr(
-            args, "eer_verbose_heuristics", False),
-        "_eer_context_lines": getattr(
-            args, "eer_context_lines", _DEFAULT_CONTEXT_LINES),
         "_eer_quiet": getattr(args, "eer_quiet", False),
         "_eer_temperature": getattr(args, "temperature",
-                                    _DEFAULT_TEMPERATURE),
+                                    _DEFAULT_IMPLEMENT_TEMPERATURE),
         "_eer_max_tokens": getattr(args, "max_tokens",
-                                   _DEFAULT_MAX_TOKENS),
+                                   _DEFAULT_IMPLEMENT_MAX_TOKENS),
         "_eer_dump_files": list(getattr(
             args, "eer_dump_files", []) or []),
-        "_eer_implement_edits": getattr(
-            args, "eer_implement_edits", False),
         "_eer_implement_max_tokens": getattr(
             args, "eer_implement_max_tokens",
             _DEFAULT_IMPLEMENT_MAX_TOKENS),
@@ -1177,7 +922,8 @@ def ctx_from_args(args):
 def build_prompt(input_value, ctx):
     ctx["_eer_input_text"] = input_value
     n = len(input_value) if hasattr(input_value, "__len__") else 0
-    return f"(extract_edit_requests: {n} chars stashed for processing)"
+    return (f"(extract_edit_requests: {n} chars stashed "
+            f"for processing)")
 
 
 def on_response(response, ctx):
@@ -1199,26 +945,11 @@ def on_response(response, ctx):
         "out_dir":               out_dir,
         "extractor":             ctx.pop("_eer_extractor", None),
         "model":                 ctx.get("model") or DEFAULT_LLM_MODEL,
-        "temperature":           ctx.get("_eer_temperature",
-                                         _DEFAULT_TEMPERATURE),
-        "max_tokens":            ctx.get("_eer_max_tokens",
-                                         _DEFAULT_MAX_TOKENS),
-        "context_lines":         ctx.get("_eer_context_lines",
-                                         _DEFAULT_CONTEXT_LINES),
-        "include_blockquotes":   ctx.get("_eer_include_blockquotes",
-                                         False),
-        "include_non_edits":     ctx.get("_eer_include_non_edits",
-                                         False),
-        "no_full_file_filter":   ctx.get("_eer_no_full_file_filter",
-                                         False),
-        "no_ai":                 ctx.get("_eer_no_ai", False),
-        "force_ai":              ctx.get("_eer_force_ai", False),
-        "verbose_heuristics":    ctx.get("_eer_verbose_heuristics",
-                                         False),
+        "include_blockquotes":   ctx.get(
+            "_eer_include_blockquotes", False),
         "quiet":                 ctx.get("_eer_quiet", False),
         "client":                ctx.get("_llm_client"),
         "dump_files":            list(ctx.get("_eer_dump_files", [])),
-        "implement_edits":       ctx.get("_eer_implement_edits", False),
         "implement_max_tokens":  ctx.get(
             "_eer_implement_max_tokens",
             _DEFAULT_IMPLEMENT_MAX_TOKENS),
@@ -1232,25 +963,24 @@ def on_response(response, ctx):
         return (f"extract_edit_requests failed: "
                 f"{result.get('error', 'unknown error')}")
 
-    return (
-        f"extracted {result['record_count']} block(s): "
-        f"{result['edit_count']} edit request(s) across "
-        f"{result['target_count']} target file(s), "
-        f"{result['unresolved_count']} unresolved, "
-        f"{result['full_file_count']} full-file pre-filtered; "
-        f"{result['written']} file(s) written\n"
-        f"retrieval:  {result.get('retrieved_resolved', 0)} "
-        f"resolved / {result.get('retrieved_ambiguous', 0)} "
-        f"ambiguous / {result.get('retrieved_not_found', 0)} "
-        f"not-found across {result.get('dump_count', 0)} dump(s)\n"
-        f"implement:  {result.get('implemented_count', 0)} file(s)"
-        + (f"  ({result['implement_log']})"
-           if result.get('implement_log') else "") + "\n"
-        f"files:      {result['files_dir']}/\n"
-        f"targets:    {result['targets']}\n"
-        f"map:        {result['edit_map']}\n"
-        f"raw:        {result['raw_dir']}/"
-    )
+    detected = result.get("detected_targets") or {}
+    detected_str = ", ".join(
+        f"{n}({c}x)"
+        for n, c in sorted(detected.items(), key=lambda x: -x[1])
+    ) or "(none)"
+
+    lines = [
+        f"detected: {len(detected)} file(s) — {detected_str}",
+        f"edit list: "
+        f"{', '.join(result.get('targets_to_edit') or []) or '(none)'}",
+        f"edited:   {result['implemented_count']}"
+        f"/{result['target_count']} target(s)",
+    ]
+    if result.get("warning"):
+        lines.append(f"warning:  {result['warning']}")
+    lines.append(f"files:    {result['out_dir']}/edited/")
+    lines.append(f"report:   {result['report']}")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

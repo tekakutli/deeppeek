@@ -431,6 +431,9 @@ def register(sub, script_name=None):
     p.add_argument("--llm-timeout", type=int, default=DEFAULT_LLM_TIMEOUT)
     p.add_argument("--max-tokens", type=int, default=2048)
     p.add_argument("--temperature", type=float, default=0.2)
+    p.add_argument("--llm-no-stream", action="store_true",
+                   help="disable streaming the LLM response to stderr "
+                        "(default: stream tokens live)")
 
     # Register script-conditional flags.  `script_name` is the
     # peeked `--script` value passed by `cli.py`, or None when the
@@ -507,7 +510,8 @@ def run(args) -> int:
         session_dir = Path("/tmp") / f"deeppeek_editor_{ts}"
     session_dir.mkdir(parents=True, exist_ok=True)
 
-    client_kwargs = {"model": args.model, "timeout": args.llm_timeout}
+    client_kwargs = {"model": args.model, "timeout": args.llm_timeout,
+                     "stream": not getattr(args, "llm_no_stream", False)}
     if args.url:
         client_kwargs["url"] = args.url
     client = LLMClient(**client_kwargs)

@@ -72,6 +72,12 @@ The output filename has three modes:
       This keeps explicit-list dumps from clobbering offset-mode dumps
       of the same project (both would otherwise target the same name).
 
+    · Tree-only runs (-t/--tree-only) additionally append a "_tree"
+      marker before the suffix, so a tree dump never collides with a
+      full dump of the same project:
+          "project_dump_myproject_tree.md"
+          "project_dump_myproject_explicit_tree.md"
+
     · -o PATH: write exactly to PATH.  A special value "-" writes the dump
       to stdout (for piping); the "Total lines" summary then goes to stderr,
       so stdout is purely the dump.
@@ -150,7 +156,7 @@ DEFAULT_EXCLUDE_DIRS = [
     ".git", "__pycache__", ".venv", "venv", "node_modules", ".pytest_cache/",
     ".aider.tags.cache.v4",
     "lib", "bin",
-    # 'playgrounds',
+    'playgrounds',
     'docker', 'website',
     # "daemon", "prompts", "capture",
     # "room", "shared",
@@ -165,6 +171,7 @@ DEFAULT_EXCLUDE_DIRS = [
 DEFAULT_TREE_EXCLUDE_DIRS = [".git", "__pycache__", ".venv", "venv", "node_modules",
                              ".aider.tags.cache.v4", ".pytest_cache/",
                              "lib", "bin",
+                             'playgrounds',
                              'docker', 'website',
                              "target", "release",
                              "kritomatic_xremap", "other_scripts",
@@ -187,21 +194,25 @@ DEFAULT_INCLUDE_DIRS = []
 # DEFAULT_INCLUDE_DIRS = ['pgkit', 'pg_comfy', 'magi', 'layout',]
 # DEFAULT_INCLUDE_DIRS = ['controlnets', 'pgkit', 'pg_comfy', 'inpaint', ]
 # DEFAULT_INCLUDE_DIRS = ['controlnets', 'pgkit', 'pg_comfy', 'segment', 'layout', 'magi']
-# DEFAULT_INCLUDE_DIRS = ['multimask', 'segment', 'controlnets', ]
+# DEFAULT_INCLUDE_DIRS = ['multimask', 'inpaint', 'controlnets', 'interceptor',]
 #
-# DEFAULT_INCLUDE_DIRS = ['multimask', 'segment', 'controlnets', 'layout', 'magi']
+# DEFAULT_INCLUDE_DIRS = ['multimask', 'segment', 'controlnets', 'layout', 'magi', 'inpaint', 'pg_comfy', 'pgkit',]
+# DEFAULT_INCLUDE_DIRS = ['segment', 'inpaint', 'pgkit',]
+# DEFAULT_INCLUDE_DIRS = ['outpaint', 'layout', ]
+# DEFAULT_INCLUDE_DIRS = ['inpaint',]
 
 
 
 # Filename substrings whitelist: if NON-EMPTY, a file is only kept when its
 # filename contains AT LEAST ONE of these substrings.
+# DEFAULT_INCLUDE_FILE_SUBSTRINGS = ['pg_base', 'pg_panel']
 DEFAULT_INCLUDE_FILE_SUBSTRINGS = []
 # DEFAULT_INCLUDE_FILE_SUBSTRINGS = ['playground',]
 # DEFAULT_INCLUDE_FILE_SUBSTRINGS = ["comfyui"]
 
 # Filename substrings blacklist: if a filename contains ANY of these, the
 # file is skipped.
-DEFAULT_EXCLUDE_FILE_SUBSTRINGS = [".aider.model.metadata.json", ".aider.chat.history.md","project_dump", "shrinking", 'EMISSION', 'README.md',]
+DEFAULT_EXCLUDE_FILE_SUBSTRINGS = [".aider.model.metadata.json", ".aider.chat.history.md","project_dump", "shrinking", 'EMISSION', 'README.md','last.md',]
 # ---------------------------------------------------------------------------
 
 HEADER = "=" * 70
@@ -600,6 +611,7 @@ def main() -> int:
     parser.add_argument(
         "-t", "--tree-only", action="store_true", default=None,
         help=("Only write the directory tree. Implies recursion. "
+              "Adds a '_tree' suffix to the default output filename. "
               f"(hardcoded default: {DEFAULT_TREE_ONLY})"),
     )
     parser.add_argument(
@@ -617,7 +629,7 @@ def main() -> int:
               "With --as-read-args, this overrides the default stdout "
               "target and saves the args line to the file at PATH. "
               f"(default: {DEFAULT_OUT} with _<scanned-dir> appended, "
-              f"plus _explicit in FILE mode)"),
+              f"plus _explicit in FILE mode, plus _tree in tree-only mode)"),
     )
     parser.add_argument(
         "--exclude-file", action="append", default=[], metavar="PATH",
@@ -803,6 +815,12 @@ def main() -> int:
         # target the same `project_dump_<project>.md` in the cwd.
         if args.files:
             out = out.with_name(f"{out.stem}_explicit{out.suffix}")
+        # Tree-only dumps get a `_tree` marker so a `-t` run never
+        # clobbers (or gets clobbered by) a full dump of the same
+        # project — both would otherwise target the same
+        # `project_dump_<project>.md` in the cwd.
+        if tree_only:
+            out = out.with_name(f"{out.stem}_tree{out.suffix}")
 
     fh = io.StringIO()
     fh.write(HEADER + "\n")

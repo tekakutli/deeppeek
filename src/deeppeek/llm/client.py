@@ -56,12 +56,14 @@ class LLMClient:
                  model: str = DEFAULT_LLM_MODEL,
                  cache_dir: Optional[Path] = None,
                  max_calls: Optional[int] = None,
-                 timeout: Optional[int] = DEFAULT_LLM_TIMEOUT):
+                 timeout: Optional[int] = DEFAULT_LLM_TIMEOUT,
+                 stream: bool = True):
         self.url = url
         self.model = model
         self.cache_dir = cache_dir
         self.max_calls = max_calls
         self.timeout = timeout
+        self.stream_default = stream
         self.calls_made = 0
         self.calls_cached = 0
         self.calls_refused = 0
@@ -107,9 +109,57 @@ class LLMClient:
             print(f"  [LLM] probe failed: {e}", file=sys.stderr)
             return False
 
+    def _stream_call(self, req, tag: str):
+        """Execute a streaming (SSE) POST; print deltas to stderr live."""
+        t0 = time.monotonic()
+        chunks: list[str] = []
+        started = False
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            while True:
+                raw = resp.readline()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                if not line:
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                payload = line[len("data:"):].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                piece = delta.get("content")
+                if piece is None:
+                    msg = choices[0].get("message") or {}
+                    piece = msg.get("content")
+                if not piece:
+                    continue
+                if not started:
+                    sys.stderr.write(f"\n  [LLM:{tag or '?'}] > ")
+                    started = True
+                sys.stderr.write(piece)
+                sys.stderr.flush()
+                chunks.append(piece)
+        if started:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+        dt = time.monotonic() - t0
+        return "".join(chunks), dt
+
     def call(self, prompt: str, max_tokens: int = 512,
              temperature: float = 0.2,
-             tag: str = "") -> Optional[str]:
+             tag: str = "",
+             stream: Optional[bool] = None) -> Optional[str]:
+        if stream is None:
+            stream = self.stream_default
+
         cp = self._cache_path(prompt)
         if cp and cp.exists():
             try:
@@ -125,8 +175,10 @@ class LLMClient:
                   f"reached", file=sys.stderr)
             return None
 
+        stream_note = ", streaming" if stream else ""
         print(f"  [LLM:{tag or '?'}] live call {self.calls_made + 1} "
-              f"(prompt {len(prompt)} chars)", file=sys.stderr)
+              f"(prompt {len(prompt)} chars{stream_note})",
+              file=sys.stderr)
 
         body = {
             "model": self.model,
@@ -135,6 +187,8 @@ class LLMClient:
             "temperature": temperature,
             "chat_template_kwargs": {"enable_thinking": False},
         }
+        if stream:
+            body["stream"] = True
         req = urllib.request.Request(
             self.url,
             data=json.dumps(body).encode(),
@@ -143,12 +197,17 @@ class LLMClient:
         )
         try:
             t0 = time.monotonic()
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                data = json.loads(resp.read())
-            dt = time.monotonic() - t0
-            content = data["choices"][0]["message"]["content"]
+            if stream:
+                content, dt = self._stream_call(req, tag)
+            else:
+                with urllib.request.urlopen(
+                        req, timeout=self.timeout) as resp:
+                    data = json.loads(resp.read())
+                dt = time.monotonic() - t0
+                content = data["choices"][0]["message"]["content"]
             self.calls_made += 1
-            print(f"  [LLM:{tag or '?'}] ok ({dt:.1f}s)", file=sys.stderr)
+            print(f"  [LLM:{tag or '?'}] ok ({dt:.1f}s, "
+                  f"{len(content)} chars)", file=sys.stderr)
             if cp:
                 cp.write_text(json.dumps({"content": content}))
             return content
