@@ -207,6 +207,7 @@ DEFAULT_INCLUDE_DIRS = []
 # filename contains AT LEAST ONE of these substrings.
 # DEFAULT_INCLUDE_FILE_SUBSTRINGS = ['pg_base', 'pg_panel']
 DEFAULT_INCLUDE_FILE_SUBSTRINGS = []
+# DEFAULT_INCLUDE_FILE_SUBSTRINGS = ["_server","_playground"]
 # DEFAULT_INCLUDE_FILE_SUBSTRINGS = ['playground',]
 # DEFAULT_INCLUDE_FILE_SUBSTRINGS = ["comfyui"]
 

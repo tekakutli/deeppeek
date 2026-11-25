@@ -16,6 +16,78 @@
 //     same hang that breaks contextualIdentities.query).
 //   · An in-memory variable is instant and lives in the single
 //     background instance shared across all tabs and containers.
+//
+// Tab reuse (2026-11-23)
+// ----------------------
+// `createTabWithContainer` accepts a 5th `reuse` argument:
+//
+//   · undefined / "never"  (default)  — always create a new tab
+//   · "if_exists"          — find a DeepSeek tab in the requested
+//                            container; activate and reuse it if
+//                            exactly one exists, else fall through
+//                            to creating a new tab.  Multiple
+//                            matches are an error (ambiguous
+//                            target), so the caller can disambiguate
+//                            with --container-id or by closing
+//                            extras.
+//
+// Tab-ready wait (2026-11-23)
+// ---------------------------
+// `browser.tabs.create({url})` returns immediately with an
+// `about:blank` tab; the page loads asynchronously.  Acking
+// `open-tab` before navigation completes causes the daemon to
+// log `about:blank` and forces a submit retry while the content
+// script boots.  Both the create and reuse paths now wait for
+// `tabs.onUpdated {status: "complete"}` with the target URL on
+// `chat.deepseek.com` before acking.  Bounded by
+// `TAB_LOAD_TIMEOUT_MS`; on timeout the caller receives whatever
+// `tabs.get` reports and the daemon's submit retry covers the
+// remainder.
+
+// ---- tab load wait -----------------------------------------------
+
+// Bound on waiting for a freshly-created tab to reach status
+// "complete" on chat.deepseek.com.  15 s is well above the typical
+// 1–3 s and leaves headroom for slow networks without making a
+// genuinely-broken tab hang the daemon (TAB_OPEN_TIMEOUT is 30 s).
+const TAB_LOAD_TIMEOUT_MS = 15000;
+const DEEPSEEK_HOST = "chat.deepseek.com";
+
+function waitForTabComplete(tabId, timeoutMs) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (tab) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try { browser.tabs.onUpdated.removeListener(listener); } catch (_) {}
+      resolve(tab);
+    };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    const listener = (changedId, changeInfo, tab) => {
+      if (changedId !== tabId) return;
+      if (changeInfo.status !== "complete") return;
+      const url = (tab && tab.url) || "";
+      if (!url.includes(DEEPSEEK_HOST)) {
+        // The tab completed but on the wrong page (about:blank,
+        // error page, redirect chain mid-flight).  Keep waiting
+        // for the real navigation.
+        return;
+      }
+      finish(tab);
+    };
+    browser.tabs.onUpdated.addListener(listener);
+    // If the tab was already complete before we subscribed,
+    // onUpdated won't fire.  Check current state immediately.
+    browser.tabs.get(tabId).then((t) => {
+      if (t && t.status === "complete"
+          && typeof t.url === "string"
+          && t.url.includes(DEEPSEEK_HOST)) {
+        finish(t);
+      }
+    }).catch(() => {});
+  });
+}
 
 // ---- container resolution -----------------------------------------
 
@@ -96,7 +168,46 @@ async function resolveContainerId(containerName, containerId) {
   };
 }
 
-async function createTabWithContainer(url, containerName, containerId, logTag) {
+// ---- tab reuse ----------------------------------------------------
+//
+// `findTabInContainer` queries all tabs at `url`'s origin and
+// filters by container in JS.  We deliberately do NOT pass
+// cookieStoreId to tabs.query: the value "firefox-default" is not
+// accepted as a filter by every Firefox/Zen version, and a failed
+// filter is indistinguishable from "no match".  Filtering in JS
+// also lets us count matches for the ambiguous case.
+
+function urlPatternFor(url) {
+  try {
+    const u = new URL(url);
+    return `*://${u.host}/*`;
+  } catch (_) {
+    return "*://chat.deepseek.com/*";
+  }
+}
+
+async function findTabInContainer(url, cookieStoreId) {
+  const pattern = urlPatternFor(url);
+  let matches;
+  try {
+    matches = await browser.tabs.query({ url: pattern });
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `tabs.query(${JSON.stringify(pattern)}) threw: ` +
+              `${err.message || err}`,
+    };
+  }
+  const want = cookieStoreId || "firefox-default";
+  const filtered = matches.filter(t => {
+    const got = t.cookieStoreId || "firefox-default";
+    return got === want;
+  });
+  return { ok: true, tabs: filtered };
+}
+
+async function createTabWithContainer(
+    url, containerName, containerId, logTag, reuse) {
   try {
     const resolved = await resolveContainerId(containerName, containerId);
     if (!resolved.ok) {
@@ -107,15 +218,111 @@ async function createTabWithContainer(url, containerName, containerId, logTag) {
         `DSX:${logTag} resolved container ` +
         `${JSON.stringify(containerName)} -> ${resolved.cookieStoreId}`);
     }
+
+    // ---- reuse path ---------------------------------------------
+    if (reuse === "if_exists") {
+      const found = await findTabInContainer(url, resolved.cookieStoreId);
+      if (!found.ok) {
+        return { success: false, reason: found.reason };
+      }
+      if (found.tabs.length === 1) {
+        const t = found.tabs[0];
+        if (logTag) {
+          console.log(
+            `DSX:${logTag} reusing existing tab ${t.id} in container ` +
+            `${resolved.cookieStoreId || "(default)"}`);
+        }
+        // Bring the tab to the foreground.  The daemon's submit and
+        // watch already pin to `tab_id`, so focus is a UX nicety
+        // rather than a correctness requirement — but users who
+        // pass --reuse-tab-in want to see the tab doing work, and
+        // some SPA composers require focus for keystroke handling.
+        // Window focus is a separate call and may fail (e.g. the
+        // tab lives in a minimised window); that's fine — the tab
+        // itself still receives tabs.sendMessage.
+        try {
+          await browser.tabs.update(t.id, { active: true });
+        } catch (err) {
+          if (logTag) {
+            console.log(
+              `DSX:${logTag} tabs.update(active) threw ` +
+              `(ignored): ${err.message || err}`);
+          }
+        }
+        if (typeof t.windowId === "number") {
+          try {
+            await browser.windows.update(t.windowId, { focused: true });
+          } catch (_) { /* not fatal */ }
+        }
+        // Already loaded in practice; still bound with a short
+        // wait so the final URL we report is the real one, not
+        // whatever tabs.query happened to snapshot.
+        const ready = await waitForTabComplete(t.id, 3000);
+        const finalTab = ready
+          || await browser.tabs.get(t.id).catch(() => t);
+        const resp = {
+          success: true,
+          reused: true,
+          tab_id: finalTab.id != null ? finalTab.id : t.id,
+          url: finalTab.url || t.url || url,
+        };
+        if (resolved.cookieStoreId) {
+          resp.cookie_store_id = resolved.cookieStoreId;
+        }
+        return resp;
+      }
+      if (found.tabs.length > 1) {
+        // Ambiguous: two DeepSeek tabs in the same container.  The
+        // daemon cannot safely pick one for the user — surface the
+        // list so they can close extras or use --container-id /
+        // --tab-id to pick explicitly.
+        return {
+          success: false,
+          reason:
+            `multiple DeepSeek tabs in container ` +
+            `${JSON.stringify(resolved.cookieStoreId || "default")} ` +
+            `(${found.tabs.length}); close extras or use ` +
+            `--container-id / --tab-id to disambiguate`,
+          tabs: found.tabs.map(t => ({
+            tab_id: t.id,
+            url: t.url,
+            title: t.title,
+            cookie_store_id: t.cookieStoreId,
+          })),
+        };
+      }
+      // 0 matches → fall through to create.
+    }
+
+    // ---- create path (default) ----------------------------------
     const createProps = { url, active: true };
     if (resolved.cookieStoreId) {
       createProps.cookieStoreId = resolved.cookieStoreId;
     }
     const tab = await browser.tabs.create(createProps);
+
+    // `tabs.create` resolves with a tab whose `url` is typically
+    // "about:blank" until navigation commits.  Wait for the page
+    // to actually land on chat.deepseek.com so the daemon's ack
+    // carries a real URL and submit fires against a live composer.
+    const ready = await waitForTabComplete(tab.id, TAB_LOAD_TIMEOUT_MS);
+    if (logTag) {
+      if (ready) {
+        console.log(
+          `DSX:${logTag} tab ${tab.id} loaded: ${ready.url || url}`);
+      } else {
+        console.log(
+          `DSX:${logTag} tab ${tab.id} did not report "complete" within ` +
+          `${TAB_LOAD_TIMEOUT_MS}ms — submit may retry`);
+      }
+    }
+    const finalTab = ready
+      || await browser.tabs.get(tab.id).catch(() => tab);
+
     const resp = {
       success: true,
-      tab_id: tab.id,
-      url: tab.url || url,
+      tab_id: finalTab.id != null ? finalTab.id : tab.id,
+      url: finalTab.url || tab.url || url,
     };
     if (resolved.cookieStoreId) {
       resp.cookie_store_id = resolved.cookieStoreId;
@@ -135,6 +342,7 @@ async function handleOpenTabMsg(msg) {
     msg.container || null,
     msg.container_id || null,
     "[msg]",
+    msg.reuse || null,
   );
 }
 

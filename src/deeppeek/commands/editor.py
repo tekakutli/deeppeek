@@ -45,6 +45,22 @@ the one on the command line.
 `ctx["_llm_client"]` is injected so scripts can invoke each other
 via `llm_scripts.run_script(...)` and still reach the LLM when the
 nested target needs it.
+
+Tab hints
+---------
+Same six flags as `deeppeek answer` (`--new-tab`, `--container`,
+`--container-id`, `--reuse-tab`, `--reuse-tab-in`,
+`--reuse-tab-by`), validated and translated by `_tab_hints.py`.
+They travel to the daemon in the request body under
+`deeppeek.tab`, so they only take effect when `--url` points at a
+deeppeek daemon and it honours them.  E.g.:
+
+    TAB=$(deeppeek daemon --which-tab)
+    deeppeek editor --reuse-tab-by "$TAB" --script rewrite "rewrite this"
+
+In daemon mode (interactive Copy Turn), the hint applies to every
+turn — each click routes through the pinned tab.  That's usually
+what you want; if it isn't, don't combine daemon mode with a pin.
 """
 from __future__ import annotations
 
@@ -60,6 +76,7 @@ from pathlib import Path
 from ..llm import LLMClient, DEFAULT_LLM_MODEL, DEFAULT_LLM_TIMEOUT
 from .. import llm_scripts
 from ..transport.server import ExportServer
+from . import _tab_hints
 
 
 # ---- helpers ------------------------------------------------------
@@ -167,7 +184,8 @@ def _display(value):
 # ---- stage execution ---------------------------------------------
 
 def _run_stage(input_value, args, script_mod, script_name,
-               session_dir, client, script_ctx, base_extra, path):
+               session_dir, client, script_ctx, base_extra, path,
+               deeppeek_hints=None):
     """Run one script: build_prompt → optional LLM → optional
     on_response → write .md → print.  Returns 0 on success, 1 on
     failure.
@@ -175,6 +193,10 @@ def _run_stage(input_value, args, script_mod, script_name,
     The ctx carries `_llm_client` so `llm_scripts.run_script(...)`
     calls from within `on_response`/`build_prompt` can reach the
     LLM when the nested target requires it.
+
+    `deeppeek_hints` is forwarded verbatim to `client.call` so the
+    daemon (when the LLM URL points at it) can route the request to
+    the tab the user pinned with `--reuse-tab-by`.
     """
     stage_t0 = time.monotonic()
 
@@ -202,6 +224,7 @@ def _run_stage(input_value, args, script_mod, script_name,
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
                 tag=f"editor:{script_name}",
+                deeppeek_hints=deeppeek_hints,
             )
             if response is None:
                 raise RuntimeError(
@@ -250,7 +273,7 @@ def _run_stage(input_value, args, script_mod, script_name,
 # ---- one-shot mode ------------------------------------------------
 
 def _run_one_shot(args, script_mod, script_name, session_dir,
-                  client, script_ctx):
+                  client, script_ctx, deeppeek_hints=None):
     hhmmss = datetime.now().strftime("%H%M%S")
 
     if args.file is not None:
@@ -278,7 +301,8 @@ def _run_one_shot(args, script_mod, script_name, session_dir,
     path = _write_input_file(session_dir, filename, md, header_ctx)
     rc = _run_stage(md, args, script_mod, script_name,
                     session_dir, client, script_ctx,
-                    base_extra={}, path=path)
+                    base_extra={}, path=path,
+                    deeppeek_hints=deeppeek_hints)
     print(f"[editor] saved: {path}", file=sys.stderr)
     return rc
 
@@ -286,7 +310,7 @@ def _run_one_shot(args, script_mod, script_name, session_dir,
 # ---- daemon mode --------------------------------------------------
 
 def _run_daemon(args, script_mod, script_name, session_dir,
-                client, script_ctx):
+                client, script_ctx, deeppeek_hints=None):
     try:
         server = ExportServer(port=args.port)
         server.start()
@@ -370,7 +394,8 @@ def _run_daemon(args, script_mod, script_name, session_dir,
                       file=sys.stderr)
                 _run_stage(md, args, script_mod, script_name,
                            session_dir, client, script_ctx,
-                           base_extra=base_extra, path=path)
+                           base_extra=base_extra, path=path,
+                           deeppeek_hints=deeppeek_hints)
             finally:
                 state["busy"] = False
 
@@ -435,6 +460,9 @@ def register(sub, script_name=None):
                    help="disable streaming the LLM response to stderr "
                         "(default: stream tokens live)")
 
+    # ---- tab hints (shared with `deeppeek answer`) ----------------
+    _tab_hints.register_tab_flags(p)
+
     # Register script-conditional flags.  `script_name` is the
     # peeked `--script` value passed by `cli.py`, or None when the
     # user did not specify `--script` at all (and when the full
@@ -472,6 +500,14 @@ def run(args) -> int:
         print("error: --file and positional TEXT are mutually exclusive",
               file=sys.stderr)
         return 1
+
+    # Validate tab flags before doing any disk or network work, so
+    # bad combinations fail fast (and no session dir is created).
+    try:
+        tab_hints = _tab_hints.build_tab_hints(args)
+    except SystemExit as e:
+        return int(e.code) if isinstance(e.code, int) else 1
+    deeppeek_hints = {"tab": tab_hints} if tab_hints else None
 
     try:
         script_mod = llm_scripts.load_script(args.script)
@@ -519,6 +555,8 @@ def run(args) -> int:
     one_shot = args.file is not None or bool(args.text)
     if one_shot:
         return _run_one_shot(args, script_mod, args.script,
-                             session_dir, client, script_ctx)
+                             session_dir, client, script_ctx,
+                             deeppeek_hints=deeppeek_hints)
     return _run_daemon(args, script_mod, args.script,
-                       session_dir, client, script_ctx)
+                       session_dir, client, script_ctx,
+                       deeppeek_hints=deeppeek_hints)

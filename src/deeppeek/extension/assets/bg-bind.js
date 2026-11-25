@@ -2,7 +2,7 @@
 // bg-bind.js — tab pinning + tab-target helper
 // =====================================================================
 //
-// Two responsibilities:
+// Responsibilities:
 //
 //   1. Handle the `bind-tab` SSE event.  Called once at CLI startup
 //      to pin the pipeline to one specific chat tab.  After a
@@ -11,7 +11,15 @@
 //      no more "which tab is active?" queries, no more "hover to
 //      enable".
 //
-//   2. Expose `_targetTab(data)` — used by every composer handler
+//   2. Handle the `get-active-tab` SSE event.  Read-only query:
+//      returns the currently-focused supported tab, or (if none is
+//      focused) the only supported tab anywhere, or — when multiple
+//      supported tabs exist and none is active — a `candidates` list
+//      so the caller can pick one.  Backs the CLI's
+//      `deeppeek daemon --which-tab` flag.  Never opens, submits
+//      to, or mutates any tab.
+//
+//   3. Expose `_targetTab(data)` — used by every composer handler
 //      (attach / type / enter / clear) and the read handlers
 //      (watch / extract / retry-last / extract-attachments).  The
 //      helper preserves backward compatibility: if `data.tab_id` is
@@ -155,6 +163,82 @@ async function handleBindTab(data, port) {
   console.log(`DSX:${tag} bind-tab result:`, result);
   await postAck(port, {
     __ack: "bind-tab", batch_id: batchId, result,
+  });
+}
+
+// get-active-tab — read-only query for the CLI's --which-tab flag.
+//
+// Precedence:
+//   1. focused tab if it is a supported chat URL
+//   2. the only supported tab anywhere (if exactly one exists)
+//   3. error with a `candidates` list (if multiple exist but none
+//      is focused) — caller can pass a tab id explicitly
+//   4. error with no candidates (if no supported tab is open)
+//
+// The daemon never uses this to open or submit; it only lets the
+// operator copy the id into `--reuse-tab-by TAB_ID`.
+async function handleGetActiveTab(data, port) {
+  const batchId = data.batch_id;
+  const tag = `[${port}]`;
+  let result;
+
+  // 1. focused tab
+  let active = null;
+  try {
+    const [t] = await browser.tabs.query({
+      active: true, currentWindow: true,
+    });
+    if (isSupportedTab(t)) active = t;
+  } catch (_) {}
+
+  if (active) {
+    result = {
+      success: true,
+      tab_id: active.id,
+      url: active.url,
+      title: active.title || null,
+      cookie_store_id: active.cookieStoreId || null,
+      source: "active",
+    };
+  } else {
+    // 2. only supported tab anywhere
+    const all = await _listSupportedTabs();
+    if (all.length === 0) {
+      result = {
+        success: false,
+        reason: "no supported chat tab open.  Open chat.deepseek.com " +
+                "in a tab and retry.",
+      };
+    } else if (all.length === 1) {
+      const t = all[0];
+      result = {
+        success: true,
+        tab_id: t.id,
+        url: t.url,
+        title: t.title || null,
+        cookie_store_id: t.cookieStoreId || null,
+        source: "only-supported",
+      };
+    } else {
+      result = {
+        success: false,
+        reason: `no supported chat tab is focused ` +
+                `(${all.length} exist elsewhere).  Focus one, or ` +
+                `pass a tab id directly (see candidates below).`,
+        candidates: all.map(t => ({
+          tab_id: t.id,
+          url: t.url,
+          title: t.title || null,
+          active: !!t.active,
+          cookie_store_id: t.cookieStoreId || null,
+        })),
+      };
+    }
+  }
+
+  console.log(`DSX:${tag} get-active-tab result:`, result);
+  await postAck(port, {
+    __ack: "get-active-tab", batch_id: batchId, result,
   });
 }
 

@@ -12,7 +12,12 @@ from .serialize import serialize_messages
 TAB_OPEN_TIMEOUT = 30.0
 SUBMIT_TIMEOUT = 45.0
 WATCH_START_TIMEOUT = 10.0
-TAB_WAIT_DEFAULT = 2.0
+# Default wait after `open-tab` ack before submitting.  The old 2.0s
+# value was chosen to mask slow tab loads; the submit path already
+# retries 3× with a 2s backoff, so the initial wait only needs to
+# cover the common "tab renders the composer in <500ms" case.  Slow
+# loads are caught by the retry loop.
+TAB_WAIT_DEFAULT = 0.5
 WATCH_MAX_WAIT = 600.0
 
 # How long the extension waits for ANY first content (thinking or
@@ -39,35 +44,58 @@ class BrowserBridge:
 
     One lock serializes requests against the single browser tab.
     Concurrent requests from aider (main chat + summarizer) queue.
+
+    Tab selection is per-request: the constructor sets *defaults*,
+    and each `stream()` / `complete()` call may pass a `tab_options`
+    dict that overrides them.  Recognised keys:
+
+        mode         "new" | "reuse_active" | "reuse_in_container" | "by_id"
+        container    str | None      (mode == "new" / "reuse_in_container")
+        container_id str | None      (mode == "new" / "reuse_in_container")
+        tab_id       int | None      (mode == "by_id")
+
+    `mode == "new"` opens a fresh tab (in `container` / `container_id`
+    when given).  `reuse_active` targets whichever tab is focused
+    (no tab id is sent).  `reuse_in_container` asks the extension to
+    find an existing tab in the container and reuse it, opening a
+    new one only if none exists — the extension honours the
+    `reuse: "if_exists"` field of the `open-tab` payload.
+    `by_id` skips `open-tab` entirely and pins to the given tab id.
+
+    `get_active_tab()` is a read-only query used by
+    `deeppeek daemon --which-tab` to discover a tab id to pass to
+    `--reuse-tab-by`.  It uses a non-blocking lock so it fails fast
+    when a completion is in flight (the two would otherwise race on
+    the shared result queue).
     """
 
     def __init__(
         self,
         server,
         *,
-        new_tab: bool = True,
+        default_mode: str = "new",
+        default_container: str | None = None,
+        default_container_id: str | None = None,
+        default_tab_id: int | None = None,
         tab_wait: float = TAB_WAIT_DEFAULT,
         poll_interval_ms: int = 300,
         settle_ticks: int = 5,
         max_duration_ms: int = DEFAULT_MAX_DURATION_MS,
         first_content_timeout_ms: int = FIRST_CONTENT_TIMEOUT_MS,
-        container: str | None = None,
-        container_id: str | None = None,
     ):
+        if default_mode not in (
+                "new", "reuse_active", "reuse_in_container", "by_id"):
+            raise ValueError(f"unknown default_mode: {default_mode!r}")
         self.server = server
-        self.new_tab = new_tab
+        self.default_mode = default_mode
+        self.default_container = default_container
+        self.default_container_id = default_container_id
+        self.default_tab_id = default_tab_id
         self.tab_wait = tab_wait
         self.poll_interval_ms = poll_interval_ms
         self.settle_ticks = settle_ticks
         self.max_duration_ms = max_duration_ms
         self.first_content_timeout_ms = first_content_timeout_ms
-        # Container selection for freshly-opened tabs.  Both are
-        # None by default (open in the browser's default container).
-        # Only `new_tab=True` runs make use of them; with
-        # `new_tab=False` (--reuse-tab) the current tab is reused
-        # and its container is whatever it already is.
-        self.container = container
-        self.container_id = container_id
         self._lock = threading.Lock()
         # Set by _prepare_tab; passed to submit/watch so they pin to
         # the same tab even if the user switches windows mid-request.
@@ -75,20 +103,22 @@ class BrowserBridge:
 
     # ---- public ----------------------------------------------------
 
-    def complete(self, messages: list[dict], model: str) -> str:
+    def complete(self, messages: list[dict], model: str,
+                 tab_options: dict | None = None) -> str:
         """Blocking, non-streaming completion."""
-        return "".join(self.stream(messages, model))
+        return "".join(self.stream(messages, model,
+                                   tab_options=tab_options))
 
-    def stream(self, messages: list[dict], model: str):
+    def stream(self, messages: list[dict], model: str,
+               tab_options: dict | None = None):
         """Generator of content deltas."""
         with self._lock:
             self._drain_queue()
             # Reset per-request state: a previous request's tab_id
-            # must not leak into this one (different request, likely
-            # different tab).
+            # must not leak into this one.
             self.tab_id = None
             try:
-                self._prepare_tab()
+                self._prepare_tab(tab_options)
                 prompt = serialize_messages(messages)
                 self._submit(prompt)
                 yield from self._watch()
@@ -96,6 +126,39 @@ class BrowserBridge:
                 raise
             except Exception as e:
                 raise BridgeError(f"bridge failure: {e}") from e
+
+    def get_active_tab(self) -> dict:
+        """Ask the extension which tab is active.  Read-only.
+
+        Returns the extension's reply verbatim:
+
+            {"success": True,
+             "tab_id": int,
+             "url": str,
+             "title": str | None,
+             "cookie_store_id": str | None,
+             "source": "active" | "only-supported"}
+
+        or, on failure:
+
+            {"success": False,
+             "reason": str,
+             "candidates": [{"tab_id": ..., "url": ..., "active": ...}]}
+
+        Uses a non-blocking lock so ``--which-tab`` fails fast instead
+        of queueing behind a long in-flight completion; the same
+        result queue is shared with ``stream()``, so concurrency here
+        would otherwise race the delta reader.
+        """
+        if not self._lock.acquire(blocking=False):
+            raise BridgeError(
+                "daemon is busy processing a chat completion; "
+                "retry --which-tab once it's idle")
+        try:
+            return self._call("get-active-tab", {},
+                              ack="get-active-tab", timeout=10.0)
+        finally:
+            self._lock.release()
 
     # ---- internals -------------------------------------------------
 
@@ -107,23 +170,66 @@ class BrowserBridge:
             except queue.Empty:
                 break
 
-    def _prepare_tab(self) -> None:
-        if not self.new_tab:
+    def _resolve_tab_options(self, request_opts: dict | None) -> dict:
+        """Merge request-level tab options over daemon defaults."""
+        opts = {
+            "mode": self.default_mode,
+            "container": self.default_container,
+            "container_id": self.default_container_id,
+            "tab_id": self.default_tab_id,
+        }
+        if request_opts:
+            for key in ("mode", "container", "container_id", "tab_id"):
+                if key in request_opts and request_opts[key] is not None:
+                    opts[key] = request_opts[key]
+        if opts["mode"] not in (
+                "new", "reuse_active", "reuse_in_container", "by_id"):
+            raise BridgeError(f"unknown tab mode: {opts['mode']!r}")
+        return opts
+
+    def _prepare_tab(self, request_opts: dict | None = None) -> None:
+        opts = self._resolve_tab_options(request_opts)
+        mode = opts["mode"]
+
+        if mode == "reuse_active":
+            print("[daemon] reusing active tab", file=sys.stderr)
             return
 
-        payload: dict = {"url": "https://chat.deepseek.com/"}
-        if self.container is not None:
-            payload["container"] = self.container
-        if self.container_id is not None:
-            payload["container_id"] = self.container_id
+        if mode == "by_id":
+            if opts["tab_id"] is None:
+                raise BridgeError(
+                    "tab mode 'by_id' requires a tab_id")
+            self.tab_id = int(opts["tab_id"])
+            print(f"[daemon] targeting tab {self.tab_id}",
+                  file=sys.stderr)
+            return
 
+        # mode is "new" or "reuse_in_container"
+        payload: dict = {"url": "https://chat.deepseek.com/"}
         container_desc = ""
-        if self.container:
-            container_desc = f" in container {self.container!r}"
-        elif self.container_id:
-            container_desc = f" in container-id {self.container_id!r}"
-        print(f"[daemon] opening new DeepSeek tab{container_desc}",
-              file=sys.stderr)
+        if opts.get("container"):
+            payload["container"] = opts["container"]
+            container_desc = f" in container {opts['container']!r}"
+        elif opts.get("container_id"):
+            payload["container_id"] = opts["container_id"]
+            container_desc = (
+                f" in container-id {opts['container_id']!r}")
+
+        if mode == "reuse_in_container":
+            if not container_desc:
+                raise BridgeError(
+                    "tab mode 'reuse_in_container' requires "
+                    "container or container_id")
+            payload["reuse"] = "if_exists"
+            print(
+                f"[daemon] find-or-open DeepSeek tab{container_desc}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[daemon] opening new DeepSeek tab{container_desc}",
+                file=sys.stderr,
+            )
 
         result = self._call(
             "open-tab",
@@ -133,12 +239,7 @@ class BrowserBridge:
         )
         # The extension acks with `success: false` when, e.g., the
         # requested container name doesn't resolve or matches more
-        # than one container.  Before this check, the daemon
-        # proceeded with `tab_id = None` and later fell back to
-        # "active tab" semantics in submit/watch — silently using
-        # whichever DeepSeek tab the user happened to have focused,
-        # possibly outside the requested container.  Raising here
-        # surfaces the extension's own reason directly.
+        # than one container.
         if not result.get("success"):
             raise BridgeError(
                 f"open-tab failed: "
@@ -146,15 +247,14 @@ class BrowserBridge:
             )
         self.tab_id = result.get("tab_id")
         cs_id = result.get("cookie_store_id")
+        reused = bool(result.get("reused"))
         detail = f"tab {self.tab_id} -> {result.get('url')}"
         if cs_id:
             detail += f"  (container: {cs_id})"
+        if reused:
+            detail += "  [reused]"
         print(f"[daemon] opened {detail}", file=sys.stderr)
         if self.tab_wait > 0:
-            print(
-                f"[daemon] waiting {self.tab_wait:.1f}s for tab load",
-                file=sys.stderr,
-            )
             time.sleep(self.tab_wait)
 
     def _submit(self, prompt: str) -> None:
@@ -193,12 +293,6 @@ class BrowserBridge:
             "poll_interval_ms": self.poll_interval_ms,
             "settle_ticks": self.settle_ticks,
             "max_duration_ms": self.max_duration_ms,
-            # Thinking phase can run for minutes with no answer
-            # content.  The historical 120s value was tuned for
-            # interactive DeepSeek use; reasoning models routinely
-            # exceed that.  Now sourced from
-            # FIRST_CONTENT_TIMEOUT_MS (10 min default), overridable
-            # via DEEPPEEK_FIRST_CONTENT_TIMEOUT_MS.
             "first_content_timeout_ms": self.first_content_timeout_ms,
         }
         if self.tab_id is not None:
@@ -229,15 +323,6 @@ class BrowserBridge:
             try:
                 msg = self.server.wait_for_result(timeout=0.5)
             except queue.Empty:
-                # Periodic heartbeat so the user can tell "browser
-                # is generating (thought phase)" from "stuck".  The
-                # heartbeat does NOT extend the deadline —
-                # WATCH_MAX_WAIT still bounds the total wait — it
-                # only makes the wait legible.  Rationale: the
-                # first-content timeout in the extension is an
-                # *idle* timeout (see injected-watch.js), so a
-                # thinking phase can legitimately run for tens of
-                # seconds with no watch-delta arriving.
                 now = time.monotonic()
                 if now - last_heartbeat >= 10.0:
                     print(
@@ -271,12 +356,6 @@ class BrowserBridge:
             elif ack == "watch-done":
                 reason = msg.get("reason")
                 if total == 0:
-                    # Distinguish real causes so the caller (and the
-                    # user reading stderr) knows what went wrong.  A
-                    # silent zero-char success is the failure shape
-                    # that produced the 2026-10-31 "daemon saw nothing"
-                    # incident — surfacing the reason turns a 120 s
-                    # silence into an actionable message.
                     if reason == "submit_failed":
                         raise BridgeError(
                             "submit appears to have been blocked — no "

@@ -8,6 +8,31 @@ endpoint changes.
 The default constants live here so a caller that omits `url` /
 `model` / `timeout` still gets something sensible.  Change them in
 this file if your local server's defaults differ.
+
+Tab hints (2026-11-23)
+----------------------
+`call()` accepts an optional `deeppeek_hints` dict that is merged
+into the request body under the key `"deeppeek"`.  Non-deeppeek
+servers (llama.cpp, llama-swap pass-through, OpenAI) ignore unknown
+body fields, so this is safe against any backend.  The deeppeek
+daemon reads `deeppeek.tab` to override its per-request tab
+behaviour (container, reuse, tab_id).
+
+Probe short-circuit (2026-11-23)
+--------------------------------
+The deeppeek daemon's `/v1/chat/completions` triggers a full
+browser cycle (open tab, submit, stream).  That makes the probe —
+whose job is only to confirm the endpoint is up — expensive and
+observable (opens a tab!).  The client now sends an
+`X-Deeppeek-Probe: 1` header on the probe POST; a deeppeek daemon
+sees it and returns a stub completion without touching the
+browser.  Standard OpenAI-compatible backends (llama-swap,
+llama.cpp, vLLM, ollama) ignore unknown headers, so the probe
+behaves exactly as before against them — cold-start warmup intact.
+
+If llama-swap (or another proxy) is in front of the deeppeek
+daemon, the header passes through unchanged and the daemon still
+short-circuits.
 """
 
 import hashlib
@@ -80,7 +105,13 @@ class LLMClient:
 
     def probe(self, probe_timeout: int = DEFAULT_PROBE_TIMEOUT) -> bool:
         """Quick health check; bypasses cache so it reflects current
-        reachability."""
+        reachability.
+
+        Sends `X-Deeppeek-Probe: 1`.  A deeppeek daemon sees the
+        header and returns a stub completion without opening a
+        browser tab; other backends ignore the header and this
+        behaves as the historical cold-start warmup POST.
+        """
         body = {
             "model": self.model,
             "messages": [{"role": "user", "content": "hi"}],
@@ -91,7 +122,10 @@ class LLMClient:
         req = urllib.request.Request(
             self.url,
             data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "X-Deeppeek-Probe": "1",
+            },
             method="POST",
         )
         try:
@@ -110,26 +144,76 @@ class LLMClient:
             return False
 
     def _stream_call(self, req, tag: str):
-        """Execute a streaming (SSE) POST; print deltas to stderr live."""
+        """Execute a streaming (SSE) POST; print deltas to stderr live.
+
+        Returns (content, dt) on success, or (None, dt) on failure.
+        A failure is either an HTTP-level error already raised by
+        urlopen, or an SSE `data: {"error": ...}` frame received from
+        the server with no accompanying content chunks.  An *empty*
+        successful reply (chunks received but all empty) returns
+        ("", dt) — that's a legitimate (if unhelpful) result, not an
+        error.
+
+        Wire-format notes:
+
+          · Lines starting with `:` are SSE comments / keepalives and
+            are skipped silently (spec: RFC-style comment lines).
+          · `data:` with no trailing space and with a single space
+            are both accepted.
+          · `data: [DONE]` terminates the stream.
+          · `data: {"error": {...}}` marks a server-side failure;
+            the client keeps reading until [DONE] to drain the
+            connection, then reports failure if no content was
+            received.
+        """
         t0 = time.monotonic()
         chunks: list[str] = []
         started = False
+        first_chunk_at: Optional[float] = None
+        total_lines = 0
+        data_lines = 0
+        keepalive_lines = 0
+        saw_error: Optional[dict] = None
+
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             while True:
                 raw = resp.readline()
                 if not raw:
                     break
+                total_lines += 1
                 line = raw.decode("utf-8", "replace").rstrip("\r\n")
                 if not line:
+                    continue
+                if line.startswith(":"):
+                    keepalive_lines += 1
                     continue
                 if not line.startswith("data:"):
                     continue
                 payload = line[len("data:"):].strip()
                 if payload == "[DONE]":
                     break
+                data_lines += 1
                 try:
                     obj = json.loads(payload)
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as e:
+                    print(
+                        f"  [LLM:{tag or '?'}] WARN: bad SSE payload "
+                        f"({e}): {payload[:120]!r}",
+                        file=sys.stderr,
+                    )
+                    continue
+                # Server-side error frame — remember it, keep draining
+                # so the connection closes cleanly.
+                err = obj.get("error")
+                if err:
+                    saw_error = err if isinstance(err, dict) else {
+                        "message": str(err)}
+                    print(
+                        f"  [LLM:{tag or '?'}] SSE error: "
+                        f"{saw_error.get('type', '?')}: "
+                        f"{saw_error.get('message', saw_error)}",
+                        file=sys.stderr,
+                    )
                     continue
                 choices = obj.get("choices") or []
                 if not choices:
@@ -142,21 +226,40 @@ class LLMClient:
                 if not piece:
                     continue
                 if not started:
-                    sys.stderr.write(f"\n  [LLM:{tag or '?'}] > ")
+                    first_chunk_at = time.monotonic()
+                    elapsed = first_chunk_at - t0
+                    sys.stderr.write(
+                        f"\n  [LLM:{tag or '?'}] first chunk after "
+                        f"{elapsed:.1f}s > "
+                    )
                     started = True
                 sys.stderr.write(piece)
                 sys.stderr.flush()
                 chunks.append(piece)
+
         if started:
             sys.stderr.write("\n")
             sys.stderr.flush()
+
         dt = time.monotonic() - t0
-        return "".join(chunks), dt
+        content = "".join(chunks)
+
+        if not content and total_lines > 0 and data_lines == 0:
+            print(
+                f"  [LLM:{tag or '?'}] WARN: received {total_lines} "
+                f"lines, {keepalive_lines} keepalives, 0 data: frames "
+                f"— SSE format mismatch? try --no-stream",
+                file=sys.stderr,
+            )
+        if saw_error and not content:
+            return None, dt
+        return content, dt
 
     def call(self, prompt: str, max_tokens: int = 512,
              temperature: float = 0.2,
              tag: str = "",
-             stream: Optional[bool] = None) -> Optional[str]:
+             stream: Optional[bool] = None,
+             deeppeek_hints: Optional[dict] = None) -> Optional[str]:
         if stream is None:
             stream = self.stream_default
 
@@ -187,6 +290,8 @@ class LLMClient:
             "temperature": temperature,
             "chat_template_kwargs": {"enable_thinking": False},
         }
+        if deeppeek_hints:
+            body["deeppeek"] = deeppeek_hints
         if stream:
             body["stream"] = True
         req = urllib.request.Request(
@@ -199,6 +304,8 @@ class LLMClient:
             t0 = time.monotonic()
             if stream:
                 content, dt = self._stream_call(req, tag)
+                if content is None:
+                    return None
             else:
                 with urllib.request.urlopen(
                         req, timeout=self.timeout) as resp:

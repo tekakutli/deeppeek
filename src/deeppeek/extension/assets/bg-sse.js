@@ -2,6 +2,10 @@
 //
 // Added 2026-11-15: wait-for-reply event listener (fast reply
 // detection for split_send).
+//
+// Added 2026-11-24: get-active-tab event listener (read-only query
+// backing the CLI's `deeppeek daemon --which-tab` flag).  Handler
+// lives in bg-bind.js alongside the other tab helpers.
 function attachHandlers(es, port) {
   const tag = `[${port}]`;
 
@@ -47,6 +51,11 @@ function attachHandlers(es, port) {
     let data = {};
     try { data = JSON.parse(e.data || "{}"); } catch (_) {}
     handleOpenTab(data, port);
+  });
+  es.addEventListener("get-active-tab", (e) => {
+    let data = {};
+    try { data = JSON.parse(e.data || "{}"); } catch (_) {}
+    handleGetActiveTab(data, port);
   });
 
   // ---- composer events ----

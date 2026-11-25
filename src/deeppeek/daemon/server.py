@@ -38,6 +38,38 @@ capture the HTTP stream in another process.  Streaming deltas are
 printed with `end=""` so stdout reconstructs the reply live; a
 newline is appended when the stream completes.  The non-streaming
 path prints the full content once.
+
+Tab hints (2026-11-23)
+----------------------
+The request body may carry an optional `deeppeek` object:
+
+    {"deeppeek": {"tab": {"mode": ..., "container": ..., ...}}}
+
+`deeppeek.tab` is forwarded verbatim to `BrowserBridge.stream` /
+`.complete` as `tab_options`.  Unknown fields are ignored, so an
+older bridge stays compatible; unknown `mode` values raise
+BridgeError → HTTP 400, matching the invalid-request shape clients
+already retry-avoid.
+
+Probe short-circuit (2026-11-23)
+--------------------------------
+A caller that only wants to confirm reachability — the LLM client's
+`probe()`, monitoring, `curl -I` equivalents — sends the header
+`X-Deeppeek-Probe: 1`.  The daemon responds with an empty
+`chat.completion` payload without invoking the bridge, so no
+browser tab is opened and no model tokens are consumed.  The
+response shape matches a valid non-streaming completion so standard
+clients parse it without special-casing.
+
+Active-tab query (2026-11-24)
+-----------------------------
+`GET /deeppeek/active-tab` is a deeppeek-specific read-only query
+(not part of the OpenAI surface) that asks the extension which
+supported chat tab is currently focused.  Backs
+`deeppeek daemon --which-tab`, whose output feeds
+`--reuse-tab-by TAB_ID`.  Returns the extension's reply verbatim:
+`{"success": bool, "tab_id": int|None, "url": str, "reason": str,
+"candidates": [...]}`.  Never opens, submits to, or mutates any tab.
 """
 import json
 import queue
@@ -78,9 +110,32 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                                    "invalid_request_error"))
             return
 
+        # Probe short-circuit.  A caller that only wants to check
+        # reachability sets X-Deeppeek-Probe: 1; we return a valid
+        # but empty completion without touching the bridge.  The
+        # body is read above, so the TCP connection drains cleanly.
+        # Unknown headers from non-deeppeek backends are ignored on
+        # their side, so nothing else in the ecosystem needs to
+        # change.
+        if self.headers.get("X-Deeppeek-Probe"):
+            model = req.get("model", "deepseek-web")
+            empty = _completion_payload(model, "", {
+                "prompt_tokens": 1,
+                "completion_tokens": 0,
+                "total_tokens": 1,
+            })
+            self._json(200, empty)
+            return
+
         model = req.get("model", "deepseek-web")
         messages = req.get("messages") or []
         stream = bool(req.get("stream", False))
+
+        # Optional per-request tab override.  Non-deeppeek clients
+        # (aider, raw curl) simply omit this and the daemon uses its
+        # CLI-configured defaults.
+        deeppeek = req.get("deeppeek") or {}
+        tab_options = deeppeek.get("tab") or None
 
         if not messages:
             self._json(
@@ -91,9 +146,11 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
         try:
             if stream:
-                self._stream_response(model, messages)
+                self._stream_response(model, messages,
+                                      tab_options=tab_options)
             else:
-                content = self.bridge.complete(messages, model)
+                content = self.bridge.complete(messages, model,
+                                               tab_options=tab_options)
                 if self.print_output:
                     print(content, flush=True)
                 usage = _usage_estimate(messages, content)
@@ -122,12 +179,27 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     },
                 ],
             })
+        elif self.path == "/deeppeek/active-tab":
+            # Read-only query backing `deeppeek daemon --which-tab`.
+            # Returns the extension's reply verbatim so the client
+            # can render success and failure (with `candidates`) the
+            # same way.
+            try:
+                result = self.bridge.get_active_tab()
+            except BridgeError as e:
+                self._json(400, _error(str(e), "invalid_request_error"))
+                return
+            except Exception as e:
+                self._json(500, _error(str(e), "server_error"))
+                return
+            self._json(200, result)
         else:
             self._json(404, _error("not found", "invalid_request_error"))
 
     # ---- streaming -------------------------------------------------
 
-    def _stream_response(self, model: str, messages: list[dict]):
+    def _stream_response(self, model: str, messages: list[dict],
+                        tab_options: dict | None = None):
         """Stream a bridge response as SSE chunks, emitting keepalives
         while the browser is thinking.
 
@@ -162,9 +234,6 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         # Opening chunk: role=assistant, empty content.  Required by
         # the OpenAI streaming protocol so the client sees a valid
         # response open *before* the first content token arrives.
-        # Sent immediately (not after the first real token) so that
-        # any client which counts "bytes received" toward a liveness
-        # deadline is satisfied within milliseconds.
         opening = {
             "id": chat_id,
             "object": "chat.completion.chunk",
@@ -184,14 +253,13 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
         # Pump the bridge generator in a background thread so this
         # thread can emit keepalives while the browser is thinking.
-        # Errors are transported to the writer via pump_error; the
-        # sentinel None means "stream finished, check pump_error".
         q: "queue.Queue" = queue.Queue()
         pump_error: list[BaseException] = []
 
         def _pump():
             try:
-                for tok in self.bridge.stream(messages, model):
+                for tok in self.bridge.stream(messages, model,
+                                              tab_options=tab_options):
                     q.put(tok)
             except BaseException as e:  # noqa: BLE001 (propagated via q)
                 pump_error.append(e)
@@ -207,10 +275,6 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 try:
                     tok = q.get(timeout=KEEPALIVE_INTERVAL_S)
                 except queue.Empty:
-                    # SSE comment. Spec says lines starting with `:`
-                    # are ignored by every compliant parser.  Keeps
-                    # TCP warm and resets litellm's first-chunk / read
-                    # timers without injecting fake content.
                     try:
                         self.wfile.write(b": keepalive\n\n")
                         self.wfile.flush()
@@ -219,7 +283,6 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     continue
 
                 if tok is None:
-                    # Bridge finished (or raised).
                     if pump_error:
                         e = pump_error[0]
                         err_type = (
@@ -230,9 +293,6 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                         self._sse_error(str(e), err_type)
                         return
                     if not sent_content:
-                        # Bridge completed with zero content — treat
-                        # as a loud failure, matching the old
-                        # pre-header-buffering behaviour.
                         self._sse_error(
                             "model produced no output "
                             "(bridge yielded nothing)",
@@ -242,7 +302,6 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     break
 
                 if not tok:
-                    # Empty delta: skip, but don't count as content.
                     continue
 
                 if self.print_output:
@@ -265,9 +324,6 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     )
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
-                    # Client disconnected mid-stream.  No trailing
-                    # newline — the reply is truncated, and a newline
-                    # here would falsely suggest completeness.
                     return
                 sent_content = True
 
@@ -291,8 +347,6 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
         except Exception as e:
-            # Headers already on the wire; best we can do is send a
-            # terminal SSE error frame so the client sees a clean end.
             self._sse_error(str(e), "server_error")
 
     def _sse_error(self, message: str, err_type: str):
@@ -362,17 +416,7 @@ def _error(message: str, err_type: str) -> dict:
 
 def serve(bridge, port: int = 8766, print_output: bool = False) -> None:
     """Blocking serve loop.  Caller binds ``bridge``, then handles
-    Ctrl+C and shuts down ``ExportServer`` in its own finally block.
-
-    ``print_output`` — when True, every text delta the daemon
-    streams back to the client (aider) is echoed to the daemon's
-    own stdout.  Streaming deltas are printed with ``end=""`` so
-    stdout reconstructs the reply live; a newline is appended when
-    the stream completes.  The non-streaming path prints the full
-    content once.  Useful for debugging what the model is actually
-    producing without having to capture the HTTP stream
-    separately.
-    """
+    Ctrl+C and shuts down ``ExportServer`` in its own finally block."""
     OpenAIHandler.bridge = bridge
     OpenAIHandler.print_output = print_output
     httpd = ThreadingHTTPServer(("127.0.0.1", port), OpenAIHandler)

@@ -32,6 +32,30 @@ instruction, separated from the file contents by a blank line:
     deeppeek answer "Summarize the following:" --file notes.txt
     cat notes.txt | deeppeek answer --file -
     deeppeek answer --script passthrough --file notes.txt
+
+Tab hints
+---------
+When the URL points at a deeppeek daemon, the flags below travel to
+the daemon in the request body under `deeppeek.tab` and let you pick
+which browser tab the request runs in:
+
+  · --new-tab                 (default) open a new tab
+  · --container NAME          open a new tab in the named Firefox
+                              container
+  · --container-id ID         open a new tab in the raw cookieStoreId
+  · --reuse-tab               reuse whichever tab is currently active
+  · --reuse-tab-in NAME       reuse an existing tab in container NAME,
+                              or create one if none exists
+  · --reuse-tab-by TAB_ID     pin to an already-known tab id
+                              (get one from `deeppeek daemon --which-tab`)
+
+Tab hints only take effect when `--url` points directly at the
+daemon (e.g. http://localhost:8766/v1/chat/completions).  An
+intermediary like llama-swap must preserve the `deeppeek` body field
+for hints to reach the daemon.
+
+The flag definitions and validation live in `_tab_hints.py` so they
+stay in lockstep with `deeppeek editor`.
 """
 from __future__ import annotations
 
@@ -47,6 +71,7 @@ from ..llm import (
     DEFAULT_PROBE_TIMEOUT,
 )
 from .. import llm_scripts
+from . import _tab_hints
 
 
 def register(sub):
@@ -91,6 +116,24 @@ def register(sub):
         "--list", action="store_true",
         help="List registered scripts and exit",
     )
+
+    # ---- streaming toggle -----------------------------------------
+    p.add_argument(
+        "--stream", dest="stream", action="store_true", default=True,
+        help="Stream the reply as SSE deltas arrive (default).  "
+             "Deltas print to stderr as they arrive.",
+    )
+    p.add_argument(
+        "--no-stream", dest="stream", action="store_false",
+        help="Wait for the full reply before printing (no SSE).  "
+             "Use this if streaming seems to hang or produce "
+             "nothing — it isolates client-side SSE parsing from "
+             "server-side streaming.",
+    )
+
+    # ---- tab hints (shared with `deeppeek editor`) ----------------
+    _tab_hints.register_tab_flags(p)
+
     p.set_defaults(func=run)
     return p
 
@@ -152,11 +195,19 @@ def run(args) -> int:
             return 1
         input_text = positional_text
 
+    # Validate tab flags before doing any network work, so bad
+    # combinations fail fast.
+    try:
+        tab_hints = _tab_hints.build_tab_hints(args)
+    except SystemExit as e:
+        return int(e.code) if isinstance(e.code, int) else 1
+
     client = LLMClient(
         url=args.url,
         model=args.model,
         timeout=args.timeout,
         cache_dir=args.cache_dir,
+        stream=args.stream,
     )
 
     if not args.no_probe and not client.probe(DEFAULT_PROBE_TIMEOUT):
@@ -177,11 +228,14 @@ def run(args) -> int:
         prompt = input_text
         tag = "answer"
 
+    deeppeek_hints = {"tab": tab_hints} if tab_hints else None
+
     out = client.call(
         prompt,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         tag=tag,
+        deeppeek_hints=deeppeek_hints,
     )
     if out is None:
         return 1
