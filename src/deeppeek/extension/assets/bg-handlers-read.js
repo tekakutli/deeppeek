@@ -6,6 +6,21 @@
 // on completion.  The page world polls the DOM for a new assistant
 // message with content; returns as soon as one appears (~1.5s
 // typical).  No content emission, no cleanup tracking.
+//
+// watch / error-banner detection (2026-11-24):
+// The primary watch path runs inside the page world
+// (injected-watch.js) and POSTs watch-delta/watch-done directly to
+// /export.  This file's `handleWatch` only runs the legacy polling
+// fallback when the MutationObserver path can't be started.  Both
+// paths now check for DeepSeek error banners (quota, rate-limit,
+// model unavailable) and report `reason: "error_banner"` with a
+// structured `error` payload — so the daemon raises a BridgeError
+// instead of returning stale content from a previous turn.
+//
+// The polling fallback uses DSX_DETECT_ERROR (content.js → page
+// world __dsx_detect_error_json) once per poll.  A simple in-flight
+// guard prevents overlapping polls while that extra round-trip is
+// in flight.
 
 async function handleExtract(data, port) {
   const batchId = data.batch_id;
@@ -235,7 +250,11 @@ async function handleWatch(data, port) {
 
   if (started) return;
 
-  // Legacy polling fallback.
+  // Legacy polling fallback.  Kept as a safety net when the
+  // MutationObserver path can't be started; rare in practice.
+  // The error-banner check (DSX_DETECT_ERROR) runs FIRST on every
+  // poll — before content extraction — so a quota/rate-limit banner
+  // can't cause us to emit the previous turn's assistant message.
   let lastContent = "";
   let stableTicks = 0;
   let stopped = false;
@@ -244,69 +263,99 @@ async function handleWatch(data, port) {
   const startedAt = Date.now();
   let lastActivityAt = startedAt;
   let initialMsgCount = 0;
+  let inFlight = false;
 
-  const pollStop = async (reason) => {
+  const pollStop = async (reason, error) => {
     if (stopped) return;
     stopped = true;
     if (timer) { clearInterval(timer); timer = null; }
-    await postAck(port, {
+    const payload = {
       __ack: "watch-done",
-      batch_id: batchId, reason: reason || null,
-    });
+      batch_id: batchId,
+      reason: reason || null,
+    };
+    if (error) payload.error = error;
+    await postAck(port, payload);
   };
 
   const poll = async () => {
-    if (stopped) return;
-    if (Date.now() - startedAt > maxDuration) {
-      await pollStop("max_duration"); return;
-    }
-    let resp;
+    if (stopped || inFlight) return;
+    inFlight = true;
     try {
-      resp = await browser.tabs.sendMessage(tab.id, {
-        type: "DSX_EXTRACT", include_forked: false,
-      });
-    } catch (_) { stableTicks = 0; return; }
-    if (!resp) { stableTicks = 0; return; }
-    let content = "";
-    let thinking = "";
-    const msgs = resp.messages || [];
-    if (initialMsgCount === 0) {
-      initialMsgCount = msgs.length;
-    }
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      if (msgs[i].role === "assistant") {
-        content = msgs[i].content || "";
-        thinking = msgs[i].thinking || "";
-        break;
+      // ---- NEW: error-banner check FIRST ----
+      try {
+        const errResp = await browser.tabs.sendMessage(tab.id, {
+          type: "DSX_DETECT_ERROR",
+        });
+        if (errResp && errResp.error) {
+          console.warn(
+            `DSX:${tag} watch polling: error banner detected ` +
+            `(pattern=${errResp.error.pattern} ` +
+            `category=${errResp.error.category})`);
+          await pollStop("error_banner", errResp.error);
+          return;
+        }
+      } catch (_) {
+        // Older content.js without DSX_DETECT_ERROR support — fall
+        // through; error detection will be missed on this poll but
+        // the primary MutationObserver path already covers the
+        // common case.
       }
-    }
-    if (content || thinking || (msgs.length > initialMsgCount)) {
-      lastActivityAt = Date.now();
-    }
-    if (content) {
-      if (firstContentAt === null) firstContentAt = Date.now();
-    } else if (firstContentAt === null
-               && Date.now() - lastActivityAt > firstContentTimeoutMs) {
-      await pollStop("no_first_content"); return;
-    }
-    if (content === lastContent) {
-      if (lastContent) stableTicks++;
-    } else if (content.startsWith(lastContent)) {
-      const delta = content.slice(lastContent.length);
-      lastContent = content; stableTicks = 0;
-      if (delta) {
+
+      if (Date.now() - startedAt > maxDuration) {
+        await pollStop("max_duration"); return;
+      }
+
+      let resp;
+      try {
+        resp = await browser.tabs.sendMessage(tab.id, {
+          type: "DSX_EXTRACT", include_forked: false,
+        });
+      } catch (_) { stableTicks = 0; return; }
+      if (!resp) { stableTicks = 0; return; }
+      let content = "";
+      let thinking = "";
+      const msgs = resp.messages || [];
+      if (initialMsgCount === 0) {
+        initialMsgCount = msgs.length;
+      }
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].role === "assistant") {
+          content = msgs[i].content || "";
+          thinking = msgs[i].thinking || "";
+          break;
+        }
+      }
+      if (content || thinking || (msgs.length > initialMsgCount)) {
+        lastActivityAt = Date.now();
+      }
+      if (content) {
+        if (firstContentAt === null) firstContentAt = Date.now();
+      } else if (firstContentAt === null
+                 && Date.now() - lastActivityAt > firstContentTimeoutMs) {
+        await pollStop("no_first_content"); return;
+      }
+      if (content === lastContent) {
+        if (lastContent) stableTicks++;
+      } else if (content.startsWith(lastContent)) {
+        const delta = content.slice(lastContent.length);
+        lastContent = content; stableTicks = 0;
+        if (delta) {
+          await postAck(port, {
+            __ack: "watch-delta", batch_id: batchId, delta,
+          });
+        }
+      } else {
+        lastContent = content; stableTicks = 0;
         await postAck(port, {
-          __ack: "watch-delta", batch_id: batchId, delta,
+          __ack: "watch-rewrite", batch_id: batchId, content,
         });
       }
-    } else {
-      lastContent = content; stableTicks = 0;
-      await postAck(port, {
-        __ack: "watch-rewrite", batch_id: batchId, content,
-      });
-    }
-    if (lastContent && stableTicks >= settleTicks) {
-      await pollStop("settled");
+      if (lastContent && stableTicks >= settleTicks) {
+        await pollStop("settled");
+      }
+    } finally {
+      inFlight = false;
     }
   };
   timer = setInterval(poll, pollInterval);

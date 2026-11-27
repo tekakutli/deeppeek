@@ -52,6 +52,11 @@ dumped files appear, and only the directories that lead to them.  The
 offset path itself shows up as ordinary nested directories under the
 project root, so you still see where in the project the dump comes from.
 
+-s/--sizes appends `ls -lh`-style sizes to every tree entry.  Files show
+their own size; directories show the recursive total of everything
+beneath them; the root line shows the grand total.  Purely a rendering
+change — file selection is unaffected.
+
 Files whose own content *looks like another dump* — i.e. contains a
 `=====...=====\nFILE i/N: ...` block header at line start — are skipped
 by default (DEFAULT_SKIP_DUMP_FILES = True). This prevents an
@@ -200,6 +205,10 @@ DEFAULT_INCLUDE_DIRS = []
 # DEFAULT_INCLUDE_DIRS = ['segment', 'inpaint', 'pgkit',]
 # DEFAULT_INCLUDE_DIRS = ['outpaint', 'layout', ]
 # DEFAULT_INCLUDE_DIRS = ['inpaint',]
+# DEFAULT_INCLUDE_DIRS = ['controlnets', 'pg_comfy', 'pgkit', 'remote_panel', 'pgruntime',]
+# DEFAULT_INCLUDE_DIRS = ['controlnets', 'workbench', 'remote_panel', 'outpaint', 'pgkit']
+# DEFAULT_INCLUDE_DIRS = ['inpaint', 'pgruntime', 'layout',]
+# DEFAULT_INCLUDE_DIRS = ['interceptor', 'outpaint',]
 
 
 
@@ -248,6 +257,56 @@ def _looks_like_dump(path: Path) -> bool:
     except OSError:
         return False
     return bool(_DUMP_MARKER_RE.search(content))
+
+
+def _format_size(nbytes: int) -> str:
+    """Format a byte count like `ls -lh` (base-1024, one decimal >= 1K).
+
+    Bytes < 1024 are shown raw ("0", "512", "1023").  Larger sizes get a
+    single decimal and a K/M/G/T/P/E suffix, and roll over to the next
+    unit when the rounded value would be 1024.0 — so 1048575 B shows as
+    "1.0M" rather than "1024.0K".
+    """
+    if nbytes < 1024:
+        return str(nbytes)
+    value = float(nbytes)
+    for unit in ("K", "M", "G", "T", "P"):
+        value /= 1024.0
+        if round(value, 1) < 1024:
+            return f"{value:.1f}{unit}"
+    return f"{value:.1f}E"
+
+
+def _compute_tree_sizes(
+    node: dict,
+    root_path: Path,
+    rel_parts: tuple,
+    sizes: dict,
+) -> int:
+    """Fill `sizes` (rel_parts -> bytes) for every file and directory in
+    `node`, and return the subtree's total bytes.
+
+    Directory entries get the *recursive* sum of everything beneath them;
+    file entries get their own `st_size`.  Files that fail to stat (deleted
+    between scan and render, permission error, …) contribute 0 bytes and
+    never raise.
+    """
+    total = 0
+    for f in node.get(_FILES, []):
+        name = f[0] if isinstance(f, tuple) else f
+        try:
+            sz = root_path.joinpath(*rel_parts, name).stat().st_size
+        except OSError:
+            sz = 0
+        sizes[rel_parts + (name,)] = sz
+        total += sz
+    for d, sub in node.items():
+        if d == _FILES:
+            continue
+        sub_total = _compute_tree_sizes(sub, root_path, rel_parts + (d,), sizes)
+        sizes[rel_parts + (d,)] = sub_total
+        total += sub_total
+    return total
 
 
 def dir_matches(rel_dir: Path, name: str, patterns: list[str]) -> bool:
@@ -336,7 +395,12 @@ def find_files(
     return results
 
 
-def _render_tree(node: dict, prefix: str) -> list[str]:
+def _render_tree(
+    node: dict,
+    prefix: str,
+    sizes: dict | None = None,
+    rel_parts: tuple = (),
+) -> list[str]:
     lines: list[str] = []
     dirs = sorted(k for k in node if k != _FILES)
 
@@ -361,13 +425,21 @@ def _render_tree(node: dict, prefix: str) -> list[str]:
     for i, (name, is_dir, is_included) in enumerate(entries):
         last = i == len(entries) - 1
         connector = "└── " if last else "├── "
+
+        size_suffix = ""
+        if sizes is not None:
+            sz = sizes.get(rel_parts + (name,), 0)
+            size_suffix = "  [" + _format_size(sz) + "]"
+
         if is_dir:
-            lines.append(prefix + connector + name + "/")
+            lines.append(prefix + connector + name + "/" + size_suffix)
             extension = "    " if last else "│   "
-            lines.extend(_render_tree(node[name], prefix + extension))
+            lines.extend(_render_tree(
+                node[name], prefix + extension, sizes, rel_parts + (name,)
+            ))
         else:
             suffix = "" if is_included else "  [skip]"
-            lines.append(prefix + connector + name + suffix)
+            lines.append(prefix + connector + name + suffix + size_suffix)
     return lines
 
 
@@ -485,13 +557,34 @@ def build_tree_from_files(
     return tree
 
 
-def render_tree(tree: dict, label: str) -> str:
-    """Return a unix-`tree`-style rendering of a tree dict."""
+def render_tree(
+    tree: dict,
+    label: str,
+    root_path: Path | None = None,
+    show_sizes: bool = False,
+) -> str:
+    """Return a unix-`tree`-style rendering of a tree dict.
+
+    When `show_sizes=True` and `root_path` is provided, every entry gets a
+    `  [<human size>]` suffix.  Directories show the recursive total of
+    everything below them; the root label line shows the grand total.
+    """
     if label in ("", "."):
         label = "."
 
-    lines = [label + "/"]
-    lines.extend(_render_tree(tree, ""))
+    sizes: dict | None = None
+    root_suffix = ""
+    if show_sizes and root_path is not None:
+        try:
+            root_abs = Path(root_path).resolve()
+        except OSError:
+            root_abs = Path(root_path)
+        sizes = {}
+        total = _compute_tree_sizes(tree, root_abs, (), sizes)
+        root_suffix = "  [" + _format_size(total) + "]"
+
+    lines = [label + "/" + root_suffix]
+    lines.extend(_render_tree(tree, "", sizes, ()))
     return "\n".join(lines)
 
 
@@ -657,6 +750,15 @@ def main() -> int:
               "without FILE arguments."),
     )
     parser.add_argument(
+        "-s", "--sizes", action="store_true", default=False,
+        help=("Append human-readable file sizes to every DIRECTORY TREE "
+              "entry, formatted like `ls -lh`.  Directory entries show "
+              "the recursive total of all contained files, and the root "
+              "line shows the grand total.  Requires a tree to be "
+              "rendered (i.e. -r or -t in scan mode).  Does not affect "
+              "which files are dumped."),
+    )
+    parser.add_argument(
         "--as-read-args", action="store_true", default=False,
         help=("Instead of building a dump file, emit a single line of "
               "space-separated `--read PATH` arguments suitable for "
@@ -805,6 +907,10 @@ def main() -> int:
                   file=sys.stderr)
         return 0
 
+    if args.sizes and not recursive:
+        print("warning: --sizes has no effect without a tree section "
+              "(enable -r or -t)", file=sys.stderr)
+
     total = len(files)
     scanned_dir = Path(os.path.abspath(str(tree_root)))
 
@@ -853,7 +959,10 @@ def main() -> int:
                 mark_skipped=args.tree_from_scan,
                 extensions=extensions if args.tree_from_scan else None,
             )
-        fh.write(render_tree(tree, str(tree_root)) + "\n")
+        fh.write(render_tree(
+            tree, str(tree_root),
+            root_path=tree_root, show_sizes=args.sizes,
+        ) + "\n")
         fh.write("```\n\n")
 
     if not tree_only:

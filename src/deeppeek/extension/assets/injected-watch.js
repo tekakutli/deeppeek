@@ -1,4 +1,5 @@
-// Streaming watcher (v18, batch mode + wait-for-reply fast path).
+// Streaming watcher (v19, batch mode + wait-for-reply fast path
+// + error-banner detection).
 //
 // =====================================================================
 // watch: heavyweight, extracts full content via API, waits settle ticks
@@ -47,6 +48,25 @@
 //
 // `baseline_msg_count` is still reported in the response for
 // diagnostic purposes but is NEVER used to gate detection.
+//
+// =====================================================================
+// ERROR-BANNER DETECTION (2026-11-24)
+// =====================================================================
+// DeepSeek renders server-side errors (rate limit, quota exhaustion,
+// model unavailable, context length) as notice banners in the chat
+// UI instead of assistant messages.  Before this change, the watch
+// flow saw "no new content" and — via the fetchFinalFromApi fallback
+// — returned the PREVIOUS turn's assistant message as if it were the
+// current reply.  The daemon then streamed stale content to aider.
+//
+// Now `extractAndEmit` and `settleNow` call
+// `window.__dsx__.detectErrorBanner(container)` before touching
+// content at all.  On detection, the watcher stops with
+// `reason: "error_banner"` and a structured `error` payload that the
+// daemon's bridge raises as a BridgeError.  Stale content is never
+// emitted.
+//
+// See injected-error-patterns.js for the registry and matcher.
 //
 // Design decisions:
 //
@@ -133,6 +153,20 @@
           || testid === "stop-generating") return true;
     }
     return false;
+  }
+
+  // NEW: shared error-banner helper for the watcher.  Wrapped
+  // defensively so a missing injected-error-patterns.js (load order
+  // change, manifest bug) degrades to "no detection" instead of
+  // breaking the watch flow.
+  function detectError(el) {
+    const fn = window.__dsx__ && window.__dsx__.detectErrorBanner;
+    if (typeof fn !== "function") return null;
+    try { return fn(el || document); }
+    catch (e) {
+      console.warn(`[DSX-WATCH] detectErrorBanner threw: ${e.message}`);
+      return null;
+    }
   }
 
   function _isInsideThinking(el) {
@@ -356,7 +390,7 @@
   };
 
   // =====================================================================
-  // watch — heavyweight streaming (unchanged from previous version)
+  // watch — heavyweight streaming
   // =====================================================================
 
   async function fetchFinalFromApi(batchId) {
@@ -414,22 +448,29 @@
     let initialMsgCount = 0;
     let initialLastMsgLen = 0;
 
-    function stop(reason) {
+    function stop(reason, error) {
       if (stopped) return;
       stopped = true;
       console.log(`[DSX-WATCH ${batchId}] STOP reason=${reason} ` +
-        `emitted=${emitted}`);
+        `emitted=${emitted}` +
+        (error ? ` error=${error.pattern}/${error.category}` : ""));
       if (msgObserver) msgObserver.disconnect();
       if (settleTimer) clearTimeout(settleTimer);
       if (containerPollTimer) clearInterval(containerPollTimer);
       if (safetyPollTimer) clearInterval(safetyPollTimer);
       watchers.delete(batchId);
-      onDone(reason);
+      onDone(reason, error);
     }
 
     async function settleNow() {
       settleTimer = null;
       if (stopped) return;
+
+      // NEW: check for an error banner BEFORE reading any content.
+      // This is the primary defense against returning stale content:
+      // if DeepSeek errored, we must never call fetchFinalFromApi.
+      const earlyErr = detectError(container);
+      if (earlyErr) { stop("error_banner", earlyErr); return; }
 
       if (isGenerating()) {
         sawGenerating = true;
@@ -437,6 +478,17 @@
       }
 
       let content = await fetchFinalFromApi(batchId);
+
+      // Re-check stopped: extractAndEmit may have fired during the
+      // await above and stopped the watcher already.
+      if (stopped) return;
+
+      // NEW: race guard.  If the banner appeared *during* the async
+      // fetch, we must not emit whatever content the fetch returned
+      // (which could be the previous turn's reply).
+      const lateErr = detectError(container);
+      if (lateErr) { stop("error_banner", lateErr); return; }
+
       let source = "api";
 
       if (!content) {
@@ -463,6 +515,23 @@
 
     function extractAndEmit() {
       if (stopped) return;
+
+      // NEW: check for an error banner on every tick, BEFORE the
+      // sawGenerating / content checks.  Without this, a "submit
+      // failed because the model is unavailable" case would wait
+      // submitTimeoutMs (20s) before reporting — and worse, if
+      // fetchFinalFromApi later runs, it would return the previous
+      // turn's content.
+      const err = detectError(container);
+      if (err) {
+        console.warn(
+          `[DSX-WATCH ${batchId}] ERROR_BANNER detected: ` +
+          `pattern=${err.pattern} category=${err.category} ` +
+          `text=${JSON.stringify(err.text.slice(0, 120))}`);
+        stop("error_banner", err);
+        return;
+      }
+
       if (Date.now() - startedAt > maxDurationMs) {
         console.warn(`[DSX-WATCH ${batchId}] MAX_DURATION reached`);
         stop("max_duration");
@@ -588,15 +657,17 @@
         }),
       }).catch(() => {});
     };
-    const onDone = (reason) => {
+    const onDone = (reason, error) => {
+      const payload = {
+        __ack: "watch-done",
+        batch_id: batchId,
+        reason,
+      };
+      if (error) payload.error = error;
       fetch(`${base}/export`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          __ack: "watch-done",
-          batch_id: batchId,
-          reason,
-        }),
+        body: JSON.stringify(payload),
       }).catch(() => {});
     };
 

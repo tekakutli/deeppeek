@@ -8,21 +8,31 @@
 // Added DSX_WAIT_FOR_REPLY message type: forwards to page-world
 // `__dsx_wait_for_reply_json`.  Used by split_send for the fast
 // "AI reply appeared" signal.
+//
+// CHANGES 2026-11-24
+// ==================
+// · Load injected-error-patterns.js before injected-watch.js so the
+//   watcher can call __dsx__.detectErrorBanner.
+// · Add DSX_DETECT_ERROR message type: forwards to page-world
+//   `__dsx_detect_error_json`.  Used by bg-handlers-read.js's legacy
+//   polling fallback to detect server-side error banners (quota,
+//   rate-limit, model unavailable) before returning stale content.
 (async function () {
   const PAGE_WORLD_SCRIPTS = [
-    "injected.js",          // bootstrap: __dsx__, config, helpers
-    "injected-idb.js",      // T1: IndexedDB schema
-    "injected-fiber.js",    // T2: React fiber walk (fallback)
-    "injected-watch.js",    // T2: MutationObserver streaming watcher
-    "injected-extract.js",  // T2: extraction orchestrator
-    "injected-fetch.js",    // T1: signed-URL → bytes
-    "injected-attach.js",   // T2: drop / file-input attach
-    "injected-composer.js", // T2: typing + Enter
-    "injected-clear.js",    // T3: composer clearing
-    "injected-attachments.js", // T3: attachment extraction modes
-    "injected-retry.js",    // T3: retry-last
-    "injected-hijack.js",   // T3: download-button interception
-    "injected-buttons.js",  // button injector FRAMEWORK (no rules)
+    "injected.js",              // bootstrap: __dsx__, config, helpers
+    "injected-idb.js",          // T1: IndexedDB schema
+    "injected-fiber.js",        // T2: React fiber walk (fallback)
+    "injected-error-patterns.js", // T2: error-banner registry + detector
+    "injected-watch.js",        // T2: MutationObserver streaming watcher
+    "injected-extract.js",      // T2: extraction orchestrator
+    "injected-fetch.js",        // T1: signed-URL → bytes
+    "injected-attach.js",       // T2: drop / file-input attach
+    "injected-composer.js",     // T2: typing + Enter
+    "injected-clear.js",        // T3: composer clearing
+    "injected-attachments.js",  // T3: attachment extraction modes
+    "injected-retry.js",        // T3: retry-last
+    "injected-hijack.js",       // T3: download-button interception
+    "injected-buttons.js",      // button injector FRAMEWORK (no rules)
   ];
 
   const BRIDGE_TYPES = new Set([
@@ -212,6 +222,23 @@
       } catch (e) {
         return { success: false,
                  reason: `wait-for-reply threw: ${e.message}` };
+      }
+    }
+
+    // NEW: read-only error-banner detection for the polling fallback.
+    // Returns { success: true, error: <obj|null> }.
+    if (msg.type === "DSX_DETECT_ERROR") {
+      if (!(await ensurePageWorldFn("__dsx_detect_error_json"))) {
+        return { success: false,
+                 reason: "page-world detect-error unavailable" };
+      }
+      try {
+        const json = await window.wrappedJSObject
+          .__dsx_detect_error_json("{}");
+        return JSON.parse(json);
+      } catch (e) {
+        return { success: false,
+                 reason: `detect-error threw: ${e.message}` };
       }
     }
 

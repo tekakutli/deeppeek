@@ -52,6 +52,7 @@
         "injected.js",
         "injected-idb.js",
         "injected-fiber.js",
+        "injected-error-patterns.js",
         "injected-watch.js",
         "injected-extract.js",
         "injected-fetch.js",

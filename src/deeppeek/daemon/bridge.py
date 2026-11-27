@@ -67,6 +67,14 @@ class BrowserBridge:
     `--reuse-tab-by`.  It uses a non-blocking lock so it fails fast
     when a completion is in flight (the two would otherwise race on
     the shared result queue).
+
+    Server-side error banners (quota exhaustion, rate limits, model
+    unavailable, context length) are surfaced as BridgeError by
+    `_watch()` when the extension emits `reason: "error_banner"` with
+    a structured `error` payload.  This prevents the daemon from
+    silently returning the previous turn's assistant message as if
+    it were the current reply — the browser-side error detector
+    (injected-error-patterns.js) runs before any content extraction.
     """
 
     def __init__(
@@ -355,6 +363,30 @@ class BrowserBridge:
                 yield content
             elif ack == "watch-done":
                 reason = msg.get("reason")
+
+                # NEW: structured error from the extension's
+                # error-banner detector (injected-error-patterns.js).
+                # Checked BEFORE the total==0 branch: if stale content
+                # was emitted before the banner appeared, we still
+                # want to surface the error (an error always wins over
+                # a partial reply).
+                error = msg.get("error")
+                if error:
+                    err_cat = error.get("category", "unknown")
+                    err_text = error.get("text", "(no text)")
+                    err_hint = error.get("hint") or ""
+                    err_msg = (
+                        f"DeepSeek error [{err_cat}]: {err_text}"
+                    )
+                    if err_hint:
+                        err_msg += f" — {err_hint}"
+                    if total > 0:
+                        err_msg += (
+                            f" (discarding {total:,} chars of "
+                            f"stale content already emitted)"
+                        )
+                    raise BridgeError(err_msg)
+
                 if total == 0:
                     if reason == "submit_failed":
                         raise BridgeError(
